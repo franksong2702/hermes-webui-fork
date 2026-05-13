@@ -1288,7 +1288,7 @@ Complete list of all HTTP endpoints as of Sprint 1 (v0.3).
     /index.html                Same as /
     /health                    {"status":"ok","sessions":N}
     /api/session               ?session_id=X -> full session + messages. 400 if no ID.
-    /api/sessions              List of all session compact() dicts, sorted by updated_at
+    /api/sessions              Reconciles stale stream state, then lists session compact() dicts sorted by updated_at
     /api/list                  ?session_id=X&path=. -> directory listing for session workspace
     /api/file                  ?session_id=X&path=rel -> file content (text, 200KB limit)
     /api/chat/stream           ?stream_id=X -> SSE stream. Long-lived. Emits token/tool/
