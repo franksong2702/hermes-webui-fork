@@ -845,6 +845,50 @@ button:hover{background:rgba(124,185,255,.25)}
 # ── GET routes ────────────────────────────────────────────────────────────────
 
 
+def _clear_stale_stream_state(session) -> bool:
+    """Clear persisted streaming flags when the in-memory stream is gone."""
+    stream_id = getattr(session, "active_stream_id", None)
+    if not stream_id:
+        return False
+    with STREAMS_LOCK:
+        if stream_id in STREAMS:
+            return False
+    if getattr(session, "active_stream_id", None) != stream_id:
+        return False
+    session.active_stream_id = None
+    if hasattr(session, "pending_user_message"):
+        session.pending_user_message = None
+    if hasattr(session, "pending_attachments"):
+        session.pending_attachments = []
+    if hasattr(session, "pending_started_at"):
+        session.pending_started_at = None
+    try:
+        session.save()
+    except Exception:
+        logger.exception(
+            "_clear_stale_stream_state: save() failed for session %s",
+            getattr(session, "session_id", "?"),
+        )
+    return True
+
+
+def _reconcile_stale_stream_state_for_sessions(session_rows) -> bool:
+    """Clear stale stream state for sessions before serializing /api/sessions."""
+    changed = False
+    for row in session_rows:
+        if not isinstance(row, dict):
+            continue
+        sid = row.get("session_id")
+        if not sid or not row.get("active_stream_id"):
+            continue
+        try:
+            session = get_session(sid, metadata_only=False)
+        except KeyError:
+            continue
+        changed = _clear_stale_stream_state(session) or changed
+    return changed
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
 
@@ -1158,6 +1202,8 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/sessions":
         webui_sessions = all_sessions()
+        if _reconcile_stale_stream_state_for_sessions(webui_sessions):
+            webui_sessions = all_sessions()
         settings = load_settings()
         if settings.get("show_cli_sessions"):
             cli = get_cli_sessions()
