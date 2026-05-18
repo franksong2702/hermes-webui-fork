@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep server-idle session rows from inheriting stale local streaming fields during sidebar optimistic merging, so PWA/browser caches cannot keep a completed session's spinner alive after `/api/sessions` reports no active stream or pending user message.
+
 ## [v0.51.88] — 2026-05-18 — Release BL (stage-381 — 3-PR security + UX + lineage batch — session-bound CSRF tokens for unsafe browser requests + quoted-reply selected-text composer append + compression-continuation sidebar collapse)
 
 ### Security
