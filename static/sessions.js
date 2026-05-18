@@ -17,6 +17,20 @@ const ICONS={
 // before the first request completes (#1060).
 let _loadingSessionId = null;
 
+// Coalesce concurrent New Conversation requests. Cold provider/model catalog
+// resolution can make /api/session/new take several seconds; without this guard,
+// repeated clicks enqueue multiple empty conversations before the first response
+// comes back (#2518).
+let _newSessionPromise = null;
+
+function _setNewSessionCreating(active){
+  const btn=(typeof $==='function')?$('btnNewChat'):null;
+  if(!btn)return;
+  btn.disabled=!!active;
+  btn.setAttribute('aria-busy',active?'true':'false');
+  btn.classList.toggle('is-loading',!!active);
+}
+
 // ── Composer draft persistence ────────────────────────────────────────────────
 
 // Debounced save — prevents hammering the server on every keystroke.
@@ -418,73 +432,83 @@ function _markPollingCompletionUnreadTransitions(sessions) {
 }
 
 async function newSession(flash, options={}){
-  updateQueueBadge();
-  S.toolCalls=[];
-  clearLiveToolCards();
-  // One-shot profile-switch workspace: applied to the first new session after a profile
-  // switch, then cleared.  Use a dedicated flag so S._profileDefaultWorkspace (the
-  // persistent boot/settings default) is not consumed and remains available for the
-  // blank-page display on all subsequent returns to the empty state (#823).
-  const switchWs=S._profileSwitchWorkspace;
-  S._profileSwitchWorkspace=null;
-  const inheritWs=switchWs||(S.session?S.session.workspace:null)||(S._profileDefaultWorkspace||null);
-  // Use the saved default model for new sessions (#872). The user's saved
-  // default_model (from Settings) takes priority over the chat-header dropdown
-  // value, which reflects the *previous* session's model. Fall back to the
-  // dropdown value only when no default_model is configured.
-  const modelSel=$('modelSelect');
-  const selectedDefaultModel=window._defaultModel||(modelSel&&modelSel.value)||'';
-  let defaultApplied=false;
-  if(window._defaultModel&&modelSel&&typeof _applyModelToDropdown==='function'){
-    defaultApplied=!!_applyModelToDropdown(window._defaultModel,modelSel,window._activeProvider||null);
-  }
-  const canQualify=!window._defaultModel||defaultApplied||(modelSel&&modelSel.value===selectedDefaultModel);
-  const newModelState=(canQualify&&typeof _modelStateForSelect==='function')
-    ? _modelStateForSelect(modelSel,selectedDefaultModel)
-    : {model:selectedDefaultModel,model_provider:null};
-  const reqBody={
-    model:newModelState.model,
-    model_provider:newModelState.model_provider||null,
-    workspace:inheritWs,
-    profile:S.activeProfile||'default',
-  };
-  if(S.session&&S.session.session_id) reqBody.prev_session_id=S.session.session_id;
-  if(options&&options.worktree) reqBody.worktree=true;
-  if(_activeProject&&_activeProject!==NO_PROJECT_FILTER) reqBody.project_id=_activeProject;
-  const data=await api('/api/session/new',{method:'POST',body:JSON.stringify(reqBody)});
-  S.session=data.session;S.messages=data.session.messages||[];
-  S.lastUsage={...(data.session.last_usage||{})};
-  if(flash)S.session._flash=true;
-  try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
-  _setActiveSessionUrl(S.session.session_id);
-  _setSessionViewedCount(S.session.session_id, S.session.message_count || 0);
-  // Sync chat-header dropdown to the session's model so the UI reflects
-  // the default model the server actually used (#872).
-  if(S.session.model && S.session.model!==$('modelSelect').value && typeof _applyModelToDropdown==='function'){
-    _applyModelToDropdown(S.session.model,$('modelSelect'),S.session.model_provider||null);
-    if(typeof syncModelChip==='function') syncModelChip();
-  }
-  // Reset per-session visual state: a fresh chat is idle even if another
-  // conversation is still streaming in the background.
-  S.busy=false;
-  S.activeStreamId=null;
-  updateSendBtn();
-  setStatus('');
-  setComposerStatus('');
-  if(typeof _setLiveAssistantTps==='function') _setLiveAssistantTps(null);
-  if(typeof _syncCtxIndicator==='function'){
-    _syncCtxIndicator({
-      input_tokens:data.session.input_tokens||0,
-      output_tokens:data.session.output_tokens||0,
-      estimated_cost:data.session.estimated_cost||0,
-      context_length:data.session.context_length||0,
-      last_prompt_tokens:data.session.last_prompt_tokens||0,
-      threshold_tokens:data.session.threshold_tokens||0,
-    });
-  }
-  updateQueueBadge(S.session.session_id);
-  syncTopbar();renderMessages();loadDir('.');
-  // don't call renderSessionList here - callers do it when needed
+  if(_newSessionPromise) return _newSessionPromise;
+  _setNewSessionCreating(true);
+  _newSessionPromise=(async()=>{
+    try{
+      updateQueueBadge();
+      S.toolCalls=[];
+      clearLiveToolCards();
+      // One-shot profile-switch workspace: applied to the first new session after a profile
+      // switch, then cleared.  Use a dedicated flag so S._profileDefaultWorkspace (the
+      // persistent boot/settings default) is not consumed and remains available for the
+      // blank-page display on all subsequent returns to the empty state (#823).
+      const switchWs=S._profileSwitchWorkspace;
+      S._profileSwitchWorkspace=null;
+      const inheritWs=switchWs||(S.session?S.session.workspace:null)||(S._profileDefaultWorkspace||null);
+      // Use the saved default model for new sessions (#872). The user's saved
+      // default_model (from Settings) takes priority over the chat-header dropdown
+      // value, which reflects the *previous* session's model. Fall back to the
+      // dropdown value only when no default_model is configured.
+      const modelSel=$('modelSelect');
+      const selectedDefaultModel=window._defaultModel||(modelSel&&modelSel.value)||'';
+      let defaultApplied=false;
+      if(window._defaultModel&&modelSel&&typeof _applyModelToDropdown==='function'){
+        defaultApplied=!!_applyModelToDropdown(window._defaultModel,modelSel,window._activeProvider||null);
+      }
+      const canQualify=!window._defaultModel||defaultApplied||(modelSel&&modelSel.value===selectedDefaultModel);
+      const newModelState=(canQualify&&typeof _modelStateForSelect==='function')
+        ? _modelStateForSelect(modelSel,selectedDefaultModel)
+        : {model:selectedDefaultModel,model_provider:null};
+      const reqBody={
+        model:newModelState.model,
+        model_provider:newModelState.model_provider||null,
+        workspace:inheritWs,
+        profile:S.activeProfile||'default',
+      };
+      if(S.session&&S.session.session_id) reqBody.prev_session_id=S.session.session_id;
+      if(options&&options.worktree) reqBody.worktree=true;
+      if(_activeProject&&_activeProject!==NO_PROJECT_FILTER) reqBody.project_id=_activeProject;
+      const data=await api('/api/session/new',{method:'POST',body:JSON.stringify(reqBody)});
+      S.session=data.session;S.messages=data.session.messages||[];
+      S.lastUsage={...(data.session.last_usage||{})};
+      if(flash)S.session._flash=true;
+      try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
+      _setActiveSessionUrl(S.session.session_id);
+      _setSessionViewedCount(S.session.session_id, S.session.message_count || 0);
+      // Sync chat-header dropdown to the session's model so the UI reflects
+      // the default model the server actually used (#872).
+      if(S.session.model && S.session.model!==$('modelSelect').value && typeof _applyModelToDropdown==='function'){
+        _applyModelToDropdown(S.session.model,$('modelSelect'),S.session.model_provider||null);
+        if(typeof syncModelChip==='function') syncModelChip();
+      }
+      // Reset per-session visual state: a fresh chat is idle even if another
+      // conversation is still streaming in the background.
+      S.busy=false;
+      S.activeStreamId=null;
+      updateSendBtn();
+      setStatus('');
+      setComposerStatus('');
+      if(typeof _setLiveAssistantTps==='function') _setLiveAssistantTps(null);
+      if(typeof _syncCtxIndicator==='function'){
+        _syncCtxIndicator({
+          input_tokens:data.session.input_tokens||0,
+          output_tokens:data.session.output_tokens||0,
+          estimated_cost:data.session.estimated_cost||0,
+          context_length:data.session.context_length||0,
+          last_prompt_tokens:data.session.last_prompt_tokens||0,
+          threshold_tokens:data.session.threshold_tokens||0,
+        });
+      }
+      updateQueueBadge(S.session.session_id);
+      syncTopbar();renderMessages();loadDir('.');
+      // don't call renderSessionList here - callers do it when needed
+    }finally{
+      _newSessionPromise=null;
+      _setNewSessionCreating(false);
+    }
+  })();
+  return _newSessionPromise;
 }
 
 async function loadSession(sid){
