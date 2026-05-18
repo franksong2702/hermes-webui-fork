@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Documentation
+
+- Add a contributor-facing project contract index that routes UI/UX, runtime
+  state, and onboarding/setup changes to the relevant public docs before
+  contributors edit code or open PRs.
+
 ## [v0.51.88] — 2026-05-18 — Release BL (stage-381 — 3-PR security + UX + lineage batch — session-bound CSRF tokens for unsafe browser requests + quoted-reply selected-text composer append + compression-continuation sidebar collapse)
 
 ### Security
