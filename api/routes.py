@@ -8784,7 +8784,12 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str) -> bool:
                 # _gateway_queues stores _ApprovalEntry objects; their
                 # .data dict carries command, pattern_key, pattern_keys.
                 gw_data = getattr(gw_entry, 'data', None) or {}
-                gateway_keys = gw_data.get("pattern_keys") or [gw_data.get("pattern_key", "")] if gw_data else []
+                gateway_keys = gw_data.get("pattern_keys") or [gw_data.get("pattern_key", "")]
+                # Peek is not strict — a concurrent resolver may pop a
+                # different gateway entry before we reach
+                # resolve_gateway_approval below, but approve_session is
+                # idempotent over the session key set so the outcome is
+                # the same regardless of which entry wins the race.
                 found_target = True
         # Notify SSE subscribers of the new head (or empty state) so the UI
         # surfaces any trailing approvals that were queued behind this one
