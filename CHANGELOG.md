@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Surface live tool activity when Hermes Agent reports tools through its dedicated `tool_start_callback` / `tool_complete_callback` path, so browser chat shows the existing running tool cards instead of appearing idle until the final answer.
+- Keep the composer usable if a transient restart/proxy blip prevents `commands.js` from loading while `boot.js` still attaches slash-command listeners.
+
 
 ## [v0.51.93] — 2026-05-19 — Release BQ (stage-386 — 10-PR full sweep batch — RFC Slice 4 runner/sidecar gate + workspace tree toggle width CSS variable + settled file:// markdown link rendering + prompt-cache coverage percentage fix + terminal shell shutdown reap + configured model picker provider preservation + profile-aware assistant display names + state.db reconciliation slice 1 + queued-message cross-session drain fix + stale-stream writeback supersede)
 

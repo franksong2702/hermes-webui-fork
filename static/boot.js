@@ -1,3 +1,20 @@
+// Slash-command helpers normally come from commands.js, which is loaded before
+// boot.js. If a restart/proxy blip makes that asset fail while boot.js loads,
+// keep the composer usable instead of throwing ReferenceError on input/keydown.
+(function(){
+  function dropdown(){ return document.getElementById('cmdDropdown'); }
+  if(typeof window.hideCmdDropdown!=='function'){
+    window.hideCmdDropdown=function(){
+      const dd=dropdown();
+      if(dd){ dd.classList.remove('open'); dd.style.display='none'; }
+    };
+  }
+  if(typeof window.showCmdDropdown!=='function') window.showCmdDropdown=function(){};
+  if(typeof window.getMatchingCommands!=='function') window.getMatchingCommands=function(){ return []; };
+  if(typeof window.navigateCmdDropdown!=='function') window.navigateCmdDropdown=function(){};
+  if(typeof window.selectCmdDropdownItem!=='function') window.selectCmdDropdownItem=function(){};
+})();
+
 async function cancelStream(){
   const streamId = S.activeStreamId;
   if(!streamId) return;
