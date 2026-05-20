@@ -87,8 +87,9 @@ class TestCopyFilePathMenuItem:
         )
         assert m, "_handle_file_path body not found"
         body = m.group(1)
-        assert "safe_resolve(Path(s.workspace)" in body
-        assert "session_id" in body  # require() check
+        assert "_workspace_root_from_session_or_body(body)" in body
+        assert "safe_resolve(Path(workspace)" in body
+        assert "session_id" in src  # helper still supports session-scoped calls
         # Returns the absolute path as a string.
         assert 'j(handler, {"ok": True, "path": str(target)})' in body
 

@@ -7539,23 +7539,38 @@ window.addEventListener('resize',()=>{
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_syncWorkspaceHiddenToggle);
 else _syncWorkspaceHiddenToggle();
 
+function _activeWorkspaceRootPayload(){
+  if(S.session&&S.session.workspace){
+    return {session_id:S.session.session_id,workspace:S.session.workspace};
+  }
+  if(S._profileDefaultWorkspace){
+    return {workspace:S._profileDefaultWorkspace};
+  }
+  return null;
+}
+
 function bindWorkspaceHeadingActions(){
   const heading=$('workspacePanelHeading');
   if(!heading||heading.dataset.bound==='1')return;
   heading.dataset.bound='1';
   const goRoot=()=>{
-    if(S.session&&S.session.workspace) loadDir('.');
+    const payload=_activeWorkspaceRootPayload();
+    if(!payload) return;
+    if(payload.session_id) loadDir('.');
+    else loadDir('.',payload);
   };
   heading.onclick=goRoot;
   heading.onkeydown=(e)=>{
-    if(!(S.session&&S.session.workspace)) return;
+    const payload=_activeWorkspaceRootPayload();
+    if(!payload) return;
     if(e.key==='Enter'||e.key===' '){
       e.preventDefault();
       goRoot();
     }
   };
   heading.oncontextmenu=(e)=>{
-    if(!(S.session&&S.session.workspace)) return;
+    const payload=_activeWorkspaceRootPayload();
+    if(!payload) return;
     e.preventDefault();
     e.stopPropagation();
     _showWorkspaceRootContextMenu(e);
@@ -7566,7 +7581,7 @@ function bindWorkspaceHeadingActions(){
 function _syncWorkspaceHeadingState(){
   const heading=$('workspacePanelHeading');
   if(!heading) return;
-  const enabled=!!(S.session&&S.session.workspace);
+  const enabled=!!_activeWorkspaceRootPayload();
   heading.classList.toggle('workspace-panel-heading--enabled',enabled);
   if(enabled){
     heading.setAttribute('role','button');
@@ -7622,6 +7637,8 @@ function _copyTextWithFallback(text, successMsg, failurePrefix){
 }
 
 function _showWorkspaceRootContextMenu(e){
+  const payload=_activeWorkspaceRootPayload();
+  if(!payload) return;
   document.querySelectorAll('.file-ctx-menu').forEach(el=>el.remove());
   const menu=document.createElement('div');
   menu.className='file-ctx-menu workspace-root-ctx-menu';
@@ -7632,14 +7649,14 @@ function _showWorkspaceRootContextMenu(e){
 
   menu.appendChild(_workspaceContextMenuItem(t('reveal_in_finder'),async()=>{
     menu.remove();
-    try{await api('/api/file/reveal',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:'.'})});}
+    try{await api('/api/file/reveal',{method:'POST',body:JSON.stringify({...payload,path:'.'})});}
     catch(err){showToast(t('reveal_failed')+(err.message||err));}
   }));
 
   menu.appendChild(_workspaceContextMenuItem(t('copy_file_path'),async()=>{
     menu.remove();
     try{
-      const r=await api('/api/file/path',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:'.'})});
+      const r=await api('/api/file/path',{method:'POST',body:JSON.stringify({...payload,path:'.'})});
       await _copyTextWithFallback((r&&r.path)||'.',t('path_copied'),t('path_copy_failed'));
     }catch(err){showToast(t('path_copy_failed')+(err.message||err));}
   }));
@@ -7660,7 +7677,7 @@ function renderFileTree(){
   S._dirCache[S.currentDir||'.']=S.entries;
   // Show empty-state when no workspace is set or the directory is empty (#703)
   const emptyEl=$('wsEmptyState');
-  const hasWorkspace=!!(S.session&&S.session.workspace);
+  const hasWorkspace=!!((typeof _activeWorkspaceRootPayload==='function')?_activeWorkspaceRootPayload():(S.session&&S.session.workspace));
   if(!hasWorkspace){
     if(emptyEl){emptyEl.textContent=t('workspace_empty_no_path');emptyEl.style.display='flex';}
     box.style.display='none';

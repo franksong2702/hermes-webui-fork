@@ -6166,24 +6166,31 @@ def _handle_sessions_search(handler, parsed):
 def _handle_list_dir(handler, parsed):
     qs = parse_qs(parsed.query)
     sid = qs.get("session_id", [""])[0]
-    if not sid:
-        return bad(handler, "session_id is required")
-    try:
-        s = get_session(sid)
-        workspace = s.workspace
-    except KeyError:
-        # Fallback for CLI sessions not loaded in WebUI memory
+    workspace_arg = qs.get("workspace", [""])[0]
+    if not sid and not workspace_arg:
+        return bad(handler, "session_id or workspace is required")
+    if sid:
         try:
-            cli_meta = None
-            for cs in get_cli_sessions():
-                if cs["session_id"] == sid:
-                    cli_meta = cs
-                    break
-            if not cli_meta:
+            s = get_session(sid)
+            workspace = s.workspace
+        except KeyError:
+            # Fallback for CLI sessions not loaded in WebUI memory
+            try:
+                cli_meta = None
+                for cs in get_cli_sessions():
+                    if cs["session_id"] == sid:
+                        cli_meta = cs
+                        break
+                if not cli_meta:
+                    return bad(handler, "Session not found", 404)
+                workspace = cli_meta.get("workspace", "")
+            except Exception:
                 return bad(handler, "Session not found", 404)
-            workspace = cli_meta.get("workspace", "")
-        except Exception:
-            return bad(handler, "Session not found", 404)
+    else:
+        try:
+            workspace = str(resolve_trusted_workspace(workspace_arg))
+        except (ValueError, PermissionError, OSError) as e:
+            return bad(handler, _sanitize_error(e), 400)
     try:
         return j(
             handler,
@@ -8773,17 +8780,39 @@ def _handle_create_dir(handler, body):
         return bad(handler, _sanitize_error(e))
 
 
+def _workspace_root_from_session_or_body(body):
+    """Resolve a workspace root from either a session or a trusted workspace path.
+
+    Workspace-panel heading actions can run before a chat session exists: the UI
+    still knows the profile default workspace and sends it as ``workspace``.  Keep
+    the session path as the normal case, but allow that explicit trusted path for
+    root-only reveal/copy/list affordances.
+    """
+    sid = body.get("session_id")
+    if sid:
+        try:
+            s = get_session(sid)
+        except KeyError:
+            raise KeyError("Session not found")
+        return Path(s.workspace)
+    if body.get("workspace"):
+        return resolve_trusted_workspace(body.get("workspace"))
+    raise ValueError("Missing required field(s): session_id or workspace")
+
+
 def _handle_file_reveal(handler, body):
     try:
-        require(body, "session_id", "path")
+        require(body, "path")
     except ValueError as e:
         return bad(handler, str(e))
     try:
-        s = get_session(body["session_id"])
+        workspace = _workspace_root_from_session_or_body(body)
     except KeyError:
         return bad(handler, "Session not found", 404)
+    except (ValueError, PermissionError, OSError) as e:
+        return bad(handler, _sanitize_error(e))
     try:
-        target = safe_resolve(Path(s.workspace), body["path"])
+        target = safe_resolve(Path(workspace), body["path"])
         if not target.exists():
             # Include the resolved server-side path in the error message so
             # the frontend toast can show *which* file the system expected.
@@ -8822,15 +8851,17 @@ def _handle_file_path(handler, body):
     to special-case 404s for an action that cannot fail destructively.
     """
     try:
-        require(body, "session_id", "path")
+        require(body, "path")
     except ValueError as e:
         return bad(handler, str(e))
     try:
-        s = get_session(body["session_id"])
+        workspace = _workspace_root_from_session_or_body(body)
     except KeyError:
         return bad(handler, "Session not found", 404)
+    except (ValueError, PermissionError, OSError) as e:
+        return bad(handler, _sanitize_error(e))
     try:
-        target = safe_resolve(Path(s.workspace), body["path"])
+        target = safe_resolve(Path(workspace), body["path"])
         return j(handler, {"ok": True, "path": str(target)})
     except (ValueError, PermissionError, OSError) as e:
         return bad(handler, _sanitize_error(e))

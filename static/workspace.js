@@ -87,7 +87,8 @@ async function api(path,opts={}){
 
 // Persist/restore expanded directory state per workspace in localStorage
 function _wsExpandKey(){
-  const ws=S.session&&S.session.workspace;
+  const payload=(typeof _activeWorkspaceRootPayload==='function')?_activeWorkspaceRootPayload():null;
+  const ws=payload&&payload.workspace;
   return ws?'hermes-webui-expanded:'+ws:null;
 }
 function _saveExpandedDirs(){
@@ -103,15 +104,26 @@ function _restoreExpandedDirs(){
   }catch(e){S._expandedDirs=new Set();}
 }
 
-async function loadDir(path){
-  if(!S.session)return;
+function _workspaceListUrl(path, workspacePayload){
+  const payload=workspacePayload||((typeof _activeWorkspaceRootPayload==='function')?_activeWorkspaceRootPayload():null);
+  if(!payload) return null;
+  const params=new URLSearchParams();
+  if(payload.session_id) params.set('session_id',payload.session_id);
+  if(payload.workspace) params.set('workspace',payload.workspace);
+  params.set('path',path||'.');
+  return `/api/list?${params.toString()}`;
+}
+
+async function loadDir(path, workspacePayload){
+  const payload=workspacePayload||((typeof _activeWorkspaceRootPayload==='function')?_activeWorkspaceRootPayload():null);
+  if(!payload)return;
   try{
     if(!path||path==='.'){
       S._dirCache={};
       _restoreExpandedDirs();  // restore per-workspace expanded state on root load
     }
     S.currentDir=path||'.';
-    const data=await api(`/api/list?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}`);
+    const data=await api(_workspaceListUrl(path,payload));
     S.entries=data.entries||[];renderBreadcrumb();renderFileTree();
     // Pre-fetch contents of restored expanded dirs so they render without a second click
     // (parallelized — avoids serial waterfall when multiple dirs are expanded)
@@ -120,7 +132,7 @@ async function loadDir(path){
       const pending=[...expanded].filter(dirPath=>!S._dirCache[dirPath]);
       if(pending.length){
         const results=await Promise.all(pending.map(dirPath=>
-          api(`/api/list?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(dirPath)}`)
+          api(_workspaceListUrl(dirPath,payload))
             .then(dc=>({dirPath,entries:dc.entries||[]}))
             .catch(()=>({dirPath,entries:[]}))
         ));
@@ -162,7 +174,7 @@ async function _refreshGitBadge(){
 }
 
 function navigateUp(){
-  if(!S.session||S.currentDir==='.')return;
+  if((!(typeof _activeWorkspaceRootPayload==='function')||!_activeWorkspaceRootPayload())||S.currentDir==='.')return;
   const parts=S.currentDir.split('/');
   parts.pop();
   loadDir(parts.length?parts.join('/'):'.');
