@@ -1822,6 +1822,8 @@ same `HERMES_HOME` (when applicable) and verify identical effect.
 - [ ] `/skills [query]` — lists matching skills.
 - [ ] `/theme <name>` — switches webui theme.
 - [ ] `/workspace <name>` — switches workspace.
+- [ ] `/goal` / `/goal status` — shows current goal status without starting a new stream; `/goal pause`, `/goal resume`, and `/goal clear` update goal state safely.
+- [ ] `/goal <text>` — sets a goal and starts the first goal-directed turn in the active WebUI session; verify the request uses the session's validated profile/workspace boundary and does not create a separate WebUI-owned worker/goal scheduler.
 
 Unknown / deferred:
 

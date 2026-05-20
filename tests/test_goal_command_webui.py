@@ -368,6 +368,210 @@ def test_goal_endpoint_adapter_error_payload_still_controls_http_status(monkeypa
     assert result["payload"]["error"] == "agent_running"
 
 
+def test_runtime_adapter_goal_action_parses_controls_and_text():
+    """The adapter seam receives only bounded actions; text still flows through unchanged."""
+    from api import routes
+
+    assert routes._runtime_adapter_goal_action("") == "status"
+    assert routes._runtime_adapter_goal_action("status") == "status"
+    assert routes._runtime_adapter_goal_action("pause") == "pause"
+    assert routes._runtime_adapter_goal_action("resume") == "resume"
+    assert routes._runtime_adapter_goal_action("clear") == "clear"
+    assert routes._runtime_adapter_goal_action("stop") == "clear"
+    assert routes._runtime_adapter_goal_action("done") == "clear"
+    assert routes._runtime_adapter_goal_action("set foo") == "set"
+    assert routes._runtime_adapter_goal_action("ship the feature") == "set"
+
+
+def test_goal_endpoint_rejects_missing_session_id_before_goal_side_effects(monkeypatch):
+    """Invalid route arguments should return a 400 and never touch goal/session state."""
+    from api import routes
+
+    touched = []
+    monkeypatch.setattr(routes, "get_session", lambda sid: touched.append(sid))
+    monkeypatch.setattr(routes, "bad", lambda handler, message, status=400: {"status": status, "message": message})
+
+    result = routes._handle_goal_command(object(), {"args": "ship it"})
+
+    assert result == {"status": 400, "message": "Missing required field(s): session_id"}
+    assert touched == []
+
+
+def test_goal_endpoint_rejects_invalid_profile_before_goal_side_effects(monkeypatch, tmp_path):
+    """Profile ids use the same validation as chat start to avoid path/profile spoofing."""
+    from api import routes
+
+    class FakeSession:
+        session_id = "sid-goal-route"
+        profile = "default"
+        workspace = str(tmp_path)
+        model = "gpt-5.5"
+        model_provider = "openai-codex"
+        messages = []
+        context_messages = []
+        pending_user_message = None
+        active_stream_id = None
+
+    monkeypatch.setattr(routes, "get_session", lambda sid: FakeSession())
+    monkeypatch.setattr(routes, "bad", lambda handler, message, status=400: {"status": status, "message": message})
+    monkeypatch.setattr(
+        routes,
+        "_start_chat_stream_for_session",
+        lambda *args, **kwargs: pytest.fail("invalid profile must not start a stream"),
+    )
+
+    result = routes._handle_goal_command(
+        object(),
+        {"session_id": "sid-goal-route", "profile": "../worker", "args": "ship it"},
+    )
+
+    assert result == {"status": 400, "message": "invalid profile"}
+
+
+def test_goal_endpoint_preserves_existing_session_profile_boundary(monkeypatch, tmp_path):
+    """Persisted sessions stay on their original profile even if the UI profile changed."""
+    from api import goals as webui_goals
+    from api import profiles, routes
+
+    class FakeGoalManager:
+        state = None
+
+        def __init__(self, session_id, default_max_turns=20):
+            pass
+
+    session = SimpleNamespace(
+        session_id="sid-goal-route",
+        profile="coordinator",
+        workspace=str(tmp_path),
+        model="gpt-5.5",
+        model_provider="openai-codex",
+        messages=[{"role": "user", "content": "already started"}],
+        context_messages=[],
+        pending_user_message=None,
+        active_stream_id=None,
+    )
+    profile_home_calls = []
+
+    monkeypatch.setattr(webui_goals, "GoalManager", FakeGoalManager)
+    monkeypatch.setattr(routes, "get_session", lambda sid: session)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda profile: profile_home_calls.append(profile) or None)
+    monkeypatch.setattr(routes, "j", lambda handler, payload, status=200, **kwargs: {"status": status, "payload": payload})
+
+    result = routes._handle_goal_command(
+        object(),
+        {"session_id": "sid-goal-route", "profile": "worker", "args": "status"},
+    )
+
+    assert result["status"] == 200
+    assert result["payload"]["action"] == "status"
+    assert session.profile == "coordinator"
+    assert profile_home_calls == ["coordinator"]
+
+
+def test_goal_endpoint_rejects_untrusted_workspace_before_setting_goal(monkeypatch, tmp_path):
+    """A kickoff goal cannot mutate goal state until the workspace boundary passes."""
+    from api import goals as webui_goals
+    from api import routes
+
+    set_calls = []
+
+    class FakeGoalManager:
+        state = None
+
+        def __init__(self, session_id, default_max_turns=20):
+            pass
+
+        def set(self, text):
+            set_calls.append(text)
+            pytest.fail("goal state must not be set for an untrusted workspace")
+
+    class FakeSession:
+        session_id = "sid-goal-route"
+        profile = "default"
+        workspace = str(tmp_path)
+        model = "gpt-5.5"
+        model_provider = "openai-codex"
+        messages = []
+        context_messages = []
+        pending_user_message = None
+        active_stream_id = None
+
+    monkeypatch.setattr(webui_goals, "GoalManager", FakeGoalManager)
+    monkeypatch.setattr(routes, "get_session", lambda sid: FakeSession())
+    monkeypatch.setattr(routes, "resolve_trusted_workspace", lambda workspace: (_ for _ in ()).throw(ValueError("untrusted workspace")))
+    monkeypatch.setattr(routes, "bad", lambda handler, message, status=400: {"status": status, "message": message})
+
+    result = routes._handle_goal_command(
+        object(),
+        {"session_id": "sid-goal-route", "workspace": "/tmp/evil", "args": "ship it"},
+    )
+
+    assert result == {"status": 400, "message": "untrusted workspace"}
+    assert set_calls == []
+
+
+def test_goal_endpoint_restores_previous_goal_when_kickoff_stream_fails(monkeypatch, tmp_path):
+    """Setting a goal and then failing kickoff rolls state back to the pre-set snapshot."""
+    from api import goals as webui_goals
+    from api import routes
+
+    class FakeState:
+        goal = "ship the feature"
+        status = "active"
+        turns_used = 0
+        max_turns = 20
+        last_verdict = None
+        last_reason = None
+        paused_reason = None
+
+    class FakeGoalManager:
+        state = None
+
+        def __init__(self, session_id, default_max_turns=20):
+            pass
+
+        def set(self, goal):
+            state = FakeState()
+            state.goal = goal
+            self.state = state
+            return state
+
+    class FakeSession:
+        session_id = "sid-goal-route"
+        profile = "default"
+        workspace = str(tmp_path)
+        model = "gpt-5.5"
+        model_provider = "openai-codex"
+        messages = []
+        context_messages = []
+        pending_user_message = None
+        active_stream_id = None
+
+    restored = []
+    monkeypatch.setattr(webui_goals, "GoalManager", FakeGoalManager)
+    monkeypatch.setattr(webui_goals, "goal_state_snapshot", lambda sid, profile_home=None: {"goal": "previous"})
+    monkeypatch.setattr(webui_goals, "restore_goal_state", lambda sid, snapshot, profile_home=None: restored.append((sid, snapshot)))
+    monkeypatch.setattr(routes, "get_session", lambda sid: FakeSession())
+    monkeypatch.setattr(routes, "resolve_trusted_workspace", lambda workspace: tmp_path)
+    monkeypatch.setattr(
+        routes,
+        "_resolve_compatible_session_model_state",
+        lambda model, provider: (model, provider, False),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_start_chat_stream_for_session",
+        lambda session, **kwargs: {"_status": 500, "stream_id": "failed-stream", "error": "boom"},
+    )
+    monkeypatch.setattr(routes, "j", lambda handler, payload, status=200, **kwargs: {"status": status, "payload": payload})
+
+    result = routes._handle_goal_command(object(), {"session_id": "sid-goal-route", "args": "ship it"})
+
+    assert result["status"] == 500
+    assert result["payload"]["ok"] is False
+    assert restored == [("sid-goal-route", {"goal": "previous"})]
+
+
 def test_routes_register_goal_endpoint_and_kickoff_stream():
     assert 'if parsed.path == "/api/goal"' in ROUTES_PY
     assert "return _handle_goal_command(handler, body)" in ROUTES_PY
@@ -401,9 +605,13 @@ def test_streaming_goal_hook_emits_evaluating_state_before_judge():
 
 def test_frontend_has_goal_slash_command_and_status_event_handler():
     assert "{name:'goal'" in COMMANDS_JS
+    assert "arg:'[status|pause|resume|clear|text]'" in COMMANDS_JS
     assert "subArgs:['status','pause','resume','clear']" in COMMANDS_JS
+    assert "function cmdHelp()" in COMMANDS_JS
+    assert "const usage=c.arg ?" in COMMANDS_JS
     assert "function cmdGoal" in COMMANDS_JS
     assert "api('/api/goal'" in COMMANDS_JS
+    assert "profile:S.activeProfile||S.session.profile||'default'" in COMMANDS_JS
     assert "stream_id" in COMMANDS_JS
     assert "goal'" in MESSAGES_JS
     assert "source.addEventListener('goal'" in MESSAGES_JS

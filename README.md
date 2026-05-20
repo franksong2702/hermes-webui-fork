@@ -487,9 +487,16 @@ Production data and real cron jobs are never touched. Current snapshot:
 
 ### Slash commands
 - Type `/` in the composer for autocomplete dropdown
-- Built-in: `/help`, `/clear`, `/compress [focus topic]`, `/compact` (alias), `/model <name>`, `/workspace <name>`, `/new`, `/usage`, `/theme`
+- Built-in: `/help`, `/clear`, `/compress [focus topic]`, `/compact` (alias), `/model <name>`, `/workspace <name>`, `/new`, `/usage`, `/theme`, `/goal [status|pause|resume|clear|text]`
 - Arrow keys navigate, Tab/Enter select, Escape closes
 - Unrecognized commands pass through to the agent
+- `/goal` mirrors Hermes Agent goal controls for the active conversation: empty or
+  `status` reports the current goal, `pause` / `resume` / `clear` control it,
+  and any other text sets a goal and starts the first goal-directed turn.
+- Goal execution stays inside the current session/runtime boundary. WebUI validates
+  the session profile and trusted workspace before kickoff, keeps post-turn goal
+  evaluation in the existing agent loop, and does not create a separate
+  coordinator/worker scheduler or WebUI-owned goal runner.
 
 ### Panels
 - **Chat** -- session list, search, pin, archive, projects, new conversation
