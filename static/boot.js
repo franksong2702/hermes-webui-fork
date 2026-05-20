@@ -949,6 +949,7 @@ $('modelSelect').onchange=async()=>{
   S.session.model_provider=modelState.model_provider||null;
   if(typeof syncModelChip==='function') syncModelChip();
   syncTopbar();
+  if(typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator({refresh:true});
   _applySessionContextMetadataUpdate(data);
   // Warn if selected model belongs to a different provider than what Hermes is configured for
   if(typeof _checkProviderMismatch==='function'){

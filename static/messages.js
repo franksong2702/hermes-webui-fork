@@ -463,12 +463,14 @@ async function send(){
       if(typeof _writePersistedModelState==='function') _writePersistedModelState(startData.effective_model,S.session.model_provider||null);
       if($('modelSelect')) _applyModelToDropdown(startData.effective_model, $('modelSelect'),S.session.model_provider||null);
       if(typeof syncTopbar==='function') syncTopbar();
+      if(typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator();
     }else if(startData.effective_model_provider && S.session){
       S.session.model_provider=startData.effective_model_provider;
       if(typeof _writePersistedModelState==='function') _writePersistedModelState(S.session.model||'',S.session.model_provider||null);
       if($('modelSelect')&&typeof _applyModelToDropdown==='function') _applyModelToDropdown(S.session.model||'', $('modelSelect'), S.session.model_provider||null);
       if(typeof syncModelChip==='function') syncModelChip();
       if(typeof syncTopbar==='function') syncTopbar();
+      if(typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator();
     }
     streamId=startData.stream_id;
     S.activeStreamId = streamId;
@@ -1732,6 +1734,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(_markerOnlyAssistantError&&typeof showToast==='function') showToast('No response received after context compression. Please retry.',5000,'error');
           if(isSessionViewed) _markSessionViewed(completedSid, completedSession.message_count ?? S.messages.length);
           syncTopbar();renderMessages({preserveScroll:true});
+          if(typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator({refresh:true});
           if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
           loadDir('.');
           // TTS auto-read: speak the last assistant response if enabled (#499)
@@ -2077,6 +2080,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         }
         if(isSessionViewed) _markSessionViewed(completedSid, session.message_count ?? S.messages.length);
         syncTopbar();renderMessages({preserveScroll:true});
+        if(typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator({refresh:true});
       }
       if(_isActiveSession()) _queueDrainSid=activeSid;
       renderSessionList();

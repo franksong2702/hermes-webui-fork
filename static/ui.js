@@ -646,6 +646,8 @@ setTimeout(_initMediaPlaybackObserver,0);
 
 // ── Ambient provider quota indicator (#1766) ────────────────────────────────
 let _providerQuotaRefreshInFlight=false;
+let _providerQuotaRequestSeq=0;
+let _providerQuotaLastProviderKey='';
 
 function _formatQuotaMoneyShort(value){
   const n=Number(value);
@@ -658,6 +660,20 @@ function _formatQuotaPercentShort(value){
   const n=Number(value);
   if(!Number.isFinite(n)) return '';
   return Math.max(0,Math.min(100,n)).toFixed(0)+'%';
+}
+function _providerQuotaRemainingRatio(status){
+  if(!status||status.status!=='available') return null;
+  const accountLimits=status.account_limits||null;
+  if(accountLimits&&Array.isArray(accountLimits.windows)&&accountLimits.windows.length){
+    const w=accountLimits.windows.find(x=>x&&Number.isFinite(Number(x.remaining_percent)))||accountLimits.windows[0];
+    const pct=Number(w&&w.remaining_percent);
+    return Number.isFinite(pct)?Math.max(0,Math.min(1,pct/100)):null;
+  }
+  const quota=status.quota||null;
+  if(quota&&Number.isFinite(Number(quota.limit_remaining))&&Number.isFinite(Number(quota.limit))&&Number(quota.limit)>0){
+    return Math.max(0,Math.min(1,Number(quota.limit_remaining)/Number(quota.limit)));
+  }
+  return null;
 }
 function _providerQuotaIndicatorText(status){
   if(!status||status.status!=='available') return null;
@@ -682,6 +698,39 @@ function _providerQuotaIndicatorText(status){
   }
   return null;
 }
+function _resetProviderQuotaChip(chip,label){
+  if(label) label.textContent='';
+  if(chip){
+    chip.hidden=true;
+    chip.removeAttribute('title');
+    chip.removeAttribute('aria-busy');
+    chip.classList.remove('provider-quota-chip-loading','provider-quota-chip-low','provider-quota-chip-empty');
+  }
+}
+function _currentProviderQuotaProviderId(){
+  const sessionProvider=S&&S.session&&S.session.model_provider?String(S.session.model_provider).trim():'';
+  if(sessionProvider) return sessionProvider;
+  const sel=$('modelSelect');
+  const selectedModel=sel&&sel.value?sel.value:(S&&S.session&&S.session.model)||'';
+  if(sel&&typeof _modelStateForSelect==='function'){
+    try{
+      const state=_modelStateForSelect(sel,selectedModel);
+      if(state&&state.model_provider) return String(state.model_provider).trim();
+    }catch(_e){}
+  }
+  if(typeof _providerFromModelValue==='function'){
+    const provider=_providerFromModelValue(selectedModel);
+    if(provider) return provider;
+  }
+  return window._activeProvider?String(window._activeProvider).trim():'';
+}
+function _providerQuotaEndpoint(options={}){
+  const providerId=String(options.providerId||'').trim();
+  const params=[];
+  if(providerId) params.push('provider='+encodeURIComponent(providerId));
+  if(options.refresh) params.push('refresh=1');
+  return '/api/provider/quota'+(params.length?'?'+params.join('&'):'');
+}
 function renderProviderQuotaIndicator(status){
   const chip=$('providerQuotaChip');
   const label=$('providerQuotaChipLabel');
@@ -690,39 +739,55 @@ function renderProviderQuotaIndicator(status){
   // Default is off (window._showQuotaChip defaults to false in boot.js) so users
   // never see the chip unless they opt in.
   if(window._showQuotaChip!==true){
-    chip.hidden=true;
-    label.textContent='';
-    chip.removeAttribute('title');
+    _resetProviderQuotaChip(chip,label);
+    return;
+  }
+  if(status&&status.status==='loading'){
+    chip.setAttribute('aria-busy','true');
+    chip.classList.add('provider-quota-chip-loading');
+    // Do not introduce noisy placeholder text; keep the last safe value if it
+    // exists, otherwise stay hidden while the selected provider is loading.
+    chip.hidden=!String(label.textContent||'').trim();
+    chip.title='Refreshing provider quota…';
     return;
   }
   const text=_providerQuotaIndicatorText(status);
   if(!text||status.status!=='available'||(!status.quota&&!status.account_limits)){
-    chip.hidden=true;
-    label.textContent='';
-    chip.removeAttribute('title');
+    _resetProviderQuotaChip(chip,label);
     return;
   }
+  chip.classList.remove('provider-quota-chip-loading','provider-quota-chip-low','provider-quota-chip-empty');
+  const ratio=_providerQuotaRemainingRatio(status);
+  if(ratio!=null&&ratio<=0.001) chip.classList.add('provider-quota-chip-empty');
+  else if(ratio!=null&&ratio<=0.15) chip.classList.add('provider-quota-chip-low');
+  chip.removeAttribute('aria-busy');
   label.textContent=text.label;
   chip.title=text.title;
   chip.hidden=false;
 }
-async function refreshProviderQuotaIndicator(){
+async function refreshProviderQuotaIndicator(options={}){
   // Short-circuit before the fetch when the chip is disabled — no point asking
   // the server for quota data the UI will throw away.
   if(window._showQuotaChip!==true){
-    const chip=$('providerQuotaChip');
-    if(chip){chip.hidden=true;chip.removeAttribute('title');}
+    _resetProviderQuotaChip($('providerQuotaChip'),$('providerQuotaChipLabel'));
     return;
   }
-  if(_providerQuotaRefreshInFlight) return;
+  const providerId=_currentProviderQuotaProviderId();
+  const providerKey=providerId||'__active__';
+  const providerChanged=providerKey!==_providerQuotaLastProviderKey;
+  _providerQuotaLastProviderKey=providerKey;
+  const seq=++_providerQuotaRequestSeq;
   _providerQuotaRefreshInFlight=true;
+  if(providerChanged) renderProviderQuotaIndicator(null);
+  else renderProviderQuotaIndicator({status:'loading'});
   try{
-    const status=await api('/api/provider/quota');
+    const status=await api(_providerQuotaEndpoint({providerId,refresh:!!options.refresh}));
+    if(seq!==_providerQuotaRequestSeq) return;
     renderProviderQuotaIndicator(status);
   }catch(_e){
-    renderProviderQuotaIndicator(null);
+    if(seq===_providerQuotaRequestSeq) renderProviderQuotaIndicator(null);
   }finally{
-    _providerQuotaRefreshInFlight=false;
+    if(seq===_providerQuotaRequestSeq) _providerQuotaRefreshInFlight=false;
   }
 }
 window.addEventListener('visibilitychange',()=>{

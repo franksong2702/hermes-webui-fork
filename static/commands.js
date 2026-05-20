@@ -381,6 +381,7 @@ async function cmdModel(args){
           S.session.model=q;
           S.session.model_provider=provider;
           if(typeof syncTopbar==='function') syncTopbar();
+          if(typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator({refresh:true});
           showToast(t('switched_to')+q);
           return;
         }

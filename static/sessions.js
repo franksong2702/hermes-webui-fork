@@ -609,6 +609,7 @@ async function loadSession(sid){
   // Sync workspace display immediately so the chip label reflects the new session's workspace
   // before any async message-loading begins (mirrors how model is handled).
   if(typeof syncTopbar==='function') syncTopbar();
+  if(typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator();
   _setSessionViewedCount(S.session.session_id, Number(data.session.message_count || 0));
   _clearSessionCompletionUnread(S.session.session_id);
   try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
@@ -1188,6 +1189,7 @@ function _resolveSessionModelForDisplaySoon(sid){
       S.session.last_prompt_tokens=data.session.last_prompt_tokens||0;
       S.session._modelResolutionDeferred=false;
       syncTopbar();
+      if(typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator();
       if(typeof _syncCtxIndicator==='function'){
         const u=S.lastUsage||{};
         const _pick=(latest,stored,dflt=0)=>latest!=null?latest:(stored!=null?stored:dflt);
