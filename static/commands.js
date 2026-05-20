@@ -789,6 +789,88 @@ async function cmdStop(){
   else showToast(t('cancel_unavailable'));
 }
 
+// ── Visible session-control actions ─────────────────────────────────────────
+// Settings > Conversation exposes the same session-control actions as the
+// slash commands. Keep these wrappers thin: they delegate to the command
+// handlers so slash behavior and button behavior cannot drift apart.
+const _visibleSessionControlIds={
+  new:'btnSessionNew',
+  stop:'btnSessionStop',
+  queue:'btnSessionQueue',
+  interrupt:'btnSessionInterrupt',
+  steer:'btnSessionSteer',
+  clear:'btnClearConvModal',
+};
+const _visibleSessionControlLoading={};
+
+function _visibleSessionDraft(){
+  const input=$('msg');
+  return (input&&input.value||'').trim();
+}
+
+function _setVisibleSessionControlBusy(action,busy){
+  _visibleSessionControlLoading[action]=!!busy;
+  const id=_visibleSessionControlIds[action];
+  const btn=id?$(id):null;
+  if(btn) btn.setAttribute('aria-busy',busy?'true':'false');
+  syncVisibleSessionControls();
+}
+
+function syncVisibleSessionControls(){
+  const draft=!!_visibleSessionDraft();
+  const hasSession=!!(S&&S.session&&S.session.session_id);
+  const hasMessages=!!((S&&S.messages)||[]).filter(m=>m&&m.role&&m.role!=='tool').length;
+  const isBusy=!!(S&&S.busy)||(typeof isCompressionUiRunning==='function'&&isCompressionUiRunning());
+  const hasActive=!!(S&&S.activeStreamId);
+  const disabled={
+    new:false,
+    stop:!hasSession||!hasActive,
+    queue:!hasSession||!isBusy||!draft,
+    interrupt:!hasSession||!hasActive||!draft,
+    steer:!hasSession||!hasActive||!draft,
+    clear:!hasSession||isBusy||!hasMessages,
+  };
+  for(const [action,id] of Object.entries(_visibleSessionControlIds)){
+    const btn=$(id);
+    if(!btn) continue;
+    const loading=!!_visibleSessionControlLoading[action];
+    btn.disabled=loading||!!disabled[action];
+    btn.classList.toggle('disabled',btn.disabled);
+    btn.setAttribute('aria-disabled',btn.disabled?'true':'false');
+    if(!loading) btn.setAttribute('aria-busy','false');
+  }
+}
+
+async function _runVisibleDraftCommand(action){
+  const text=_visibleSessionDraft();
+  const usageKey={queue:'cmd_queue_no_msg',interrupt:'cmd_interrupt_no_msg',steer:'cmd_steer_no_msg'}[action];
+  if(!text){showToast(t(usageKey));return;}
+  const input=$('msg');
+  if(input){input.value='';if(typeof autoResize==='function')autoResize();}
+  if(action==='queue') await cmdQueue(text);
+  else if(action==='interrupt') await cmdInterrupt(text);
+  else if(action==='steer') await cmdSteer(text);
+}
+
+async function runVisibleSessionControl(action){
+  if(!_visibleSessionControlIds[action]) return;
+  const btn=$(_visibleSessionControlIds[action]);
+  if(btn&&btn.disabled&&!_visibleSessionControlLoading[action]) return;
+  _setVisibleSessionControlBusy(action,true);
+  try{
+    if(action==='new') await cmdNew();
+    else if(action==='stop') await cmdStop();
+    else if(action==='clear'&&typeof clearConversation==='function') await clearConversation();
+    else await _runVisibleDraftCommand(action);
+  }catch(e){
+    showToast((e&&e.message)||String(e||'Session action failed'));
+  }finally{
+    _setVisibleSessionControlBusy(action,false);
+    if(typeof updateSendBtn==='function') updateSendBtn();
+    else syncVisibleSessionControls();
+  }
+}
+
 async function cmdGoal(args){
   if(!S.session){await newSession();await renderSessionList();}
   if(!S.session||!S.session.session_id){showToast(t('no_active_session'));return;}

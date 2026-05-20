@@ -3226,6 +3226,7 @@ async function clearConversation() {
     S.toolCalls = [];
     syncTopbar();
     renderMessages();
+    if(typeof syncVisibleSessionControls==='function') syncVisibleSessionControls();
     showToast(t('conversation_cleared'));
   } catch(e) { setStatus(t('clear_failed') + e.message); }
 }

@@ -2785,6 +2785,13 @@ main.main.showing-logs > #mainLogs{display:flex;}
 
 /* Quick-action grid in Conversation pane — outlined card buttons. */
 .hermes-action-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:18px;}
+.session-control-help{font-size:11px;line-height:1.4;color:var(--muted);margin:-4px 0 10px;}
+.session-control-grid{grid-template-columns:repeat(3,minmax(0,1fr));}
+.session-action-slash{font-family:var(--mono,ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace);font-size:11px;font-weight:700;letter-spacing:.01em;color:var(--muted);background:var(--hover-bg);border:1px solid var(--border2);border-radius:999px;padding:2px 6px;}
+.settings-action-btn:hover .session-action-slash{color:var(--accent-text);border-color:var(--accent-bg-strong);background:var(--accent-bg);}
+.settings-action-btn.danger:hover .session-action-slash{color:var(--error,#e05);border-color:var(--error,#e05);background:color-mix(in srgb,var(--error,#e05) 8%,transparent);}
+.settings-action-btn[aria-busy="true"]{cursor:wait;opacity:.72;}
+.settings-action-btn[aria-busy="true"] .session-action-slash{opacity:.65;}
 .settings-action-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 14px;border-radius:10px;border:1px solid var(--border);background:var(--sidebar);color:var(--text);font-size:13px;font-weight:500;cursor:pointer;transition:background .15s,border-color .15s,color .15s;}
 .settings-action-btn:hover{background:var(--accent-bg);border-color:var(--accent-bg-strong);color:var(--accent-text);}
 .settings-action-btn.danger{color:var(--error,#e05);border-color:color-mix(in srgb,var(--error,#e05) 30%,transparent);}

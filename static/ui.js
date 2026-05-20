@@ -3226,6 +3226,7 @@ function _setComposerPrimaryButtonIcon(btn,action){
 function updateSendBtn(){
   const btn=$('btnSend');
   if(!btn) return;
+  if(typeof syncVisibleSessionControls==='function') syncVisibleSessionControls();
   const action=getComposerPrimaryAction();
   btn.dataset.action=action;
   btn.classList.toggle('stop',action==='stop');
