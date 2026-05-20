@@ -388,7 +388,7 @@ Or using the agent venv explicitly:
 
 Tests run against an isolated server with a separate state directory.
 Production data and real cron jobs are never touched. Current snapshot:
-**5303 tests collected** across **488 test files**.
+**6064 tests collected** across **569 test files**.
 
 ---
 
@@ -480,6 +480,7 @@ Production data and real cron jobs are never touched. Current snapshot:
 - Send key: Enter (default) or Ctrl/Cmd+Enter
 - Show/hide CLI sessions toggle (enabled by default)
 - Token usage display toggle (off by default, also via `/usage` command)
+- Optional Desktop Pet beta toggle (off by default) launches a source-built local shell mounted to the active WebUI base URL; no app/exe artifacts are committed
 - Control Center always opens on the Conversation tab; resets on close
 - Unsaved changes guard -- discard/save prompt when closing with unpersisted changes
 - Cron completion alerts -- toast notifications and unread badge on Tasks tab
@@ -487,7 +488,7 @@ Production data and real cron jobs are never touched. Current snapshot:
 
 ### Slash commands
 - Type `/` in the composer for autocomplete dropdown
-- Built-in: `/help`, `/clear`, `/compress [focus topic]`, `/compact` (alias), `/model <name>`, `/workspace <name>`, `/new`, `/usage`, `/theme`
+- Built-in: `/help`, `/clear`, `/compress [focus topic]`, `/compact` (alias), `/model <name>`, `/workspace <name>`, `/new`, `/usage`, `/theme`, `/pet wakeup|sleep`
 - Arrow keys navigate, Tab/Enter select, Escape closes
 - Unrecognized commands pass through to the agent
 
@@ -520,6 +521,7 @@ api/
   helpers.py            HTTP helpers, security headers (~302 lines)
   models.py             Session model + CRUD + CLI bridge (~1927 lines)
   onboarding.py         First-run onboarding wizard, OAuth provider support (~1002 lines)
+  pet_routes.py         Optional desktop pet beta routes, skins, launch/close helpers
   profiles.py           Profile state management, hermes_cli wrapper (~1056 lines)
   routes.py             All GET + POST route handlers (~9772 lines)
   state_sync.py         /insights sync — message_count to state.db (~118 lines)
@@ -535,11 +537,15 @@ static/
   sessions.js           Session CRUD, collapsible groups, search, reload recovery (~3517 lines)
   messages.js           send(), SSE handlers, live streaming, session recovery (~2301 lines)
   panels.js             Cron, skills, memory, profiles, settings (~6480 lines)
+  pet_bridge.js         Optional desktop pet setting bridge
   commands.js           Slash command autocomplete (~1302 lines)
+  desktop_pet/          Browser-rendered pet and bubble surfaces for the shell
+  pets/                 Bundled static desktop pet skins
   boot.js               Mobile nav, voice input, boot IIFE (~1607 lines)
+desktop-pet/            Optional Tauri shell source; app/exe build artifacts stay untracked
 tests/
   conftest.py           Isolated test server/state fixtures
-  488 test files         5303 tests collected
+  569 test files         6064 tests collected
 Dockerfile              python:3.12-slim container image
 docker-compose.yml      Compose with named volume and optional auth
 .github/workflows/      CI: multi-arch Docker build + GitHub Release on tag

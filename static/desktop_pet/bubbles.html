@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Hermes Pet Updates</title>
+  <link rel="stylesheet" href="/static/desktop_pet/pet.css?v=__WEBUI_VERSION__">
+  <script>window.__HERMES_CONFIG__={csrfToken:__CSRF_TOKEN_JSON__};</script>
+</head>
+<body class="pet-bubbles-body">
+  <section class="pet-install" id="petInstall" aria-live="polite" data-tauri-drag-region hidden>
+    <div class="pet-install-card" data-tauri-drag-region>
+      <span class="pet-install-sprite" id="petInstallSprite" aria-hidden="true"></span>
+      <div class="pet-install-copy">
+        <div class="pet-install-title" id="petInstallTitle" data-i18n="desktop_pet_install_title">Starting desktop pet</div>
+        <div class="pet-install-status" id="petInstallStatus" data-i18n="desktop_pet_install_check_webui">Checking WebUI connection</div>
+      </div>
+    </div>
+  </section>
+  <div class="pet-ready-toast" id="petReadyToast" hidden data-i18n="desktop_pet_ready_toast">Ready to use. Drag the pet, right-click to switch skins, and click bubbles to open sessions.</div>
+  <section class="pet-bubbles" id="petBubbles" aria-live="polite" hidden></section>
+  <button class="pet-collapse" id="petCollapse" type="button" aria-label="Collapse updates" data-i18n-aria-label="desktop_pet_collapse_updates" hidden>
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+  </button>
+  <script src="/static/i18n.js?v=__WEBUI_VERSION__" defer></script>
+  <script src="/static/desktop_pet/bubbles.js?v=__WEBUI_VERSION__&pet_windows=2" defer></script>
+</body>
+</html>

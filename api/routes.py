@@ -3449,6 +3449,11 @@ def handle_get(handler, parsed) -> bool:
         except Exception as exc:
             return _serve_shell_unavailable(handler, exc)
 
+    from api import pet_routes
+
+    if pet_routes.handle_get(handler, parsed):
+        return True
+
     if parsed.path == "/login":
         _settings = load_settings()
         _bn = _html.escape(_settings.get("bot_name") or "Hermes")
@@ -4567,6 +4572,10 @@ def handle_post(handler, parsed) -> bool:
         result = handle_kanban_post(handler, parsed, body)
         if result is False:
             return _kanban_unknown_endpoint(handler, parsed, "POST")
+        return True
+    from api import pet_routes
+
+    if pet_routes.handle_post(handler, parsed, body):
         return True
     if parsed.path == "/api/dashboard/config":
         from api import dashboard_probe

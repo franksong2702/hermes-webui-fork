@@ -971,6 +971,14 @@
               </label>
               <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_session_endless_scroll">When enabled, older messages load automatically as you scroll upward. When disabled, use the older-messages button.</div>
             </div>
+            <div class="settings-field">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="settingsDesktopPetEnabled" style="width:15px;height:15px;accent-color:var(--accent)" onchange="toggleDesktopPetFromAppearance(this.checked)">
+                <span data-i18n="desktop_pet_title">Desktop pet (Beta)</span>
+              </label>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_desktop_pet">Start the native desktop pet. If it is not installed yet, WebUI will guide you through setup first.</div>
+              <div id="desktopPetInlineStatus" style="font-size:11px;color:var(--muted);margin-top:6px" aria-live="polite"></div>
+            </div>
             <div id="settingsAppearanceAutosaveStatus" class="settings-autosave-status" aria-live="polite"></div>
           </div>
           <div class="settings-pane" id="settingsPanePreferences">
@@ -1347,6 +1355,7 @@
 <script src="static/workspace.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/terminal.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/sessions.js?v=__WEBUI_VERSION__" defer></script>
+<script src="static/pet_bridge.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/commands.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/messages.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/panels.js?v=__WEBUI_VERSION__" defer></script>

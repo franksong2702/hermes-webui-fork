@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add an opt-in desktop pet beta with a dedicated `/pet` surface, native Tauri shell launcher, bundled pet skins, `/pet wakeup|sleep` slash commands, and WebUI-to-pet session navigation helpers. The launcher now passes the active loopback WebUI URL to the desktop shell so it follows the user's current port instead of assuming `8787`.
 
 ## [v0.51.95] — 2026-05-20 — Release BS (stage-388 — 5-PR batch — live tool callback event dedup + browser-only dashboard links + messaging transcript merge alignment + Geist Contrast skin + SSE runtime diagnostics)
 

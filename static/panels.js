@@ -5323,6 +5323,156 @@ function _preferencesPayloadFromUi(){
   return payload;
 }
 
+function _desktopPetSetupDelay(ms){
+  return new Promise(resolve=>setTimeout(resolve,ms));
+}
+
+const DESKTOP_PET_INSTALL_TIMEOUT_MS=600000;
+
+async function _waitForDesktopPetRunning(timeoutMs=2600){
+  const deadline=Date.now()+timeoutMs;
+  while(Date.now()<deadline){
+    try{
+      const status=await api('/api/pet/status',{method:'POST',body:'{}'});
+      if(status&&status.running) return true;
+    }catch(_){}
+    await _desktopPetSetupDelay(180);
+  }
+  return false;
+}
+
+let _desktopPetToggleBusy=false;
+
+function _desktopPetSwitch(){
+  return $('settingsDesktopPetEnabled');
+}
+
+function _setDesktopPetInlineStatus(keyOrText, options={}){
+  const el=$('desktopPetInlineStatus');
+  if(!el) return;
+  const text=options.raw?String(keyOrText||''):(keyOrText?t(keyOrText):'');
+  el.textContent=text;
+}
+
+function _setDesktopPetSwitch(checked, disabled){
+  const toggle=_desktopPetSwitch();
+  if(!toggle) return;
+  toggle.checked=!!checked;
+  if(typeof disabled==='boolean') toggle.disabled=disabled;
+}
+
+async function refreshDesktopPetSwitch(){
+  const toggle=_desktopPetSwitch();
+  if(!toggle) return;
+  try{
+    const status=await api('/api/pet/status',{method:'POST',body:'{}'});
+    if(status&&status.ok){
+      toggle.checked=!!status.running;
+      _setDesktopPetInlineStatus('');
+    }
+  }catch(_){}
+}
+
+async function prepareDesktopPetInline(){
+  _setDesktopPetSwitch(true,true);
+  _setDesktopPetInlineStatus('settings_desktop_pet_setup_prepare');
+  try{
+    const result=await Promise.all([
+      api('/api/pet/install',{method:'POST',body:'{}',timeoutMs:DESKTOP_PET_INSTALL_TIMEOUT_MS}),
+      _desktopPetSetupDelay(250),
+    ]).then(values=>values[0]);
+    if(!result||!result.ok) throw new Error((result&&result.error)||t('settings_desktop_pet_start_failed'));
+    _setDesktopPetInlineStatus('settings_desktop_pet_setup_load');
+    await _desktopPetSetupDelay(180);
+    _setDesktopPetInlineStatus('settings_desktop_pet_setup_starting');
+    await launchDesktopPet({fromSetup:true});
+    _setDesktopPetSwitch(true,false);
+    _setDesktopPetInlineStatus('');
+  }catch(e){
+    _setDesktopPetInlineStatus(`${t('settings_desktop_pet_start_failed')}: ${(e&&e.message)?e.message:e}`,{raw:true});
+    _setDesktopPetSwitch(false,false);
+    throw e;
+  }finally{
+    const toggle=_desktopPetSwitch();
+    if(toggle) toggle.disabled=false;
+  }
+}
+
+async function startDesktopPet(){
+  _setDesktopPetSwitch(true,true);
+  _setDesktopPetInlineStatus('settings_desktop_pet_setup_starting');
+  try{
+    const status=await api('/api/pet/status',{method:'POST',body:'{}'});
+    if(status&&status.installed){
+      await launchDesktopPet();
+      _setDesktopPetSwitch(true,false);
+      _setDesktopPetInlineStatus('');
+      return;
+    }
+    await prepareDesktopPetInline();
+  }catch(e){
+    const message=(e&&e.message)?e.message:String(e||'');
+    _setDesktopPetInlineStatus(`${t('settings_desktop_pet_start_failed')}: ${message}`,{raw:true});
+    if(typeof showToast==='function') showToast(`${t('settings_desktop_pet_start_failed')}: ${message}`,5000);
+    _setDesktopPetSwitch(false,false);
+  }finally{
+    const toggle=_desktopPetSwitch();
+    if(toggle) toggle.disabled=false;
+  }
+}
+
+async function launchDesktopPet(options={}){
+  _setDesktopPetSwitch(true,true);
+  try{
+    const result=await api('/api/pet/launch',{method:'POST',body:'{}'});
+    if(result&&result.ok){
+      await _waitForDesktopPetRunning();
+      _setDesktopPetSwitch(true,false);
+      _setDesktopPetInlineStatus('');
+      return;
+    }
+    throw new Error((result&&result.error)||t('settings_desktop_pet_start_failed'));
+  }catch(e){
+    const message=(e&&e.message)?e.message:String(e||'');
+    if(options.fromSetup){
+      throw e;
+    }
+    if(typeof showToast==='function') showToast(`${t('settings_desktop_pet_start_failed')}: ${message}`,5000);
+  }finally{
+    const toggle=_desktopPetSwitch();
+    if(toggle) toggle.disabled=false;
+  }
+}
+
+async function closeDesktopPet(){
+  _setDesktopPetSwitch(false,true);
+  try{
+    const result=await api('/api/pet/close',{method:'POST',body:'{}'});
+    if(result&&!result.ok) throw new Error(result.error||t('settings_desktop_pet_start_failed'));
+    _setDesktopPetSwitch(false,false);
+    _setDesktopPetInlineStatus('');
+  }catch(e){
+    const message=(e&&e.message)?e.message:String(e||'');
+    _setDesktopPetSwitch(true,false);
+    _setDesktopPetInlineStatus(`${t('settings_desktop_pet_start_failed')}: ${message}`,{raw:true});
+    if(typeof showToast==='function') showToast(`${t('settings_desktop_pet_start_failed')}: ${message}`,5000);
+  }
+}
+
+async function toggleDesktopPetFromAppearance(enabled){
+  if(_desktopPetToggleBusy) return;
+  _desktopPetToggleBusy=true;
+  try{
+    if(enabled){
+      await startDesktopPet();
+    }else{
+      await closeDesktopPet();
+    }
+  }finally{
+    _desktopPetToggleBusy=false;
+  }
+}
+
 function _setPreferencesAutosaveStatus(state){
   const el=$('settingsPreferencesAutosaveStatus');
   if(!el) return;
@@ -5441,6 +5591,7 @@ async function loadSettingsPanel(){
       };
     }
     if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
+    refreshDesktopPetSwitch();
     // Workspace panel default-open toggle (localStorage-backed)
     // Uses a separate key (hermes-webui-workspace-panel-pref) so that
     // closing the panel via toolbar X does not clear the user's preference.

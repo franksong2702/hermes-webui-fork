@@ -29,6 +29,7 @@ const COMMANDS=[
   {name:'background',desc:t('cmd_background'),fn:cmdBackground,arg:'prompt',  noEcho:true},
   {name:'status',    desc:t('cmd_status'),   fn:cmdStatus},
   {name:'voice',     desc:t('cmd_voice'),    fn:cmdVoice,     noEcho:true},
+  {name:'pet',       desc:t('cmd_pet'),      fn:cmdPet,       arg:'wakeup|sleep', subArgs:['wakeup','sleep'], subArgDescs:{wakeup:t('cmd_pet_wakeup_desc'),sleep:t('cmd_pet_sleep_desc')}, noEcho:true},
   {name:'reasoning', desc:t('cmd_reasoning'), fn:cmdReasoning, arg:'show|hide|none|minimal|low|medium|high|xhigh', subArgs:['show','hide','none','minimal','low','medium','high','xhigh'], noEcho:true},
   {name:'yolo', desc:t('cmd_yolo'), fn:cmdYolo, noEcho:true},
   {name:'branch', desc:t('cmd_branch'), fn:cmdBranch, arg:'[name]', noEcho:true},
@@ -265,7 +266,7 @@ function _parseSlashAutocomplete(text){
     return {kind:'commands', query:raw};
   }
   const argText=raw.slice(cmdName.length).replace(/^\s+/,'');
-  return {kind:'subargs', command:{name:cmdName, desc:subArgSource.desc, subArgs:subArgSource.subArgs}, query:argText.toLowerCase(), rawQuery:argText};
+  return {kind:'subargs', command:{name:cmdName, desc:subArgSource.desc, subArgs:subArgSource.subArgs, subArgDescs:subArgSource.subArgDescs||{}}, query:argText.toLowerCase(), rawQuery:argText};
 }
 
 async function getSlashAutocompleteMatches(text){
@@ -278,7 +279,7 @@ async function getSlashAutocompleteMatches(text){
     .map(opt=>({
       name:parsed.command.name,
       value:String(opt),
-      desc:parsed.command.desc,
+      desc:parsed.command.subArgDescs[String(opt)]||parsed.command.desc,
       source:'subarg',
       parent:parsed.command.name,
     }));
@@ -705,6 +706,35 @@ async function cmdTheme(args){
     return;
   }
   showToast(t('theme_usage')+themes.join('|')+' | '+skins.join('|')+' | legacy:'+legacyThemes.join('|'));
+}
+
+async function cmdPet(args){
+  const action=String(args||'').trim().toLowerCase();
+  if(!['wakeup','sleep'].includes(action)){
+    if(typeof showToast==='function') showToast(t('cmd_pet_usage'),3000);
+    return;
+  }
+  if(action==='wakeup'){
+    if(typeof toggleDesktopPetFromAppearance==='function'){
+      await toggleDesktopPetFromAppearance(true);
+    }else if(typeof startDesktopPet==='function'){
+      await startDesktopPet();
+    }else{
+      if(typeof showToast==='function') showToast(t('cmd_pet_unavailable'),3000);
+      return;
+    }
+    if(typeof showToast==='function') showToast(t('cmd_pet_wakeup_done'),2200);
+    return;
+  }
+  if(typeof toggleDesktopPetFromAppearance==='function'){
+    await toggleDesktopPetFromAppearance(false);
+  }else if(typeof closeDesktopPet==='function'){
+    await closeDesktopPet();
+  }else{
+    if(typeof showToast==='function') showToast(t('cmd_pet_unavailable'),3000);
+    return;
+  }
+  if(typeof showToast==='function') showToast(t('cmd_pet_sleep_done'),2200);
 }
 
 async function cmdSkills(args){

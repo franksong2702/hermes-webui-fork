@@ -8,7 +8,7 @@
 > Prerequisites: SSH tunnel is active on port 8787. Open http://localhost:8787 in browser.
 > Server health check: curl http://127.0.0.1:8787/health should return {"status":"ok"}.
 >
-> Automated coverage: 5303 tests collected via `pytest tests/ --collect-only -q`. Tests run on every PR via GitHub Actions on Python 3.11, 3.12, and 3.13. The suite covers the bootstrap/static wizard, real provider config persistence (`config.yaml` + `.env`), the `/api/onboarding/*` backend, the onboarding skip/existing-config guard, CSS regression coverage for thinking/tool card animation, streaming session persistence, mobile layout breakpoints, locale parity across 11 languages, and hundreds of issue/PR-pinned regression tests.
+> Automated coverage: 6064 tests collected via `pytest tests/ --collect-only -q`. Tests run on every PR via GitHub Actions on Python 3.11, 3.12, and 3.13. The suite covers the bootstrap/static wizard, real provider config persistence (`config.yaml` + `.env`), the `/api/onboarding/*` backend, the onboarding skip/existing-config guard, CSS regression coverage for thinking/tool card animation, streaming session persistence, mobile layout breakpoints, locale parity across 11 languages, and hundreds of issue/PR-pinned regression tests.
 > Run: `pytest tests/ -v --timeout=60`
 >
 > Local regression focus: verify that a previously closed workspace panel stays visually closed from first paint through boot completion on desktop refresh; there should be no brief open-then-close flash.
@@ -1836,8 +1836,30 @@ Bridged CLI sessions:
 
 ---
 
-*Last updated: v0.51.54, May 13, 2026*
-*Total automated tests collected: 5303*
+## Optional desktop pet beta (manual checklist)
+
+Use isolated dev state unless the test intentionally targets an existing user
+runtime:
+
+```bash
+HERMES_HOME=/tmp/hermes-webui-agent-home \
+HERMES_WEBUI_STATE_DIR=/tmp/hermes-webui-agent-state \
+HERMES_WEBUI_PORT=8788 \
+python3 bootstrap.py
+```
+
+- [ ] Open the dev WebUI and confirm Settings -> Appearance exposes the Desktop Pet beta toggle without adding composer, titlebar, or session-row controls.
+- [ ] Turn the toggle on. The pet shell launches from source-built local artifacts, or the status message explains which build tool is missing. No `.app`, `.exe`, `target/`, or `node_modules/` output is tracked by git.
+- [ ] With the WebUI on a non-8787 loopback port, `/api/pet/launch` passes the active request base URL to the shell. The shell should navigate to `/pet` and `/pet/bubbles` under that same base URL.
+- [ ] Type `/pet wakeup` from the slash command menu. The command should be suggested by autocomplete, not sent as free text, and should request launch.
+- [ ] Type `/pet sleep`. It should close only verified desktop-pet process IDs. Windows tasklist-only matches are treated as unverified and must not be killed.
+- [ ] Trigger long title/summary text and approval/clarify-style bubbles. The bubble stays within its fixed width, clamps to the title plus two description lines, and does not overlap a previous bubble after waiting for the previous bubble to dismiss.
+- [ ] Confirm the default bundled pet skin is `keeper` (`May`) and skin metadata loads from `/api/pet/skins`.
+
+---
+
+*Last updated: May 20, 2026*
+*Total automated tests collected: 6064*
 *Regression gate: tests/test_regressions.py*
 *Run: pytest tests/ -v --timeout=60*
 *Source: <repo>/*

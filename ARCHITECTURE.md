@@ -8,7 +8,7 @@
 > Keep this document updated as architecture changes are made.
 
 > Current shipped build: `v0.51.54` (May 13, 2026).
-> Automated coverage: 5303 tests via `pytest tests/ --collect-only -q`. CI runs on Python 3.11, 3.12, and 3.13 against every PR.
+> Automated coverage: 6064 tests via `pytest tests/ --collect-only -q`. CI runs on Python 3.11, 3.12, and 3.13 against every PR.
 >
 > Notable architecture state as of v0.51.54: the bootstrap and first-run onboarding flow own setup discovery; the default WebUI state directory is `~/.hermes/webui`; `ctl.sh` provides a daemon wrapper for homelab installs; chat streaming is still WebUI-owned SSE with stream-ownership guards, cancellation, async manual compression, and turn-journal audit plumbing; provider/model discovery is profile-aware with live-model cache invalidation and custom-provider scoping.
 
@@ -56,6 +56,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       config.py            Discovery, globals, model detection, reloadable config (~4139 lines)
       helpers.py           HTTP helpers: j(), bad(), require(), safe_resolve(), security headers (~302 lines)
       models.py            Session model + CRUD, per-session profile tracking (~1927 lines)
+      pet_routes.py        Optional desktop pet beta routes, skin metadata, launch/close helpers
       profiles.py          Profile state management, hermes_cli wrapper (~1056 lines)
       onboarding.py        First-run onboarding status, real provider config writes, OAuth linking, and readiness detection (~1002 lines)
       routes.py            All GET + POST route handlers (~9772 lines)
@@ -71,12 +72,16 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       sessions.js          Session CRUD, list rendering, search, SVG icons, dropdown actions (~3517 lines)
       messages.js          send(), SSE event handlers, approval, transcript (~2301 lines)
       panels.js            Cron, skills, memory, workspace, profiles, todo, settings (~6480 lines)
+      pet_bridge.js        Optional desktop pet setting bridge and wake/sleep control calls
       commands.js          Slash command registry, parser, autocomplete dropdown (~1302 lines)
+      desktop_pet/         Browser-rendered pet window and bounded bubble surface for the desktop shell
+      pets/                Bundled static pet skins used by the optional desktop pet beta
       onboarding.js        First-run wizard overlay, provider setup flow, and settings/workspace orchestration.
       boot.js              Event wiring, mobile sidebar/workspace nav, voice input, boot IIFE (~1607 lines)
+    desktop-pet/           Optional Tauri shell source; generated app/exe artifacts remain untracked
     tests/
       conftest.py          Isolated test server/state fixtures (~644 lines)
-      488 test files       5303 tests collected via pytest
+      569 test files       6064 tests collected via pytest
       test_regressions.py  Permanent regression gate (~976 lines)
     CONTRIBUTING.md        Contributor workflow and PR expectations.
     ROADMAP.md             Feature and product roadmap document.
@@ -700,7 +705,7 @@ Current structure:
         ui.js, workspace.js, sessions.js, messages.js, panels.js, commands.js, boot.js
       tests/
         conftest.py           Isolated test server/state fixtures
-        488 test files        5303 tests collected
+        569 test files        6064 tests collected
         test_regressions.py   Permanent regression gate
 
 Route extraction to api/routes.py completed in Sprint 11. server.py remains a
@@ -800,7 +805,7 @@ Optional password gate for non-SSH-tunnel deployments.
 
 ### Phase I: Test Infrastructure -- COMPLETE
 
-5303 tests across 488 test files + regression gates. The pytest fixture derives
+6064 tests across 569 test files + regression gates. The pytest fixture derives
 an isolated port and state directory from the repo path unless
 `HERMES_WEBUI_TEST_PORT` / `HERMES_WEBUI_TEST_STATE_DIR` pin them explicitly.
 Production data never touched.
