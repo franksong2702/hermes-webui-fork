@@ -3513,6 +3513,23 @@ if(typeof window!=='undefined'){
   });
 }
 
+function _clearWorktreeMetadataForSession(sessionId, session=null){
+  const clear=(s)=>{
+    if(!s)return;
+    s.worktree_path=null;
+    s.worktree_branch=null;
+    s.worktree_repo_root=null;
+    s.worktree_created_at=null;
+  };
+  clear(session);
+  if(S.session&&S.session.session_id===sessionId)clear(S.session);
+  if(Array.isArray(_allSessions)){
+    for(const s of _allSessions){
+      if(s&&s.session_id===sessionId)clear(s);
+    }
+  }
+}
+
 async function removeWorktree(session){
   // Fetch status first
   let status=null;
@@ -3574,14 +3591,7 @@ async function removeWorktree(session){
     });
     const warn=result.warnings&&result.warnings.length?(' '+result.warnings.join(' ')):'';
     showToast(t('session_worktree_removed')+warn);
-    // Clear the worktree_path from cached session so menu doesn't show stale remove action
-    if(session.worktree_path){
-      session.worktree_path=null;
-    }
-    // Re-render the list if this is the active session
-    if(S.session&&S.session.session_id===session.session_id&&S.session.worktree_path){
-      S.session.worktree_path=null;
-    }
+    _clearWorktreeMetadataForSession(session.session_id, session);
     await renderSessionList();
   }catch(e){
     showToast(t('session_worktree_remove_failed')+e.message,0,'error');

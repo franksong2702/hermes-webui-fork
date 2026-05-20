@@ -33,6 +33,14 @@ def _resolve_path(path: str | Path | None) -> Path | None:
         return Path(path).expanduser()
 
 
+def _path_is_within(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def _worktree_list_cwd(worktree_path: Path, repo_root: str | Path | None) -> Path | None:
     repo = _resolve_path(repo_root)
     if repo and repo.is_dir():
@@ -201,6 +209,41 @@ def worktree_status_for_session(session) -> dict:
     return status
 
 
+def _require_removal_ownership(session, worktree_path: Path, status: dict) -> tuple[Path, str]:
+    """Validate that WebUI owns the worktree before any cleanup mutation."""
+    raw_repo_root = getattr(session, "worktree_repo_root", None)
+    if not raw_repo_root:
+        raise ValueError("Session missing worktree_repo_root; refusing to remove worktree")
+    repo_root = _resolve_path(raw_repo_root)
+    if repo_root is None or not repo_root.is_dir():
+        raise ValueError("Session worktree_repo_root is missing on disk; refusing to remove worktree")
+
+    branch = str(getattr(session, "worktree_branch", "") or "").strip()
+    if not branch:
+        raise ValueError("Session missing worktree_branch; refusing to remove worktree")
+    if not branch.startswith("hermes/"):
+        raise ValueError("Session worktree_branch is not WebUI-managed; refusing to remove worktree")
+
+    try:
+        repo_check = _run_git(["rev-parse", "--show-toplevel"], repo_root)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("Session worktree_repo_root is not a readable git repository") from exc
+    if repo_check.returncode != 0:
+        raise ValueError("Session worktree_repo_root is not a git repository")
+    canonical_repo_root = _resolve_path(repo_check.stdout.strip()) or repo_root
+    if canonical_repo_root != repo_root:
+        repo_root = canonical_repo_root
+
+    managed_root = (repo_root / ".worktrees").resolve(strict=False)
+    if not _path_is_within(worktree_path, managed_root):
+        raise ValueError("Worktree path is outside the WebUI-managed .worktrees directory; refusing to remove it")
+
+    if status.get("exists") and status.get("listed") is not True:
+        raise ValueError("Worktree is not registered in the owning git repository; refusing automatic removal")
+
+    return repo_root, branch
+
+
 def remove_worktree_for_session(session, *, force: bool = False) -> dict:
     """Remove a session's git worktree from disk.
 
@@ -216,14 +259,15 @@ def remove_worktree_for_session(session, *, force: bool = False) -> dict:
     if worktree_path is None:
         raise ValueError("Session is not worktree-backed")
 
-    # Read current status before removal
+    # Read current status before removal and prove ownership before any cleanup mutation.
     status = worktree_status_for_session(session)
+    repo_root, _branch = _require_removal_ownership(session, worktree_path, status)
 
     if not status["exists"]:
         return {
             "ok": True,
             "removed_path": str(worktree_path),
-            "warnings": ["Worktree directory no longer exists on disk."],
+            "warnings": ["Worktree directory no longer exists on disk; no cleanup was attempted."],
         }
 
     warnings = []
@@ -237,10 +281,13 @@ def remove_worktree_for_session(session, *, force: bool = False) -> dict:
         raise ValueError("Worktree is locked by an active terminal session")
 
     # Guard: local changes and unpushed commits without explicit force.
-    if status["dirty"] and not force:
-        raise ValueError(
-            "Worktree has uncommitted changes. Use force=true to override."
-        )
+    if status["dirty"]:
+        if force:
+            warnings.append("Uncommitted changes will be removed.")
+        else:
+            raise ValueError(
+                "Worktree has uncommitted changes. Use force=true to override."
+            )
     if status["untracked_count"] > 0:
         if force:
             warnings.append(
@@ -261,10 +308,7 @@ def remove_worktree_for_session(session, *, force: bool = False) -> dict:
                 "Use force=true to override."
             )
 
-    # Remove the worktree — must run from the repo root, not the worktree dir
-    repo_root = getattr(session, "worktree_repo_root", None)
-    if not repo_root:
-        raise ValueError("Session missing worktree_repo_root")
+    # Remove the worktree — must run from the validated repo root, not the worktree dir.
     try:
         remove_args = ["worktree", "remove"]
         if force:

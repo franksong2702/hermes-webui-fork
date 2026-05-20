@@ -4972,6 +4972,8 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(sid, metadata_only=True)
         except KeyError:
             return bad(handler, "Session not found", status=404)
+        if getattr(s, "read_only", False) or _lookup_cli_session_metadata(sid).get("read_only"):
+            return bad(handler, "Read-only imported sessions cannot remove worktrees from WebUI", 400)
         force = bool(body.get("force", False))
         try:
             from api.worktrees import remove_worktree_for_session

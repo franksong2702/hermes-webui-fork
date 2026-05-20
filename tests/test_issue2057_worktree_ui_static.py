@@ -80,3 +80,15 @@ def test_remove_worktree_ui_does_not_force_unsafe_status_by_default():
     assert "Resolve local changes or unpushed commits before removing this worktree." in i18n
     assert "JSON.stringify({session_id:session.session_id, force:false})" in src
     assert "const force=(status.dirty||status.untracked_count>0)" not in src
+
+
+def test_remove_worktree_clears_all_cached_worktree_metadata():
+    src = read("static/sessions.js")
+    assert "function _clearWorktreeMetadataForSession(sessionId, session=null)" in src
+    assert "s.worktree_path=null;" in src
+    assert "s.worktree_branch=null;" in src
+    assert "s.worktree_repo_root=null;" in src
+    assert "s.worktree_created_at=null;" in src
+    assert "if(S.session&&S.session.session_id===sessionId)clear(S.session);" in src
+    assert "if(s&&s.session_id===sessionId)clear(s);" in src
+    assert "_clearWorktreeMetadataForSession(session.session_id, session);" in src
