@@ -2,13 +2,12 @@
 Hermes Web UI -- File upload: multipart parser and upload handler.
 """
 import mimetypes
-import os
 import re as _re
 import email.parser
 import tempfile
 from pathlib import Path
 
-from api.config import MAX_UPLOAD_BYTES, STATE_DIR
+from api.config import MAX_UPLOAD_BYTES, resolve_attachment_root
 from api.helpers import j, bad
 from api.models import get_session
 from api.workspace import safe_resolve_ws
@@ -63,16 +62,8 @@ def _sanitize_upload_name(filename: str) -> str:
 
 
 def _attachment_root() -> Path:
-    """Return the configured upload inbox root.
-
-    Plain chat attachments are transient context for the agent, not project
-    source files.  Keep them out of the active workspace by default while still
-    allowing operators to move the inbox with HERMES_WEBUI_ATTACHMENT_DIR.
-    """
-    override = os.getenv('HERMES_WEBUI_ATTACHMENT_DIR', '').strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    return (STATE_DIR / 'attachments').resolve()
+    """Return the configured upload inbox root."""
+    return resolve_attachment_root()
 
 
 def _upload_destination(session_id: str, safe_name: str) -> Path:
@@ -120,6 +111,7 @@ def handle_upload(handler):
             'size': dest.stat().st_size,
             'mime': mime,
             'is_image': mime.startswith('image/'),
+            'session_id': session_id,
         })
     except ValueError as e:
         return j(handler, {'error': str(e)}, status=400)

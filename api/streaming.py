@@ -849,7 +849,7 @@ def _resolve_image_input_mode(cfg: dict) -> str:
     return "native"
 
 
-def _build_native_multimodal_message(workspace_ctx: str, msg_text: str, attachments, workspace: str, *, cfg: dict = None):
+def _build_native_multimodal_message(workspace_ctx: str, msg_text: str, attachments, workspace: str, *, cfg: dict = None, session_id: str | None = None):
     """Build native multimodal content parts for current-turn image uploads.
 
     WebUI uploads files into the active workspace. For image files, pass the
@@ -870,21 +870,34 @@ def _build_native_multimodal_message(workspace_ctx: str, msg_text: str, attachme
 
     parts = [{'type': 'text', 'text': workspace_ctx + msg_text}]
     workspace_root = Path(workspace).expanduser().resolve()
-    # Stage-361 maintainer fix (Opus SHOULD-FIX): chat uploads from #2319 now
-    # land in ~/.hermes/webui/attachments/<sid>/ (outside workspace_root by
-    # design). The pre-existing `path.relative_to(workspace_root)` guard would
-    # silently reject every image upload for vision-capable models. Allow the
-    # configured attachment root in addition to workspace_root so native
-    # multimodal embeds still build the base64 image_url part. The
-    # _attachment_root() helper applies expanduser+resolve and is also reused
-    # by _upload_destination — single source of truth for the inbox root.
+    # Chat uploads live under <attachment_root>/<session_id>/ outside the
+    # workspace. Keep native image reads scoped to the workspace or a concrete
+    # session attachment directory; never allow the bare attachment root.
     try:
-        from api.upload import _attachment_root
-        attachment_root = _attachment_root()
-        _allowed_roots = (workspace_root, attachment_root)
+        from api.upload import _attachment_root, _session_attachment_dir
+        attachment_root = _attachment_root().resolve()
     except Exception:
-        _allowed_roots = (workspace_root,)
+        attachment_root = None
+        _session_attachment_dir = None
     image_count = 0
+
+    def _allowed_attachment_path(path: Path, att: dict) -> bool:
+        if path.is_relative_to(workspace_root):
+            return True
+        if attachment_root is None:
+            return False
+        try:
+            att_sid = str(att.get('session_id') or session_id or '').strip()
+            if att_sid and _session_attachment_dir is not None:
+                session_root = _session_attachment_dir(att_sid).resolve()
+                return path.is_relative_to(session_root)
+            rel = path.relative_to(attachment_root)
+            # Legacy metadata may not include a session id. Preserve those
+            # uploads only when the path is inside a session-scoped child dir,
+            # not directly in the bare root.
+            return len(rel.parts) >= 2 and rel.parts[0] not in ('', '.', '..')
+        except Exception:
+            return False
 
     for att in attachments or []:
         if not isinstance(att, dict):
@@ -897,7 +910,7 @@ def _build_native_multimodal_message(workspace_ctx: str, msg_text: str, attachme
             # Uploads should live inside the selected workspace OR the
             # session attachment inbox (#2319). Do not read arbitrary paths
             # from client-provided attachment metadata.
-            if not any(path.is_relative_to(r) for r in _allowed_roots):
+            if not _allowed_attachment_path(path, att):
                 continue
             if not path.is_file():
                 continue
@@ -4200,7 +4213,7 @@ def _run_agent_streaming(
             _agent_msg_text = msg_text
             if _process_notifications:
                 _agent_msg_text = "\n\n".join([*_process_notifications, msg_text]).strip()
-            user_message = _build_native_multimodal_message(workspace_ctx, _agent_msg_text, attachments, workspace, cfg=_cfg)
+            user_message = _build_native_multimodal_message(workspace_ctx, _agent_msg_text, attachments, workspace, cfg=_cfg, session_id=session_id)
             result = agent.run_conversation(
                 user_message=user_message,
                 system_message=workspace_system_msg,

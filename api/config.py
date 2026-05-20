@@ -387,6 +387,121 @@ reload_config()
 cfg = _cfg_cache  # alias for backward compat with existing references
 
 
+# ── Attachment storage ───────────────────────────────────────────────────────
+_ATTACHMENT_DIR_ENV = "HERMES_WEBUI_ATTACHMENT_DIR"
+_ATTACHMENT_LEGACY_DIRS_ENV = "HERMES_WEBUI_ATTACHMENT_LEGACY_DIRS"
+
+
+def _resolve_attachment_path(raw: str | Path | None, *, default_name: str = "attachments") -> Path:
+    """Resolve and validate a WebUI attachment root.
+
+    Relative configured paths are intentionally scoped under STATE_DIR so a
+    simple value like ``attachments`` or ``uploads`` never drifts into the repo
+    or the server's current working directory. Absolute paths are allowed for
+    operators who need large/external storage, but filesystem roots and relative
+    traversal are rejected because /api/file/raw serves files from this tree.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        text = default_name
+
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        resolved = path.resolve()
+        if resolved == Path(resolved.anchor).resolve():
+            raise ValueError("Invalid attachment directory: filesystem root is not allowed")
+        return resolved
+
+    base = STATE_DIR.resolve()
+    resolved = (base / path).resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError as exc:
+        raise ValueError("Invalid attachment directory: path escapes WebUI state directory") from exc
+    return resolved
+
+
+def resolve_attachment_root(config_data: dict | None = None) -> Path:
+    """Return the effective attachment inbox root.
+
+    Precedence: HERMES_WEBUI_ATTACHMENT_DIR env var, then
+    ``webui.attachment_dir`` from config.yaml, then ``STATE_DIR/attachments``.
+    """
+    env_override = os.getenv(_ATTACHMENT_DIR_ENV, "").strip()
+    if env_override:
+        return _resolve_attachment_path(env_override)
+
+    active_cfg = config_data if isinstance(config_data, dict) else cfg
+    webui_cfg = active_cfg.get("webui", {}) if isinstance(active_cfg, dict) else {}
+    raw = webui_cfg.get("attachment_dir") if isinstance(webui_cfg, dict) else None
+    return _resolve_attachment_path(raw)
+
+
+def _attachment_legacy_values(config_data: dict | None = None) -> list[str]:
+    active_cfg = config_data if isinstance(config_data, dict) else cfg
+    webui_cfg = active_cfg.get("webui", {}) if isinstance(active_cfg, dict) else {}
+    values: list[str] = []
+    if isinstance(webui_cfg, dict):
+        raw_cfg = webui_cfg.get("attachment_legacy_dirs")
+        if isinstance(raw_cfg, (list, tuple)):
+            values.extend(str(v).strip() for v in raw_cfg if str(v).strip())
+        elif isinstance(raw_cfg, str) and raw_cfg.strip():
+            values.extend(part.strip() for part in raw_cfg.split(",") if part.strip())
+
+    raw_env = os.getenv(_ATTACHMENT_LEGACY_DIRS_ENV, "").strip()
+    if raw_env:
+        # Comma-separated keeps paths with ':' (Windows drives, URLs in comments)
+        # intact; operators can repeat values in config.yaml for more complex cases.
+        values.extend(part.strip() for part in raw_env.split(",") if part.strip())
+    return values
+
+
+def resolve_attachment_legacy_roots(config_data: dict | None = None) -> list[Path]:
+    """Return extra read-only attachment roots for migrations/backcompat."""
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for raw in _attachment_legacy_values(config_data):
+        root = _resolve_attachment_path(raw)
+        if root not in seen:
+            roots.append(root)
+            seen.add(root)
+    return roots
+
+
+def get_attachment_storage_status(config_data: dict | None = None) -> dict:
+    """Return the effective attachment storage configuration for APIs/tests."""
+    return {
+        "attachment_dir": str(resolve_attachment_root(config_data)),
+        "attachment_dir_env_var": bool(os.getenv(_ATTACHMENT_DIR_ENV, "").strip()),
+        "attachment_legacy_dirs": [
+            str(root) for root in resolve_attachment_legacy_roots(config_data)
+        ],
+    }
+
+
+def set_attachment_dir(path: str | Path | None) -> dict:
+    """Persist ``webui.attachment_dir`` in Hermes config.yaml and reload cfg."""
+    raw = str(path or "").strip()
+    # Validate before mutating config.yaml. Empty resets to default.
+    _resolve_attachment_path(raw)
+
+    config_path = _get_config_path()
+    with _cfg_lock:
+        config_data = _load_yaml_config_file(config_path)
+        webui_cfg = config_data.get("webui")
+        if not isinstance(webui_cfg, dict):
+            webui_cfg = {}
+        if raw:
+            webui_cfg["attachment_dir"] = raw
+        else:
+            webui_cfg.pop("attachment_dir", None)
+        config_data["webui"] = webui_cfg
+        _save_yaml_config_file(config_path, config_data)
+
+    reload_config()
+    return get_attachment_storage_status()
+
+
 # ── Default workspace discovery ───────────────────────────────────────────────
 def _workspace_candidates(raw: str | Path | None = None) -> list[Path]:
     """Return ordered candidate workspace paths, de-duplicated."""

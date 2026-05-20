@@ -6740,9 +6740,25 @@ def _file_raw_target(session, sid: str, rel: str) -> Path | None:
 
         attachment_target = safe_resolve(_session_attachment_dir(sid), rel)
     except Exception:
-        return None
-    if attachment_target.exists() and attachment_target.is_file():
+        attachment_target = None
+    if attachment_target and attachment_target.exists() and attachment_target.is_file():
         return attachment_target
+
+    # Migration/backcompat: when operators move the attachment inbox, old
+    # messages may still reference files under prior roots. Legacy roots are
+    # read-only fallbacks, still scoped by session id and safe_resolve.
+    try:
+        from api.config import resolve_attachment_legacy_roots
+
+        for legacy_root in resolve_attachment_legacy_roots():
+            try:
+                legacy_target = safe_resolve(legacy_root / sid, rel)
+            except ValueError:
+                continue
+            if legacy_target.exists() and legacy_target.is_file():
+                return legacy_target
+    except Exception:
+        pass
     return None
 
 
@@ -8356,6 +8372,9 @@ def _normalize_chat_attachments(raw_attachments):
             is_image = item.get("is_image")
             if isinstance(is_image, bool):
                 att["is_image"] = is_image
+            session_id = str(item.get("session_id") or "").strip()
+            if session_id:
+                att["session_id"] = session_id
             normalized.append(att)
         else:
             value = str(item).strip()
