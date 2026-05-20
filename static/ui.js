@@ -7406,18 +7406,24 @@ function renderBreadcrumb(){
 }
 
 const WORKSPACE_HIDDEN_FILE_NAMES=new Set([
-  '.DS_Store','._.DS_Store','.AppleDouble','.Spotlight-V100','.Trashes','.fseventsd',
-  'Thumbs.db','Desktop.ini','ehthumbs.db','$RECYCLE.BIN',
-  '.directory','.git','.svn','.hg','node_modules','__pycache__',
-  '.pytest_cache','.mypy_cache','.ruff_cache','.tox','.venv','venv'
+  'thumbs.db','desktop.ini','ehthumbs.db','$recycle.bin',
+  'node_modules','__pycache__','dist','build','venv'
 ]);
-const WORKSPACE_HIDDEN_FILE_PREFIXES=['._','.Trash-'];
+const WORKSPACE_HIDDEN_FILE_SUFFIXES=['.pyc','.pyo'];
+function _workspaceShouldHideName(name){
+  const raw=String(name||'');
+  if(!raw)return false;
+  const lower=raw.toLowerCase();
+  // Hidden means real dotfiles/dot-directories plus high-noise generated
+  // workspace entries. Keep this at the render boundary so toggling the
+  // preference can reveal cached entries without changing workspace state.
+  if(raw.startsWith('.'))return true;
+  if(WORKSPACE_HIDDEN_FILE_NAMES.has(lower))return true;
+  return WORKSPACE_HIDDEN_FILE_SUFFIXES.some(suffix=>lower.endsWith(suffix));
+}
 function _workspaceShouldHideEntry(item){
   if(!item||S.showHiddenWorkspaceFiles)return false;
-  const name=String(item.name||'');
-  if(!name)return false;
-  if(WORKSPACE_HIDDEN_FILE_NAMES.has(name))return true;
-  return WORKSPACE_HIDDEN_FILE_PREFIXES.some(prefix=>name.startsWith(prefix));
+  return _workspaceShouldHideName(item.name);
 }
 function _visibleWorkspaceEntries(entries){
   const list=Array.isArray(entries)?entries:[];

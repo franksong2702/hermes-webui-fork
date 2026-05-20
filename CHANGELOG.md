@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+### Fixed
+- Hide ordinary workspace dotfiles and dot-directories by default under the existing "Show hidden files" preference, while preserving the render-boundary cache behavior so enabling the toggle reveals them without a refetch.
 
 ## [v0.51.95] — 2026-05-20 — Release BS (stage-388 — 5-PR batch — live tool callback event dedup + browser-only dashboard links + messaging transcript merge alignment + Geist Contrast skin + SSE runtime diagnostics)
 

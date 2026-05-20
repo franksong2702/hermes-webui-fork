@@ -4,11 +4,12 @@ Original v0.51.21 work added an inline "Show hidden files" toggle that sat
 permanently between the breadcrumb and the file tree, eating ~32px of
 vertical space on every panel view (root, subdir, file preview).
 
-Follow-up UX refinement (this commit) moves the toggle behind a kebab
-dropdown in the panel-actions row and surfaces the non-default
-"hidden-files-visible" state via a small indicator next to the panel
-heading. The original filtering behavior is unchanged; only the affordance
-shape moved.
+Follow-up UX refinements moved the toggle behind a kebab dropdown in the
+panel-actions row and surface the non-default "hidden-files-visible" state via
+a small indicator next to the panel heading. Later follow-up coverage keeps the
+same render-boundary filtering model while broadening the matcher so true
+dotfiles / dot-directories are hidden by default until the user enables the
+toggle.
 """
 
 from pathlib import Path
@@ -40,12 +41,44 @@ def test_workspace_panel_has_show_hidden_files_toggle():
 def test_file_tree_filters_common_cruft_by_default():
     """macOS/Windows/VCS/cache noise should not render by default."""
     assert "WORKSPACE_HIDDEN_FILE_NAMES" in UI_JS
-    for name in [".DS_Store", "Thumbs.db", "Desktop.ini", ".git",
-                 "__pycache__", "node_modules"]:
+    for name in ["thumbs.db", "desktop.ini", "__pycache__", "node_modules"]:
         assert name in UI_JS
     assert "_visibleWorkspaceEntries" in UI_JS
     assert "S.showHiddenWorkspaceFiles" in UI_JS
     assert "_workspaceShouldHideEntry" in UI_JS
+
+
+def test_file_tree_hides_dotfiles_and_hidden_dirs_by_default():
+    """The hidden-files toggle must cover ordinary dotfiles/dot-directories,
+    not only a curated cruft list like .DS_Store and .git.
+    """
+    assert "function _workspaceShouldHideName" in UI_JS
+    body_start = UI_JS.index("function _workspaceShouldHideName")
+    body_end = UI_JS.index("\n}", body_start)
+    body = UI_JS[body_start:body_end]
+    assert "raw.startsWith('.')" in body
+    assert "WORKSPACE_HIDDEN_FILE_NAMES.has(lower)" in body
+    assert "WORKSPACE_HIDDEN_FILE_SUFFIXES.some" in body
+    for name in ["dist", "build", "node_modules", "venv"]:
+        assert f"'{name}'" in UI_JS
+    for suffix in [".pyc", ".pyo"]:
+        assert f"'{suffix}'" in UI_JS
+
+
+def test_show_hidden_toggle_bypasses_all_workspace_filtering():
+    """When the toggle is on, dotfiles, generated dirs, and suffix matches
+    must all be recoverable from the cached listing without a refetch.
+    """
+    entry_start = UI_JS.index("function _workspaceShouldHideEntry")
+    entry_end = UI_JS.index("\n}", entry_start)
+    entry_body = UI_JS[entry_start:entry_end]
+    assert "S.showHiddenWorkspaceFiles" in entry_body
+    assert "return _workspaceShouldHideName(item.name)" in entry_body
+
+    visible_start = UI_JS.index("function _visibleWorkspaceEntries")
+    visible_end = UI_JS.index("\n}", visible_start)
+    visible_body = UI_JS[visible_start:visible_end]
+    assert "S.showHiddenWorkspaceFiles?list:list.filter" in visible_body
 
 
 def test_hidden_file_toggle_invalidates_tree_render_without_refetch():
