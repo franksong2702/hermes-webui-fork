@@ -3244,7 +3244,8 @@ function updateSendBtn(){
     const _tmap={send:'Send message',queue:'Queue message',interrupt:'Interrupt and send',steer:'Steer current response',stop:'Stop generation'};
     _btnTitle=_tt('composer_'+action,_tmap[action]||'Send message');
   }
-  btn.title=_btnTitle;
+  if(typeof _setButtonTooltip==='function') _setButtonTooltip(btn,_btnTitle);
+  else btn.title=_btnTitle;
   btn.setAttribute('aria-label',_btnTitle);
   _setComposerPrimaryButtonIcon(btn,action);
   // Single primary action button: while busy/no-draft it becomes the red Stop
