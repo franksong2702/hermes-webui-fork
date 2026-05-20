@@ -4615,6 +4615,7 @@ function _renderProfileDetail(p, activeName){
 }
 
 function _setProfileHeaderButtons(mode, p, activeName){
+  const editBtn = $('btnEditProfileDetail');
   const actBtn = $('btnActivateProfileDetail');
   const delBtn = $('btnDeleteProfileDetail');
   const cancelBtn = $('btnCancelProfileDetail');
@@ -4624,13 +4625,14 @@ function _setProfileHeaderButtons(mode, p, activeName){
   if (mode === 'read') {
     const isActive = p && p.name === activeName;
     const isDefault = !!(p && p.is_default);
+    show(editBtn);
     if (isActive) hide(actBtn); else show(actBtn);
     if (isDefault) hide(delBtn); else show(delBtn);
     hide(cancelBtn); hide(saveBtn);
-  } else if (mode === 'create') {
-    hide(actBtn); hide(delBtn); show(cancelBtn); show(saveBtn);
+  } else if (mode === 'create' || mode === 'edit') {
+    hide(editBtn); hide(actBtn); hide(delBtn); show(cancelBtn); show(saveBtn);
   } else {
-    [actBtn, delBtn, cancelBtn, saveBtn].forEach(hide);
+    [editBtn, actBtn, delBtn, cancelBtn, saveBtn].forEach(hide);
   }
 }
 
@@ -4876,55 +4878,73 @@ function openProfileCreate(){
   if (typeof switchPanel === 'function' && _currentPanel !== 'profiles') switchPanel('profiles');
   _profilePreFormDetail = _currentProfileDetail ? { ..._currentProfileDetail } : null;
   _profileMode = 'create';
-  _renderProfileForm();
+  _renderProfileForm({ mode: 'create' });
 }
 
-function _renderProfileForm(){
+function openProfileEdit(){
+  if (!_currentProfileDetail) return;
+  if (typeof switchPanel === 'function' && _currentPanel !== 'profiles') switchPanel('profiles');
+  _profilePreFormDetail = { ..._currentProfileDetail };
+  _profileMode = 'edit';
+  _renderProfileForm({ mode: 'edit', profile: _currentProfileDetail });
+}
+
+function _renderProfileForm({ mode = 'create', profile = null } = {}){
   const title = $('profileDetailTitle');
   const body = $('profileDetailBody');
   const empty = $('profileDetailEmpty');
   if (!title || !body) return;
-  title.textContent = t('new_profile');
+  const isEdit = mode === 'edit';
+  const profileName = profile && profile.name ? profile.name : '';
+  const nameHint = isEdit
+    ? (t('profile_name_readonly_hint') === 'profile_name_readonly_hint' ? 'Profile names cannot be changed here.' : t('profile_name_readonly_hint'))
+    : (t('profile_name_rule') || 'Lowercase letters, numbers, hyphens, underscores only.');
+  const modelHint = isEdit
+    ? (t('profile_model_hint_edit') === 'profile_model_hint_edit' ? 'Change the saved model/provider for this profile.' : t('profile_model_hint_edit'))
+    : (t('profile_model_hint') || 'Choose from configured providers and models for this new profile.');
+  title.textContent = isEdit ? profileName : t('new_profile');
   body.innerHTML = `
     <div class="main-view-content">
       <form class="detail-form" onsubmit="event.preventDefault(); saveProfileForm();">
         <div class="detail-form-row">
           <label for="profileFormName">${esc(t('profile_name_label') || 'Name')}</label>
-          <input type="text" id="profileFormName" placeholder="${esc(t('profile_name_placeholder') || 'lowercase, a-z 0-9 hyphens')}" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" required>
-          <div class="detail-form-hint">${esc(t('profile_name_rule') || 'Lowercase letters, numbers, hyphens, underscores only.')}</div>
+          <input type="text" id="profileFormName" value="${esc(profileName)}" placeholder="${esc(t('profile_name_placeholder') || 'lowercase, a-z 0-9 hyphens')}" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" required ${isEdit ? 'readonly aria-readonly="true"' : ''}>
+          <div class="detail-form-hint">${esc(nameHint)}</div>
         </div>
-        <div class="detail-form-row">
+        ${isEdit ? '' : `<div class="detail-form-row">
           <label class="detail-form-check" for="profileFormClone">
             <input type="checkbox" id="profileFormClone"> <span>${esc(t('profile_clone_label') || 'Clone config from active profile')}</span>
           </label>
-        </div>
+        </div>`}
         <div class="detail-form-row">
           <label for="profileFormModel">${esc(t('profile_model_label') || 'Model / provider')}</label>
           <select id="profileFormModel"></select>
-          <div class="detail-form-hint">${esc(t('profile_model_hint') || 'Choose from configured providers and models for this new profile.')}</div>
+          <div class="detail-form-hint">${esc(modelHint)}</div>
         </div>
-        <div class="detail-form-row">
+        ${isEdit ? '' : `<div class="detail-form-row">
           <label for="profileFormBaseUrl">${esc(t('profile_base_url_label') || 'Base URL')}</label>
           <input type="text" id="profileFormBaseUrl" placeholder="${esc(t('profile_base_url_placeholder') || 'Optional, e.g. http://localhost:11434')}" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
         </div>
         <div class="detail-form-row">
           <label for="profileFormApiKey">${esc(t('profile_api_key_label') || 'API key')}</label>
           <input type="password" id="profileFormApiKey" placeholder="${esc(t('profile_api_key_placeholder') || 'Optional')}" autocomplete="off">
-        </div>
+        </div>`}
         <div id="profileFormError" class="detail-form-error" style="display:none"></div>
       </form>
     </div>`;
   body.style.display = '';
   if (empty) empty.style.display = 'none';
-  _setProfileHeaderButtons('create');
+  _setProfileHeaderButtons(isEdit ? 'edit' : 'create');
   const n = $('profileFormName');
-  if (n) n.focus();
-  _populateProfileFormModelSelect();
+  if (n && !isEdit) n.focus();
+  _populateProfileFormModelSelect(profile);
 }
 
-async function _populateProfileFormModelSelect(){
+async function _populateProfileFormModelSelect(profile){
   const sel = $('profileFormModel');
   if (!sel) return;
+  const profileModel = profile && profile.model ? String(profile.model) : '';
+  const profileProvider = profile && profile.provider ? String(profile.provider) : null;
   sel.innerHTML = `<option value="">${esc(t('profile_model_use_default') || 'Use active profile default')}</option>`;
   try {
     const data = await api('/api/models');
@@ -4942,8 +4962,12 @@ async function _populateProfileFormModelSelect(){
       }
       if (og.children.length) sel.appendChild(og);
     }
-    if (data && data.default_model && typeof _applyModelToDropdown === 'function') {
-      _applyModelToDropdown(data.default_model, sel, data.active_provider || window._activeProvider || null);
+    const modelToApply = profile ? profileModel : (data && data.default_model);
+    const providerToApply = profile
+      ? (profileProvider || (typeof _providerFromModelValue === 'function' ? _providerFromModelValue(profileModel) : null) || null)
+      : (data && data.active_provider) || window._activeProvider || null;
+    if (modelToApply && typeof _applyModelToDropdown === 'function') {
+      _applyModelToDropdown(modelToApply, sel, providerToApply);
     }
   } catch (e) {
     console.warn('Failed to load profile model picker:', e.message);
@@ -4978,7 +5002,9 @@ async function saveProfileForm(){
   const apiKey = (apiKeyEl ? (apiKeyEl.value || '') : '').trim();
   if (baseUrl && !/^https?:\/\//.test(baseUrl)) { errEl.textContent = t('profile_base_url_rule'); errEl.style.display = ''; return; }
   try {
-    const payload = { name, clone_config: cloneConfig };
+    const currentName = _currentProfileDetail && _currentProfileDetail.name ? _currentProfileDetail.name : name;
+    const isEdit = _profileMode === 'edit';
+    const payload = isEdit ? { name: currentName } : { name, clone_config: cloneConfig };
     const selectedModel = modelEl ? (modelEl.value || '').trim() : '';
     if (selectedModel) {
       const modelState = (typeof _modelStateForSelect === 'function')
@@ -4986,15 +5012,19 @@ async function saveProfileForm(){
         : { model: selectedModel, model_provider: null };
       if (modelState.model) payload.default_model = modelState.model;
       if (modelState.model_provider) payload.model_provider = modelState.model_provider;
+    } else if (isEdit) {
+      payload.clear_model = true;
     }
-    if (baseUrl) payload.base_url = baseUrl;
-    if (apiKey) payload.api_key = apiKey;
-    await api('/api/profile/create', { method: 'POST', body: JSON.stringify(payload) });
+    if (!isEdit) {
+      if (baseUrl) payload.base_url = baseUrl;
+      if (apiKey) payload.api_key = apiKey;
+    }
+    await api(isEdit ? '/api/profile/update' : '/api/profile/create', { method: 'POST', body: JSON.stringify(payload) });
     _invalidateKanbanProfileCache();
     _profilePreFormDetail = null;
     await loadProfilesPanel();
-    showToast(t('profile_created', name));
-    openProfileDetail(name);
+    showToast(isEdit ? t('saved') : t('profile_created', name));
+    openProfileDetail(isEdit ? currentName : name);
   } catch (e) {
     errEl.textContent = e.message || t('create_failed');
     errEl.style.display = '';

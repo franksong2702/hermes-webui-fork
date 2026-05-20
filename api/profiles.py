@@ -1203,15 +1203,16 @@ def _validate_profile_model_selection(
     raise ValueError(f"Selected model provider '{model_provider}' is not available")
 
 
-def _write_model_defaults_to_config(
+def _update_model_defaults_in_config(
     profile_dir: Path,
     *,
     default_model: Optional[str] = None,
     model_provider: Optional[str] = None,
+    clear_model: bool = False,
 ) -> None:
-    """Write model default/provider fields into config.yaml for a profile."""
+    """Update model default/provider fields in config.yaml for an existing profile."""
     default_model, model_provider = _split_webui_provider_model_value(default_model, model_provider)
-    if not default_model and not model_provider:
+    if not clear_model and not default_model and not model_provider:
         return
     config_path = profile_dir / 'config.yaml'
     try:
@@ -1229,12 +1230,29 @@ def _write_model_defaults_to_config(
     model_section = cfg.get('model', {})
     if not isinstance(model_section, dict):
         model_section = {}
+    if clear_model:
+        model_section.pop('default', None)
+        model_section.pop('provider', None)
     if default_model:
         model_section['default'] = default_model
     if model_provider:
         model_section['provider'] = model_provider
     cfg['model'] = model_section
     config_path.write_text(_yaml.dump(cfg, default_flow_style=False, allow_unicode=True), encoding='utf-8')
+
+
+def _write_model_defaults_to_config(
+    profile_dir: Path,
+    *,
+    default_model: Optional[str] = None,
+    model_provider: Optional[str] = None,
+) -> None:
+    """Write model default/provider fields into config.yaml for a newly-created profile."""
+    _update_model_defaults_in_config(
+        profile_dir,
+        default_model=default_model,
+        model_provider=model_provider,
+    )
 
 
 def create_profile_api(name: str, clone_from: str = None,
@@ -1324,8 +1342,72 @@ def create_profile_api(name: str, clone_from: str = None,
         'is_default': False,
         'is_active': _active_profile == name,
         'gateway_running': False,
-        'model': None,
-        'provider': None,
+        'model': default_model,
+        'provider': model_provider,
+        'has_env': (profile_path / '.env').exists(),
+        'skill_count': 0,
+    }
+
+
+def _resolve_profile_home_for_update(name: str) -> Path:
+    """Resolve an existing profile directory for config updates."""
+    if _is_root_profile(name):
+        return _DEFAULT_HERMES_HOME
+    _validate_profile_name(name)
+    home = _resolve_named_profile_home(name)
+    if not home.is_dir():
+        raise ValueError(f"Profile '{name}' does not exist.")
+    return home
+
+
+def update_profile_api(
+    name: str,
+    *,
+    default_model: Optional[str] = None,
+    model_provider: Optional[str] = None,
+    clear_model: bool = False,
+) -> dict:
+    """Update editable settings for an existing profile and return fresh metadata."""
+    name = str(name or '').strip()
+    if not name:
+        raise ValueError("name is required")
+    profile_path = _resolve_profile_home_for_update(name)
+    default_model, model_provider = _split_webui_provider_model_value(default_model, model_provider)
+    if default_model or model_provider:
+        _validate_profile_model_selection(default_model, model_provider)
+
+    _update_model_defaults_in_config(
+        profile_path,
+        default_model=default_model,
+        model_provider=model_provider,
+        clear_model=clear_model,
+    )
+
+    # If the process-wide active profile was edited, refresh the cached config.
+    if name == _active_profile or (_is_root_profile(name) and _is_root_profile(_active_profile)):
+        try:
+            from api.config import reload_config
+
+            reload_config()
+        except Exception:
+            logger.debug("Failed to reload config after profile update", exc_info=True)
+
+    for p in list_profiles_api():
+        if p['name'] == name or (_is_root_profile(name) and p.get('is_default')):
+            result = dict(p)
+            if default_model or clear_model:
+                result['model'] = None if clear_model and not default_model else default_model
+            if model_provider or clear_model:
+                result['provider'] = None if clear_model and not model_provider else model_provider
+            return result
+    return {
+        'name': name,
+        'path': str(profile_path),
+        'is_default': _is_root_profile(name),
+        'is_active': _active_profile == name,
+        'gateway_running': False,
+        'model': None if clear_model else default_model,
+        'provider': None if clear_model else model_provider,
         'has_env': (profile_path / '.env').exists(),
         'skill_count': 0,
     }

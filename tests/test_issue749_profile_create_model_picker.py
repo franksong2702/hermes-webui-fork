@@ -170,3 +170,91 @@ def test_profile_create_rejects_unknown_model_before_creating_profile(monkeypatc
         )
 
     assert calls == []
+
+
+def test_profile_detail_exposes_model_edit_flow():
+    assert 'id="btnEditProfileDetail"' in (REPO / "static" / "index.html").read_text(encoding="utf-8")
+    assert "function openProfileEdit" in PANELS_JS
+    assert "_renderProfileForm({ mode: 'edit'" in PANELS_JS
+    assert "profile_model_hint_edit" in PANELS_JS
+
+
+def test_profile_edit_payload_updates_existing_profile_instead_of_create():
+    fn_start = PANELS_JS.find("async function saveProfileForm()")
+    assert fn_start != -1
+    fn_body = PANELS_JS[fn_start : PANELS_JS.find("\n}", fn_start) + 2]
+    assert "_profileMode === 'edit'" in fn_body
+    assert "/api/profile/update" in fn_body
+    assert "name: currentName" in fn_body
+    assert "clear_model" in fn_body
+
+
+def test_profile_update_route_passes_model_fields_to_profile_api():
+    route_start = ROUTES_PY.find('if parsed.path == "/api/profile/update":')
+    assert route_start != -1
+    route_body = ROUTES_PY[route_start : ROUTES_PY.find('if parsed.path == "/api/profile/delete":', route_start)]
+    assert 'default_model = body.get("default_model"' in route_body
+    assert 'model_provider = body.get("model_provider"' in route_body
+    assert "update_profile_api" in route_body
+    assert "clear_model=clear_model" in route_body
+
+
+def test_profile_model_config_updater_changes_and_clears_existing_model_settings(tmp_path):
+    profile_dir = tmp_path / "profiles" / "research"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text(
+        "model:\n  base_url: https://gateway.example/v1\n  default: old-model\n  provider: old-provider\n",
+        encoding="utf-8",
+    )
+
+    profiles._update_model_defaults_in_config(
+        profile_dir,
+        default_model="gpt-5.5",
+        model_provider="openai-codex",
+    )
+
+    saved = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
+    assert saved["model"]["base_url"] == "https://gateway.example/v1"
+    assert saved["model"]["default"] == "gpt-5.5"
+    assert saved["model"]["provider"] == "openai-codex"
+
+    profiles._update_model_defaults_in_config(profile_dir, clear_model=True)
+
+    cleared = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
+    assert cleared["model"] == {"base_url": "https://gateway.example/v1"}
+
+
+def test_profile_update_rejects_unknown_model_before_writing(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "profiles" / "research"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text(
+        "model:\n  default: keep-me\n  provider: keep-provider\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: False)
+    monkeypatch.setattr(profiles, "_resolve_named_profile_home", lambda name: profile_dir)
+    monkeypatch.setattr(
+        profiles,
+        "_get_available_models_for_profile_validation",
+        lambda: {
+            "groups": [
+                {
+                    "provider": "OpenAI Codex",
+                    "provider_id": "openai-codex",
+                    "models": [{"id": "gpt-5.5", "label": "GPT-5.5"}],
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(ValueError, match="Selected model 'missing-model'"):
+        profiles.update_profile_api(
+            "research",
+            default_model="missing-model",
+            model_provider="openai-codex",
+        )
+
+    saved = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
+    assert saved["model"]["default"] == "keep-me"
+    assert saved["model"]["provider"] == "keep-provider"

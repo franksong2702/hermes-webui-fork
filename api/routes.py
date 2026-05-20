@@ -5445,6 +5445,38 @@ def handle_post(handler, parsed) -> bool:
         except (ValueError, FileExistsError, RuntimeError) as e:
             return bad(handler, str(e))
 
+    if parsed.path == "/api/profile/update":
+        name = body.get("name", "").strip()
+        if not name:
+            return bad(handler, "name is required")
+        import re as _re
+
+        if name != 'default' and not _re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", name):
+            return bad(
+                handler,
+                "Invalid profile name: lowercase letters, numbers, hyphens, underscores only",
+            )
+        default_model = body.get("default_model", "").strip() if body.get("default_model") else None
+        model_provider = body.get("model_provider", "").strip() if body.get("model_provider") else None
+        clear_model = bool(body.get("clear_model", False))
+        try:
+            from api.profiles import update_profile_api
+
+            result = update_profile_api(
+                name,
+                default_model=default_model,
+                model_provider=model_provider,
+                clear_model=clear_model,
+            )
+            try:
+                from api.config import invalidate_models_cache
+                invalidate_models_cache()
+            except Exception:
+                pass
+            return j(handler, {"ok": True, "profile": result})
+        except (ValueError, FileNotFoundError, RuntimeError) as e:
+            return bad(handler, str(e))
+
     if parsed.path == "/api/profile/delete":
         name = body.get("name", "").strip()
         if not name:
