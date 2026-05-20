@@ -382,6 +382,134 @@ def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
     )
 
 
+ATTACHMENT_DIR_ENV = "HERMES_WEBUI_ATTACHMENT_DIR"
+ATTACHMENT_CONFIG_KEY = "webui.attachment_dir"
+
+
+def _default_attachment_root() -> Path:
+    return (STATE_DIR / "attachments").resolve()
+
+
+def normalize_attachment_dir(value: str | Path | None, *, create: bool = False) -> Path:
+    """Resolve and optionally create a configured WebUI attachment root.
+
+    Absolute paths are honoured as-is after expanduser+resolve. Relative paths
+    are intentionally anchored under STATE_DIR (never process cwd) and may not
+    traverse out of STATE_DIR. A blank value means the built-in default.
+    """
+    if value is None:
+        raw = ""
+    elif isinstance(value, Path):
+        raw = str(value)
+    elif isinstance(value, str):
+        raw = value
+    else:
+        raise ValueError("Attachment directory must be a path string")
+
+    raw = raw.strip()
+    if "\x00" in raw:
+        raise ValueError("Attachment directory cannot contain NUL bytes")
+    if not raw:
+        path = _default_attachment_root()
+    else:
+        candidate = Path(raw).expanduser()
+        if candidate.is_absolute():
+            path = candidate.resolve()
+        else:
+            path = (STATE_DIR / candidate).resolve()
+            if not path.is_relative_to(STATE_DIR):
+                raise ValueError(
+                    "Relative attachment directories must stay under the WebUI state directory"
+                )
+
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"Attachment directory is not a directory: {path}")
+    if create:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(f"Cannot create attachment directory: {exc}") from exc
+        if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+            raise ValueError(f"Attachment directory is not readable and writable: {path}")
+    return path
+
+
+def get_attachment_dir_status() -> dict:
+    """Return the effective attachment-root configuration for Settings UI."""
+    env_value = os.getenv(ATTACHMENT_DIR_ENV, "").strip()
+    active_cfg = get_config()
+    webui_cfg = active_cfg.get("webui", {}) if isinstance(active_cfg, dict) else {}
+    if not isinstance(webui_cfg, dict):
+        webui_cfg = {}
+    configured_value = webui_cfg.get("attachment_dir")
+    if not isinstance(configured_value, str):
+        configured_value = ""
+    configured_value = configured_value.strip()
+
+    if env_value:
+        raw = env_value
+        source = "env"
+        editable = False
+    elif configured_value:
+        raw = configured_value
+        source = "config"
+        editable = True
+    else:
+        raw = ""
+        source = "default"
+        editable = True
+
+    status = {
+        "config_key": ATTACHMENT_CONFIG_KEY,
+        "env_var": ATTACHMENT_DIR_ENV,
+        "source": source,
+        "editable": editable,
+        "configured_value": configured_value,
+        "input_value": env_value if env_value else configured_value,
+        "env_override": env_value or None,
+        "default_path": str(_default_attachment_root()),
+        "relative_base": str(STATE_DIR),
+        "error": None,
+    }
+    try:
+        status["effective_path"] = str(normalize_attachment_dir(raw, create=False))
+    except ValueError as exc:
+        status["effective_path"] = str(_default_attachment_root())
+        status["error"] = str(exc)
+    return status
+
+
+def set_webui_attachment_dir(value: str | None) -> dict:
+    """Persist webui.attachment_dir in the active Hermes config.yaml.
+
+    HERMES_WEBUI_ATTACHMENT_DIR remains a deployment-level override; when it is
+    set, the WebUI refuses writes instead of pretending a saved config value is
+    active. Blank values clear webui.attachment_dir and return to the default.
+    """
+    if os.getenv(ATTACHMENT_DIR_ENV, "").strip():
+        raise ValueError(
+            f"{ATTACHMENT_DIR_ENV} is set and overrides {ATTACHMENT_CONFIG_KEY}; unset it and restart the server before changing this setting."
+        )
+    raw = "" if value is None else str(value).strip()
+    normalize_attachment_dir(raw, create=True)
+
+    config_path = _get_config_path()
+    config_data = _load_yaml_config_file(config_path)
+    webui_cfg = config_data.get("webui")
+    if not isinstance(webui_cfg, dict):
+        webui_cfg = {}
+        config_data["webui"] = webui_cfg
+    if raw:
+        webui_cfg["attachment_dir"] = raw
+    else:
+        webui_cfg.pop("attachment_dir", None)
+    if not webui_cfg:
+        config_data.pop("webui", None)
+    _save_yaml_config_file(config_path, config_data)
+    reload_config()
+    return get_attachment_dir_status()
+
+
 # Initial load
 reload_config()
 cfg = _cfg_cache  # alias for backward compat with existing references

@@ -5414,6 +5414,11 @@ async function loadSettingsPanel(){
       const agentVersion = (settings.agent_version || 'not detected').toString().trim() || 'not detected';
       agentBadge.textContent = `Agent: ${agentVersion}`;
     }
+    _renderAttachmentDirSettings(settings.attachment_dir);
+    const attachmentDirField=$('settingsAttachmentDir');
+    if(attachmentDirField){
+      attachmentDirField.addEventListener('input',_markSettingsDirty,{once:false});
+    }
     // Hydrate appearance controls first so a slow /api/models request
     // cannot overwrite an in-progress theme/skin selection.
     const themeSel=$('settingsTheme');
@@ -6309,6 +6314,36 @@ function _setSettingsAuthButtonsVisible(active){
   if(disableBtn) disableBtn.style.display=active?'':'none';
 }
 
+function _renderAttachmentDirSettings(info, errorMessage){
+  const input=$('settingsAttachmentDir');
+  const status=$('settingsAttachmentDirStatus');
+  if(!input&&!status) return;
+  info=info||{};
+  if(input){
+    input.value=info.input_value||info.configured_value||'';
+    input.placeholder=info.default_path||'Default attachment directory';
+    input.disabled=info.editable===false;
+    input.title=info.editable===false
+      ? `${info.env_var||'HERMES_WEBUI_ATTACHMENT_DIR'} is set and overrides this setting`
+      : 'Leave blank to use the default attachment directory';
+  }
+  if(status){
+    const parts=[];
+    if(errorMessage){
+      parts.push(`<span style="color:var(--error)">${esc(errorMessage)}</span>`);
+    }else if(info.error){
+      parts.push(`<span style="color:var(--error)">${esc(info.error)}</span>`);
+    }
+    if(info.effective_path) parts.push(`Effective: <code>${esc(info.effective_path)}</code>`);
+    if(info.source) parts.push(`Source: ${esc(info.source)}`);
+    if(info.relative_base) parts.push(`Relative base: <code>${esc(info.relative_base)}</code>`);
+    if(info.editable===false&&info.env_var){
+      parts.push(`${esc(info.env_var)} is set, so config.yaml changes are disabled until the server is restarted without that environment variable.`);
+    }
+    status.innerHTML=parts.join('<br>');
+  }
+}
+
 function _applySavedSettingsUi(saved, body, opts){
   const {sendKey,showTokenUsage,showQuotaChip,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
   window._sendKey=sendKey||'enter';
@@ -6337,6 +6372,7 @@ function _applySavedSettingsUi(saved, body, opts){
     else if(typeof stopGatewaySSE==='function') stopGatewaySSE();
   }
   _setSettingsAuthButtonsVisible(!!saved.auth_enabled);
+  if(saved.attachment_dir) _renderAttachmentDirSettings(saved.attachment_dir);
   _settingsDirty=false;
   _settingsThemeOnOpen=theme;
   _settingsSkinOnOpen=skin||'default';
@@ -6422,6 +6458,8 @@ async function saveSettings(andClose){
   const sidebarDensity=($('settingsSidebarDensity')||{}).value==='detailed'?'detailed':'compact';
   const busyInputMode=($('settingsBusyInputMode')||{}).value||'queue';
   const body={};
+  const attachmentDirField=$('settingsAttachmentDir');
+  if(attachmentDirField&&!attachmentDirField.disabled) body.attachment_dir=attachmentDirField.value||'';
 
   if(sendKey) body.send_key=sendKey;
   body.theme=theme;
@@ -6469,7 +6507,13 @@ async function saveSettings(andClose){
       if(!andClose) _pendingSettingsTargetPanel = null;
       if(andClose) _hideSettingsPanel();
       return;
-    }catch(e){showToast(t('settings_save_failed')+e.message);return;}
+    }catch(e){
+      if(attachmentDirField&&!attachmentDirField.disabled){
+        _renderAttachmentDirSettings({input_value:attachmentDirField.value},e.message);
+      }
+      showToast(t('settings_save_failed')+e.message);
+      return;
+    }
   }
   try{
     const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(body)});
@@ -6488,6 +6532,9 @@ async function saveSettings(andClose){
     if(!andClose) _pendingSettingsTargetPanel = null;
     if(andClose) _hideSettingsPanel();
   }catch(e){
+    if(attachmentDirField&&!attachmentDirField.disabled){
+      _renderAttachmentDirSettings({input_value:attachmentDirField.value},e.message);
+    }
     showToast(t('settings_save_failed')+e.message);
   }
 }

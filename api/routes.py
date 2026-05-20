@@ -924,6 +924,8 @@ from api.config import (
     SESSION_AGENT_LOCKS_LOCK,
     load_settings,
     save_settings,
+    get_attachment_dir_status,
+    set_webui_attachment_dir,
     set_hermes_default_model,
     model_with_provider_context,
     get_reasoning_status,
@@ -3603,6 +3605,7 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/settings":
         settings = load_settings()
+        settings["attachment_dir"] = get_attachment_dir_status()
         # Never expose the stored password hash to clients
         settings.pop("password_hash", None)
         # Surface env-var precedence so the UI can disable the password field
@@ -5496,7 +5499,19 @@ def handle_post(handler, parsed) -> bool:
                     409,
                 )
 
+        attachment_dir_requested = "attachment_dir" in body
+        requested_attachment_dir = body.pop("attachment_dir", None)
+        attachment_dir_status = None
+        if attachment_dir_requested:
+            try:
+                attachment_dir_status = set_webui_attachment_dir(requested_attachment_dir)
+            except ValueError as e:
+                return bad(handler, str(e), 400)
+            except RuntimeError as e:
+                return bad(handler, str(e), 500)
+
         saved = save_settings(body)
+        saved["attachment_dir"] = attachment_dir_status or get_attachment_dir_status()
         saved.pop("password_hash", None)  # never expose hash to client
 
         auth_enabled_after = is_auth_enabled()

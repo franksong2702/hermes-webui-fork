@@ -8,7 +8,7 @@ import email.parser
 import tempfile
 from pathlib import Path
 
-from api.config import MAX_UPLOAD_BYTES, STATE_DIR
+from api.config import MAX_UPLOAD_BYTES, STATE_DIR, get_attachment_dir_status, normalize_attachment_dir
 from api.helpers import j, bad
 from api.models import get_session
 from api.workspace import safe_resolve_ws
@@ -63,16 +63,18 @@ def _sanitize_upload_name(filename: str) -> str:
 
 
 def _attachment_root() -> Path:
-    """Return the configured upload inbox root.
+    """Return the effective upload inbox root.
 
     Plain chat attachments are transient context for the agent, not project
-    source files.  Keep them out of the active workspace by default while still
-    allowing operators to move the inbox with HERMES_WEBUI_ATTACHMENT_DIR.
+    source files. Keep them out of the active workspace by default. Operators
+    may configure the root with webui.attachment_dir in config.yaml, while the
+    HERMES_WEBUI_ATTACHMENT_DIR environment variable remains the highest-
+    precedence deployment override.
     """
-    override = os.getenv('HERMES_WEBUI_ATTACHMENT_DIR', '').strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    return (STATE_DIR / 'attachments').resolve()
+    status = get_attachment_dir_status()
+    if status.get('error'):
+        raise ValueError(status['error'])
+    return normalize_attachment_dir(status.get('input_value') or '', create=False)
 
 
 def _upload_destination(session_id: str, safe_name: str) -> Path:

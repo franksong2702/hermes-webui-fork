@@ -1213,6 +1213,12 @@
               </div>
             </div>
             <div class="settings-field">
+              <label for="settingsAttachmentDir">Attachment Directory</label>
+              <div style="font-size:11px;color:var(--muted);margin-bottom:6px;line-height:1.45">Chat uploads are stored in a per-session folder under this root, separate from the active workspace. Relative paths resolve under the WebUI state directory, not the current workspace.</div>
+              <input type="text" id="settingsAttachmentDir" placeholder="Default attachment directory" autocomplete="off" style="width:100%;padding:8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:13px;font-family:'SF Mono',ui-monospace,monospace">
+              <div id="settingsAttachmentDirStatus" class="settings-autosave-status" aria-live="polite" style="margin-top:6px;line-height:1.45"></div>
+            </div>
+            <div class="settings-field">
               <label for="settingsPassword" data-i18n="settings_label_password">Access Password</label>
               <div style="font-size:11px;color:var(--muted);margin-bottom:6px" data-i18n="settings_desc_password">Enter a new password to set or change it. Leave blank to keep current setting.</div>
               <input type="password" id="settingsPassword" placeholder="Enter new password…" data-i18n-placeholder="password_placeholder" style="width:100%;padding:8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:13px">
