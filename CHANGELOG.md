@@ -3,6 +3,9 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Composer model picker now opens immediately from the existing option list while the dynamic `/api/models` catalog hydrates in the background, and a just-selected session model survives a hard refresh even if the refresh interrupts the async session update. Previously a slow model-catalog request could make the model button appear unresponsive, and a quick reload after selecting a model could restore the old session model.
 
 ## [v0.51.107] — 2026-05-21 — Release CE (stage-400 — 8-PR batch — pinned-sessions-limit getter rename + uploaded-file user-turn dedupe + active-run repair guard + incremental KaTeX streaming + profile default model on fresh boot + French locale completion + update-check error surfacing + release-update apply path)
 

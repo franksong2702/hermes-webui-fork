@@ -609,6 +609,7 @@ async function loadSession(sid){
   if (typeof window !== 'undefined' && typeof window._resetScrollDirectionTracker === 'function') {
     try { window._resetScrollDirectionTracker(); } catch (_) {}
   }
+  if(typeof _applyPendingSessionModelForSession==='function') _applyPendingSessionModelForSession(sid);
   // Sync workspace display immediately so the chip label reflects the new session's workspace
   // before any async message-loading begins (mirrors how model is handled).
   if(typeof syncTopbar==='function') syncTopbar();

@@ -955,6 +955,11 @@ $('modelSelect').onchange=async()=>{
   if(typeof closeModelDropdown==='function') closeModelDropdown();
   if(typeof _writePersistedModelState==='function') _writePersistedModelState(modelState.model,modelState.model_provider);
   else try{localStorage.setItem('hermes-webui-model',modelState.model)}catch{}
+  if(typeof _rememberPendingSessionModel==='function') _rememberPendingSessionModel(S.session.session_id,modelState.model,modelState.model_provider);
+  S.session.model=modelState.model;
+  S.session.model_provider=modelState.model_provider||null;
+  if(typeof syncModelChip==='function') syncModelChip();
+  syncTopbar();
   // Clarify scope: composer model changes are session-local, not the global default.
   if(typeof showToast==='function'){
     showToast(t('model_scope_toast')||'Applies to this conversation from your next message.', 3000);
@@ -965,10 +970,12 @@ $('modelSelect').onchange=async()=>{
     model:modelState.model,
     model_provider:modelState.model_provider||null,
   })});
-  S.session.model=modelState.model;
-  S.session.model_provider=modelState.model_provider||null;
-  if(typeof syncModelChip==='function') syncModelChip();
-  syncTopbar();
+  if(typeof _readPendingSessionModel==='function'&&typeof _clearPendingSessionModel==='function'){
+    const pending=_readPendingSessionModel(S.session.session_id);
+    if(!pending||(pending.model===modelState.model&&String(pending.model_provider||'')===String(modelState.model_provider||''))){
+      _clearPendingSessionModel(S.session.session_id);
+    }
+  }
   _applySessionContextMetadataUpdate(data);
   // Warn if selected model belongs to a different provider than what Hermes is configured for
   if(typeof _checkProviderMismatch==='function'){
