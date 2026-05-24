@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Workspace Markdown previews now fall back to plain text for very large files instead of synchronously running the full rich Markdown renderer on the browser main thread.
+
 ## [v0.51.124] — 2026-05-24 — Release CV (stage-batch6 — 3-PR Windows-only stack — agent paths / docs / port hardening)
 
 ### Added
