@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Surface a Tasks panel warning when the Hermes gateway is not configured or not
+  running so Docker users know scheduled jobs need the gateway daemon, and
+  clarify the same single-container boundary in the Docker guide.
+
 ## [v0.51.124] — 2026-05-24 — Release CV (stage-batch6 — 3-PR Windows-only stack — agent paths / docs / port hardening)
 
 ### Added

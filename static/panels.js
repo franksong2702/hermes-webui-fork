@@ -428,9 +428,44 @@ function _cronDiagnostics(job) {
   return JSON.stringify(fields, null, 2);
 }
 
+function _cronGatewayNoticeHtml(status) {
+  if (!status || (status.configured && status.running)) return '';
+  const notConfigured = !status.configured;
+  const title = notConfigured
+    ? 'Gateway not configured'
+    : 'Gateway not running';
+  const body = notConfigured
+    ? 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon. If this is a single-container Docker install, jobs can be created and run manually here, but scheduled ticks need a gateway container or `hermes gateway` running outside the WebUI.'
+    : 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon to be running. Start the gateway container or `hermes gateway` before relying on offline scheduled runs.';
+  return `
+    <div class="detail-alert-title">${esc(title)}</div>
+    <p>${esc(body)}</p>
+  `;
+}
+
+async function loadCronGatewayNotice() {
+  const box = $('cronGatewayNotice');
+  if (!box) return;
+  try {
+    const status = await api('/api/gateway/status');
+    const html = _cronGatewayNoticeHtml(status);
+    if (html) {
+      box.innerHTML = html;
+      box.style.display = '';
+    } else {
+      box.innerHTML = '';
+      box.style.display = 'none';
+    }
+  } catch (_) {
+    box.innerHTML = '';
+    box.style.display = 'none';
+  }
+}
+
 async function loadCrons(animate) {
   const box = $('cronList');
   const refreshBtn = $('cronRefreshBtn');
+  loadCronGatewayNotice();
   if (animate && refreshBtn) {
     refreshBtn.style.opacity = '0.5';
     refreshBtn.disabled = true;
