@@ -91,23 +91,35 @@ if (-not $Python) {
 # that's about to crash on missing imports. Smoke-test feedback on
 # PR #2783: nesquena/hermes-webui requested this guard.
 $AgentDir = $env:HERMES_WEBUI_AGENT_DIR
-if ($AgentDir -and -not (Test-Path (Join-Path $AgentDir 'hermes_cli'))) {
+if ($AgentDir -and -not (Test-Path (Join-Path $AgentDir 'hermes_cli') -PathType Container)) {
     Write-Error "HERMES_WEBUI_AGENT_DIR is set to '$AgentDir' but no hermes_cli/ folder exists there. Unset the variable to fall back to auto-discovery, or fix the path."
     exit 1
 }
 if (-not $AgentDir) {
-    $candidates = @(
-        (Join-Path $env:USERPROFILE '.hermes\hermes-agent'),
-        (Join-Path (Split-Path -Parent $RepoRoot) 'hermes-agent')
-    )
+    # Build candidate list incrementally — ${env:ProgramFiles(x86)} is null on
+    # 32-bit Windows and in some constrained environments, and Join-Path throws
+    # on a null Path. Skip any system-wide root that isn't set so the launcher
+    # stays robust across Windows variants. USERPROFILE is always set so it
+    # stays unguarded; the dev-checkout sibling is path-derived, not env-based.
+    $candidates = @()
+    $candidates += (Join-Path $env:USERPROFILE '.hermes\hermes-agent')
+    foreach ($root in @($env:LOCALAPPDATA, ${env:ProgramW6432}, ${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
+        if ($root) { $candidates += (Join-Path $root 'hermes\hermes-agent') }
+    }
+    $candidates += (Join-Path (Split-Path -Parent $RepoRoot) 'hermes-agent')
+    # De-dup: when running in a WOW64 (32-bit-on-64-bit) PowerShell process,
+    # $env:ProgramFiles is redirected to C:\Program Files (x86), so without
+    # $env:ProgramW6432 (the canonical 64-bit override) we'd miss the real
+    # C:\Program Files\hermes\hermes-agent AND duplicate the x86 entry.
+    # Select-Object -Unique collapses any collisions regardless of cause.
+    $candidates = $candidates | Select-Object -Unique
     foreach ($c in $candidates) {
-        if (Test-Path (Join-Path $c 'hermes_cli')) { $AgentDir = $c; break }
+        if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $AgentDir = $c; break }
     }
 }
 if (-not $AgentDir) {
-    $expectedPrimary = Join-Path $env:USERPROFILE '.hermes\hermes-agent'
-    $expectedSibling = Join-Path (Split-Path -Parent $RepoRoot) 'hermes-agent'
-    Write-Error "hermes-agent not found at $expectedPrimary or $expectedSibling. Set HERMES_WEBUI_AGENT_DIR explicitly."
+    $searched = $candidates -join ', '
+    Write-Error "hermes-agent not found. Searched: $searched. Set HERMES_WEBUI_AGENT_DIR explicitly to override."
     exit 1
 }
 
