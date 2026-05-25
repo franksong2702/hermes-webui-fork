@@ -1577,10 +1577,21 @@ def _open_pet_url_with_macos_browser_script(url: str) -> bool:
     app_name = _recent_pet_webui_browser_hint()
     if app_name not in _PET_BROWSER_APPS:
         return False
-    script = _macos_browser_open_script(app_name)
-    if not script:
+    try:
+        result = subprocess.run(
+            ["open", url],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        logger.debug("failed to open desktop pet url in default browser", exc_info=True)
         return False
-    return _run_pet_browser_open_script(app_name, script, url)
+    if result.returncode != 0:
+        logger.debug("default browser open failed for desktop pet url: %s", result.stderr.strip())
+        return False
+    return True
 
 
 def _handle_pet_navigation_ack(handler, body: dict) -> bool:

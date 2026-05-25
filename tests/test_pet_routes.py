@@ -808,14 +808,14 @@ def test_pet_fallback_open_only_allows_loopback_urls(monkeypatch):
     monkeypatch.setattr(
         pet_routes.subprocess,
         "Popen",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback must use the verifiable browser script")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback must use default browser open")),
     )
 
     assert pet_routes._fallback_open_pet_browser_url("https://evil.example/session/sid-1") is False
     assert runs == []
     assert pet_routes._fallback_open_pet_browser_url("http://127.0.0.1:8787/session/sid-1") is True
     assert len(runs) == 1
-    assert runs[0][0][0:2] == ["osascript", "-e"]
+    assert runs[0][0][0:1] == ["open"]
     assert runs[0][0][-1] == "http://127.0.0.1:8787/session/sid-1"
 
 
