@@ -4754,7 +4754,7 @@ def handle_get(handler, parsed) -> bool:
             configured = True
         else:  # alive is None → gateway not configured / unavailable
             running = bool(identity_map)
-            configured = False
+            configured = bool(identity_map)
 
         platforms_set: set[str] = set()
         for meta in identity_map.values():
