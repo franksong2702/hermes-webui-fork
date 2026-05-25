@@ -1,4 +1,5 @@
 import hashlib
+import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -845,6 +846,9 @@ def test_desktop_pet_uses_webui_app_icon_assets():
 
 def test_desktop_pet_i18n_keys_exist_in_all_locales():
     i18n = read("static/i18n.js")
+    locale_count = len(
+        re.findall(r"^  (?:[A-Za-z_][A-Za-z0-9_]*|'[^']+'):\s*\{", i18n, re.MULTILINE)
+    )
     keys = [
         "desktop_pet_title:",
         "desktop_pet_shell_label:",
@@ -906,8 +910,9 @@ def test_desktop_pet_i18n_keys_exist_in_all_locales():
         "desktop_pet_welcome_copy:",
         "desktop_pet_welcome_action:",
     ]
+    assert locale_count >= 1
     for key in keys:
-        assert i18n.count(key) == 11
+        assert i18n.count(key) == locale_count
     assert "desktop_pet_install_title: '正在启动桌面宠物'" in i18n
     assert "desktop_pet_install_title: '正在啟動桌面寵物'" in i18n
     assert "desktop_pet_switch_skin: '切换皮肤'" in i18n

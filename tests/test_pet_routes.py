@@ -744,6 +744,7 @@ def test_pet_open_session_skips_fallback_when_bridge_acks(monkeypatch):
     }
     focused = []
     title_focused = []
+    monkeypatch.setattr(pet_routes.sys, "platform", "darwin")
     monkeypatch.setattr(pet_routes, "_queue_and_focus_pet_session_navigation", lambda handler, body: dict(command))
     monkeypatch.setattr(pet_routes, "_pet_bridge_recently_polled", lambda: True)
     monkeypatch.setattr(pet_routes, "_wait_for_pet_navigation_ack", lambda command_id: True)
