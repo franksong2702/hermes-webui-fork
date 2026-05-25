@@ -765,8 +765,118 @@ def test_pet_open_session_skips_fallback_when_bridge_acks(monkeypatch):
     assert payload["opened"] is False
     assert payload["focused"] is True
     if pet_routes.sys.platform == "darwin":
-        assert title_focused == [True]
-        assert focused == []
+        # The tab-switching focus runs first (it surfaces the correct session
+        # tab); the title-based window raise is only a fallback.
+        assert focused == ["http://127.0.0.1:8787/session/sid-visible"]
+        assert title_focused == []
+
+
+def test_pet_open_session_foregrounds_app_when_appleScript_focus_fails(monkeypatch):
+    """When bridge acks but both AppleScript focus helpers fail, _foreground_pet_browser_app
+    must be called as a fallback.  It does not require Automation permission, so it
+    succeeds even when the AppleScript paths return False.
+    """
+    import api.pet_routes as pet_routes
+
+    class WFile:
+        def __init__(self):
+            self.body = b""
+
+        def write(self, value):
+            self.body += value
+
+    class Handler:
+        client_address = ("127.0.0.1", 12345)
+        headers = {"Host": "127.0.0.1:8787"}
+
+        def __init__(self):
+            self.status = None
+            self.wfile = WFile()
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, _key, _value):
+            pass
+
+        def end_headers(self):
+            pass
+
+    command = {
+        "id": "nav-noapple",
+        "session_id": "sid-noapple",
+        "url": "http://127.0.0.1:8787/session/sid-noapple",
+        "reused": False,
+        "focused": False,
+    }
+    foreground_calls = []
+    monkeypatch.setattr(pet_routes.sys, "platform", "darwin")
+    monkeypatch.setattr(pet_routes, "_queue_and_focus_pet_session_navigation", lambda handler, body: dict(command))
+    monkeypatch.setattr(pet_routes, "_pet_bridge_recently_polled", lambda: True)
+    monkeypatch.setattr(pet_routes, "_wait_for_pet_navigation_ack", lambda command_id: True)
+    # Both AppleScript helpers fail (e.g. Automation permission not granted).
+    monkeypatch.setattr(pet_routes, "_focus_existing_pet_browser_window_by_title", lambda: False)
+    monkeypatch.setattr(pet_routes, "_focus_existing_pet_browser_tab", lambda url: False)
+    # open(1)-based fallback should be tried and succeeds.
+    monkeypatch.setattr(pet_routes, "_foreground_pet_browser_app", lambda: foreground_calls.append(True) or True)
+    # _fallback_open_pet_browser_url must NOT be called (consumed=True skips it).
+    monkeypatch.setattr(
+        pet_routes,
+        "_fallback_open_pet_browser_url",
+        lambda url: (_ for _ in ()).throw(AssertionError("bridge-acked navigation must not open a fallback URL")),
+    )
+
+    handler = Handler()
+    pet_routes._handle_pet_open_session(handler, {"session_id": "sid-noapple"})
+    payload = json.loads(handler.wfile.body.decode("utf-8"))
+
+    assert handler.status == 200
+    assert payload["consumed"] is True
+    assert payload["opened"] is False
+    # _foreground_pet_browser_app filled in for ack_focused.
+    assert payload["focused"] is True
+    assert foreground_calls == [True]
+
+
+def test_pet_browser_automation_block_short_circuits_osascript_probes(monkeypatch):
+    """Once an osascript probe reports a permission error, the AppleScript browser
+    helpers must short-circuit instead of re-probing every browser on each click.
+    This bounds the click->open latency when macOS Automation permission is denied.
+    """
+    import api.pet_routes as pet_routes
+
+    monkeypatch.setattr(pet_routes.sys, "platform", "darwin")
+    # Start from a clean slate where Automation is presumed available.
+    pet_routes._pet_record_automation_result(True)
+
+    calls = []
+
+    class FakeResult:
+        returncode = 1
+        stdout = ""
+        stderr = "execution error: Not authorized to send Apple events to System Events. (-1743)"
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return FakeResult()
+
+    monkeypatch.setattr(pet_routes.subprocess, "run", fake_run)
+
+    url = "http://127.0.0.1:8787/session/sid-x"
+    # First attempt runs osascript (>=1 call) and records the permission block.
+    assert pet_routes._reuse_existing_pet_browser_tab(url) is False
+    first_count = len(calls)
+    assert first_count >= 1
+    assert pet_routes._pet_automation_maybe_available() is False
+
+    # Subsequent AppleScript helpers must NOT spawn any more osascript probes.
+    assert pet_routes._reuse_existing_pet_browser_tab(url) is False
+    assert pet_routes._focus_existing_pet_browser_tab(url) is False
+    assert pet_routes._focus_existing_pet_browser_window_by_title() is False
+    assert len(calls) == first_count
+
+    # Restore the cache so later tests are unaffected.
+    pet_routes._pet_record_automation_result(True)
 
 
 def test_pet_navigation_ack_skips_consumed_commands(monkeypatch):
@@ -819,22 +929,32 @@ def test_pet_fallback_open_only_allows_loopback_urls(monkeypatch):
     assert runs[0][0][-1] == "http://127.0.0.1:8787/session/sid-1"
 
 
-def test_pet_fallback_open_does_not_guess_browser_without_detected_webui(monkeypatch):
+def test_pet_fallback_open_uses_default_browser_without_detected_webui(monkeypatch):
+    # Cold start: no WebUI tab has been seen recently, so there is no browser
+    # hint. The fallback must still open the session in the system default
+    # browser via `open <url>`; otherwise a bubble click opens nothing.
     import api.pet_routes as pet_routes
 
-    calls = []
+    runs = []
     monkeypatch.setattr(pet_routes.sys, "platform", "darwin")
     monkeypatch.setitem(pet_routes._PET_WEBUI_BROWSER_HINT, "app", "")
     monkeypatch.setitem(pet_routes._PET_WEBUI_BROWSER_HINT, "seen_at", 0.0)
 
-    def fake_popen(argv, **kwargs):
-        calls.append((argv, kwargs))
-        return object()
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
 
-    monkeypatch.setattr(pet_routes.subprocess, "Popen", fake_popen)
+    def fake_run(argv, **kwargs):
+        runs.append(argv)
+        return Result()
 
-    assert pet_routes._fallback_open_pet_browser_url("http://127.0.0.1:8787/session/sid-1") is False
-    assert calls == []
+    monkeypatch.setattr(pet_routes.subprocess, "run", fake_run)
+
+    assert pet_routes._fallback_open_pet_browser_url("http://127.0.0.1:8787/session/sid-1") is True
+    assert len(runs) == 1
+    assert runs[0][0:1] == ["open"]
+    assert runs[0][-1] == "http://127.0.0.1:8787/session/sid-1"
 
 
 def test_pet_open_url_rejects_host_and_scheme_injection():

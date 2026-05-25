@@ -64,6 +64,17 @@ _PET_NAVIGATION_LAST_POLL_AT = 0.0
 # false negatives for a live-but-backgrounded tab while still detecting a closed
 # tab quickly.
 _PET_BRIDGE_POLL_FRESH_SECONDS = 4.0
+# osascript-driven browser control (tab reuse / window focus) needs the macOS
+# Automation permission.  When the Hermes process lacks it, every probe fails
+# after ~150-300ms; iterating all known browsers burns ~1s of dead time on each
+# click.  Cache the verdict so repeat clicks skip the dead probes and fall
+# straight through to the permission-free open(1) activation path
+# (_foreground_pet_browser_app).  Re-checked periodically in case the user
+# grants permission later.
+_PET_AUTOMATION_LOCK = threading.Lock()
+_PET_AUTOMATION_AVAILABLE: bool | None = None
+_PET_AUTOMATION_CHECKED_AT = 0.0
+_PET_AUTOMATION_RECHECK_SECONDS = 60.0
 _PET_WEBUI_BROWSER_HINT_LOCK = threading.Lock()
 _PET_WEBUI_BROWSER_HINT: dict[str, float | str] = {"app": "", "seen_at": 0.0}
 _PET_LAUNCH_LOCK = threading.Lock()
@@ -1574,9 +1585,12 @@ end run
 
 
 def _open_pet_url_with_macos_browser_script(url: str) -> bool:
-    app_name = _recent_pet_webui_browser_hint()
-    if app_name not in _PET_BROWSER_APPS:
-        return False
+    # Open the loopback session URL in the system default browser. The caller
+    # (_fallback_open_pet_browser_url) has already validated it as a loopback
+    # http(s) URL. We intentionally do NOT gate on a recently-seen WebUI browser
+    # hint: `open url` targets the default browser and needs no hint, and the
+    # hint is empty in the exact case the fallback exists for — a cold start with
+    # no open WebUI tab. Gating here made a bubble click open nothing.
     try:
         result = subprocess.run(
             ["open", url],
@@ -1661,6 +1675,30 @@ def _pet_browser_host_candidates(url: str) -> list[str]:
     return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
 
+def _pet_automation_maybe_available() -> bool:
+    """Return False only while a recent osascript probe confirmed Automation is blocked.
+
+    Used to short-circuit the AppleScript browser-control helpers so a process
+    without macOS Automation permission does not burn ~1s probing every known
+    browser on each click.  After _PET_AUTOMATION_RECHECK_SECONDS we optimistically
+    allow another probe in case the user granted permission in the meantime.
+    """
+    with _PET_AUTOMATION_LOCK:
+        if (
+            _PET_AUTOMATION_AVAILABLE is False
+            and (time.time() - _PET_AUTOMATION_CHECKED_AT) < _PET_AUTOMATION_RECHECK_SECONDS
+        ):
+            return False
+    return True
+
+
+def _pet_record_automation_result(available: bool) -> None:
+    global _PET_AUTOMATION_AVAILABLE, _PET_AUTOMATION_CHECKED_AT
+    with _PET_AUTOMATION_LOCK:
+        _PET_AUTOMATION_AVAILABLE = bool(available)
+        _PET_AUTOMATION_CHECKED_AT = time.time()
+
+
 def _run_pet_browser_reuse_script(app_name: str, script: str, url: str, host_candidates: list[str]) -> bool:
     try:
         result = subprocess.run(
@@ -1671,15 +1709,28 @@ def _run_pet_browser_reuse_script(app_name: str, script: str, url: str, host_can
             timeout=4,
         )
     except Exception:
+        # A timeout or spawn failure is transient — do not poison the Automation
+        # cache, just report failure for this attempt.
         logger.debug("failed to run pet browser reuse script for %s", app_name, exc_info=True)
         return False
     if result.returncode != 0:
-        logger.debug("pet browser reuse script for %s failed: %s", app_name, result.stderr.strip())
+        stderr = result.stderr or ""
+        lowered = stderr.lower()
+        if "-1743" in stderr or "not authorized" in lowered or "not allowed" in lowered:
+            # The Hermes process lacks Automation permission for the browser.
+            # Remember so later clicks skip the dead osascript probes and fall
+            # straight through to open(1) activation.
+            _pet_record_automation_result(False)
+        logger.debug("pet browser reuse script for %s failed: %s", app_name, stderr.strip())
         return False
+    # A clean exit (even "not-running"/"not-found") proves Automation works.
+    _pet_record_automation_result(True)
     return result.stdout.strip() == "reused"
 
 
 def _reuse_existing_pet_browser_tab(url: str) -> bool:
+    if not _pet_automation_maybe_available():
+        return False
     host_candidates = _pet_browser_host_candidates(url)
     if not host_candidates:
         return False
@@ -1755,6 +1806,8 @@ end run
 
 
 def _focus_existing_pet_browser_tab(url: str) -> bool:
+    if not _pet_automation_maybe_available():
+        return False
     host_candidates = _pet_browser_host_candidates(url)
     if not host_candidates:
         return False
@@ -1826,6 +1879,8 @@ end run
 
 
 def _focus_existing_pet_browser_window_by_title() -> bool:
+    if not _pet_automation_maybe_available():
+        return False
     script = r'''
 on run argv
   set browserNames to {"Google Chrome", "Microsoft Edge", "Brave Browser", "Arc", "Safari"}
@@ -1853,6 +1908,51 @@ end run
     return _run_pet_browser_reuse_script("System Events", script, "", [])
 
 
+def _foreground_pet_browser_app() -> bool:
+    """Bring the running WebUI browser to the foreground using open(1).
+
+    Unlike the AppleScript-based helpers (_focus_existing_pet_browser_*), this
+    does not require the macOS 'Automation' TCC permission for the Hermes
+    process.  open(1) activates the application via LaunchServices, which works
+    unconditionally on macOS regardless of the Accessibility/Automation grant.
+
+    Iterates _ordered_pet_browser_apps() so the browser that last served the
+    WebUI is tried first.  Returns True as soon as a running browser is found
+    and the activate succeeds.
+    """
+    if sys.platform != "darwin":
+        return False
+    for app_name in _ordered_pet_browser_apps():
+        try:
+            # pgrep -x matches the exact process name — no special permission
+            # required.  We only activate a browser that is already running so
+            # that we do not accidentally launch an unrelated application.
+            chk = subprocess.run(
+                ["pgrep", "-x", app_name],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if chk.returncode != 0:
+                continue
+        except Exception:
+            logger.debug("pgrep check failed for %s", app_name, exc_info=True)
+            continue
+        try:
+            result = subprocess.run(
+                ["open", "-a", app_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if result.returncode == 0:
+                return True
+        except Exception:
+            logger.debug("open -a failed for %s", app_name, exc_info=True)
+    return False
+
+
 def _handle_pet_open_session(handler, body: dict) -> bool:
     if not _pet_client_is_loopback(handler):
         return bad(handler, "desktop pet session navigation is only available from this machine", status=403)
@@ -1869,7 +1969,18 @@ def _handle_pet_open_session(handler, body: dict) -> bool:
         elif _pet_bridge_recently_polled():
             consumed = _wait_for_pet_navigation_ack(str(command.get("id") or ""))
             if consumed and not command.get("focused") and sys.platform == "darwin":
-                ack_focused = _focus_existing_pet_browser_window_by_title() or _focus_existing_pet_browser_tab(str(command.get("url") or ""))
+                # _focus_existing_pet_browser_tab switches the browser's ACTIVE
+                # tab to the session tab (and raises its window), so it must run
+                # first: the bridge navigates the WebUI tab in-page, but that tab
+                # is often a background tab in a multi-tab window.  The title-based
+                # window raise only fronts the window without switching tabs, so on
+                # its own it would surface the wrong (currently-active) tab.  open(1)
+                # activation is the permission-free last resort.
+                ack_focused = (
+                    _focus_existing_pet_browser_tab(str(command.get("url") or ""))
+                    or _focus_existing_pet_browser_window_by_title()
+                    or _foreground_pet_browser_app()
+                )
         else:
             # Cold start: no WebUI tab has polled the navigation bridge recently, so
             # there is no live page to consume + ack the command. Don't burn the

@@ -672,6 +672,18 @@ def test_main_webui_pet_bridge_is_narrow():
     assert "elif _pet_bridge_recently_polled():" in routes
     assert "command[\"reused\"] = bool(reused)" in routes
     assert 'opened = False if (consumed or command.get("reused")) else _fallback_open_pet_browser_url(str(command.get("url") or ""))' in routes
+    # open(1)-based activation is the final fallback in the focus chain; it does
+    # not require macOS Automation/Accessibility permission.
+    assert "def _foreground_pet_browser_app()" in routes
+    assert "_foreground_pet_browser_app()" in routes
+    assert '["open", "-a", app_name]' in routes
+    # Automation-permission cache bounds click latency: when osascript probes are
+    # known-blocked, the AppleScript helpers short-circuit instead of re-probing
+    # every browser (~1s of dead time) on each click.
+    assert "def _pet_automation_maybe_available()" in routes
+    assert "if not _pet_automation_maybe_available():" in routes
+    assert "_pet_record_automation_result(False)" in routes
+    assert "_pet_record_automation_result(True)" in routes
     assert "_queue_and_open_pet_session_navigation" not in routes
     assert "_open_pet_session_in_existing_browser_window" not in routes
     assert "def _open_pet_session_url" not in routes
