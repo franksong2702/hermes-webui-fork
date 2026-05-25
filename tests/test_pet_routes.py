@@ -790,22 +790,33 @@ def test_pet_navigation_ack_skips_consumed_commands(monkeypatch):
 def test_pet_fallback_open_only_allows_loopback_urls(monkeypatch):
     import api.pet_routes as pet_routes
 
-    calls = []
+    runs = []
     monkeypatch.setattr(pet_routes.sys, "platform", "darwin")
     monkeypatch.setitem(pet_routes._PET_WEBUI_BROWSER_HINT, "app", "Google Chrome")
     monkeypatch.setitem(pet_routes._PET_WEBUI_BROWSER_HINT, "seen_at", time.time())
 
-    def fake_popen(argv, **kwargs):
-        calls.append((argv, kwargs))
-        return object()
+    class Result:
+        returncode = 0
+        stdout = "opened\n"
+        stderr = ""
 
-    monkeypatch.setattr(pet_routes.subprocess, "Popen", fake_popen)
+    def fake_run(argv, **kwargs):
+        runs.append((argv, kwargs))
+        return Result()
+
+    monkeypatch.setattr(pet_routes.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        pet_routes.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback must use the verifiable browser script")),
+    )
 
     assert pet_routes._fallback_open_pet_browser_url("https://evil.example/session/sid-1") is False
-    assert calls == []
+    assert runs == []
     assert pet_routes._fallback_open_pet_browser_url("http://127.0.0.1:8787/session/sid-1") is True
-    assert len(calls) == 1
-    assert calls[0][0] == ["open", "-a", "Google Chrome", "http://127.0.0.1:8787/session/sid-1"]
+    assert len(runs) == 1
+    assert runs[0][0][0:2] == ["osascript", "-e"]
+    assert runs[0][0][-1] == "http://127.0.0.1:8787/session/sid-1"
 
 
 def test_pet_fallback_open_does_not_guess_browser_without_detected_webui(monkeypatch):

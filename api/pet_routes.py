@@ -1575,9 +1575,12 @@ end run
 
 def _open_pet_url_with_macos_browser_script(url: str) -> bool:
     app_name = _recent_pet_webui_browser_hint()
-    if app_name not in {"Google Chrome", "Microsoft Edge", "Safari"}:
+    if app_name not in _PET_BROWSER_APPS:
         return False
-    return _launch_pet_browser_open_url(app_name, url)
+    script = _macos_browser_open_script(app_name)
+    if not script:
+        return False
+    return _run_pet_browser_open_script(app_name, script, url)
 
 
 def _handle_pet_navigation_ack(handler, body: dict) -> bool:
