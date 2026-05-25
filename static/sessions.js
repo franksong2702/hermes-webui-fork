@@ -647,6 +647,7 @@ async function loadSession(sid){
     if(!Array.isArray(messages)) return false;
     const pendingMsg=typeof getPendingSessionMessage==='function'?getPendingSessionMessage(session,messages):null;
     if(!pendingMsg) return false;
+    if(messages.some(existing=>_sameTranscriptMessage(existing,pendingMsg))) return false;
     const liveAssistantIdx=messages.findIndex(m=>m&&m.role==='assistant'&&m._live);
     if(liveAssistantIdx>=0) messages.splice(liveAssistantIdx,0,pendingMsg);
     else messages.push(pendingMsg);
