@@ -94,6 +94,63 @@ def test_cost_protection_counts_distinct_identical_prev_tools():
     assert guard.tool_errors == 2
 
 
+def test_default_cost_protection_tolerates_routine_diagnostic_tool_errors():
+    guard = CostProtectionGuard(session_id="sid", stream_id="stream")
+
+    for index in range(3):
+        guard.record_tool_complete(
+            name="terminal",
+            arguments={"command": f"probe-{index}"},
+            result={"is_error": True, "output": "Traceback (most recent call last)"},
+        )
+        payload = guard.record_step(index + 1)
+
+    assert payload is None
+    assert guard.tool_errors == 3
+
+
+def test_default_cost_protection_pauses_on_repeated_tool_error_pattern():
+    guard = CostProtectionGuard(session_id="sid", stream_id="stream")
+    tool = {
+        "name": "terminal",
+        "arguments": {"command": "retry-the-same-failing-probe"},
+        "result": {"is_error": True, "output": "same failure"},
+    }
+
+    assert guard.record_step(1, prev_tools=[dict(tool)]) is None
+    assert guard.record_step(2, prev_tools=[dict(tool), dict(tool)]) is None
+    payload = guard.record_step(3, prev_tools=[dict(tool), dict(tool), dict(tool)])
+
+    assert payload is not None
+    assert payload["reason"] == "repeated_tool_errors"
+    assert payload["stats"]["repeated_tool_error_count"] == 3
+
+
+def test_cost_protection_can_still_pause_on_configured_tool_errors():
+    guard = CostProtectionGuard(
+        session_id="sid",
+        stream_id="stream",
+        tool_error_threshold=2,
+    )
+
+    guard.record_tool_complete(
+        name="terminal",
+        arguments={"command": "same-failing-probe"},
+        result={"is_error": True, "output": "failed"},
+    )
+    assert guard.record_step(1) is None
+
+    guard.record_tool_complete(
+        name="terminal",
+        arguments={"command": "same-failing-probe"},
+        result={"is_error": True, "output": "failed"},
+    )
+    payload = guard.record_step(2)
+
+    assert payload is not None
+    assert payload["reason"] == "repeated_tool_errors"
+
+
 def test_cost_protection_thresholds_can_be_configured(monkeypatch):
     import api.config as config
 

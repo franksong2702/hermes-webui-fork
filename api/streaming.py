@@ -190,8 +190,10 @@ class CostProtectionGuard:
         self.fallback_events = 0
         self.tool_errors = 0
         self.tool_calls = 0
+        self.repeated_tool_error_count = 0
         self.paused_payload = None
         self._counted_tool_key_counts = {}
+        self._tool_error_key_counts = {}
         self._seen_prev_tool_key_counts = {}
 
     def record_status(self, kind: str, message: str) -> None:
@@ -236,12 +238,16 @@ class CostProtectionGuard:
             result=result,
         )
         self._counted_tool_key_counts[key] = self._counted_tool_key_counts.get(key, 0) + 1
-        self._record_tool_count(is_error=is_error, result=result)
+        self._record_tool_count(key=key, is_error=is_error, result=result)
 
-    def _record_tool_count(self, *, is_error: bool = False, result=None) -> None:
+    def _record_tool_count(self, *, key=None, is_error: bool = False, result=None) -> None:
         self.tool_calls += 1
         if is_error or self._result_looks_error(result):
             self.tool_errors += 1
+            if key is not None:
+                count = self._tool_error_key_counts.get(key, 0) + 1
+                self._tool_error_key_counts[key] = count
+                self.repeated_tool_error_count = max(self.repeated_tool_error_count, count)
 
     def record_step(self, api_call_count: int, prev_tools=None):
         self.api_call_count = max(self.api_call_count, int(api_call_count or 0))
@@ -266,6 +272,7 @@ class CostProtectionGuard:
                         self._counted_tool_key_counts[key] = counted - 1
                     continue
                 self._record_tool_count(
+                    key=key,
                     is_error=bool(tool.get("is_error", False)),
                     result=tool.get("result"),
                 )
@@ -285,7 +292,7 @@ class CostProtectionGuard:
             reason = "repeated_context_compression"
         elif self.fallback_events >= self.fallback_threshold:
             reason = "repeated_provider_fallbacks"
-        elif self.tool_errors >= self.tool_error_threshold:
+        elif self.repeated_tool_error_count >= self.tool_error_threshold:
             reason = "repeated_tool_errors"
         elif self.api_call_count >= self.api_call_threshold:
             reason = "high_model_call_count"
@@ -308,6 +315,7 @@ class CostProtectionGuard:
                 "fallback_events": self.fallback_events,
                 "tool_calls": self.tool_calls,
                 "tool_errors": self.tool_errors,
+                "repeated_tool_error_count": self.repeated_tool_error_count,
             },
         }
         return self.paused_payload
