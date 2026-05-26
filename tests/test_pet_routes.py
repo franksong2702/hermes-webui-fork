@@ -512,6 +512,8 @@ def test_pet_open_session_reuses_existing_webui_url(monkeypatch):
     monkeypatch.setattr(pet_routes, "get_session", lambda sid, metadata_only=False: object())
     monkeypatch.setattr(pet_routes.sys, "platform", "darwin")
     monkeypatch.setattr(pet_routes, "_reuse_existing_pet_browser_tab", lambda url: reused.append(url) or True)
+    # Reuse only happens when the bridge is NOT live; simulate a cold start.
+    monkeypatch.setattr(pet_routes, "_pet_bridge_recently_polled", lambda: False)
     pet_routes._PET_NAVIGATION_COMMANDS.clear()
 
     command = pet_routes._queue_and_focus_pet_session_navigation(
@@ -524,6 +526,35 @@ def test_pet_open_session_reuses_existing_webui_url(monkeypatch):
     assert command["reused"] is True
     assert reused == ["http://127.0.0.1:8787/session/sid-1?draft=%E7%BB%A7%E7%BB%AD"]
     assert pet_routes._PET_NAVIGATION_COMMANDS == [command]
+
+
+def test_queue_and_focus_skips_reuse_when_bridge_is_live(monkeypatch):
+    """When a live WebUI tab is polling the bridge, _queue_and_focus must NOT
+    call _reuse_existing_pet_browser_tab.  The bridge will handle in-page
+    loadSession() — no hard URL change, no full page reload."""
+    import api.pet_routes as pet_routes
+
+    class Handler:
+        headers = {"Host": "127.0.0.1:8787"}
+
+    reused = []
+    monkeypatch.setattr(pet_routes, "get_session", lambda sid, metadata_only=False: object())
+    monkeypatch.setattr(pet_routes.sys, "platform", "darwin")
+    monkeypatch.setattr(pet_routes, "_reuse_existing_pet_browser_tab", lambda url: reused.append(url) or True)
+    # Bridge is live — reuse must be skipped.
+    monkeypatch.setattr(pet_routes, "_pet_bridge_recently_polled", lambda: True)
+    pet_routes._PET_NAVIGATION_COMMANDS.clear()
+
+    command = pet_routes._queue_and_focus_pet_session_navigation(
+        Handler(),
+        {"session_id": "sid-live"},
+    )
+
+    # _reuse_existing_pet_browser_tab must not have been called.
+    assert reused == []
+    assert command["reused"] is False
+    assert command["focused"] is False
+    assert command["session_id"] == "sid-live"
 
 
 def test_pet_open_session_reused_skips_ack_and_fallback(monkeypatch):
@@ -635,6 +666,73 @@ def test_pet_open_session_cold_start_skips_ack_wait_when_no_live_bridge(monkeypa
     assert opened == ["http://127.0.0.1:8787/session/sid-cold"]
     assert payload["consumed"] is False
     assert payload["opened"] is True
+
+
+def test_pet_open_session_falls_back_to_reuse_when_bridge_ack_times_out(monkeypatch):
+    """When the bridge is live but ack times out (e.g. poll interval missed),
+    the handler must fall back to _reuse_existing_pet_browser_tab so the user
+    sees navigation immediately instead of a silent failure."""
+    import api.pet_routes as pet_routes
+
+    class WFile:
+        def __init__(self):
+            self.body = b""
+
+        def write(self, value):
+            self.body += value
+
+    class Handler:
+        client_address = ("127.0.0.1", 12345)
+        headers = {"Host": "127.0.0.1:8787"}
+
+        def __init__(self):
+            self.status = None
+            self.wfile = WFile()
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, _key, _value):
+            pass
+
+        def end_headers(self):
+            pass
+
+    command = {
+        "id": "nav-timeout",
+        "session_id": "sid-timeout",
+        "url": "http://127.0.0.1:8787/session/sid-timeout",
+        "reused": False,
+        "focused": False,
+    }
+    reused_late = []
+    opened = []
+    monkeypatch.setattr(pet_routes.sys, "platform", "darwin")
+    monkeypatch.setattr(pet_routes, "_queue_and_focus_pet_session_navigation", lambda handler, body: dict(command))
+    monkeypatch.setattr(pet_routes, "_pet_bridge_recently_polled", lambda: True)
+    # Bridge ack times out (returns False).
+    monkeypatch.setattr(pet_routes, "_wait_for_pet_navigation_ack", lambda command_id: False)
+    # Fallback reuse is called with the session URL.
+    monkeypatch.setattr(
+        pet_routes,
+        "_reuse_existing_pet_browser_tab",
+        lambda url: reused_late.append(url) or True,
+    )
+    monkeypatch.setattr(pet_routes, "_fallback_open_pet_browser_url", lambda url: opened.append(url) or True)
+
+    handler = Handler()
+    pet_routes._handle_pet_open_session(handler, {"session_id": "sid-timeout"})
+    payload = json.loads(handler.wfile.body.decode("utf-8"))
+
+    assert handler.status == 200
+    assert payload["consumed"] is False
+    # Hard URL reuse is the fallback — tab was navigated and brought to front.
+    assert reused_late == ["http://127.0.0.1:8787/session/sid-timeout"]
+    assert payload["reused"] is True
+    assert payload["focused"] is True
+    # No extra fallback open (reuse already handled it).
+    assert opened == []
+    assert payload["opened"] is False
 
 
 def test_pet_open_session_plain_click_uses_bridge_focus_and_ack(monkeypatch):

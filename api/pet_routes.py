@@ -1350,7 +1350,12 @@ def _queue_pet_session_navigation(handler, body: dict) -> dict:
 def _queue_and_focus_pet_session_navigation(handler, body: dict) -> dict:
     command = _queue_pet_session_navigation(handler, body)
     reused = False
-    if sys.platform == "darwin":
+    if sys.platform == "darwin" and not _pet_bridge_recently_polled():
+        # Bridge is not live — no WebUI tab will pick up the queued command.
+        # Fall back to a direct AppleScript URL reuse (hard navigation) so the
+        # user sees the session immediately.  When the bridge IS live we skip
+        # this step: the bridge will call loadSession(sid) for a smooth in-page
+        # transition without a full page reload.
         reused = _reuse_existing_pet_browser_tab(command.get("url", ""))
     command["reused"] = bool(reused)
     command["focused"] = bool(reused)
@@ -1981,6 +1986,14 @@ def _handle_pet_open_session(handler, body: dict) -> bool:
                     or _focus_existing_pet_browser_window_by_title()
                     or _foreground_pet_browser_app()
                 )
+            elif not consumed and sys.platform == "darwin":
+                # Bridge ack timed out — the live tab may be busy or the poll
+                # interval missed the window.  Fall back to the same hard
+                # URL-change path used for cold starts so the user sees
+                # navigation immediately rather than a silent failure.
+                reused_late = _reuse_existing_pet_browser_tab(str(command.get("url") or ""))
+                command["reused"] = bool(reused_late)
+                command["focused"] = bool(reused_late)
         else:
             # Cold start: no WebUI tab has polled the navigation bridge recently, so
             # there is no live page to consume + ack the command. Don't burn the

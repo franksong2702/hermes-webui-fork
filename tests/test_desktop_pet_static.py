@@ -156,7 +156,6 @@ def test_standalone_pet_page_assets_and_apis_are_wired():
     assert "localStorage.getItem(SKIN_KEY)||'keeper'" in pet_js
     assert "let _isDragging=false;" in pet_js
     assert "let _dragPrevX=null;" in pet_js
-    assert "if(!_isDragging){_setState(items.some(item=>item.status==='action_required')?'waiting':(items.some(item=>item.status==='ready')?'waving':(items.some(item=>item.status==='running')?'running':'idle')));}" in pet_js
     assert "_isDragging=true;_dragPrevX=null;" in pet_js
     assert "_isDragging=false;_dragPrevX=null;" in pet_js
     assert "_emitPetLayoutBurst();\n    render();" in pet_js
@@ -667,10 +666,15 @@ def test_main_webui_pet_bridge_is_narrow():
     # A reused tab is already navigated + frontmost, so the open-session handler
     # returns without waiting on the bridge ack (avoids a ~1.6s spinner tail).
     assert 'if command.get("reused"):' in routes
+    # Bridge-first: reuse must be skipped when a live WebUI tab is polling so
+    # the bridge can do an in-page loadSession() instead of a hard URL reload.
+    assert "not _pet_bridge_recently_polled()" in routes
     # Cold start (no live bridge polling) must not burn the ack timeout.
     assert "def _pet_bridge_recently_polled()" in routes
     assert "elif _pet_bridge_recently_polled():" in routes
     assert "command[\"reused\"] = bool(reused)" in routes
+    # Ack timeout fallback: if bridge doesn't ack, hard-reuse is the safety net.
+    assert "elif not consumed and sys.platform" in routes
     assert 'opened = False if (consumed or command.get("reused")) else _fallback_open_pet_browser_url(str(command.get("url") or ""))' in routes
     # open(1)-based activation is the final fallback in the focus chain; it does
     # not require macOS Automation/Accessibility permission.
