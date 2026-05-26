@@ -106,6 +106,144 @@ def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
     )
 
 
+COST_PROTECTION_INTERRUPT_PREFIX = "Hermes WebUI cost protection pause:"
+
+
+class CostProtectionGuard:
+    """Track objective signals that a run should stop before more model calls."""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        stream_id: str,
+        api_call_threshold: int = 12,
+        compression_event_threshold: int = 5,
+        compression_failure_threshold: int = 2,
+        fallback_threshold: int = 3,
+        tool_error_threshold: int = 3,
+    ):
+        self.session_id = session_id
+        self.stream_id = stream_id
+        self.api_call_threshold = max(1, int(api_call_threshold or 12))
+        self.compression_event_threshold = max(1, int(compression_event_threshold or 5))
+        self.compression_failure_threshold = max(1, int(compression_failure_threshold or 2))
+        self.fallback_threshold = max(1, int(fallback_threshold or 3))
+        self.tool_error_threshold = max(1, int(tool_error_threshold or 3))
+        self.api_call_count = 0
+        self.compression_events = 0
+        self.compression_failures = 0
+        self.fallback_events = 0
+        self.tool_errors = 0
+        self.tool_calls = 0
+        self.paused_payload = None
+        self._seen_prev_tool_keys = set()
+
+    def record_status(self, kind: str, message: str) -> None:
+        message_text = str(message or "").strip()
+        if not message_text:
+            return
+        lower = message_text.lower()
+        lifecycle = str(kind or "").strip().lower() == "lifecycle"
+        compression_related = (
+            "compress" in lower
+            or "compaction" in lower
+            or "summary" in lower
+            or "summar" in lower
+            or "auxiliary responses stream" in lower
+        )
+        if lifecycle and compression_related:
+            self.compression_events += 1
+            if (
+                "timeout" in lower
+                or "timed out" in lower
+                or "exceeded" in lower
+                or "failed" in lower
+                or "error" in lower
+            ):
+                self.compression_failures += 1
+        if _is_fallback_lifecycle_message(kind, message_text):
+            self.fallback_events += 1
+
+    def record_tool_complete(self, *, is_error: bool = False, result=None) -> None:
+        self.tool_calls += 1
+        if is_error or self._result_looks_error(result):
+            self.tool_errors += 1
+
+    def record_step(self, api_call_count: int, prev_tools=None):
+        self.api_call_count = max(self.api_call_count, int(api_call_count or 0))
+        for tool in prev_tools or []:
+            if isinstance(tool, dict):
+                key = (
+                    str(tool.get("name") or "")[:120],
+                    str(tool.get("arguments") or "")[:512],
+                    str(tool.get("result") or "")[:512],
+                )
+                if key in self._seen_prev_tool_keys:
+                    continue
+                self._seen_prev_tool_keys.add(key)
+                self.record_tool_complete(result=tool.get("result"))
+        return self._maybe_pause()
+
+    def interrupt_message(self) -> str:
+        reason = (self.paused_payload or {}).get("reason") or "suspicious_long_running_session"
+        return f"{COST_PROTECTION_INTERRUPT_PREFIX} {reason}"
+
+    def _maybe_pause(self):
+        if self.paused_payload is not None:
+            return None
+        reason = None
+        if self.compression_failures >= self.compression_failure_threshold:
+            reason = "repeated_context_compression_failures"
+        elif self.compression_events >= self.compression_event_threshold:
+            reason = "repeated_context_compression"
+        elif self.fallback_events >= self.fallback_threshold:
+            reason = "repeated_provider_fallbacks"
+        elif self.tool_errors >= self.tool_error_threshold:
+            reason = "repeated_tool_errors"
+        elif self.api_call_count >= self.api_call_threshold:
+            reason = "high_model_call_count"
+        if reason is None:
+            return None
+        self.paused_payload = {
+            "type": "cost_protection_pause",
+            "session_id": self.session_id,
+            "stream_id": self.stream_id,
+            "reason": reason,
+            "message": (
+                "This run was paused before the next model call because it matched "
+                "cost-protection signals for a suspicious long-running session."
+            ),
+            "hint": "Review the run. Send a follow-up such as 'continue' if it is still on track.",
+            "stats": {
+                "api_call_count": self.api_call_count,
+                "compression_events": self.compression_events,
+                "compression_failures": self.compression_failures,
+                "fallback_events": self.fallback_events,
+                "tool_calls": self.tool_calls,
+                "tool_errors": self.tool_errors,
+            },
+        }
+        return self.paused_payload
+
+    @staticmethod
+    def _result_looks_error(result) -> bool:
+        if isinstance(result, dict):
+            if result.get("is_error") or result.get("error"):
+                return True
+            result = result.get("content") or result.get("result") or result.get("output")
+        text = str(result or "").strip().lower()
+        if not text:
+            return False
+        return (
+            text.startswith("error:")
+            or text.startswith("failed:")
+            or "traceback (most recent call last)" in text
+            or "command not found" in text
+            or "path not found" in text
+        )
+
+
 def _prewarm_skill_tool_modules():
     """Import tools.skills_tool and tools.skill_manager_tool outside any lock.
 
@@ -3666,6 +3804,9 @@ def _run_agent_streaming(
         except Exception:
             logger.debug("Failed to put event to queue")
 
+    _cost_guard = CostProtectionGuard(session_id=session_id, stream_id=stream_id)
+    _agent_ref = [None]
+
     def _agent_status_callback(kind, message):
         """Bridge Agent lifecycle status into WebUI SSE.
 
@@ -3677,6 +3818,7 @@ def _run_agent_streaming(
         _kind = str(kind or '').strip().lower()
         if not _message:
             return
+        _cost_guard.record_status(_kind, _message)
         _lower = _message.lower()
         _is_compression_start = (
             _kind == 'lifecycle'
@@ -3698,6 +3840,19 @@ def _run_agent_streaming(
         _is_fallback_notice = _is_fallback_lifecycle_message(_kind, _message)
         if _is_fallback_notice:
             put('warning', {'type': 'fallback', 'message': _message})
+
+    def _agent_step_callback(api_call_count, prev_tools=None):
+        payload = _cost_guard.record_step(api_call_count, prev_tools)
+        if not payload:
+            return
+        put('warning', {
+            'type': 'cost_protection_pause',
+            'message': payload['message'],
+            'stats': payload.get('stats') or {},
+        })
+        agent = _agent_ref[0]
+        if agent is not None and hasattr(agent, 'interrupt'):
+            agent.interrupt(_cost_guard.interrupt_message())
 
     # Initialised here (before any code that may raise) so the outer `finally`
     # block can safely check `if _checkpoint_stop is not None` even when an
@@ -4119,6 +4274,10 @@ def _run_agent_streaming(
                     return
 
                 if event_type == 'tool.completed':
+                    _cost_guard.record_tool_complete(
+                        is_error=bool(cb_kwargs.get('is_error', False)),
+                        result=preview,
+                    )
                     for live_tc in reversed(_live_tool_calls):
                         if live_tc.get('done'):
                             continue
@@ -4186,8 +4345,12 @@ def _run_agent_streaming(
                 except Exception:
                     logger.debug('Failed to update live prompt estimate on tool start', exc_info=True)
 
-            def on_tool_complete(tool_call_id, name, args, function_result):
+            def on_tool_complete(tool_call_id, name, args, function_result, **cb_kwargs):
                 try:
+                    _cost_guard.record_tool_complete(
+                        is_error=bool(cb_kwargs.get('is_error', False)),
+                        result=function_result,
+                    )
                     _record_live_tool_complete(tool_call_id, name, function_result)
                     if tool_call_id and tool_call_id not in _live_tool_event_complete_ids:
                         _live_tool_event_complete_ids.add(tool_call_id)
@@ -4214,7 +4377,7 @@ def _run_agent_streaming(
                             'preview': result_snippet,
                             'args': _tool_args_snapshot(args),
                             'tid': tool_call_id,
-                            'is_error': False,
+                            'is_error': bool(cb_kwargs.get('is_error', False)),
                         })
                     _tool_stats = meter().get_stats()
                     _tool_stats['session_id'] = session_id
@@ -4418,6 +4581,8 @@ def _run_agent_streaming(
                 _agent_kwargs['tool_complete_callback'] = on_tool_complete
             if 'status_callback' in _agent_params:
                 _agent_kwargs['status_callback'] = _agent_status_callback
+            if 'step_callback' in _agent_params:
+                _agent_kwargs['step_callback'] = _agent_step_callback
             if 'max_iterations' in _agent_params and _max_iterations_cfg is not None:
                 _agent_kwargs['max_iterations'] = _max_iterations_cfg
             if 'max_tokens' in _agent_params and _max_tokens_cfg is not None:
@@ -4517,6 +4682,8 @@ def _run_agent_streaming(
                         agent.tool_complete_callback = _agent_kwargs.get('tool_complete_callback')
                     if hasattr(agent, 'status_callback'):
                         agent.status_callback = _agent_kwargs.get('status_callback')
+                    if hasattr(agent, 'step_callback'):
+                        agent.step_callback = _agent_kwargs.get('step_callback')
                     if hasattr(agent, 'interim_assistant_callback'):
                         agent.interim_assistant_callback = _agent_kwargs.get('interim_assistant_callback')
                     if hasattr(agent, 'reasoning_callback'):
@@ -4588,6 +4755,8 @@ def _run_agent_streaming(
                             logger.debug("Failed to close evicted agent for session %s", _evicted_sid, exc_info=True)
                         logger.debug('[webui] Evicted LRU agent from cache: %s', _evicted_sid)
                     logger.debug('[webui] Created new agent for session %s', session_id)
+
+            _agent_ref[0] = agent
 
             # Store agent instance for cancel/interrupt propagation
             with STREAMS_LOCK:
@@ -4796,6 +4965,58 @@ def _run_agent_streaming(
                         logger.debug("Failed to append cancelled turn journal event", exc_info=True)
                 put('cancel', {'message': 'Cancelled by user'})
                 return
+            if _cost_guard.paused_payload is not None:
+                _cost_payload = _cost_guard.paused_payload
+                with _agent_lock:
+                    if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                        logger.info(
+                            "Skipping stale cost-protection writeback for session %s stream %s; active_stream_id=%s",
+                            getattr(s, 'session_id', session_id),
+                            stream_id,
+                            getattr(s, 'active_stream_id', None),
+                        )
+                        return
+                    _materialize_pending_user_turn_before_error(s)
+                    s.active_stream_id = None
+                    s.pending_user_message = None
+                    s.pending_attachments = []
+                    s.pending_started_at = None
+                    _stats_json = json.dumps(_cost_payload.get('stats') or {}, ensure_ascii=False, sort_keys=True)
+                    s.messages.append({
+                        'role': 'assistant',
+                        'content': (
+                            f"**Run paused for review:** {_cost_payload.get('message')}\n\n"
+                            f"*{_cost_payload.get('hint')}*"
+                        ),
+                        'timestamp': int(time.time()),
+                        '_error': True,
+                        'provider_details': _stats_json,
+                        'provider_details_label': 'Cost protection details',
+                    })
+                    try:
+                        s.save()
+                    except Exception:
+                        pass
+                    if not ephemeral:
+                        try:
+                            append_turn_journal_event_for_stream(
+                                s.session_id,
+                                stream_id,
+                                {
+                                    "event": "interrupted",
+                                    "created_at": time.time(),
+                                    "reason": "cost_protection_pause",
+                                },
+                            )
+                        except Exception:
+                            logger.debug("Failed to append cost-protection turn journal event", exc_info=True)
+                put('apperror', {
+                    'type': 'cost_protection_pause',
+                    'message': _cost_payload.get('message'),
+                    'hint': _cost_payload.get('hint'),
+                    'details': json.dumps(_cost_payload.get('stats') or {}, ensure_ascii=False, sort_keys=True),
+                })
+                return
             with _agent_lock:
                 if not ephemeral and not _stream_writeback_is_current(s, stream_id):
                     if _stream_writeback_can_supersede_recovery_marker(s, msg_text):
@@ -4938,6 +5159,7 @@ def _run_agent_streaming(
                             if 'credential_pool' in _agent_params:
                                 _agent_kwargs['credential_pool'] = _heal_rt.get('credential_pool')
                             agent = _AIAgent(**_agent_kwargs)
+                            _agent_ref[0] = agent
                             with STREAMS_LOCK:
                                 AGENT_INSTANCES[stream_id] = agent
                             from api.config import SESSION_AGENT_CACHE as _SAC, SESSION_AGENT_CACHE_LOCK as _SAC_L
@@ -5769,6 +5991,64 @@ def _run_agent_streaming(
                             logger.debug("Failed to append cancelled turn journal event", exc_info=True)
             put('cancel', {'message': 'Cancelled by user'})
             return
+        if _cost_guard.paused_payload is not None:
+            _cost_payload = _cost_guard.paused_payload
+            if s is not None:
+                if _checkpoint_stop is not None:
+                    _checkpoint_stop.set()
+                if _ckpt_thread is not None:
+                    _ckpt_thread.join(timeout=15)
+                _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
+                with _lock_ctx:
+                    if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                        logger.info(
+                            "Skipping stale cost-protection error writeback for session %s stream %s; active_stream_id=%s",
+                            getattr(s, 'session_id', session_id),
+                            stream_id,
+                            getattr(s, 'active_stream_id', None),
+                        )
+                        return
+                    _materialize_pending_user_turn_before_error(s)
+                    s.active_stream_id = None
+                    s.pending_user_message = None
+                    s.pending_attachments = []
+                    s.pending_started_at = None
+                    _stats_json = json.dumps(_cost_payload.get('stats') or {}, ensure_ascii=False, sort_keys=True)
+                    s.messages.append({
+                        'role': 'assistant',
+                        'content': (
+                            f"**Run paused for review:** {_cost_payload.get('message')}\n\n"
+                            f"*{_cost_payload.get('hint')}*"
+                        ),
+                        'timestamp': int(time.time()),
+                        '_error': True,
+                        'provider_details': _stats_json,
+                        'provider_details_label': 'Cost protection details',
+                    })
+                    try:
+                        s.save()
+                    except Exception:
+                        pass
+                    if not ephemeral:
+                        try:
+                            append_turn_journal_event_for_stream(
+                                s.session_id,
+                                stream_id,
+                                {
+                                    "event": "interrupted",
+                                    "created_at": time.time(),
+                                    "reason": "cost_protection_pause",
+                                },
+                            )
+                        except Exception:
+                            logger.debug("Failed to append cost-protection turn journal event", exc_info=True)
+            put('apperror', {
+                'type': 'cost_protection_pause',
+                'message': _cost_payload.get('message'),
+                'hint': _cost_payload.get('hint'),
+                'details': json.dumps(_cost_payload.get('stats') or {}, ensure_ascii=False, sort_keys=True),
+            })
+            return
         _exc_is_quota = _classification['type'] == 'quota_exhausted'
         # Exception quota text still includes: 'more credits' in _exc_lower, 'can only afford' in _exc_lower, 'fewer max_tokens' in _exc_lower.
         # Rate-limit detection remains guarded as: (not _exc_is_quota).
@@ -5815,6 +6095,7 @@ def _run_agent_streaming(
                     if 'credential_pool' in _agent_params:
                         _heal_kwargs['credential_pool'] = _heal_rt.get('credential_pool')
                     _heal_agent = _AIAgent(**_heal_kwargs)
+                    _agent_ref[0] = _heal_agent
                     with STREAMS_LOCK:
                         AGENT_INSTANCES[stream_id] = _heal_agent
                     from api.config import SESSION_AGENT_CACHE as _SAC2, SESSION_AGENT_CACHE_LOCK as _SAC2_L
