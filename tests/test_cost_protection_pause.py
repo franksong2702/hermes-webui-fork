@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from api.streaming import CostProtectionGuard, _cost_protection_guard_from_config
+from api.streaming import CostProtectionGuard, _cost_protection_guard_from_settings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -151,19 +151,42 @@ def test_cost_protection_can_still_pause_on_configured_tool_errors():
     assert payload["reason"] == "repeated_tool_errors"
 
 
-def test_cost_protection_thresholds_can_be_configured(monkeypatch):
-    import api.config as config
+def test_cost_protection_is_disabled_by_default(monkeypatch):
+    import api.streaming as streaming
+
+    monkeypatch.setattr(streaming, "load_settings", lambda: {})
+
+    guard = _cost_protection_guard_from_settings(session_id="sid", stream_id="stream")
+
+    assert guard is None
+
+
+def test_cost_protection_can_be_enabled_from_webui_settings(monkeypatch):
+    import api.streaming as streaming
 
     monkeypatch.setattr(
-        config,
-        "cfg",
-        {"cost_protection": {"api_call_threshold": 7, "tool_error_threshold": 4}},
+        streaming,
+        "load_settings",
+        lambda: {"cost_protection_enabled": True},
     )
 
-    guard = _cost_protection_guard_from_config(session_id="sid", stream_id="stream")
+    guard = _cost_protection_guard_from_settings(session_id="sid", stream_id="stream")
 
-    assert guard.api_call_threshold == 7
-    assert guard.tool_error_threshold == 4
+    assert guard is not None
+    assert guard.api_call_threshold == 36
+    assert guard.tool_error_threshold == 3
+
+
+def test_cost_protection_setting_persists_as_webui_owned_bool(tmp_path, monkeypatch):
+    import api.config as config
+
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_FILE", settings_file)
+
+    saved = config.save_settings({"cost_protection_enabled": True})
+
+    assert saved["cost_protection_enabled"] is True
+    assert config.load_settings()["cost_protection_enabled"] is True
 
 
 def test_streaming_wires_cost_protection_to_agent_step_callback():
@@ -171,6 +194,7 @@ def test_streaming_wires_cost_protection_to_agent_step_callback():
     assert "_agent_kwargs['step_callback'] = _agent_step_callback" in STREAMING_SRC
     assert "agent.step_callback = _agent_kwargs.get('step_callback')" in STREAMING_SRC
     assert "agent.interrupt(_cost_guard.interrupt_message())" in STREAMING_SRC
+    assert "if _cost_guard is None:" in STREAMING_SRC
 
 
 def test_cost_protection_pause_is_not_rendered_as_generic_error():

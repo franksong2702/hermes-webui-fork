@@ -5,7 +5,7 @@
 
 ### Added
 
-- Optional cost-protection pause for chat runs can now be enabled from `config.yaml` with `cost_protection.enabled: true` or `webui.cost_protection.enabled: true`. When enabled, WebUI pauses at a safe agent step boundary if repeated compression failures, fallback churn, repeated same-pattern tool failures, or very high model-call counts match configured risk thresholds, then shows a "Run paused for review" message instead of continuing to spend tokens silently. The feature is disabled by default, and thresholds can be tuned under the same config block.
+- Optional Cost Protection pause for chat runs can now be enabled with `./ctl.sh cost-protection enable`. When enabled, WebUI pauses future chat runs at a safe agent step boundary if repeated compression failures, fallback churn, repeated same-pattern tool failures, or very high model-call counts match runaway-cost signals, then shows a "Run paused for review" message instead of continuing to spend tokens silently. The feature is disabled by default, writes WebUI-owned `settings.json` state, and does not mutate Hermes Agent `config.yaml`.
 
 ## [v0.51.141] — 2026-05-26 — Release DM (stage-batch23 — 4-PR second hold-bucket pass)
 

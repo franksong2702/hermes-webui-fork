@@ -124,25 +124,20 @@ def _positive_int(value, fallback: int) -> int:
     return parsed if parsed > 0 else fallback
 
 
-def _cost_protection_config() -> dict:
+def _cost_protection_settings() -> dict:
     try:
-        cfg_data = get_config()
+        settings = load_settings()
     except Exception:
-        cfg_data = {}
-    if not isinstance(cfg_data, dict):
-        return {}
-    direct = cfg_data.get("cost_protection")
-    if isinstance(direct, dict):
-        return direct
-    webui = cfg_data.get("webui")
-    nested = webui.get("cost_protection") if isinstance(webui, dict) else None
-    return nested if isinstance(nested, dict) else {}
+        settings = {}
+    return settings if isinstance(settings, dict) else {}
 
 
-def _cost_protection_guard_from_config(*, session_id: str, stream_id: str):
-    cfg_data = _cost_protection_config()
+def _cost_protection_guard_from_settings(*, session_id: str, stream_id: str):
+    settings = _cost_protection_settings()
+    if not settings.get("cost_protection_enabled", False):
+        return None
     thresholds = {
-        key: _positive_int(cfg_data.get(key), fallback)
+        key: fallback
         for key, fallback in _DEFAULT_COST_PROTECTION_THRESHOLDS.items()
     }
     return CostProtectionGuard(session_id=session_id, stream_id=stream_id, **thresholds)
@@ -3917,7 +3912,7 @@ def _run_agent_streaming(
         except Exception:
             logger.debug("Failed to put event to queue")
 
-    _cost_guard = _cost_protection_guard_from_config(session_id=session_id, stream_id=stream_id)
+    _cost_guard = _cost_protection_guard_from_settings(session_id=session_id, stream_id=stream_id)
     _agent_ref = [None]
 
     def _agent_status_callback(kind, message):
@@ -3931,7 +3926,8 @@ def _run_agent_streaming(
         _kind = str(kind or '').strip().lower()
         if not _message:
             return
-        _cost_guard.record_status(_kind, _message)
+        if _cost_guard is not None:
+            _cost_guard.record_status(_kind, _message)
         _lower = _message.lower()
         _is_compression_start = (
             _kind == 'lifecycle'
@@ -3955,6 +3951,8 @@ def _run_agent_streaming(
             put('warning', {'type': 'fallback', 'message': _message})
 
     def _agent_step_callback(api_call_count, prev_tools=None):
+        if _cost_guard is None:
+            return
         payload = _cost_guard.record_step(api_call_count, prev_tools)
         if not payload:
             return
@@ -4387,12 +4385,13 @@ def _run_agent_streaming(
                     return
 
                 if event_type == 'tool.completed':
-                    _cost_guard.record_tool_complete(
-                        name=name,
-                        arguments=args if isinstance(args, dict) else {},
-                        is_error=bool(cb_kwargs.get('is_error', False)),
-                        result=preview,
-                    )
+                    if _cost_guard is not None:
+                        _cost_guard.record_tool_complete(
+                            name=name,
+                            arguments=args if isinstance(args, dict) else {},
+                            is_error=bool(cb_kwargs.get('is_error', False)),
+                            result=preview,
+                        )
                     for live_tc in reversed(_live_tool_calls):
                         if live_tc.get('done'):
                             continue
@@ -4462,13 +4461,14 @@ def _run_agent_streaming(
 
             def on_tool_complete(tool_call_id, name, args, function_result, **cb_kwargs):
                 try:
-                    _cost_guard.record_tool_complete(
-                        tool_call_id=tool_call_id,
-                        name=name,
-                        arguments=args,
-                        is_error=bool(cb_kwargs.get('is_error', False)),
-                        result=function_result,
-                    )
+                    if _cost_guard is not None:
+                        _cost_guard.record_tool_complete(
+                            tool_call_id=tool_call_id,
+                            name=name,
+                            arguments=args,
+                            is_error=bool(cb_kwargs.get('is_error', False)),
+                            result=function_result,
+                        )
                     _record_live_tool_complete(tool_call_id, name, function_result)
                     if tool_call_id and tool_call_id not in _live_tool_event_complete_ids:
                         _live_tool_event_complete_ids.add(tool_call_id)
@@ -5083,7 +5083,7 @@ def _run_agent_streaming(
                         logger.debug("Failed to append cancelled turn journal event", exc_info=True)
                 put('cancel', {'message': 'Cancelled by user'})
                 return
-            if _cost_guard.paused_payload is not None:
+            if _cost_guard is not None and _cost_guard.paused_payload is not None:
                 _cost_payload = _cost_guard.paused_payload
                 with _agent_lock:
                     if not ephemeral and not _stream_writeback_is_current(s, stream_id):
@@ -6109,7 +6109,7 @@ def _run_agent_streaming(
                             logger.debug("Failed to append cancelled turn journal event", exc_info=True)
             put('cancel', {'message': 'Cancelled by user'})
             return
-        if _cost_guard.paused_payload is not None:
+        if _cost_guard is not None and _cost_guard.paused_payload is not None:
             _cost_payload = _cost_guard.paused_payload
             if s is not None:
                 if _checkpoint_stop is not None:
