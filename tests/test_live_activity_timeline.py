@@ -187,6 +187,26 @@ def test_record_activity_boundary_does_not_create_empty_duplicate_burst():
     assert boundary_fn.find("if(textEnd<=lastTextEnd)") < boundary_fn.find("_currentActivityBurstId+=1;")
 
 
+def test_inactive_interim_assistant_still_records_activity_boundary():
+    """A session can receive SSE events while the pane is being switched away.
+
+    Token/tool state is still persisted for reattach in that window, so interim
+    progress boundaries must also be persisted before the inactive-pane return.
+    Otherwise later tool calls keep an activityBurstId with no text anchor and
+    Activity groups pile up at the tail after switching back.
+    """
+    wire_fn = MESSAGES_JS.split("function _wireSSE(source)", 1)[1].split("source.addEventListener('reasoning'", 1)[0]
+    inactive_returns = [
+        idx for idx in range(len(wire_fn))
+        if wire_fn.startswith("if(!S.session||S.session.session_id!==activeSid){", idx)
+    ]
+    assert len(inactive_returns) >= 2
+    for idx in inactive_returns[:2]:
+        branch = wire_fn[idx:wire_fn.find("}", idx) + 1]
+        assert "recordActivityBoundary();" in branch
+        assert "_resetAssistantSegment();" in branch
+
+
 def test_activity_status_rows_have_quiet_metadata_styling():
     assert ".agent-activity-status{" in STYLE_CSS
     assert "grid-template-columns:18px minmax(0,1fr) auto" in STYLE_CSS

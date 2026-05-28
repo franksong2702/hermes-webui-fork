@@ -1675,7 +1675,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       reasoningText='';
       liveReasoningText='';
       if(alreadyStreamed){
-        if(!S.session||S.session.session_id!==activeSid) return;
+        if(!S.session||S.session.session_id!==activeSid){
+          recordActivityBoundary();
+          _resetAssistantSegment();
+          return;
+        }
         const parsed=_parseStreamState();
         if(String((parsed&&parsed.displayText)||'').trim()||assistantRow){
           ensureAssistantRow(true);
@@ -1689,7 +1693,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       assistantText += assistantText ? `\n\n${visible}` : visible;
       visibleInterimSnippets.push(visible);
       syncInflightAssistantMessage();
-      if(!S.session||S.session.session_id!==activeSid) return;
+      if(!S.session||S.session.session_id!==activeSid){
+        recordActivityBoundary();
+        _resetAssistantSegment();
+        return;
+      }
       if(window._showThinking!==false){
         if(typeof updateThinking==='function') updateThinking(_liveThinkingText());
         else appendThinking(_liveThinkingText());
