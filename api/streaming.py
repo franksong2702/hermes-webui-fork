@@ -195,8 +195,11 @@ _CANCEL_MARKER_PATTERNS = ('task cancelled', 'task canceled', 'response interrup
 _WEBUI_PROGRESS_PROMPT = """
 WebUI progress guidance:
 - Match the normal Hermes messaging style, but do not let long tool-running WebUI turns appear silent.
-- For long multi-step work that uses tools, provide brief user-visible progress updates as normal assistant content before the next tool batch or after a meaningful finding.
-- Do not keep all progress only in reasoning, thinking, or tool-result channels; those are not a substitute for visible interim updates.
+- For long multi-step work that uses tools, emit brief user-visible progress updates as normal assistant content, not only as hidden reasoning.
+- Before the first tool batch in a long task, say what you are about to inspect.
+- After each meaningful batch of tool calls, say what you just confirmed and what you will check next before continuing with more tools.
+- Do not run many independent tool batches back-to-back without visible assistant text between them when the task is still ongoing.
+- Do not keep progress only in reasoning, thinking, or tool-result channels; those are not a substitute for visible interim updates.
 - Each update should say what you are about to check, what you just confirmed, or why the next tool call is needed.
 - Keep updates concise, factual, and in the user's language. One or two short sentences are enough.
 - Do not reveal hidden reasoning, chain-of-thought, private scratchpads, secrets, raw logs, or long tool output.
