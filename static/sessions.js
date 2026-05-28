@@ -1515,13 +1515,13 @@ function _prepareRunningLiveTail(baseMessages,inflightMessages){
 function _mergeInflightTailMessages(baseMessages, inflightMessages){
   const base=Array.isArray(baseMessages)?baseMessages:[];
   const inflight=Array.isArray(inflightMessages)?inflightMessages:[];
-  let liveIdx=-1;
-  for(let i=inflight.length-1;i>=0;i--){
-    if(inflight[i]&&inflight[i]._live){liveIdx=i;break;}
+  let firstLiveIdx=-1;
+  for(let i=0;i<inflight.length;i++){
+    if(inflight[i]&&inflight[i]._live){firstLiveIdx=i;break;}
   }
-  if(liveIdx<0) return base;
-  let start=liveIdx;
-  if(liveIdx>0&&inflight[liveIdx-1]&&inflight[liveIdx-1].role==='user') start=liveIdx-1;
+  if(firstLiveIdx<0) return base;
+  let start=firstLiveIdx;
+  if(firstLiveIdx>0&&inflight[firstLiveIdx-1]&&inflight[firstLiveIdx-1].role==='user') start=firstLiveIdx-1;
   const tail=inflight.slice(start).filter(m=>m&&m.role);
   const merged=[...base];
   for(const msg of tail){

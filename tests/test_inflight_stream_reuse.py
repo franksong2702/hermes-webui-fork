@@ -386,6 +386,42 @@ def test_load_session_prefers_structured_inflight_state_over_live_turn_snapshot(
     assert "!hasStructuredLiveState&&" in guard_block.replace(" ", "")
 
 
+def test_merge_inflight_tail_preserves_all_segmented_live_progress():
+    """The reattach merge must keep every projected live progress segment.
+
+    _projectInflightMessagesForActivityBursts() can split one live assistant
+    accumulator into multiple _live messages.  If the merge starts at the last
+    _live segment, the earlier process-text anchors disappear and Activity
+    groups whose burst ids point to those anchors pile up at the bottom.
+    """
+    assert NODE, "node not on PATH"
+    fn_start = SESSIONS_JS.index("function _mergeInflightTailMessages")
+    fn_end = SESSIONS_JS.index("// Load older messages", fn_start)
+    merge_fn = SESSIONS_JS[fn_start:fn_end]
+    script = f"""
+const assert = require('assert');
+function _messageComparableText(m) {{ return String((m&&m.content)||'').trim(); }}
+function _sameTranscriptMessage(a,b) {{
+  return !!(a&&b&&a.role===b.role&&_messageComparableText(a)===_messageComparableText(b));
+}}
+{merge_fn}
+const base = [{{role:'user', content:'go'}}];
+const inflight = [
+  {{role:'user', content:'go'}},
+  {{role:'assistant', _live:true, content:'first progress', _activityBurstId:1}},
+  {{role:'assistant', _live:true, content:'second progress', _activityBurstId:2}},
+  {{role:'assistant', _live:true, content:'third progress', _activityBurstId:3}},
+];
+const merged = _mergeInflightTailMessages(base, inflight);
+assert.deepStrictEqual(
+  merged.filter(m => m.role === 'assistant').map(m => m.content),
+  ['first progress', 'second progress', 'third progress']
+);
+"""
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
 def test_load_session_does_not_advance_replay_cursor_from_session_journal_summary():
     body = _function_body(SESSIONS_JS, "loadSession")
     assert "INFLIGHT[sid].lastRunJournalSeq=journalSeq;" not in body
