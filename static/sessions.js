@@ -1354,6 +1354,47 @@ function _sameTranscriptMessage(a,b){
   return false;
 }
 
+function _currentTurnAssistantText(messages){
+  const list=Array.isArray(messages)?messages:[];
+  let start=-1;
+  for(let i=list.length-1;i>=0;i--){
+    if(list[i]&&list[i].role==='user'){start=i;break;}
+  }
+  const parts=[];
+  for(let i=start+1;i<list.length;i++){
+    const msg=list[i];
+    if(!msg||msg.role!=='assistant'||msg._live) continue;
+    const text=_messageComparableText(msg);
+    if(text) parts.push(text);
+  }
+  return parts.join('\n\n').trim();
+}
+
+function _compactTranscriptText(text){
+  return String(text||'').replace(/\s+/g,' ').trim();
+}
+
+function _stripPersistedAssistantPrefixFromLiveTail(msg,baseMessages){
+  if(!(msg&&msg.role==='assistant'&&msg._live)) return msg;
+  const liveText=_messageComparableText(msg);
+  if(!liveText) return msg;
+  const covered=_currentTurnAssistantText(baseMessages);
+  if(!covered) return msg;
+  if(liveText===covered||covered.startsWith(liveText)){
+    return null;
+  }
+  if(liveText.startsWith(covered)){
+    const suffix=liveText.slice(covered.length).trim();
+    if(!suffix) return null;
+    const trimmed={...msg,content:suffix};
+    return trimmed;
+  }
+  if(_compactTranscriptText(liveText)===_compactTranscriptText(covered)){
+    return null;
+  }
+  return msg;
+}
+
 function _mergeInflightTailMessages(baseMessages, inflightMessages){
   const base=Array.isArray(baseMessages)?baseMessages:[];
   const inflight=Array.isArray(inflightMessages)?inflightMessages:[];
@@ -1367,8 +1408,14 @@ function _mergeInflightTailMessages(baseMessages, inflightMessages){
   const tail=inflight.slice(start).filter(m=>m&&m.role);
   const merged=[...base];
   for(const msg of tail){
-    const duplicate=merged.slice(-Math.max(5,tail.length+2)).some(existing=>_sameTranscriptMessage(existing,msg));
-    if(!duplicate) merged.push(msg);
+    let candidate=_stripPersistedAssistantPrefixFromLiveTail(msg,merged);
+    if(msg&&msg.role==='assistant'&&msg._live){
+      msg.content=candidate?_messageComparableText(candidate):'';
+      if(candidate&&candidate.reasoning!==undefined) msg.reasoning=candidate.reasoning;
+    }
+    if(!candidate) continue;
+    const duplicate=merged.slice(-Math.max(5,tail.length+2)).some(existing=>_sameTranscriptMessage(existing,candidate));
+    if(!duplicate) merged.push(candidate);
   }
   return merged;
 }
