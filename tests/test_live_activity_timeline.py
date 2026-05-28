@@ -207,6 +207,23 @@ def test_inactive_interim_assistant_still_records_activity_boundary():
         assert "_resetAssistantSegment();" in branch
 
 
+def test_tool_event_flushes_pending_text_before_inserting_activity():
+    """A tool card must not appear before the text segment it is anchored to.
+
+    Token rendering is throttled through rAF.  On mobile/slow clients a `tool`
+    event can arrive while the current assistantRow exists but its pending text
+    has not been written into `.msg-body` yet.  If appendLiveToolCard() runs
+    first, the Activity group appears, then the delayed flush fills the empty
+    segment above it a frame later, which looks like process text was inserted
+    before an already-visible Activity row.
+    """
+    tool_handler = MESSAGES_JS.split("source.addEventListener('tool',e=>{", 1)[1].split("source.addEventListener('tool_complete'", 1)[0]
+    flush_pos = tool_handler.find("_flushPendingSegmentRender({force:true});")
+    append_pos = tool_handler.find("appendLiveToolCard(tc);")
+    assert flush_pos != -1 and append_pos != -1
+    assert flush_pos < append_pos
+
+
 def test_reattach_segment_start_aligns_with_last_burst_anchor():
     """Simulate the reattach segmentStart initializer with multiple anchors.
 

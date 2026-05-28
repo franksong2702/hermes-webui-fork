@@ -1780,12 +1780,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       liveReasoningText='';
       reasoningText='';
       const oldRow=$('toolRunningRow');if(oldRow)oldRow.remove();
+      // Flush any pending text into the current segment before inserting the
+      // Activity group. Otherwise the group can appear first, then the delayed
+      // text render fills the empty anchor above it a frame later, producing a
+      // visible "text inserted before Activity" reorder on slow/mobile clients.
+      _flushPendingSegmentRender({force:true});
       appendLiveToolCard(tc);
       snapshotLiveTurn();
       // Reset the live assistant row reference so that any text tokens arriving
       // after this tool call create a NEW segment appended below the tool card,
       // rather than updating the old segment that sits above it in the DOM.
-      _flushPendingSegmentRender({force:true});
       _freshSegment=true;
       _smdEndParser();
       _resetAssistantSegment();
