@@ -1,10 +1,13 @@
 """Regression tests for preserving live streams across session switches."""
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
 MESSAGES_JS = (REPO_ROOT / "static" / "messages.js").read_text(encoding="utf-8")
 SESSIONS_JS = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+NODE = shutil.which("node")
 
 
 def _function_body(src: str, name: str) -> str:
@@ -172,3 +175,61 @@ def test_load_session_reattaches_when_inflight_is_in_memory_and_marked_for_reatt
         "loadSession() must reattach via attachLiveStream() when "
         "INFLIGHT[sid].reattach && activeStreamId"
     )
+
+
+def test_inflight_merge_strips_live_assistant_text_already_persisted_by_server():
+    """Switching back to a running session must not append the whole live text
+    when the server transcript already contains the same assistant progress
+    split around tool rows.
+    """
+    assert NODE, "node not on PATH"
+    start = SESSIONS_JS.find("function _messageComparableText")
+    end = SESSIONS_JS.find("// Load older messages", start)
+    assert start != -1 and end != -1
+    helper_src = SESSIONS_JS[start:end]
+    script = f"""
+const assert = require('assert');
+{helper_src}
+
+let base = [
+  {{role:'user', content:'go'}},
+  {{role:'assistant', content:'First progress.'}},
+  {{role:'tool', content:'{{}}'}},
+  {{role:'assistant', content:'Second progress.'}},
+];
+let inflight = [
+  {{role:'user', content:'go'}},
+  {{role:'assistant', _live:true, content:'First progress.\\n\\nSecond progress.'}},
+];
+let merged = _mergeInflightTailMessages(base, inflight);
+assert.strictEqual(merged.length, base.length);
+assert.strictEqual(inflight[1].content, '');
+
+base = [
+  {{role:'user', content:'go'}},
+  {{role:'assistant', content:'First progress.'}},
+  {{role:'tool', content:'{{}}'}},
+  {{role:'assistant', content:'Second progress.'}},
+];
+inflight = [
+  {{role:'user', content:'go'}},
+  {{role:'assistant', _live:true, content:'First progress.\\n\\nSecond progress.\\n\\nThird progress.'}},
+];
+merged = _mergeInflightTailMessages(base, inflight);
+assert.strictEqual(merged.length, base.length + 1);
+assert.strictEqual(merged[merged.length - 1].content, 'Third progress.');
+assert.strictEqual(inflight[1].content, 'Third progress.');
+"""
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_reconnect_prefers_trimmed_live_message_over_stale_full_assistant_cache():
+    body = _function_body(MESSAGES_JS, "attachLiveStream")
+    live_msg_pos = body.find("const _liveInflightAssistant")
+    last_text_pos = body.find("const _lastLiveAssistant")
+    assert live_msg_pos != -1 and last_text_pos != -1
+    assert live_msg_pos < last_text_pos
+    assistant_block = body[last_text_pos:body.find("const _lastLiveReasoning", last_text_pos)]
+    assert "_liveInflightAssistant.content" in assistant_block
+    assert "lastAssistantText" in assistant_block
