@@ -325,13 +325,11 @@ def test_load_session_rebuilds_live_tail_before_dropping_stale_dom_snapshot():
     assert ensure_pos < inflight_pos < prepare_pos < drop_dom_pos < drop_assistant_pos < merge_pos < restore_pos
 
 
-def test_load_session_advances_replay_cursor_when_loaded_transcript_has_current_turn_output():
+def test_load_session_does_not_advance_replay_cursor_from_session_journal_summary():
     body = _function_body(SESSIONS_JS, "loadSession")
-    assert "const journalSeq=_runJournalSeqFromSession(S.session);" in body
-    assert "_currentTurnHasVisibleOutput(S.messages)" in body
-    assert "INFLIGHT[sid].lastRunJournalSeq=journalSeq;" in body
-    ensure_body = _function_body(SESSIONS_JS, "_ensureMessagesLoaded")
-    assert "S.session.runtime_journal=data.session.runtime_journal;" in ensure_body
+    assert "INFLIGHT[sid].lastRunJournalSeq=journalSeq;" not in body
+    assert "const journalSeq=_runJournalSeqFromSession(S.session);" not in body
+    assert "function _runJournalSeqFromSession" not in SESSIONS_JS
 
 
 def test_reconnect_prefers_trimmed_live_message_over_stale_full_assistant_cache():

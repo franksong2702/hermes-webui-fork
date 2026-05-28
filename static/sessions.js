@@ -717,14 +717,6 @@ async function loadSession(sid){
       S.messages=_dropCurrentTurnAssistantMessages(S.messages);
     }
     S.messages=_mergeInflightTailMessages(S.messages,inflightMessages);
-    const journalSeq=_runJournalSeqFromSession(S.session);
-    if(
-      activeStreamId
-      && journalSeq>Number(INFLIGHT[sid].lastRunJournalSeq||0)
-      && _currentTurnHasVisibleOutput(S.messages)
-    ){
-      INFLIGHT[sid].lastRunJournalSeq=journalSeq;
-    }
     S.toolCalls=(INFLIGHT[sid].toolCalls||[]);
     if(_mergePendingSessionMessage(S.session,S.messages)&&inflightMessages===(INFLIGHT[sid].messages||[])){
       INFLIGHT[sid].messages=S.messages;
@@ -1490,32 +1482,6 @@ function _prepareRunningLiveTail(baseMessages,inflightMessages){
     }
   }
   return !!_messageComparableText(live);
-}
-
-function _runJournalSeqFromSession(session){
-  const journal=session&&session.runtime_journal;
-  if(!journal) return 0;
-  const direct=Number(journal.last_seq||0)||0;
-  if(direct>0) return direct;
-  const raw=String(journal.last_event_id||'').trim();
-  const tail=raw.split(':').pop();
-  return Number(tail||0)||0;
-}
-
-function _currentTurnHasVisibleOutput(messages){
-  const list=Array.isArray(messages)?messages:[];
-  let start=-1;
-  for(let i=list.length-1;i>=0;i--){
-    if(list[i]&&list[i].role==='user'){start=i;break;}
-  }
-  if(start<0) return false;
-  for(let i=start+1;i<list.length;i++){
-    const msg=list[i];
-    if(!msg) continue;
-    if(msg.role==='tool') return true;
-    if(msg.role==='assistant'&&_messageComparableText(msg)) return true;
-  }
-  return false;
 }
 
 function _mergeInflightTailMessages(baseMessages, inflightMessages){
