@@ -177,10 +177,14 @@ def test_load_session_reattaches_when_inflight_is_in_memory_and_marked_for_reatt
     )
 
 
-def test_inflight_merge_strips_live_assistant_text_already_persisted_by_server():
-    """Switching back to a running session must not append the whole live text
-    when the server transcript already contains the same assistant progress
-    split around tool rows.
+def test_running_reattach_refreshes_single_live_assistant_from_server_progress():
+    """Switching back to a running session should keep one visible assistant
+    source for the active turn.
+
+    The server transcript can already contain interim assistant progress while
+    INFLIGHT also holds the live assistant tail. Reattach must refresh the live
+    tail from the server copy, drop the server's active-turn assistant rows, and
+    render one `_live` assistant instead of duplicating or deleting progress.
     """
     assert NODE, "node not on PATH"
     start = SESSIONS_JS.find("function _messageComparableText")
@@ -199,12 +203,15 @@ let base = [
 ];
 let inflight = [
   {{role:'user', content:'go'}},
-  {{role:'assistant', _live:true, content:'First progress.\\n\\nSecond progress.'}},
+  {{role:'assistant', _live:true, content:'First progress.\\n\\nSecond progress.\\n\\nSecond progress.'}},
 ];
+assert.strictEqual(_prepareRunningLiveTail(base, inflight), true);
+assert.strictEqual(inflight[1].content, 'First progress.\\n\\nSecond progress.');
+base = _dropCurrentTurnAssistantMessages(base);
 let merged = _mergeInflightTailMessages(base, inflight);
-assert.strictEqual(merged.length, base.length);
-assert.strictEqual(inflight[1].content, '');
-assert.strictEqual(inflight[1]._coveredAssistantPrefixStripped, true);
+assert.strictEqual(merged.filter(m => m.role === 'assistant').length, 1);
+assert.strictEqual(merged[merged.length - 1]._live, true);
+assert.strictEqual(merged[merged.length - 1].content, 'First progress.\\n\\nSecond progress.');
 
 base = [
   {{role:'user', content:'go'}},
@@ -214,26 +221,30 @@ base = [
 ];
 inflight = [
   {{role:'user', content:'go'}},
-  {{role:'assistant', _live:true, content:'First progress.\\n\\nSecond progress.\\n\\nThird progress.'}},
+  {{role:'assistant', _live:true, content:'First progress.'}},
 ];
+assert.strictEqual(_prepareRunningLiveTail(base, inflight), true);
+assert.strictEqual(inflight[1].content, 'First progress.\\n\\nSecond progress.');
+base = _dropCurrentTurnAssistantMessages(base);
 merged = _mergeInflightTailMessages(base, inflight);
-assert.strictEqual(merged.length, base.length + 1);
-assert.strictEqual(merged[merged.length - 1].content, 'Third progress.');
-assert.strictEqual(inflight[1].content, 'Third progress.');
-assert.strictEqual(inflight[1]._coveredAssistantPrefixStripped, true);
+assert.strictEqual(merged.filter(m => m.role === 'assistant').length, 1);
+assert.strictEqual(merged[merged.length - 1]._live, true);
+assert.strictEqual(merged[merged.length - 1].content, 'First progress.\\n\\nSecond progress.');
 """
     result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
 
 
-def test_load_session_drops_stale_live_dom_snapshot_after_trimming_covered_tail():
+def test_load_session_rebuilds_live_tail_before_dropping_stale_dom_snapshot():
     body = _function_body(SESSIONS_JS, "loadSession")
+    prepare_pos = body.find("const liveTailPrepared=_prepareRunningLiveTail(S.messages,inflightMessages);")
+    drop_dom_pos = body.find("delete INFLIGHT[sid].liveTurnHtml;")
+    drop_assistant_pos = body.find("S.messages=_dropCurrentTurnAssistantMessages(S.messages);")
     merge_pos = body.find("S.messages=_mergeInflightTailMessages(S.messages,inflightMessages);")
-    drop_pos = body.find("delete INFLIGHT[sid].liveTurnHtml;")
     restore_pos = body.find("restoreLiveTurnHtmlForSession(sid)")
-    assert merge_pos != -1 and drop_pos != -1 and restore_pos != -1
-    assert merge_pos < drop_pos < restore_pos
-    assert "_coveredAssistantPrefixStripped" in body[merge_pos:restore_pos]
+    assert prepare_pos != -1 and drop_dom_pos != -1
+    assert drop_assistant_pos != -1 and merge_pos != -1 and restore_pos != -1
+    assert prepare_pos < drop_dom_pos < drop_assistant_pos < merge_pos < restore_pos
 
 
 def test_load_session_advances_replay_cursor_when_loaded_transcript_has_current_turn_output():

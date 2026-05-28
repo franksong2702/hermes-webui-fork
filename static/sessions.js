@@ -706,11 +706,14 @@ async function loadSession(sid){
     } catch(e) {
       S.messages=inflightMessages;
     }
-    S.messages=_mergeInflightTailMessages(S.messages,inflightMessages);
-    const coveredLiveTail=Array.isArray(inflightMessages)&&inflightMessages.some(m=>m&&m._coveredAssistantPrefixStripped);
-    if(coveredLiveTail&&INFLIGHT[sid]){
+    const liveTailPrepared=_prepareRunningLiveTail(S.messages,inflightMessages);
+    if(liveTailPrepared&&INFLIGHT[sid]){
       delete INFLIGHT[sid].liveTurnHtml;
     }
+    if(liveTailPrepared){
+      S.messages=_dropCurrentTurnAssistantMessages(S.messages);
+    }
+    S.messages=_mergeInflightTailMessages(S.messages,inflightMessages);
     const journalSeq=_runJournalSeqFromSession(S.session);
     if(
       activeStreamId
@@ -1389,28 +1392,37 @@ function _compactTranscriptText(text){
   return String(text||'').replace(/\s+/g,' ').trim();
 }
 
-function _stripPersistedAssistantPrefixFromLiveTail(msg,baseMessages){
-  if(!(msg&&msg.role==='assistant'&&msg._live)) return msg;
-  const liveText=_messageComparableText(msg);
-  if(!liveText) return msg;
-  const covered=_currentTurnAssistantText(baseMessages);
-  if(!covered) return msg;
-  if(liveText===covered||covered.startsWith(liveText)){
-    msg._coveredAssistantPrefixStripped=true;
-    return null;
+function _dropCurrentTurnAssistantMessages(messages){
+  const list=Array.isArray(messages)?messages:[];
+  let start=-1;
+  for(let i=list.length-1;i>=0;i--){
+    if(list[i]&&list[i].role==='user'){start=i;break;}
   }
-  if(liveText.startsWith(covered)){
-    const suffix=liveText.slice(covered.length).trim();
-    msg._coveredAssistantPrefixStripped=true;
-    if(!suffix) return null;
-    const trimmed={...msg,content:suffix};
-    return trimmed;
+  if(start<0) return list;
+  return list.filter((msg,idx)=>idx<=start||!(msg&&msg.role==='assistant'));
+}
+
+function _prepareRunningLiveTail(baseMessages,inflightMessages){
+  const inflight=Array.isArray(inflightMessages)?inflightMessages:[];
+  const live=[...inflight].reverse().find(m=>m&&m.role==='assistant'&&m._live);
+  if(!live) return false;
+  const liveText=_messageComparableText(live);
+  const persistedText=_currentTurnAssistantText(baseMessages);
+  if(persistedText){
+    const compactPersisted=_compactTranscriptText(persistedText);
+    const compactLive=_compactTranscriptText(liveText);
+    if(!liveText || persistedText.startsWith(liveText)){
+      live.content=persistedText;
+    }else if(liveText.startsWith(persistedText)){
+      const extra=liveText.slice(persistedText.length).trim();
+      if(extra&&compactPersisted.includes(_compactTranscriptText(extra))){
+        live.content=persistedText;
+      }
+    }else if(compactPersisted===compactLive){
+      live.content=persistedText;
+    }
   }
-  if(_compactTranscriptText(liveText)===_compactTranscriptText(covered)){
-    msg._coveredAssistantPrefixStripped=true;
-    return null;
-  }
-  return msg;
+  return !!_messageComparableText(live);
 }
 
 function _runJournalSeqFromSession(session){
@@ -1452,12 +1464,7 @@ function _mergeInflightTailMessages(baseMessages, inflightMessages){
   const tail=inflight.slice(start).filter(m=>m&&m.role);
   const merged=[...base];
   for(const msg of tail){
-    let candidate=_stripPersistedAssistantPrefixFromLiveTail(msg,merged);
-    if(msg&&msg.role==='assistant'&&msg._live){
-      msg.content=candidate?_messageComparableText(candidate):'';
-      if(candidate&&candidate.reasoning!==undefined) msg.reasoning=candidate.reasoning;
-      if(!msg.content) msg._coveredAssistantPrefixStripped=true;
-    }
+    let candidate=msg;
     if(!candidate) continue;
     const duplicate=merged.slice(-Math.max(5,tail.length+2)).some(existing=>_sameTranscriptMessage(existing,candidate));
     if(!duplicate) merged.push(candidate);
