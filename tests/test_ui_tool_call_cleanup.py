@@ -219,11 +219,13 @@ class TestToolCallGroupingStatic:
         sync_fn = _function_body(UI_JS, "_syncToolCallGroupSummary")
         progress_fn = _function_body(UI_JS, "_activityProgressLabelForToolName")
         live_progress_fn = _function_body(UI_JS, "_activityLiveProgressLabel")
-        assert "_activityLiveProgressLabel" in sync_fn, (
-            "Live compact Activity rows should expose a readable transient progress label."
+        assert "_activityLiveProgressLabel" not in sync_fn, (
+            "Per-segment Activity rows should not show a group-level live timer/progress label; "
+            "only the top Run Activity owns the running timer."
         )
-        assert "durationEl.textContent" in sync_fn and "filter(Boolean).join(' · ')" in sync_fn, (
-            "Progress should share the existing non-persistent summary/duration slot, not become transcript text."
+        assert "durationEl.textContent='';" in sync_fn and "durationEl.style.display='none';" in sync_fn, (
+            "Per-segment Activity rows should keep the summary duration slot empty; "
+            "individual tool durations belong on tool cards."
         )
         for label in ("Searching workspace", "Reading files", "Updating files", "Running command"):
             assert label in progress_fn

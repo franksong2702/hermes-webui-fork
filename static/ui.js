@@ -2395,10 +2395,7 @@ let _activityElapsedTimer=null;
 let _activityElapsedTimerGroup=null;
 function _activityNowSeconds(){return Date.now()/1000;}
 function _isActivityTimerGroup(group){
-  return !!(group&&(
-    group.getAttribute('data-live-tool-call-group')==='1'||
-    group.getAttribute('data-run-activity-group')==='1'
-  ));
+  return !!(group&&group.getAttribute('data-run-activity-group')==='1');
 }
 function _activityElapsedStartedAt(group){
   if(!group)return null;
@@ -2482,9 +2479,7 @@ function _updateActiveActivityElapsedTimer(){
   if(durationEl){
     const settledText=_formatTurnDuration(group.dataset.turnDuration);
     const activeText=(!settledText&&label)?`Working for ${label}`:'';
-    const progressText=(settledText||group.getAttribute('data-run-activity-group')==='1')?'':_activityLiveProgressLabel(group);
-    durationEl.textContent=[progressText, activeText].filter(Boolean).join(' · ');
-    if(settledText) durationEl.textContent=`Done in ${settledText}`;
+    durationEl.textContent=settledText?`Done in ${settledText}`:activeText;
     durationEl.style.display=durationEl.textContent?'':'none';
   }
 }
@@ -4506,8 +4501,9 @@ function restoreLiveTurnHtmlForSession(sid){
   _mergeRestoredLiveAssistantSegment(restored, existing);
   if(existing) existing.replaceWith(restored);
   else inner.appendChild(restored);
-  const liveGroup=restored.querySelector('.tool-call-group[data-live-tool-call-group="1"]');
-  if(liveGroup&&typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(liveGroup);
+  if(typeof normalizeLiveActivityGroupPlacement==='function') normalizeLiveActivityGroupPlacement(restored);
+  const runGroup=restored.querySelector('.tool-call-group[data-run-activity-group="1"]');
+  if(runGroup&&typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(runGroup);
   if(typeof placeLiveToolCardsHost==='function') placeLiveToolCardsHost();
   requestAnimationFrame(()=>postProcessRenderedMessages(restored));
   return true;
@@ -5491,8 +5487,29 @@ function ensureActivityGroup(inner, opts){
     group.setAttribute('data-activity-disclosure-key',activityKey);
   }
   if(burstId&&!group.getAttribute('data-activity-burst-id')) group.setAttribute('data-activity-burst-id',burstId);
+  const anchor=opts.anchor||null;
+  if(anchor&&anchor.parentElement===inner&&group.parentElement===inner&&group.previousElementSibling!==anchor){
+    anchor.insertAdjacentElement('afterend',group);
+  }
   _syncToolCallGroupSummary(group);
   return group;
+}
+function normalizeLiveActivityGroupPlacement(turn){
+  const blocks=_assistantTurnBlocks(turn);
+  if(!blocks) return;
+  const groups=Array.from(blocks.querySelectorAll('.tool-call-group[data-live-tool-call-group="1"][data-activity-burst-id]'));
+  groups.sort((a,b)=>{
+    const av=Number(a.getAttribute('data-activity-burst-id'));
+    const bv=Number(b.getAttribute('data-activity-burst-id'));
+    if(Number.isFinite(av)&&Number.isFinite(bv)&&av!==bv) return av-bv;
+    return 0;
+  });
+  for(const group of groups){
+    const burstId=group.getAttribute('data-activity-burst-id')||'';
+    if(!burstId) continue;
+    const anchor=blocks.querySelector(`[data-live-assistant="1"][data-activity-burst-id="${CSS.escape(burstId)}"]`);
+    if(anchor&&group.previousElementSibling!==anchor) anchor.insertAdjacentElement('afterend',group);
+  }
 }
 function ensureRunActivityGroup(inner, opts){
   opts=opts||{};
@@ -7077,12 +7094,9 @@ function _syncToolCallGroupSummary(group){
       durationEl.textContent=durationText?`Done in ${durationText}`:(activeText?`Working for ${activeText}`:'');
       durationEl.style.display=durationEl.textContent?'':'none';
     }else if(group.getAttribute('data-live-tool-call-group')==='1'){
-      const activeText=_activityElapsedLabel(group);
-      const progressText=_activityLiveProgressLabel(group);
-      if(activeText) group.setAttribute('data-active-turn-elapsed',activeText);
-      else group.removeAttribute('data-active-turn-elapsed');
-      durationEl.textContent=[progressText, activeText].filter(Boolean).join(' · ');
-      durationEl.style.display=durationEl.textContent?'':'none';
+      group.removeAttribute('data-active-turn-elapsed');
+      durationEl.textContent='';
+      durationEl.style.display='none';
     }else{
       const durationText=_formatTurnDuration(group.dataset.turnDuration);
       durationEl.textContent=durationText?`Done in ${durationText}`:'';

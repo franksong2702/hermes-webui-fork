@@ -38,13 +38,16 @@ def test_per_segment_tool_activity_does_not_include_run_metadata_rows():
 def test_tool_activity_uses_tool_cards_and_run_activity_owns_timer():
     assert "buildToolCard(tc)" in UI_JS
     assert "tool-card-duration" in UI_JS
-    assert "No recent activity for ${_formatActiveElapsedTimer(idleAge)}" in UI_JS
     assert "Activity · Running" in UI_JS
     assert "Working for ${label}" in UI_JS
     assert "_isActivityTimerGroup(group)" in UI_JS
     assert "opts.turnDuration" in UI_JS
     assert "data-turn-duration" in UI_JS
     assert "durationText?`Done in ${durationText}`" in UI_JS
+    assert "return !!(group&&group.getAttribute('data-run-activity-group')==='1');" in UI_JS
+    live_summary_fn = UI_JS.split("function _syncToolCallGroupSummary(group)", 1)[1].split("function _activityProgressLabelForToolName", 1)[0]
+    assert "group.removeAttribute('data-active-turn-elapsed');" in live_summary_fn
+    assert "durationEl.textContent='';" in live_summary_fn
 
 
 def test_settled_activity_render_keeps_tools_bound_to_progress_bursts():
@@ -55,6 +58,16 @@ def test_settled_activity_render_keeps_tools_bound_to_progress_bursts():
     assert "`burst:${burstId}`" in render_fn
     assert "ensureActivityGroup(anchorParent,{collapsed:true,anchor:insertAfterNode,activityKey,burstId})" in render_fn
     assert "group.setAttribute('data-turn-duration'" not in render_fn
+
+
+def test_reattach_normalizes_live_activity_group_placement_by_burst_anchor():
+    assert "function normalizeLiveActivityGroupPlacement(turn)" in UI_JS
+    assert "normalizeLiveActivityGroupPlacement(restored)" in UI_JS
+    activity_fn = UI_JS.split("function ensureActivityGroup(inner, opts)", 1)[1].split("function normalizeLiveActivityGroupPlacement", 1)[0]
+    assert "anchor.insertAdjacentElement('afterend',group);" in activity_fn
+    normalize_fn = UI_JS.split("function normalizeLiveActivityGroupPlacement(turn)", 1)[1].split("function ensureRunActivityGroup", 1)[0]
+    assert '.tool-call-group[data-live-tool-call-group="1"][data-activity-burst-id]' in normalize_fn
+    assert '[data-live-assistant="1"][data-activity-burst-id="${CSS.escape(burstId)}"]' in normalize_fn
 
 
 def test_done_handler_preserves_live_tool_burst_metadata_for_settled_render():
