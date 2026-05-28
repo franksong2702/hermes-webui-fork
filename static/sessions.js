@@ -1443,11 +1443,33 @@ function _projectInflightMessagesForActivityBursts(inflight){
   const cleanAnchors=anchors
     .map(a=>({id:Number(a&&a.id),textEnd:Number(a&&a.textEnd)}))
     .filter(a=>Number.isFinite(a.id)&&Number.isFinite(a.textEnd)&&a.textEnd>0)
-    .sort((a,b)=>a.textEnd-b.textEnd);
+    .sort((a,b)=>a.textEnd-b.textEnd||a.id-b.id);
   if(!cleanAnchors.length) return messages;
+  const aliasBurstIds=new Map();
+  let lastVisibleBurstId=null;
+  let lastVisibleTextEnd=0;
+  const visibleAnchors=[];
+  for(const anchor of cleanAnchors){
+    const end=Math.min(text.length,anchor.textEnd);
+    if(end<=lastVisibleTextEnd){
+      if(lastVisibleBurstId!==null) aliasBurstIds.set(anchor.id,lastVisibleBurstId);
+      continue;
+    }
+    visibleAnchors.push(anchor);
+    lastVisibleBurstId=anchor.id;
+    lastVisibleTextEnd=end;
+  }
+  if(aliasBurstIds.size&&Array.isArray(inflight.toolCalls)){
+    inflight.toolCalls.forEach(tc=>{
+      if(!tc||tc.activityBurstId===undefined||tc.activityBurstId===null) return;
+      const current=Number(tc.activityBurstId);
+      if(aliasBurstIds.has(current)) tc.activityBurstId=aliasBurstIds.get(current);
+    });
+  }
+  if(!visibleAnchors.length) return messages;
   const projected=[];
   let prev=0;
-  for(const anchor of cleanAnchors){
+  for(const anchor of visibleAnchors){
     const end=Math.max(prev,Math.min(text.length,anchor.textEnd));
     const part=text.slice(prev,end).trim();
     if(part) projected.push({...live,content:part,_activityBurstId:anchor.id});

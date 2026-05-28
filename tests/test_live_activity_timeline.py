@@ -93,6 +93,14 @@ def test_record_activity_boundary_updates_segment_burst_id_to_post_increment():
     assert "if(assistantRow) assistantRow.setAttribute" in boundary_fn
 
 
+def test_record_activity_boundary_does_not_create_empty_duplicate_burst():
+    boundary_fn = MESSAGES_JS.split("function recordActivityBoundary()", 1)[1].split("function ensureAssistantRow", 1)[0]
+    assert "const lastTextEnd=inflight.activityBurstAnchors.reduce" in boundary_fn
+    assert "if(textEnd<=lastTextEnd)" in boundary_fn
+    assert "_currentActivityBurstId+=1;" in boundary_fn
+    assert boundary_fn.find("if(textEnd<=lastTextEnd)") < boundary_fn.find("_currentActivityBurstId+=1;")
+
+
 def test_activity_status_rows_have_quiet_metadata_styling():
     assert ".agent-activity-status{" in STYLE_CSS
     assert "grid-template-columns:18px minmax(0,1fr) auto" in STYLE_CSS
