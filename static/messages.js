@@ -839,9 +839,23 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const inflight=INFLIGHT[activeSid];
     if(!inflight) return;
     if(!Array.isArray(inflight.activityBurstAnchors)) inflight.activityBurstAnchors=[];
+    const textEnd=String(assistantText||'').length;
+    const lastTextEnd=inflight.activityBurstAnchors.reduce((max,a)=>{
+      const n=Number(a&&a.textEnd);
+      return Number.isFinite(n)?Math.max(max,n):max;
+    },0);
+    if(textEnd<=lastTextEnd){
+      // A replayed or duplicate interim boundary with no new visible text must
+      // not create a fresh burst.  Tools after it still belong to the previous
+      // visible segment; otherwise they get a burst id with no DOM/text anchor
+      // and Activity cards pile up at the end of the turn after reattach.
+      inflight.currentActivityBurstId=_currentActivityBurstId;
+      if(assistantRow) assistantRow.setAttribute('data-activity-burst-id',String(_currentActivityBurstId));
+      _throttledPersist();
+      return;
+    }
     _currentActivityBurstId+=1;
     inflight.currentActivityBurstId=_currentActivityBurstId;
-    const textEnd=String(assistantText||'').length;
     const existing=inflight.activityBurstAnchors.find(a=>Number(a&&a.id)===_currentActivityBurstId);
     if(existing) existing.textEnd=textEnd;
     else inflight.activityBurstAnchors.push({id:_currentActivityBurstId,textEnd});
@@ -1006,7 +1020,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         used.add(matchEntry.idx);
         const live=matchEntry.tc||{};
         for(const key of ['activityBurstId','duration','started_at']){
-          if(next[key]===undefined&&live[key]!==undefined) next[key]=live[key];
+          if((next[key]===undefined||next[key]===null)&&live[key]!==undefined&&live[key]!==null) next[key]=live[key];
         }
       }
       return next;
@@ -1986,6 +2000,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(!hasMessageToolMetadata&&d.session.tool_calls&&d.session.tool_calls.length){
             S.toolCalls=_mergeSettledToolCallsWithLiveMetadata(d.session.tool_calls);
           } else {
+            if(hasMessageToolMetadata) S._settledLiveToolMetadata=S.toolCalls.map(tc=>({...tc,done:true}));
             S.toolCalls=hasMessageToolMetadata?[]:S.toolCalls.map(tc=>({...tc,done:true}));
           }
           if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
@@ -2390,7 +2405,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(!hasMessageToolMetadata&&session.tool_calls&&session.tool_calls.length){
           S.toolCalls=_mergeSettledToolCallsWithLiveMetadata(session.tool_calls||[]);
         }else{
-          S.toolCalls=[];
+          if(hasMessageToolMetadata) S._settledLiveToolMetadata=S.toolCalls.map(tc=>({...tc,done:true}));
+          S.toolCalls=hasMessageToolMetadata?[]:S.toolCalls.map(tc=>({...tc,done:true}));
         }
         if(isSessionViewed) _markSessionViewed(completedSid, session.message_count ?? S.messages.length);
         syncTopbar();renderMessages({preserveScroll:true});

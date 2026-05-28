@@ -100,6 +100,54 @@ def test_active_stream_replay_uses_snapshot_cutoff_and_skips_duplicate_queue_ite
     assert stream.unsubscribed is True
 
 
+def test_active_stream_replay_without_journal_keeps_buffered_queue_items(monkeypatch):
+    import api.routes as routes
+
+    class FakeStream:
+        def __init__(self):
+            self.q = queue.Queue()
+            self.q.put_nowait(("token", {"text": "buffered"}, "missing_journal_run:1"))
+            self.q.put_nowait(("stream_end", {}, "missing_journal_run:2"))
+
+        def subscribe_with_snapshot(self):
+            return self.q, {"last_event_id": "missing_journal_run:1", "offline_buffered_events": 1}
+
+        def unsubscribe(self, _q):
+            pass
+
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+        def send_response(self, _code):
+            pass
+
+        def send_header(self, _name, _value):
+            pass
+
+        def end_headers(self):
+            pass
+
+    monkeypatch.setattr(routes, "find_run_summary", lambda _stream_id: None)
+    handler = Handler()
+    previous_streams = dict(routes.STREAMS)
+    routes.STREAMS.clear()
+    routes.STREAMS["missing_journal_run"] = FakeStream()
+    try:
+        routes._handle_sse_stream(
+            handler,
+            urlparse("/api/chat/stream?stream_id=missing_journal_run&replay=1&after_seq=0"),
+        )
+    finally:
+        routes.STREAMS.clear()
+        routes.STREAMS.update(previous_streams)
+
+    body = handler.wfile.getvalue().decode("utf-8")
+    assert "id: missing_journal_run:1\n" in body
+    assert "event: token\n" in body
+    assert "buffered" in body
+
+
 def test_live_sse_uses_each_queue_items_own_event_id():
     import api.routes as routes
     from api.config import create_stream_channel

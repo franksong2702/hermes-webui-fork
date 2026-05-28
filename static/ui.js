@@ -6713,6 +6713,31 @@ function renderMessages(options){
       }
     });
     const derived=[];
+    const liveToolMetadata=Array.isArray(S._settledLiveToolMetadata)
+      ? S._settledLiveToolMetadata
+      : (Array.isArray(S.toolCalls)?S.toolCalls:[]);
+    const liveMetadataByTid=new Map();
+    liveToolMetadata.forEach((tc,idx)=>{
+      if(!tc||typeof tc!=='object') return;
+      const tid=tc.tid||tc.id||tc.tool_call_id||tc.call_id||'';
+      if(tid&&!liveMetadataByTid.has(tid)) liveMetadataByTid.set(tid,{tc,idx});
+    });
+    const usedLiveToolMetadata=new Set();
+    const copyLiveToolMetadata=(next,name,tid)=>{
+      let matchEntry=tid?liveMetadataByTid.get(tid):null;
+      if(!matchEntry){
+        const matchIdx=liveToolMetadata.findIndex((tc,i)=>tc&&!usedLiveToolMetadata.has(i)&&(!name||tc.name===name));
+        if(matchIdx>=0) matchEntry={tc:liveToolMetadata[matchIdx],idx:matchIdx};
+      }
+      if(matchEntry){
+        usedLiveToolMetadata.add(matchEntry.idx);
+        const live=matchEntry.tc||{};
+        for(const key of ['activityBurstId','duration','started_at']){
+          if((next[key]===undefined||next[key]===null)&&live[key]!==undefined&&live[key]!==null) next[key]=live[key];
+        }
+      }
+      return next;
+    };
     fallbackToolSources.forEach(({m,rawIdx})=>{
       // OpenAI format: top-level tool_calls field on the assistant message
       (m.tool_calls||[]).forEach(tc=>{
@@ -6726,7 +6751,7 @@ function renderMessages(options){
         const resultSnippet=resultsByTid[tid]||'';
         let argsSnap={};
         Object.keys(args).slice(0,4).forEach(k=>{ const v=String(args[k]); argsSnap[k]=v.slice(0,120)+(v.length>120?'...':''); });
-        derived.push({
+        derived.push(copyLiveToolMetadata({
           name,
           snippet:_cliToolCardSnippet(resultSnippet,patchSnippet),
           is_diff:_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet),
@@ -6734,7 +6759,7 @@ function renderMessages(options){
           assistant_msg_idx:rawIdx,
           args:argsSnap,
           done:true,
-        });
+        }, name, tid));
       });
       // Anthropic format: tool_use blocks inside assistant content array
       if(Array.isArray(m.content)){
@@ -6749,7 +6774,7 @@ function renderMessages(options){
           if(args && typeof args==='object'){
             Object.keys(args).slice(0,4).forEach(k=>{ const v=String(args[k]); argsSnap[k]=v.slice(0,120)+(v.length>120?'...':''); });
           }
-          derived.push({
+          derived.push(copyLiveToolMetadata({
             name,
             snippet:_cliToolCardSnippet(resultSnippet,patchSnippet),
             is_diff:_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet),
@@ -6757,11 +6782,12 @@ function renderMessages(options){
             assistant_msg_idx:rawIdx,
             args:argsSnap,
             done:true,
-          });
+          }, name, tid));
         });
       }
     });
     if(derived.length) S.toolCalls=derived;
+    if(S._settledLiveToolMetadata) S._settledLiveToolMetadata=null;
   }
   if(!S.busy){
     inner.querySelectorAll('.tool-call-group:not([data-compression-card]),.tool-card-row:not([data-compression-card]),.agent-activity-thinking:not([data-live-thinking="1"])').forEach(el=>el.remove());
@@ -6773,7 +6799,7 @@ function renderMessages(options){
     }
     const assistantIdxs=[...assistantSegments.keys()].sort((a,b)=>a-b);
     const _assistantAnchorForActivity=(aIdx,burstId)=>{
-      const wantedBurst=burstId!==undefined&&burstId!==null&&String(burstId)!==''?String(burstId):'';
+      const wantedBurst=burstId!==undefined&&burstId!==null&&String(burstId)!==''&&String(burstId)!=='0'?String(burstId):'';
       if(wantedBurst){
         for(const seg of assistantSegments.values()){
           if(seg&&seg.getAttribute('data-activity-burst-id')===wantedBurst) return seg;
@@ -6815,7 +6841,7 @@ function renderMessages(options){
       for(const tc of (S.toolCalls||[])){
         if(!tc) continue;
         const aIdx=tc.assistant_msg_idx!==undefined?parseInt(tc.assistant_msg_idx):-1;
-        const burstId=tc.activityBurstId!==undefined&&tc.activityBurstId!==null?String(tc.activityBurstId):'';
+        const burstId=tc.activityBurstId!==undefined&&tc.activityBurstId!==null&&String(tc.activityBurstId)!=='0'?String(tc.activityBurstId):'';
         const key=burstId?`burst:${burstId}`:`assistant:${aIdx}`;
         ensureActivityBucket(key,aIdx,burstId).cards.push(tc);
       }
@@ -7190,7 +7216,7 @@ function appendLiveToolCard(tc){
     return;
   }
   const children=Array.from(inner.children);
-  const burstId=tc.activityBurstId!==undefined&&tc.activityBurstId!==null?String(tc.activityBurstId):'';
+  const burstId=tc.activityBurstId!==undefined&&tc.activityBurstId!==null&&String(tc.activityBurstId)!=='0'?String(tc.activityBurstId):'';
   const burstAnchor=burstId?inner.querySelector(`[data-live-assistant="1"][data-activity-burst-id="${CSS.escape(burstId)}"]`):null;
   const anchor=burstAnchor||children.filter(el=>el.matches('[data-live-assistant="1"],.tool-call-group,.tool-card-row,.agent-activity-thinking')).pop();
   const group=ensureActivityGroup(inner,{live:true,collapsed:true,anchor,activityKey:burstId?`live:${S.activeStreamId}:burst:${burstId}`:_activityKeyForLiveTurn(),burstId});

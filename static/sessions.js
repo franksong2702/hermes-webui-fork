@@ -717,14 +717,6 @@ async function loadSession(sid){
       S.messages=_dropCurrentTurnAssistantMessages(S.messages);
     }
     S.messages=_mergeInflightTailMessages(S.messages,inflightMessages);
-    const journalSeq=_runJournalSeqFromSession(S.session);
-    if(
-      activeStreamId
-      && journalSeq>Number(INFLIGHT[sid].lastRunJournalSeq||0)
-      && _currentTurnHasVisibleOutput(S.messages)
-    ){
-      INFLIGHT[sid].lastRunJournalSeq=journalSeq;
-    }
     S.toolCalls=(INFLIGHT[sid].toolCalls||[]);
     if(_mergePendingSessionMessage(S.session,S.messages)&&inflightMessages===(INFLIGHT[sid].messages||[])){
       INFLIGHT[sid].messages=S.messages;
@@ -1451,11 +1443,33 @@ function _projectInflightMessagesForActivityBursts(inflight){
   const cleanAnchors=anchors
     .map(a=>({id:Number(a&&a.id),textEnd:Number(a&&a.textEnd)}))
     .filter(a=>Number.isFinite(a.id)&&Number.isFinite(a.textEnd)&&a.textEnd>0)
-    .sort((a,b)=>a.textEnd-b.textEnd);
+    .sort((a,b)=>a.textEnd-b.textEnd||a.id-b.id);
   if(!cleanAnchors.length) return messages;
+  const aliasBurstIds=new Map();
+  let lastVisibleBurstId=null;
+  let lastVisibleTextEnd=0;
+  const visibleAnchors=[];
+  for(const anchor of cleanAnchors){
+    const end=Math.min(text.length,anchor.textEnd);
+    if(end<=lastVisibleTextEnd){
+      if(lastVisibleBurstId!==null) aliasBurstIds.set(anchor.id,lastVisibleBurstId);
+      continue;
+    }
+    visibleAnchors.push(anchor);
+    lastVisibleBurstId=anchor.id;
+    lastVisibleTextEnd=end;
+  }
+  if(aliasBurstIds.size&&Array.isArray(inflight.toolCalls)){
+    inflight.toolCalls.forEach(tc=>{
+      if(!tc||tc.activityBurstId===undefined||tc.activityBurstId===null) return;
+      const current=Number(tc.activityBurstId);
+      if(aliasBurstIds.has(current)) tc.activityBurstId=aliasBurstIds.get(current);
+    });
+  }
+  if(!visibleAnchors.length) return messages;
   const projected=[];
   let prev=0;
-  for(const anchor of cleanAnchors){
+  for(const anchor of visibleAnchors){
     const end=Math.max(prev,Math.min(text.length,anchor.textEnd));
     const part=text.slice(prev,end).trim();
     if(part) projected.push({...live,content:part,_activityBurstId:anchor.id});
@@ -1490,32 +1504,6 @@ function _prepareRunningLiveTail(baseMessages,inflightMessages){
     }
   }
   return !!_messageComparableText(live);
-}
-
-function _runJournalSeqFromSession(session){
-  const journal=session&&session.runtime_journal;
-  if(!journal) return 0;
-  const direct=Number(journal.last_seq||0)||0;
-  if(direct>0) return direct;
-  const raw=String(journal.last_event_id||'').trim();
-  const tail=raw.split(':').pop();
-  return Number(tail||0)||0;
-}
-
-function _currentTurnHasVisibleOutput(messages){
-  const list=Array.isArray(messages)?messages:[];
-  let start=-1;
-  for(let i=list.length-1;i>=0;i--){
-    if(list[i]&&list[i].role==='user'){start=i;break;}
-  }
-  if(start<0) return false;
-  for(let i=start+1;i<list.length;i++){
-    const msg=list[i];
-    if(!msg) continue;
-    if(msg.role==='tool') return true;
-    if(msg.role==='assistant'&&_messageComparableText(msg)) return true;
-  }
-  return false;
 }
 
 function _mergeInflightTailMessages(baseMessages, inflightMessages){

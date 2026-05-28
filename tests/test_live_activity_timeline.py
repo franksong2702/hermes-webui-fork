@@ -6,12 +6,32 @@ family.
 """
 
 import pathlib
+import shutil
+import subprocess
 
 
 REPO = pathlib.Path(__file__).parent.parent
 UI_JS = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
 MESSAGES_JS = (REPO / "static" / "messages.js").read_text(encoding="utf-8")
 STYLE_CSS = (REPO / "static" / "style.css").read_text(encoding="utf-8")
+NODE = shutil.which("node")
+
+
+def _function_source(src, name):
+    marker = f"function {name}("
+    start = src.find(marker)
+    assert start != -1
+    brace = src.find("{", start)
+    depth = 0
+    for idx in range(brace, len(src)):
+        ch = src[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:idx + 1]
+    raise AssertionError(f"function {name} did not close")
 
 
 def test_run_activity_group_has_observable_baseline_events():
@@ -77,6 +97,43 @@ def test_done_handler_preserves_live_tool_burst_metadata_for_settled_render():
     assert "S.toolCalls=_mergeSettledToolCallsWithLiveMetadata(session.tool_calls||[]);" in MESSAGES_JS
 
 
+def test_message_tool_metadata_path_keeps_live_burst_metadata_available():
+    assert "S._settledLiveToolMetadata=S.toolCalls.map" in MESSAGES_JS
+    assert "S.toolCalls=hasMessageToolMetadata?[]:S.toolCalls.map" in MESSAGES_JS
+    render_fn = UI_JS.split("const derived=[];", 1)[1].split("if(derived.length) S.toolCalls=derived;", 1)[0]
+    assert "S._settledLiveToolMetadata" in render_fn
+    assert "liveToolMetadata" in render_fn
+    assert "copyLiveToolMetadata" in render_fn
+    assert "activityBurstId" in render_fn
+
+
+def test_settled_tool_metadata_merge_replaces_null_activity_metadata():
+    assert NODE, "node not on PATH"
+    fn = _function_source(MESSAGES_JS, "_mergeSettledToolCallsWithLiveMetadata")
+    script = f"""
+const assert = require('assert');
+const S = {{
+  toolCalls: [{{tid:'tool-1', name:'read_file', activityBurstId:2, duration:1.25, started_at:123}}]
+}};
+{fn}
+const merged = _mergeSettledToolCallsWithLiveMetadata([
+  {{tid:'tool-1', name:'read_file', activityBurstId:null, duration:null, started_at:null}}
+]);
+assert.strictEqual(merged[0].activityBurstId, 2);
+assert.strictEqual(merged[0].duration, 1.25);
+assert.strictEqual(merged[0].started_at, 123);
+"""
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_settled_activity_render_treats_burst_zero_as_unanchored_activity():
+    render_fn = UI_JS.split("if(!S.busy){", 1)[1].split("// Render per-turn duration", 1)[0]
+    assert "String(burstId)!=='0'" in render_fn
+    assert "if(aIdx<assistantIdxs[0]) return null;" in render_fn
+    assert "String(tc.activityBurstId)!=='0'" in render_fn
+
+
 def test_record_activity_boundary_updates_segment_burst_id_to_post_increment():
     """recordActivityBoundary must re-stamp the current assistantRow DOM element with
     the post-increment burst id so that subsequent tool events (which read the same
@@ -91,6 +148,14 @@ def test_record_activity_boundary_updates_segment_burst_id_to_post_increment():
     assert "assistantRow.setAttribute('data-activity-burst-id',String(_currentActivityBurstId))" in boundary_fn
     # The update must be guarded so it only fires when assistantRow exists
     assert "if(assistantRow) assistantRow.setAttribute" in boundary_fn
+
+
+def test_record_activity_boundary_does_not_create_empty_duplicate_burst():
+    boundary_fn = MESSAGES_JS.split("function recordActivityBoundary()", 1)[1].split("function ensureAssistantRow", 1)[0]
+    assert "const lastTextEnd=inflight.activityBurstAnchors.reduce" in boundary_fn
+    assert "if(textEnd<=lastTextEnd)" in boundary_fn
+    assert "_currentActivityBurstId+=1;" in boundary_fn
+    assert boundary_fn.find("if(textEnd<=lastTextEnd)") < boundary_fn.find("_currentActivityBurstId+=1;")
 
 
 def test_activity_status_rows_have_quiet_metadata_styling():

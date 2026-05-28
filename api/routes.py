@@ -7176,14 +7176,16 @@ def _handle_sse_stream(handler, parsed):
     handler.end_headers()
     try:
         if active_replay:
-            _replay_run_journal(
+            replayed = _replay_run_journal(
                 handler,
                 stream_id,
                 _parse_run_journal_after_seq(qs),
                 max_seq=replay_cutoff_seq,
                 emit_stale_interrupted=False,
             )
-            if _run_journal_terminal_at_or_before(stream_id, replay_cutoff_seq):
+            if not replayed:
+                replay_cutoff_seq = None
+            elif _run_journal_terminal_at_or_before(stream_id, replay_cutoff_seq):
                 return True
         while True:
             try:
