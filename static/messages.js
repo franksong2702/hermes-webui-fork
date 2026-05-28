@@ -1020,7 +1020,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         used.add(matchEntry.idx);
         const live=matchEntry.tc||{};
         for(const key of ['activityBurstId','duration','started_at']){
-          if(next[key]===undefined&&live[key]!==undefined) next[key]=live[key];
+          if((next[key]===undefined||next[key]===null)&&live[key]!==undefined&&live[key]!==null) next[key]=live[key];
         }
       }
       return next;
@@ -2000,7 +2000,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(!hasMessageToolMetadata&&d.session.tool_calls&&d.session.tool_calls.length){
             S.toolCalls=_mergeSettledToolCallsWithLiveMetadata(d.session.tool_calls);
           } else {
-            S.toolCalls=hasMessageToolMetadata?[]:S.toolCalls.map(tc=>({...tc,done:true}));
+            S.toolCalls=S.toolCalls.map(tc=>({...tc,done:true}));
           }
           if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
           if(typeof _copyActivityDisclosureState==='function'&&lastAsst){
@@ -2404,7 +2404,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(!hasMessageToolMetadata&&session.tool_calls&&session.tool_calls.length){
           S.toolCalls=_mergeSettledToolCallsWithLiveMetadata(session.tool_calls||[]);
         }else{
-          S.toolCalls=[];
+          S.toolCalls=S.toolCalls.map(tc=>({...tc,done:true}));
         }
         if(isSessionViewed) _markSessionViewed(completedSid, session.message_count ?? S.messages.length);
         syncTopbar();renderMessages({preserveScroll:true});
