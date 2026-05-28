@@ -6216,6 +6216,31 @@ function _cliToolCardHasDiffSnippet(resultSnippet, patchSnippet){
   return !!patchSnippet || _cliLooksLikePatchDiff(resultSnippet);
 }
 
+function _assistantMessageHasVisibleContent(m){
+  if(!m||m.role!=='assistant') return false;
+  const content=m.content;
+  if(typeof content==='string') return !!content.trim();
+  if(!Array.isArray(content)) return false;
+  return content.some(part=>{
+    if(typeof part==='string') return !!part.trim();
+    if(!part||typeof part!=='object') return false;
+    if(part.type==='text'||part.type==='input_text'||part.type==='output_text'){
+      return !!String(part.text||part.content||'').trim();
+    }
+    return false;
+  });
+}
+
+function _assistantToolAnchorIdxForMessage(messages, rawIdx){
+  const list=Array.isArray(messages)?messages:[];
+  const current=list[rawIdx];
+  if(_assistantMessageHasVisibleContent(current)) return rawIdx;
+  for(let idx=rawIdx-1;idx>=0;idx--){
+    if(_assistantMessageHasVisibleContent(list[idx])) return idx;
+  }
+  return rawIdx;
+}
+
 function _captureMessageScrollSnapshot(){
   const el=$('messages');
   if(!el) return null;
@@ -6739,6 +6764,7 @@ function renderMessages(options){
       return next;
     };
     fallbackToolSources.forEach(({m,rawIdx})=>{
+      const assistantToolAnchorIdx=_assistantToolAnchorIdxForMessage(S.messages,rawIdx);
       // OpenAI format: top-level tool_calls field on the assistant message
       (m.tool_calls||[]).forEach(tc=>{
         if(!tc||typeof tc!=='object') return;
@@ -6756,7 +6782,7 @@ function renderMessages(options){
           snippet:_cliToolCardSnippet(resultSnippet,patchSnippet),
           is_diff:_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet),
           tid,
-          assistant_msg_idx:rawIdx,
+          assistant_msg_idx:assistantToolAnchorIdx,
           args:argsSnap,
           done:true,
         }, name, tid));
@@ -6779,7 +6805,7 @@ function renderMessages(options){
             snippet:_cliToolCardSnippet(resultSnippet,patchSnippet),
             is_diff:_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet),
             tid,
-            assistant_msg_idx:rawIdx,
+            assistant_msg_idx:assistantToolAnchorIdx,
             args:argsSnap,
             done:true,
           }, name, tid));

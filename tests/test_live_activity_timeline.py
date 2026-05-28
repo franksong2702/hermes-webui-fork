@@ -107,6 +107,35 @@ def test_message_tool_metadata_path_keeps_live_burst_metadata_available():
     assert "activityBurstId" in render_fn
 
 
+def test_message_tool_metadata_empty_assistant_tools_reuse_previous_visible_anchor():
+    assert "function _assistantToolAnchorIdxForMessage(messages, rawIdx)" in UI_JS
+    render_fn = UI_JS.split("const derived=[];", 1)[1].split("if(derived.length) S.toolCalls=derived;", 1)[0]
+    assert "const assistantToolAnchorIdx=_assistantToolAnchorIdxForMessage(S.messages,rawIdx);" in render_fn
+    assert "assistant_msg_idx:assistantToolAnchorIdx" in render_fn
+
+    assert NODE, "node not on PATH"
+    has_visible_fn = _function_source(UI_JS, "_assistantMessageHasVisibleContent")
+    anchor_fn = _function_source(UI_JS, "_assistantToolAnchorIdxForMessage")
+    script = f"""
+const assert = require('assert');
+{has_visible_fn}
+{anchor_fn}
+const messages = [
+  {{role:'assistant', content:'visible progress'}},
+  {{role:'assistant', content:'', tool_calls:[{{id:'call-1'}}]}},
+  {{role:'assistant', content:'', tool_calls:[{{id:'call-2'}}]}},
+  {{role:'assistant', content:'next progress', tool_calls:[{{id:'call-3'}}]}},
+  {{role:'assistant', content:[{{type:'tool_use', id:'call-4', name:'read_file'}}]}},
+];
+assert.strictEqual(_assistantToolAnchorIdxForMessage(messages, 1), 0);
+assert.strictEqual(_assistantToolAnchorIdxForMessage(messages, 2), 0);
+assert.strictEqual(_assistantToolAnchorIdxForMessage(messages, 3), 3);
+assert.strictEqual(_assistantToolAnchorIdxForMessage(messages, 4), 3);
+"""
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
 def test_settled_tool_metadata_merge_replaces_null_activity_metadata():
     assert NODE, "node not on PATH"
     fn = _function_source(MESSAGES_JS, "_mergeSettledToolCallsWithLiveMetadata")
