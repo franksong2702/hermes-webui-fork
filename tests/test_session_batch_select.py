@@ -48,6 +48,20 @@ def test_batch_select_intercepts_navigation():
         "Pointerup handler should call toggleSessionSelect in select mode"
 
 
+def test_batch_checkbox_sets_selection_without_row_double_toggle():
+    """Clicking the checkbox itself must not also trigger row-level toggling."""
+    with open('static/sessions.js') as f:
+        src = f.read()
+    assert 'function setSessionSelected(sid, selected)' in src, \
+        "Checkbox changes should set explicit state instead of toggling blindly"
+    assert 'cb.onchange=(e)=>{e.stopPropagation();setSessionSelected(s.session_id,cb.checked);};' in src, \
+        "Checkbox change must use its checked state"
+    assert 'cb.onpointerup=(e)=>{e.stopPropagation();};' in src, \
+        "Checkbox pointerup must not bubble to the row pointerup handler"
+    assert 'cbWrapper.onpointerup=(e)=>{e.stopPropagation();};' in src, \
+        "Checkbox wrapper pointerup must not bubble to the row pointerup handler"
+
+
 def test_batch_select_escape_handler():
     """Verify Escape key exits select mode."""
     with open('static/sessions.js') as f:
@@ -71,6 +85,86 @@ def test_batch_select_bar_element():
     assert 'batchActionBar' in src, "Missing batchActionBar element"
     assert 'batch-action-bar' in src, "Missing batch-action-bar CSS class"
     assert 'batch-action-btn' in src, "Missing batch-action-btn class"
+
+
+def test_batch_action_bar_overrides_css_hidden_state():
+    """Selected sessions must make the fixed action bar visible."""
+    with open('static/sessions.js') as f:
+        src = f.read()
+    assert "if(count>0){_renderBatchActionBar();}" in src, \
+        "Updating selected count must render action buttons, not just reveal an empty bar"
+    assert "t('session_selected_count',_selectedSessions.size)" in src, \
+        "Selected count must pass the selected session count to i18n"
+    assert "t('session_batch_archive_confirm',ids.length)" in src, \
+        "Batch archive confirmation must pass selected session count to i18n"
+    assert "t('session_batch_delete_confirm',ids.length)" in src, \
+        "Batch delete confirmation must pass selected session count to i18n"
+    assert "bar.innerHTML='';bar.style.display=_selectedSessions.size>0?'flex':'none'" in src, \
+        "Rendering the action bar must explicitly show it when selections exist"
+    assert "batchBar.style.display='flex'" in src, \
+        "Session list render must explicitly show the action bar in select mode"
+
+
+def test_batch_action_bar_is_sidebar_inline_not_global_footer():
+    """Batch actions should appear in the session list, not over the composer."""
+    with open('static/sessions.js') as f:
+        js = f.read()
+    with open('static/style.css') as f:
+        css = f.read()
+    assert "list.appendChild(batchBar)" in js, \
+        "Batch action bar should be rendered inside the session list"
+    assert "document.body.appendChild(batchBar)" not in js, \
+        "Batch action bar must not be mounted as a global footer"
+    assert ".batch-action-bar{display:none;margin:" in css, \
+        "Batch action bar should use inline sidebar spacing"
+    assert "position:fixed" not in css[css.find(".batch-action-bar{"):css.find(".batch-count{")], \
+        "Batch action bar must not be fixed to the bottom of the viewport"
+
+
+def test_batch_project_picker_is_anchored_to_batch_actions():
+    """Batch move project picker should open inside the sidebar action bar."""
+    with open('static/sessions.js') as f:
+        js = f.read()
+    with open('static/style.css') as f:
+        css = f.read()
+    assert "const bar=$('batchActionBar');if(!bar)return;" in js, \
+        "Batch project picker should anchor to the batch action bar"
+    assert "picker.className='project-picker batch-project-picker'" in js, \
+        "Batch project picker needs its own inline styling hook"
+    assert "bar.appendChild(picker)" in js, \
+        "Batch project picker should render inside the batch action bar"
+    assert "document.body.appendChild(picker);picker.style.cssText='position:fixed" not in js, \
+        "Batch project picker must not use the old global fixed placement"
+    assert ".batch-action-bar .batch-project-picker{position:static;" in css, \
+        "Batch project picker should override the shared absolute project picker style"
+    assert css.find(".project-picker{") < css.find(".batch-action-bar .batch-project-picker{"), \
+        "Batch project picker override must come after the shared project picker rule"
+
+
+def test_streaming_zero_message_sessions_stay_visible_after_reload():
+    """In-flight sessions may have zero saved messages during reload recovery."""
+    with open('static/sessions.js') as f:
+        src = f.read()
+    assert "_isSessionEffectivelyStreaming(s)" in src, \
+        "Streaming sessions must bypass the zero-message sidebar filter"
+    assert "!!s.active_stream_id" in src, \
+        "Sessions with persisted active stream IDs must remain visible after reload"
+    assert "!!s.pending_user_message" in src, \
+        "Sessions with pending user turns must remain visible after reload"
+
+
+def test_boot_does_not_drop_zero_message_inflight_session():
+    """Reloading /session/<id> during a running turn must keep the session open."""
+    with open('static/boot.js') as f:
+        src = f.read()
+    assert "const _restoredInFlight = S.session && (" in src, \
+        "Boot must detect restored in-flight sessions before ephemeral cleanup"
+    assert "S.session.active_stream_id" in src, \
+        "Boot must treat active stream IDs as real sessions"
+    assert "S.session.pending_user_message" in src, \
+        "Boot must treat pending user messages as real sessions"
+    assert "&& !_restoredInFlight" in src, \
+        "Zero-message cleanup must not run for in-flight sessions"
 
 
 def test_batch_select_i18n_keys():
@@ -103,7 +197,17 @@ def test_batch_select_i18n_keys():
     # Count occurrences - each key should appear in all 7 locales
     for key in required_keys:
         count = src.count(f"{key}:")
-        assert count == 7, f"Key '{key}' found {count} times, expected 7 (one per locale)"
+        assert count >= 8, f"Key '{key}' found {count} times, expected >= 8 (one per locale) (one per locale)"
+
+
+def test_i18n_string_placeholder_interpolation_supported():
+    """String-valued translations with {0} placeholders should interpolate args."""
+    with open('static/i18n.js') as f:
+        src = f.read()
+    assert "String(val).replace(/\\{(\\d+)\\}/g" in src, \
+        "t() must interpolate {0}-style placeholders for string-valued translations"
+    assert "Object.prototype.hasOwnProperty.call(args, idx)" in src, \
+        "t() must preserve unknown placeholders instead of replacing with undefined"
 
 
 def test_batch_select_css_exists():
