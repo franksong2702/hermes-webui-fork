@@ -7305,6 +7305,7 @@ def _handle_sse_stream(handler, parsed):
     handler.send_header("X-Accel-Buffering", "no")
     handler.send_header("Connection", "close")
     handler.end_headers()
+    stream_get = getattr(stream, "get_with_event_id", None)
     try:
         if active_replay:
             replayed = _replay_run_journal(
@@ -7320,12 +7321,21 @@ def _handle_sse_stream(handler, parsed):
                 return True
         while True:
             try:
-                item = subscriber.get(timeout=_SSE_HEARTBEAT_INTERVAL_SECONDS)
+                if callable(stream_get):
+                    item, stream_item_event_id = stream_get(
+                        subscriber,
+                        timeout=_SSE_HEARTBEAT_INTERVAL_SECONDS,
+                    )
+                else:
+                    item = subscriber.get(timeout=_SSE_HEARTBEAT_INTERVAL_SECONDS)
+                    stream_item_event_id = None
             except queue.Empty:
                 handler.wfile.write(b": heartbeat\n\n")
                 handler.wfile.flush()
                 continue
             event, data, event_id = _stream_queue_item_parts(item)
+            if event_id is None:
+                event_id = stream_item_event_id
             if active_replay and replay_cutoff_seq is not None:
                 item_run_id, item_seq = _parse_stream_event_id_parts(event_id)
                 if item_seq is not None:

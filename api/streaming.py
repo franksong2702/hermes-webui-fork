@@ -3951,7 +3951,7 @@ def _run_agent_streaming(
             except Exception:
                 logger.debug("Failed to append run journal event %s for stream %s", event, stream_id, exc_info=True)
         try:
-            q.put_nowait((event, data, event_id))
+            q.put_nowait((event, data))
         except Exception:
             logger.debug("Failed to put event to queue")
 

@@ -4587,26 +4587,52 @@ class StreamChannel:
     def __init__(self):
         self._lock = threading.Lock()
         self._subscribers: list[queue.Queue] = []
-        self._offline_buffer: list[tuple[str, object, str | None]] = []
+        self._offline_buffer: list[tuple[str, object]] = []
+        self._offline_buffer_event_ids: list[str | None] = []
+        self._subscriber_event_ids: dict[queue.Queue, collections.deque[str | None]] = {}
+        self._last_event_id: str | None = None
 
-    def _normalize_offline_item(self, item):
-        if isinstance(item, tuple):
-            if len(item) >= 3:
-                return item[0], item[1], (str(item[2]) if item[2] else None)
-            if len(item) >= 2:
-                return item[0], item[1], None
-        return str(item), None, None
+    @staticmethod
+    def _event_id_from_item(item) -> str | None:
+        if isinstance(item, tuple) and len(item) >= 3:
+            event_id = item[2]
+            return str(event_id) if event_id else None
+        return None
+
+    @staticmethod
+    def _normalize_item(item) -> tuple[tuple[str, object], str | None]:
+        if isinstance(item, tuple) and len(item) >= 2:
+            return (item[0], item[1]), StreamChannel._event_id_from_item(item)
+        return ("message", item), None
+
+    @staticmethod
+    def _strip_event_id_from_item(item) -> tuple[str, object]:
+        return StreamChannel._normalize_item(item)[0]
 
     def subscribe_with_snapshot(self) -> tuple[queue.Queue, dict[str, object]]:
         q: queue.Queue = queue.Queue()
         with self._lock:
+            q_ids = collections.deque(
+                str(event_id) if event_id else None
+                for event_id in self._offline_buffer_event_ids
+            )
+            self._subscriber_event_ids[q] = q_ids
+            # Replay buffered events to the new subscriber INSIDE the lock so a
+            # concurrent put_nowait() can't broadcast a newer event before we
+            # finish replaying the older buffered tail. queue.Queue.put_nowait
+            # is non-blocking on an unbounded queue, so holding the lock here
+            # is safe. Per Opus advisor on stage-292.
             for item in self._offline_buffer:
                 q.put_nowait(item)
-            last_event_id = self._offline_buffer[-1][2] if self._offline_buffer else None
             self._subscribers.append(q)
         return q, {
-            "last_event_id": last_event_id,
             "offline_buffered_events": len(self._offline_buffer),
+            "offline_buffered_event_ids": [
+                event_id
+                for event_id in self._offline_buffer_event_ids
+                if event_id
+            ],
+            "last_event_id": self._last_event_id,
         }
 
     def subscribe(self) -> queue.Queue:
@@ -4622,23 +4648,66 @@ class StreamChannel:
             self._subscribers.append(q)
         return q
 
+    def get_with_event_id(
+        self,
+        subscriber: queue.Queue,
+        timeout: float | None = None,
+    ) -> tuple[tuple[str, object], str | None]:
+        if timeout is None:
+            item = subscriber.get()
+        else:
+            item = subscriber.get(timeout=timeout)
+
+        event_id = None
+        with self._lock:
+            q_ids = self._subscriber_event_ids.get(subscriber)
+            if q_ids:
+                try:
+                    event_id = q_ids.popleft()
+                except IndexError:
+                    event_id = None
+                if not q_ids:
+                    self._subscriber_event_ids.pop(subscriber, None)
+
+        if event_id is None:
+            normalized_item, parsed_event_id = StreamChannel._normalize_item(item)
+            return normalized_item, parsed_event_id
+        return StreamChannel._strip_event_id_from_item(item), event_id
+
     def unsubscribe(self, q: queue.Queue) -> None:
         with self._lock:
             try:
                 self._subscribers.remove(q)
             except ValueError:
                 pass
+            self._subscriber_event_ids.pop(q, None)
 
     def put_nowait(self, item: tuple[str, object, str | None] | tuple[str, object]) -> None:
+        normalized_item, event_id = self._normalize_item(item)
         with self._lock:
-            item = self._normalize_offline_item(item)
+            if event_id:
+                self._last_event_id = event_id
             subscribers = list(self._subscribers)
             if not subscribers:
-                self._offline_buffer.append(item)
+                self._offline_buffer.append(normalized_item)
+                self._offline_buffer_event_ids.append(event_id)
                 return
             self._offline_buffer.clear()
+            self._offline_buffer_event_ids.clear()
         for q in subscribers:
-            q.put_nowait(item)
+            with self._lock:
+                q_ids = self._subscriber_event_ids.setdefault(q, collections.deque())
+                q_ids.append(event_id)
+            try:
+                q.put_nowait(normalized_item)
+            except queue.Full:
+                with self._lock:
+                    q_ids = self._subscriber_event_ids.get(q)
+                    if q_ids:
+                        try:
+                            q_ids.pop()
+                        except IndexError:
+                            pass
 
     def diagnostic_snapshot(self) -> dict[str, int]:
         """Return non-sensitive stream observation counters for health checks."""
@@ -4646,6 +4715,12 @@ class StreamChannel:
             return {
                 "subscriber_count": len(self._subscribers),
                 "offline_buffered_events": len(self._offline_buffer),
+                "offline_buffered_event_ids": [
+                    event_id
+                    for event_id in self._offline_buffer_event_ids
+                    if event_id
+                ],
+                "last_event_id": self._last_event_id,
             }
 
 
