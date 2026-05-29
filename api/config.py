@@ -4591,7 +4591,9 @@ class StreamChannel:
     def __init__(self):
         self._lock = threading.Lock()
         self._subscribers: list[queue.Queue] = []
-        self._offline_buffer: list[tuple[str, object] | tuple[str, object, str | None]] = []
+        self._offline_buffer: list[tuple[str, object]] = []
+        self._offline_buffer_event_ids: list[str | None] = []
+        self._subscriber_event_ids: dict[queue.Queue, collections.deque[str | None]] = {}
         self._last_event_id: str | None = None
 
     @staticmethod
@@ -4601,6 +4603,16 @@ class StreamChannel:
             return str(event_id) if event_id else None
         return None
 
+    @staticmethod
+    def _normalize_item(item) -> tuple[tuple[str, object], str | None]:
+        if not isinstance(item, tuple) or len(item) < 2:
+            return ("message", item), None
+        return (item[0], item[1]), StreamChannel._event_id_from_item(item)
+
+    @staticmethod
+    def _strip_event_id_from_item(item) -> tuple[str, object]:
+        return StreamChannel._normalize_item(item)[0]
+
     def subscribe(self) -> queue.Queue:
         q, _snapshot = self.subscribe_with_snapshot()
         return q
@@ -4608,6 +4620,8 @@ class StreamChannel:
     def subscribe_with_snapshot(self) -> tuple[queue.Queue, dict[str, object]]:
         q: queue.Queue = queue.Queue()
         with self._lock:
+            q_ids = collections.deque(str(event_id) if event_id else None for event_id in self._offline_buffer_event_ids)
+            self._subscriber_event_ids[q] = q_ids
             # Replay buffered events to the new subscriber INSIDE the lock so a
             # concurrent put_nowait() can't broadcast a newer event before we
             # finish replaying the older buffered tail. queue.Queue.put_nowait
@@ -4615,13 +4629,16 @@ class StreamChannel:
             # is safe. Per Opus advisor on stage-292.
             for item in self._offline_buffer:
                 q.put_nowait(item)
+                # Keep per-queue side-channel IDs in the same order as replayed
+                # events so active-replay filtering still works even though
+                # subscriber traffic is 2-tuples.
             self._subscribers.append(q)
             snapshot = {
                 "subscriber_count": len(self._subscribers),
                 "offline_buffered_events": len(self._offline_buffer),
                 "offline_buffered_event_ids": [
                     event_id
-                    for event_id in (self._event_id_from_item(item) for item in self._offline_buffer)
+                    for event_id in self._offline_buffer_event_ids
                     if event_id
                 ],
                 "last_event_id": self._last_event_id,
@@ -4634,19 +4651,56 @@ class StreamChannel:
                 self._subscribers.remove(q)
             except ValueError:
                 pass
+            self._subscriber_event_ids.pop(q, None)
 
     def put_nowait(self, item: tuple[str, object] | tuple[str, object, str | None]) -> None:
+        normalized_item, event_id = self._normalize_item(item)
         with self._lock:
-            event_id = self._event_id_from_item(item)
             if event_id:
                 self._last_event_id = event_id
             subscribers = list(self._subscribers)
             if not subscribers:
-                self._offline_buffer.append(item)
+                self._offline_buffer.append(normalized_item)
+                self._offline_buffer_event_ids.append(event_id)
                 return
             self._offline_buffer.clear()
+            self._offline_buffer_event_ids.clear()
         for q in subscribers:
-            q.put_nowait(item)
+            with self._lock:
+                q_ids = self._subscriber_event_ids.setdefault(q, collections.deque())
+                q_ids.append(event_id)
+            try:
+                q.put_nowait(normalized_item)
+            except queue.Full:
+                with self._lock:
+                    q_ids = self._subscriber_event_ids.get(q)
+                    if q_ids:
+                        try:
+                            q_ids.pop()
+                        except IndexError:
+                            pass
+
+    def get_with_event_id(self, subscriber: queue.Queue, timeout: float | None = None) -> tuple[tuple[str, object], str | None]:
+        if timeout is None:
+            item = subscriber.get()
+        else:
+            item = subscriber.get(timeout=timeout)
+
+        event_id = None
+        with self._lock:
+            q_ids = self._subscriber_event_ids.get(subscriber)
+            if q_ids:
+                try:
+                    event_id = q_ids.popleft()
+                except IndexError:
+                    event_id = None
+                if not q_ids:
+                    self._subscriber_event_ids.pop(subscriber, None)
+
+        if event_id is None:
+            normalized_item, parsed_event_id = self._normalize_item(item)
+            return normalized_item, parsed_event_id
+        return self._strip_event_id_from_item(item), event_id
 
     def diagnostic_snapshot(self) -> dict[str, int]:
         """Return non-sensitive stream observation counters for health checks."""
@@ -4656,7 +4710,7 @@ class StreamChannel:
                 "offline_buffered_events": len(self._offline_buffer),
                 "offline_buffered_event_ids": [
                     event_id
-                    for event_id in (self._event_id_from_item(item) for item in self._offline_buffer)
+                    for event_id in self._offline_buffer_event_ids
                     if event_id
                 ],
                 "last_event_id": self._last_event_id,
