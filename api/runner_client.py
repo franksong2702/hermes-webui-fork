@@ -35,6 +35,14 @@ class HttpRunnerClient:
         self.base_url = str(base_url or "").strip().rstrip("/")
         if not self.base_url:
             raise ValueError("runner base_url is required")
+        # Hardening: the runner endpoint is operator-configured, but reject any
+        # non-HTTP(S) scheme so a misconfigured HERMES_WEBUI_RUNNER_BASE_URL
+        # (e.g. file:///etc/passwd or ftp://) can never be handed to urlopen.
+        _scheme = urllib.parse.urlsplit(self.base_url).scheme.lower()
+        if _scheme not in ("http", "https"):
+            raise ValueError(
+                f"runner base_url must be http(s); got scheme '{_scheme or '(none)'}'"
+            )
         self.api_key = str(api_key or "").strip()
 
     @classmethod
@@ -118,9 +126,18 @@ class HttpRunnerClient:
         )
         return self._request_json(req)
 
+    def _opener(self) -> urllib.request.OpenerDirector:
+        # Hardening: do NOT follow redirects. A misbehaving/compromised runner
+        # returning 3xx Location could otherwise smuggle the Bearer token to
+        # another host. Treat any redirect as an error instead.
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+        return urllib.request.build_opener(_NoRedirect)
+
     def _request_json(self, req: urllib.request.Request) -> dict[str, Any]:
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with self._opener().open(req, timeout=60) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             try:

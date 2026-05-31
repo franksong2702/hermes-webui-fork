@@ -1,4 +1,5 @@
 import json
+import urllib.request
 
 import pytest
 
@@ -20,6 +21,22 @@ class FakeResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 
+class _FakeOpener:
+    """Stand-in for the no-redirect opener: routes .open() to a fake urlopen."""
+
+    def __init__(self, fake_urlopen):
+        self._fake = fake_urlopen
+
+    def open(self, req, timeout=0):
+        return self._fake(req, timeout=timeout)
+
+
+def _patch_opener(monkeypatch, fake_urlopen):
+    monkeypatch.setattr(
+        HttpRunnerClient, "_opener", lambda self: _FakeOpener(fake_urlopen)
+    )
+
+
 def test_runner_client_is_default_off_without_endpoint():
     assert runner_client_configured({}) is False
     with pytest.raises(NotImplementedError, match="runner-local chat backend is not configured"):
@@ -36,7 +53,7 @@ def test_runner_client_start_run_posts_explicit_boundary_payload(monkeypatch):
         captured["body"] = json.loads(req.data.decode("utf-8"))
         return FakeResponse({"run_id": "run-1", "stream_id": "run-1", "status": "running"})
 
-    monkeypatch.setattr("api.runner_client.urllib.request.urlopen", fake_urlopen)
+    _patch_opener(monkeypatch, fake_urlopen)
     client = HttpRunnerClient(base_url="http://runner.local/", api_key="secret")
 
     result = client.start_run(
@@ -79,7 +96,7 @@ def test_runner_client_maps_observe_status_and_controls(monkeypatch):
         calls.append((req.get_method(), req.full_url, json.loads(req.data.decode("utf-8")) if req.data else None))
         return FakeResponse({"ok": True, "status": "accepted"})
 
-    monkeypatch.setattr("api.runner_client.urllib.request.urlopen", fake_urlopen)
+    _patch_opener(monkeypatch, fake_urlopen)
     client = HttpRunnerClient(base_url="http://runner.local")
 
     client.observe_run("run/1", cursor="event:2")
@@ -106,6 +123,34 @@ def test_runner_client_rejects_non_object_json(monkeypatch):
         def read(self):
             return b"[]"
 
-    monkeypatch.setattr("api.runner_client.urllib.request.urlopen", lambda req, timeout=0: ArrayResponse({}))
+    _patch_opener(monkeypatch, lambda req, timeout=0: ArrayResponse({}))
     with pytest.raises(RunnerClientError, match="non-object"):
         HttpRunnerClient(base_url="http://runner.local").get_run("r1")
+
+
+def test_runner_client_rejects_non_http_scheme():
+    """Hardening: a misconfigured base_url with a non-http(s) scheme must be
+    rejected at construction so it can never reach urlopen (e.g. file://)."""
+    for bad in ("file:///etc/passwd", "ftp://runner.local/x", "/no/scheme"):
+        with pytest.raises(ValueError, match="http"):
+            HttpRunnerClient(base_url=bad)
+    # http and https are accepted.
+    assert HttpRunnerClient(base_url="http://runner.local").base_url == "http://runner.local"
+    assert HttpRunnerClient(base_url="https://runner.local/").base_url == "https://runner.local"
+
+
+def test_runner_client_opener_does_not_follow_redirects():
+    """Hardening: the request opener must NOT follow 3xx redirects, so a
+    misbehaving runner cannot smuggle the Bearer token to another host."""
+    opener = HttpRunnerClient(base_url="http://runner.local")._opener()
+    redirect_handlers = [
+        h for h in opener.handlers
+        if isinstance(h, urllib.request.HTTPRedirectHandler)
+    ]
+    assert redirect_handlers, "expected a redirect handler on the opener"
+    # The overridden handler returns None from redirect_request → urllib raises
+    # instead of following the redirect.
+    assert all(
+        h.redirect_request(None, None, 302, "Found", {}, "http://evil.example") is None
+        for h in redirect_handlers
+    )
