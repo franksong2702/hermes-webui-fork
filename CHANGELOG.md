@@ -3,6 +3,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Streaming finalization now treats compression-exhausted or tool-tail agent results as errors instead of completed turns, so long tool-heavy sessions do not appear done when Hermes Agent failed before writing a final assistant answer.
+- Completed transcripts no longer render internal `[CONTEXT COMPACTION — REFERENCE ONLY]` reference cards; compression-exhausted runs now surface as explicit errors instead.
+
 ## [v0.51.192] — 2026-05-31 — Release FL (stage-batch4 — per-model context_length default-only guard)
 
 ### Fixed
