@@ -753,7 +753,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return typeof _isPreservedCompressionTaskListMarkerOnlyText==='function'
       && _isPreservedCompressionTaskListMarkerOnlyText(text);
   }
-  function _isRecoveryControlMessageText(text){
+  function _streamRecoveryControlMessageText(text){
     const normalized=String(text||'').replace(/\s+/g,' ').trim();
     if(!normalized) return false;
     const systemRecovery=/^\[System:/i.test(normalized)
@@ -762,16 +762,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const backendRecovery=/^the live worker stopped before this run finished\.?$/i.test(normalized);
     return !!(systemRecovery || backendRecovery);
   }
-  function _isRecoveryControlMessage(m){
+  function _streamRecoveryControlMessage(m){
     if(!m||m.role==='tool') return false;
     if(m.recovery_control===true) return true;
     const text=String(typeof msgContent==='function'?msgContent(m):(m.content||''));
-    if(_isRecoveryControlMessageText(text)) return true;
+    if(_streamRecoveryControlMessageText(text)) return true;
     return !!(m.provider_details_label && String(m.provider_details_label).toLowerCase()==='interruption details');
   }
   function _filterRecoveryControlMessages(messages){
     if(!Array.isArray(messages)) return [];
-    return messages.filter((m)=>!_isRecoveryControlMessage(m));
+    return messages.filter((m)=>!_streamRecoveryControlMessage(m));
   }
   function _replaceMarkerOnlyAssistantWithStreamError(messages){
     if(!Array.isArray(messages)) return false;
@@ -2200,7 +2200,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const isModelNotFound=d.type==='model_not_found';
           const isCancelled=d.type==='cancelled';
           const isInterrupted=d.type==='interrupted';
-          isRecoveryControlMessage=isInterrupted && (d.recovery_control===true || _isRecoveryControlMessageText(d.message));
+          isRecoveryControlMessage=isInterrupted && (d.recovery_control===true || _streamRecoveryControlMessageText(d.message));
           const isNoResponse=d.type==='no_response'||d.type==='silent_failure';
           const label=isCancelled?'Task cancelled':isInterrupted?'Response interrupted':isQuotaExhausted?'Out of credits':isRateLimit?'Rate limit reached':isGatewayAuthError?(typeof t==='function'?t('gateway_auth_label'):'Gateway authentication failed'):isAuthMismatch?(typeof t==='function'?t('provider_mismatch_label'):'Provider mismatch'):isModelNotFound?(typeof t==='function'?t('model_not_found_label'):'Model not found'):isNoResponse?'No response from provider':'Error';
           const hint=d.hint?`\n\n*${d.hint}*`:'';

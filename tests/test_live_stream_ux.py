@@ -18,7 +18,7 @@ def test_done_and_restore_filters_recovery_messages_from_frontend_state():
 
 
 def test_apererror_recovers_on_recovery_control_event():
-    assert "isRecoveryControlMessage=isInterrupted && (d.recovery_control===true || _isRecoveryControlMessageText(d.message));" in MESSAGES_JS
+    assert "isRecoveryControlMessage=isInterrupted && (d.recovery_control===true || _streamRecoveryControlMessageText(d.message));" in MESSAGES_JS
     assert "Stream recovery signal received. Restoring transcript..." in MESSAGES_JS
     assert "if(await _restoreSettledSession(source)) return;" in MESSAGES_JS
 
