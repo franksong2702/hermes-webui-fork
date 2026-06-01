@@ -1,0 +1,26 @@
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+MESSAGES_JS = (ROOT / "static" / "messages.js").read_text(encoding="utf-8")
+UI_JS = (ROOT / "static" / "ui.js").read_text(encoding="utf-8")
+RUN_JOURNAL_PY = (ROOT / "api" / "run_journal.py").read_text(encoding="utf-8")
+
+def test_stale_interrupted_event_marks_recovery_control():
+    assert "\"recovery_control\": True" in RUN_JOURNAL_PY
+
+
+def test_done_and_restore_filters_recovery_messages_from_frontend_state():
+    assert "_filterRecoveryControlMessages(S.messages || [])" in MESSAGES_JS
+
+
+def test_apererror_recovers_on_recovery_control_event():
+    assert "isRecoveryControlMessage=isInterrupted && (d.recovery_control===true || _isRecoveryControlMessageText(d.message));" in MESSAGES_JS
+    assert "Stream recovery signal received. Restoring transcript..." in MESSAGES_JS
+    assert "if(await _restoreSettledSession(source)) return;" in MESSAGES_JS
+
+
+def test_ui_rejects_recovery_control_as_visible_assistant_content():
+    assert "function _isRecoveryControlMessageText" in UI_JS
+    assert "function _assistantMessageHasVisibleContent" in UI_JS
+    assert "if(_isRecoveryControlMessage(m)) return false;" in UI_JS
+    assert "_assistantMessageHasVisibleContent(m)" in UI_JS
