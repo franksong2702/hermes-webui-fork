@@ -5407,15 +5407,15 @@ function msgContent(m){
 function _isRecoveryControlMessageText(text){
   const normalized=String(text||'').replace(/\s+/g,' ').trim();
   if(!normalized) return false;
-  if(/^\[System:/i.test(normalized) && /continue exactly where you left off/i.test(normalized)){
-    return true;
-  }
-  return /the live worker stopped before this run finished\./i.test(normalized)
-    || /previous response was cut off by a network error/i.test(normalized)
-    || /continue exactly where you left off/i.test(normalized);
+  const systemRecovery=/^\[System:/i.test(normalized)
+    && /previous response was cut off by a network error/i.test(normalized)
+    && /continue exactly where you left off/i.test(normalized);
+  const backendRecovery=/^the live worker stopped before this run finished\.?$/i.test(normalized);
+  return !!(systemRecovery || backendRecovery);
 }
 function _isRecoveryControlMessage(m){
-  if(!m||m.role!=='assistant') return false;
+  if(!m||m.role==='tool') return false;
+  if(m.recovery_control===true) return true;
   if(_isRecoveryControlMessageText(msgContent(m)||String(m.content||''))) return true;
   return !!(m.provider_details_label && String(m.provider_details_label).toLowerCase()==='interruption details');
 }
@@ -6377,6 +6377,7 @@ function renderMessages(options){
     if(!m||!m.role||m.role==='tool')return false;
     if(_isContextCompactionMessage(m)) return false;
     if(_isPreservedCompressionTaskListMessage(m)) return false;
+    if(_isRecoveryControlMessage(m)) return false;
     if(m.role==='assistant'){
       const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
       const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
@@ -6408,6 +6409,7 @@ function renderMessages(options){
     for(const m of S.messages){
       if(!m||!m.role||m.role==='tool'){ri++;continue;}
       if(_isPreservedCompressionTaskListMessage(m)){ri++;continue;}
+      if(_isRecoveryControlMessage(m)){ri++;continue;}
       const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
       const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
       if(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||_messageHasReasoningPayload(m)||_assistantMessageHasVisibleContent(m)))) rebuilt.push({m,rawIdx:ri});

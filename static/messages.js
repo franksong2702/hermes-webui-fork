@@ -756,15 +756,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _isRecoveryControlMessageText(text){
     const normalized=String(text||'').replace(/\s+/g,' ').trim();
     if(!normalized) return false;
-    if(/^\[System:/i.test(normalized) && /continue exactly where you left off/i.test(normalized)){
-      return true;
-    }
-    return /the live worker stopped before this run finished\./i.test(normalized)
-      || /previous response was cut off by a network error/i.test(normalized)
-      || /continue exactly where you left off/i.test(normalized);
+    const systemRecovery=/^\[System:/i.test(normalized)
+      && /previous response was cut off by a network error/i.test(normalized)
+      && /continue exactly where you left off/i.test(normalized);
+    const backendRecovery=/^the live worker stopped before this run finished\.?$/i.test(normalized);
+    return !!(systemRecovery || backendRecovery);
   }
   function _isRecoveryControlMessage(m){
-    if(!m||m.role!=='assistant') return false;
+    if(!m||m.role==='tool') return false;
+    if(m.recovery_control===true) return true;
     const text=String(typeof msgContent==='function'?msgContent(m):(m.content||''));
     if(_isRecoveryControlMessageText(text)) return true;
     return !!(m.provider_details_label && String(m.provider_details_label).toLowerCase()==='interruption details');
