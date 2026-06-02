@@ -424,8 +424,9 @@ def handle_workspace_upload(handler):
         # outside the root (read trust model). For an UPLOAD target that's not
         # acceptable: a planted symlink subpath would let mkdir() + writes create
         # files OUTSIDE the workspace. Require the resolved target to be inside
-        # the workspace before creating anything.
-        if target_dir.resolve() != workspace.resolve() and not target_dir.resolve().is_relative_to(workspace.resolve()):
+        # the workspace before creating anything. (is_relative_to is True for the
+        # workspace==target equality case, so the normal subpath='' path passes.)
+        if not target_dir.resolve().is_relative_to(workspace.resolve()):
             return j(handler, {'error': 'Upload target escapes workspace'}, status=403)
         target_dir.mkdir(parents=True, exist_ok=True)
 

@@ -503,17 +503,20 @@ class TestWorkspaceUploadSymlinkTarget:
         escape.mkdir(parents=True, exist_ok=True)
         link = ws / "outlink"
         try:
-            os.symlink(str(escape), str(link))
-        except (OSError, NotImplementedError):
-            import pytest
-            pytest.skip("symlinks not supported in this environment")
-        result, status = post_multipart(
-            "/api/workspace/upload",
-            {"session_id": sid, "path": "outlink"},
-            {"file": ("pwned.txt", b"should not land outside")},
-        )
-        # Either a 403 escape rejection, or at minimum nothing written outside.
-        assert status == 403 or not (escape / "pwned.txt").exists(), (
-            f"upload escaped workspace via symlink: status={status} result={result}"
-        )
-        assert not (escape / "pwned.txt").exists()
+            try:
+                os.symlink(str(escape), str(link))
+            except (OSError, NotImplementedError):
+                import pytest
+                pytest.skip("symlinks not supported in this environment")
+            result, status = post_multipart(
+                "/api/workspace/upload",
+                {"session_id": sid, "path": "outlink"},
+                {"file": ("pwned.txt", b"should not land outside")},
+            )
+            # The escaping target must be rejected outright, and nothing may land
+            # outside the workspace.
+            assert status == 403, f"expected 403, got status={status} result={result}"
+            assert not (escape / "pwned.txt").exists()
+        finally:
+            import shutil
+            shutil.rmtree(escape, ignore_errors=True)
