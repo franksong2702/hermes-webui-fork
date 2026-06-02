@@ -403,12 +403,39 @@ class TestRuntimeRouteInjection(unittest.TestCase):
         self.assertTrue(callable(init_kwargs["interim_assistant_callback"]))
         self.assertIn("WebUI progress guidance", captured["agent"].ephemeral_system_prompt)
         self.assertIn("Match the normal Hermes messaging style", captured["agent"].ephemeral_system_prompt)
-        self.assertIn("user-visible progress updates", captured["agent"].ephemeral_system_prompt)
+        self.assertIn(
+            "do not let long tool-running WebUI turns appear silent",
+            captured["agent"].ephemeral_system_prompt,
+        )
+        self.assertIn(
+            "emit brief user-visible progress updates as normal assistant content",
+            captured["agent"].ephemeral_system_prompt,
+        )
+        self.assertIn(
+            "Before the first tool batch in a long task",
+            captured["agent"].ephemeral_system_prompt,
+        )
+        self.assertIn(
+            "Do not run many independent tool batches back-to-back without visible assistant text between them",
+            captured["agent"].ephemeral_system_prompt,
+        )
+        self.assertIn(
+            "Do not keep progress only in reasoning, thinking, or tool-result channels",
+            captured["agent"].ephemeral_system_prompt,
+        )
+        self.assertNotIn(
+            "you may provide brief user-visible progress updates",
+            captured["agent"].ephemeral_system_prompt,
+        )
 
         interim_events = []
         while not fake_queue.empty():
             try:
-                interim_events.append(fake_queue.get_nowait())
+                item = fake_queue.get_nowait()
+                if isinstance(item, tuple) and len(item) >= 2:
+                    interim_events.append((item[0], item[1]))
+                else:
+                    interim_events.append(item)
             except queue.Empty:
                 break
         self.assertTrue(
