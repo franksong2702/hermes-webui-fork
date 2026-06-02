@@ -321,7 +321,6 @@ class TestToolCallGroupingStatic:
         assert "isSimplifiedToolCalling()" in render_fn and "assistantThinking.set(rawIdx, thinkingText)" in render_fn, (
             "Compact settled transcript rendering should keep reasoning metadata available without promoting it to visible prose."
         )
-        step_fn = _function_body(UI_JS, "_appendWorklogStep")
         helper = _function_body(UI_JS, "_worklogReasoningTextFromMessage")
         assert "return '';" in helper, (
             "Provider reasoning metadata should not render as Worklog prose."

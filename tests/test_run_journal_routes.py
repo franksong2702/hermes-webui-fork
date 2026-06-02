@@ -100,7 +100,7 @@ def test_active_stream_replay_uses_snapshot_cutoff_and_skips_duplicate_queue_ite
     assert stream.unsubscribed is True
 
 
-def test_active_stream_replay_keeps_items_for_new_run_with_same_seq_range(monkeypatch):
+def test_active_stream_snapshot_keeps_items_for_new_run_with_same_seq_range(monkeypatch):
     import api.routes as routes
 
     class FakeStream:
