@@ -3,6 +3,13 @@
 
 ## [Unreleased]
 
+### Fixed
+- Cancelling a live turn now still works after the browser SSE stream has
+  detached, as long as the worker is still registered in the active-run
+  registry. The session payload also now reports run-journal activity from the
+  real live registry instead of treating any persisted `active_stream_id` as
+  proof that the worker is still alive.
+
 ## [v0.51.230] — 2026-06-03 — Release GX (stage-p14 — extract <think> blocks to m.reasoning + LLM Wiki last-writer)
 
 ### Fixed
