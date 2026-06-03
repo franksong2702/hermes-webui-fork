@@ -524,9 +524,23 @@ async function newSession(flash, options={}){
       // get_available_models() and a 3-4s cold catalog rebuild. window._activeProvider
       // is hydrated at boot (ui.js) and on config refresh (panels.js), so it's a
       // safe default that matches the user's configured route. S.session.model_provider
-      // is the previous-session fallback when the dropdown is unhydrated. Closes
-      // the open follow-up from #2518.
-      reqBody.model_provider=newModelState.model_provider||null||(window._activeProvider||null)||(S.session&&S.session.model_provider)||null;
+      // is the previous-session fallback when the dropdown is unhydrated.
+      //
+      // Guard: a slash-qualified model (e.g. "gemini/gemini-2.5") or an
+      // @provider:model string already carries a foreign provider namespace from
+      // a previous session that was served by a different backend. Attaching
+      // the current _activeProvider to such a slug would let the server's fast
+      // path pass it through without consulting the catalog, silently
+      // re-pointing the new session at the wrong backend (the very case the
+      // slow-path normalization in _resolve_compatible_session_model_state is
+      // designed to fix — see routes.py docstring around line 1891-1894). For
+      // those models we leave the wire shape with model_provider=null so the
+      // slow path's cross-provider repair still runs. Closes the open
+      // follow-up from #2518.
+      const _bareModel=!/[/]/.test(newModelState.model)&&!newModelState.model.startsWith('@');
+      reqBody.model_provider=newModelState.model_provider
+        ||(_bareModel?(window._activeProvider||(S.session&&S.session.model_provider)):null)
+        ||null;
     }
     const data=await api('/api/session/new',{method:'POST',body:JSON.stringify(reqBody)});
     S.session=data.session;S.messages=data.session.messages||[];
