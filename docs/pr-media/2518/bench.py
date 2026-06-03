@@ -67,13 +67,13 @@ def main():
     print("=" * 70)
 
     cold_slow = sample(get_available_models, n=3)
-    print(f"\ncold_slow  (n=3, get_available_models() on fresh process):")
+    print("\ncold_slow  (n=3, get_available_models() on fresh process):")
     print(f"  median: {cold_slow['median_ms']:.1f} ms   "
           f"min: {cold_slow['min_ms']:.1f}   "
           f"max: {cold_slow['max_ms']:.1f}")
 
     warm_slow = sample(get_available_models, n=5)
-    print(f"\nwarm_slow  (n=5, get_available_models() with hot cache):")
+    print("\nwarm_slow  (n=5, get_available_models() with hot cache):")
     print(f"  median: {warm_slow['median_ms']:.1f} ms   "
           f"min: {warm_slow['min_ms']:.1f}   "
           f"max: {warm_slow['max_ms']:.1f}")
@@ -102,8 +102,8 @@ def main():
     finally:
         routes.get_available_models = original
 
-    print(f"\ncold_fast  (n=10, _resolve_compatible_session_model_state, "
-          f"model+provider supplied):")
+    print("\ncold_fast  (n=10, _resolve_compatible_session_model_state, "
+          "model+provider supplied):")
     print(f"  median: {cold_fast['median_ms']:.3f} ms   "
           f"min: {cold_fast['min_ms']:.3f}   "
           f"max: {cold_fast['max_ms']:.3f}")
