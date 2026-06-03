@@ -1344,7 +1344,14 @@ function _addLiveModelsToSelect(provider, models, sel){
   // 'minimax/minimax-m2.7' matches '@nous:minimax/minimax-m2.7' (#907).
   const _normId=id=>{
     let s=String(id||'');
-    if(s.startsWith('@')&&s.includes(':')) s=s.substring(s.indexOf(':')+1);
+    const providerPrefix=`@${provider}:`;
+    if(s.startsWith(providerPrefix)){
+      s=s.substring(providerPrefix.length);
+    }else if(s.startsWith('@')&&s.includes(':')){
+      // Preserve non-custom multi-colon model IDs like qwen3:235b-instruct
+      // by only removing the explicit provider prefix segment.
+      s=s.substring(s.indexOf(':')+1);
+    }
     s=s.split('/').pop();
     return s.replace(/-/g,'.').toLowerCase();
   };

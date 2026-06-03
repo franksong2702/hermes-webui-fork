@@ -62,6 +62,23 @@ class TestIssue907LiveModelDedup:
             "use indexOf/substring instead."
         )
 
+    def test_normId_handles_nested_custom_provider_namespace(self):
+        """Named custom provider namespaces (e.g. @custom:alibaba-bailian:...) must
+        be fully stripped from nested provider ids in _normId."""
+        fn_idx = UI_JS.find('function _addLiveModelsToSelect(')
+        fn_body = UI_JS[fn_idx:fn_idx + 2000]
+        assert "const providerPrefix=" in fn_body, (
+            "_normId should use an active-provider prefix for provider-aware "
+            "normalization so nested custom provider namespaces are removed."
+        )
+        assert "s.startsWith(providerPrefix)" in fn_body, (
+            "_normId should strip the full active-provider namespace (not only the first"
+            " @provider: segment) for named custom providers."
+        )
+        assert "const providerPrefix=`@${provider}:`" in fn_body, (
+            "_normId should derive provider-aware prefix from the active provider."
+        )
+
 
 # ── #908: window._defaultModel updated on settings save ─────────────────────
 
