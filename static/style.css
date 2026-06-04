@@ -929,6 +929,7 @@
   :root{--app-titlebar-safe-top:0px;}
   .pwa-standalone{overscroll-behavior:none;}
   .pwa-standalone body{-webkit-tap-highlight-color:transparent;}
+  .app-titlebar-new-chat{display:none;}
   .pwa-standalone .app-titlebar-reload{display:inline-flex;}
   .pwa-offline .app-titlebar::after{content:'';position:absolute;left:50%;bottom:5px;width:5px;height:5px;border-radius:999px;background:var(--warning);box-shadow:0 0 0 3px color-mix(in srgb,var(--warning) 22%,transparent);transform:translateX(-50%);}
   .pwa-resumed .app-titlebar-title{animation:pwa-title-resume .6s ease-out;}
@@ -944,7 +945,9 @@
     .pull-to-refresh-indicator .ptr-icon{display:inline-block;transition:transform .2s;font-size:16px;}
     .pull-to-refresh-indicator .ptr-icon.ready{transform:rotate(180deg);color:var(--accent);}
     /* Reload button — visible only in PWA standalone / fullscreen */
+    .app-titlebar-new-chat,
     .app-titlebar-reload{display:none;align-items:center;justify-content:center;width:32px;height:32px;flex-shrink:0;background:none;border:none;color:var(--muted);border-radius:8px;cursor:pointer;padding:0;-webkit-tap-highlight-color:transparent;transition:background-color .15s,color .15s;}
+    .app-titlebar-new-chat:hover,
     .app-titlebar-reload:hover{background:var(--hover-bg);color:var(--text);}
     @media (display-mode: standalone), (display-mode: fullscreen){
       :root{--app-titlebar-safe-top:env(safe-area-inset-top,0px);}
@@ -2348,6 +2351,7 @@
     /* Hamburger button (in app titlebar on mobile) */
     .app-titlebar{justify-content:space-between;}
     .app-titlebar-hamburger,.app-titlebar-spacer{display:flex;}
+    .app-titlebar-new-chat{display:inline-flex;}
     .app-titlebar-inner{flex:1 1 auto;}
     .system-health-panel.insights-card{gap:10px;padding:12px;}
     .system-health-head{align-items:flex-start;}

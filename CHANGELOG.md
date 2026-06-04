@@ -3,6 +3,8 @@
 
 ## [Unreleased]
 
+- Added a **mobile-only titlebar quick action** for New Conversation, positioned before the titlebar reload control and reusing the existing `btnNewChat` handler/logic and `new_conversation` label translation. This keeps desktop and non-mobile layouts unchanged while restoring a fast chat-entry path for phone users. (#3226)
+
 ## [v0.51.287] — 2026-06-06 — Release JC (stage-r22 — WeCom session classification + worker-profile picker hiding)
 
 ### Fixed
