@@ -8,6 +8,11 @@
 - Streaming finalization now treats compression-exhausted or tool-tail agent results as errors instead of completed turns, so long tool-heavy sessions do not appear done when Hermes Agent failed before writing a final assistant answer. When Hermes Agent rotated the session id during automatic compression before that terminal failure, WebUI now preserves the pre-compression snapshot, migrates continuation state first, and persists the final error on the continuation session instead of the stale parent row.
 - Completed transcripts no longer render internal `[CONTEXT COMPACTION — REFERENCE ONLY]` reference cards; compression-exhausted runs now surface as explicit errors instead.
 
+## [v0.51.249] — 2026-06-03 — Release HQ (stage-q21 — auto-expand terminal on output toggle)
+
+### Added
+- New **"Auto-expand terminal on output"** preference (Settings → Preferences, **off by default**). When enabled, the collapsed embedded terminal panel surfaces itself automatically the first time a running command emits output, so long-running command output isn't silently collected behind a collapsed panel. The auto-expand does not steal focus from the composer, and fires once per stream (not per output chunk). Mirrors the existing `simplified_tool_calling` setting pattern; default-off means no behavior change on upgrade. (#2974, @rodboev)
+
 ## [v0.51.248] — 2026-06-03 — Release HP (stage-q20 — self-heal deleted WebUI sessions instead of bricking the chat)
 
 ### Fixed
