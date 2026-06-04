@@ -437,5 +437,5 @@ def test_exception_apperror_payload_includes_session_id_before_enqueue():
     assert end != -1, "exception apperror enqueue not found"
     block = src[start:end]
 
-    assert "_error_payload['session_id']" in block
-    assert "_error_payload['old_session_id']" in block
+    assert "_error_payload['session_id'] = getattr(s, 'session_id', session_id)" in block
+    assert "_error_payload['old_session_id'] = session_id" in block

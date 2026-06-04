@@ -6941,7 +6941,7 @@ def _run_agent_streaming(
                     except Exception:
                         logger.debug("Failed to append interrupted turn journal event", exc_info=True)
             _error_payload['session_id'] = getattr(s, 'session_id', session_id)
-            _error_payload['old_session_id'] = getattr(s, 'session_id', session_id)
+            _error_payload['old_session_id'] = session_id
         put('apperror', _error_payload)
     finally:
         # Stop the periodic checkpoint thread before the final recovery path.
