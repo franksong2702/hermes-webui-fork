@@ -243,6 +243,16 @@ function cliOnlyCommandResponse(cmdName, meta){
   return `\`/${name}\` is a Hermes CLI-only command and cannot run inside the WebUI.${detail}${extra}`;
 }
 
+async function executeAgentCommand(text,_meta){
+  const command=String(text||'').trim();
+  if(!command) throw new Error('command is required');
+  const data=await api('/api/commands/exec',{
+    method:'POST',
+    body:JSON.stringify({command})
+  });
+  return String(data&&data.output||'(no output)');
+}
+
 async function executeAgentPluginCommand(text,_meta){
   const command=String(text||'').trim();
   if(!command) throw new Error('command is required');

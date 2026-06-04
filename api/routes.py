@@ -7197,11 +7197,21 @@ def handle_post(handler, parsed) -> bool:
 
     # ── Commands (POST) ──
     if parsed.path == "/api/commands/exec":
-        from api.commands import execute_plugin_command
+        from api.commands import execute_agent_command, execute_plugin_command
 
         command = str(body.get("command", "") or "").strip()
         if not command:
             return bad(handler, "command is required")
+
+        try:
+            return j(handler, {"output": execute_agent_command(command)})
+        except KeyError:
+            pass
+        except ValueError as e:
+            return bad(handler, str(e), 400)
+        except RuntimeError as e:
+            return bad(handler, _sanitize_error(e), 500)
+
         try:
             return j(handler, {"output": execute_plugin_command(command)})
         except ValueError as e:

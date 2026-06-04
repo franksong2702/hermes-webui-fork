@@ -20,6 +20,29 @@ _NEVER_EXPOSE: frozenset[str] = frozenset({
 })
 
 
+# Narrow agent-side execution allowlist for /api/commands/exec.
+_AGENT_COMMAND_ALIASES = {
+    'reload_mcp': 'reload-mcp',
+}
+_ALLOWED_AGENT_COMMANDS = frozenset({'reload-mcp'})
+
+
+def _normalize_agent_command_name(command: str) -> str:
+    """Normalize slash text to a canonical command name."""
+
+    raw = str(command or "").strip()
+    if not raw:
+        raise ValueError("command is required")
+
+    cmd_text = raw[1:] if raw.startswith("/") else raw
+    cmd_parts = cmd_text.split(maxsplit=1)
+    cmd_base = (cmd_parts[0] if cmd_parts else "").strip().lower()
+    if not cmd_base:
+        raise ValueError("command is required")
+
+    return _AGENT_COMMAND_ALIASES.get(cmd_base, cmd_base)
+
+
 def list_commands(_registry=None) -> list[dict[str, Any]]:
     """Return COMMAND_REGISTRY entries as JSON-friendly dicts.
 
@@ -74,8 +97,65 @@ def list_commands(_registry=None) -> list[dict[str, Any]]:
             })
     except Exception:
         pass
-
     return out
+
+
+def execute_agent_command(command: str) -> str:
+    """Execute a narrow allowlist of agent-side runtime commands."""
+
+    canonical = _normalize_agent_command_name(command)
+    if canonical not in _ALLOWED_AGENT_COMMANDS:
+        raise KeyError(canonical)
+
+    if canonical == 'reload-mcp':
+        return _run_reload_mcp_command()
+
+    raise KeyError(canonical)
+
+
+def _run_reload_mcp_command() -> str:
+    """Execute the MCP reconnect path and return a short user-facing summary."""
+
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+    except Exception as exc:
+        logger.warning("Failed to import MCP runtime for /reload-mcp", exc_info=exc)
+        raise RuntimeError("MCP runtime unavailable") from exc
+
+    try:
+        with _lock:
+            old_servers = set(_servers.keys())
+
+        shutdown_mcp_servers()
+        new_tools = discover_mcp_tools()
+
+        with _lock:
+            connected_servers = set(_servers.keys())
+    except Exception as exc:
+        logger.warning("/reload-mcp failed", exc_info=exc)
+        raise RuntimeError(f"/reload-mcp failed: {exc}") from exc
+
+    added = connected_servers - old_servers
+    removed = old_servers - connected_servers
+    reconnected = connected_servers & old_servers
+
+    lines = ["Reloaded MCP servers from configuration."]
+    if reconnected:
+        lines.append(f"Reconnected: {', '.join(sorted(reconnected))}")
+    if added:
+        lines.append(f"Added: {', '.join(sorted(added))}")
+    if removed:
+        lines.append(f"Removed: {', '.join(sorted(removed))}")
+
+    if connected_servers:
+        lines.append(f"{len(new_tools or [])} tool(s) available across {len(connected_servers)} server(s)")
+    else:
+        lines.append("No MCP servers connected")
+
+    if not reconnected and not added and not removed:
+        lines.append("Tooling state was already current")
+
+    return "\n".join(lines)
 
 
 def execute_plugin_command(command: str) -> str:

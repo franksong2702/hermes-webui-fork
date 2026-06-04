@@ -208,6 +208,7 @@ if(typeof document!=='undefined'){
 let _sendInProgress = false;
 let _sendInProgressSid = null;  // session_id of the in-flight send
 const _sessionTitleProvisionalBySid = new Map();
+const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp']);
 
 function _clearStaleBusyStateBeforeSend({compressionRunning=false}={}){
   if(!S||!S.busy||compressionRunning) return false;
@@ -420,6 +421,22 @@ async function send(){
         if(!S.session){await newSession();await renderSessionList();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
+        renderMessages();
+        $('msg').value='';autoResize();hideCmdDropdown();return;
+      }
+      const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();
+      if(_agentCmd&&_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){
+        if(!S.session){await newSession();await renderSessionList();}
+        S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+        let _agentOutput='(no output)';
+        try{
+          _agentOutput=typeof executeAgentCommand==='function'
+            ? await executeAgentCommand(text,_agentCmd)
+            : 'Agent command runtime unavailable in WebUI.';
+        }catch(e){
+          _agentOutput=`Agent command error: ${e&&e.message||e}`;
+        }
+        S.messages.push({role:'assistant',content:String(_agentOutput||'(no output)'),_ts:Date.now()/1000});
         renderMessages();
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }

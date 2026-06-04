@@ -1,5 +1,6 @@
 """Tests for GET /api/commands -- exposes hermes-agent COMMAND_REGISTRY."""
 import json
+import urllib.error
 import urllib.request
 
 import pytest
@@ -11,6 +12,24 @@ def _get(path):
     """GET helper -- returns parsed JSON or raises HTTPError."""
     with urllib.request.urlopen(TEST_BASE + path, timeout=10) as r:
         return json.loads(r.read())
+
+
+def _post(path, body):
+    payload = json.dumps(body or {}).encode()
+    req = urllib.request.Request(
+        TEST_BASE + path,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return getattr(r, 'status', 200), json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read())
+        except Exception:
+            return e.code, {}
 
 
 @requires_agent_modules
@@ -62,6 +81,40 @@ def test_commands_endpoint_keeps_new_with_reset_alias():
     body = _get('/api/commands')
     new_cmd = next(c for c in body['commands'] if c['name'] == 'new')
     assert 'reset' in new_cmd['aliases']
+
+
+@requires_agent_modules
+def test_commands_exec_runs_allowlisted_agent_command():
+    """Allowed agent-side commands execute through /api/commands/exec."""
+    status, body = _post('/api/commands/exec', {'command': '/reload-mcp'})
+    assert status == 200
+    assert 'output' in body
+    assert isinstance(body['output'], str)
+
+
+@requires_agent_modules
+def test_commands_exec_runs_reload_mcp_alias():
+    """Telegram-style underscore alias resolves to the same allowlisted command."""
+    status, body = _post('/api/commands/exec', {'command': '/reload_mcp'})
+    assert status == 200
+    assert 'output' in body
+    assert isinstance(body['output'], str)
+
+
+@requires_agent_modules
+def test_commands_exec_cli_only_command_returns_404():
+    """CLI-only commands should stay blocked from the generic execution endpoint."""
+    status, body = _post('/api/commands/exec', {'command': '/clear'})
+    assert status == 404
+    assert isinstance(body, dict)
+
+
+@requires_agent_modules
+def test_commands_exec_regular_agent_command_returns_404():
+    """Non-allowlisted agent commands must not become generic WebUI exec targets."""
+    status, body = _post('/api/commands/exec', {'command': '/help'})
+    assert status == 404
+    assert isinstance(body, dict)
 
 
 def test_list_commands_returns_empty_for_empty_registry():

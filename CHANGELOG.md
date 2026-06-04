@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+### Fixed
+- `/reload-mcp` now executes through `/api/commands/exec` using a narrow,
+  allowlisted agent-side command path instead of falling through to the normal
+  LLM prompt path. Unknown and CLI-only commands are still rejected unless
+  explicitly enabled.
+
 ## [v0.51.252] — 2026-06-03 — Release HT (stage-q24 — selection-bleed fix + compatibility docs)
 
 ### Fixed
