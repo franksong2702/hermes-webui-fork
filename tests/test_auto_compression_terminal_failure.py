@@ -168,7 +168,7 @@ def test_compression_exhausted_result_is_terminal_failure_even_after_streamed_te
     assert _session_lacks_final_assistant_answer(result["messages"]) is True
 
 
-def test_terminal_failure_checks_final_answer_even_when_assistant_was_added():
+def test_terminal_failure_gates_shape_check_to_no_streamed_text():
     src = _read("api/streaming.py")
     start = src.find("_terminal_failure = (")
     assert start != -1, "terminal failure assignment not found"
@@ -176,6 +176,8 @@ def test_terminal_failure_checks_final_answer_even_when_assistant_was_added():
     assert end != -1, "terminal failure guard not found"
     block = src[start:end]
 
+    assert "_agent_result_terminal_failure(result)" in block
+    assert "not _token_sent" in block
     assert "_session_lacks_final_assistant_answer(_all_result_messages)" in block
     assert "not _assistant_added" not in block
 

@@ -5794,7 +5794,10 @@ def _run_agent_streaming(
                 )
                 _terminal_failure = (
                     _agent_result_terminal_failure(result)
-                    or _session_lacks_final_assistant_answer(_all_result_messages)
+                    or (
+                        not _token_sent
+                        and _session_lacks_final_assistant_answer(_all_result_messages)
+                    )
                 )
                 if _terminal_failure:
                     _assistant_added = False
