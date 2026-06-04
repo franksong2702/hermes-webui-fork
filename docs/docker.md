@@ -71,7 +71,8 @@ isolated Hermes home and follow
 **Symptom**: Cron jobs created in the Tasks panel never fire. System Settings or Tasks shows:
 
 - Orange "Gateway not configured", or
-- Red "Gateway not running" with stale metadata text.
+- Red "Gateway not running" with stale metadata text, or
+- Red "Gateway endpoint not reachable" when WebUI has a gateway URL configured but cannot reach its health endpoint.
 
 **Cause**: Scheduled cron ticks are not driven by the WebUI itself. The gateway daemon ticks the scheduler every 60 seconds; without one running, scheduled jobs sit idle. "Run now" / "Trigger" buttons still work because the WebUI handles those in-process.
 
