@@ -99,11 +99,11 @@ WebUI shows the version it is currently running, but that display does not in it
 
 Until the compatibility boundary work in [#1925](https://github.com/nesquena/hermes-webui/issues/1925) and [#2491](https://github.com/nesquena/hermes-webui/issues/2491) land, the WebUI and Hermes Agent deployment should be treated as a release pair: the WebUI release is tested against its matching agent release and should be upgraded/pinned together.
 
-If you use `latest`, apply the same pinning discipline on both sides and avoid mixing:
+If you use `latest`, use it consistently on both sides and avoid mixing a fixed tag with `latest`:
 - fixed WebUI tag + `hermes-agent:latest`
 - `hermes-webui:latest` + fixed `hermes-agent` tag
 
-In multi-container setups, if you must run a pinned pair, prefer the matching tag in `docker-compose.two-container.yml`/`three-container.yml` and perform the agent-volume refresh workflow in [Upgrading the agent container](#upgrading-the-agent-container) whenever you upgrade the agent image.
+In multi-container setups, if you must run a pinned pair, prefer the matching tag in `docker-compose.two-container.yml`/`docker-compose.three-container.yml` and perform the agent-volume refresh workflow in [Upgrading the agent container](#upgrading-the-agent-container) whenever you upgrade the agent image.
 
 If you see behavior issues after a mixed-version upgrade, capture both WebUI and hermes-agent versions and the compose layout in the issue.
 
