@@ -17,6 +17,8 @@ def test_openai_codex_gpt5_supports_reasoning_effort_levels():
     )
     assert "medium" in efforts
     assert "high" in efforts
+    assert "xhigh" in efforts
+    assert "max" not in efforts
 
 
 def test_openai_codex_prefixed_gpt5_supports_reasoning_effort_levels():
@@ -26,6 +28,16 @@ def test_openai_codex_prefixed_gpt5_supports_reasoning_effort_levels():
     )
     assert "medium" in efforts
     assert "high" in efforts
+    assert "xhigh" in efforts
+    assert "max" not in efforts
+
+
+def test_openai_codex_max_effort_is_clamped_before_streaming():
+    assert cfg.coerce_reasoning_effort_for_model(
+        "max",
+        "gpt-5.5",
+        provider_id="openai-codex",
+    ) == "xhigh"
 
 
 def test_github_copilot_gpt5_supports_reasoning_effort_levels():

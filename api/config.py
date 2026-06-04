@@ -2148,8 +2148,6 @@ def _strip_provider_hint_for_reasoning(model_id: str) -> str:
     if model.startswith("@") and ":" in model:
         return model.split(":", 1)[1]
     return model
-
-
 def _reasoning_name_candidates(model_id: str) -> list[str]:
     """Return normalized model-name candidates for heuristic capability checks."""
     bare = str(model_id or "").strip().lower().rsplit("/", 1)[-1]
@@ -2234,6 +2232,28 @@ def _candidate_supports_reasoning(candidate: str) -> bool:
     return False
 
 
+def _filter_reasoning_efforts_for_provider(
+    efforts: list[str],
+    model_id: str,
+    provider_id: str,
+) -> list[str]:
+    """Apply provider/model quirks to otherwise valid reasoning effort levels."""
+    normalized = [
+        str(eff).strip().lower()
+        for eff in efforts
+        if str(eff).strip().lower() in VALID_REASONING_EFFORTS
+    ]
+    normalized = list(dict.fromkeys(normalized))
+    provider = _resolve_provider_alias(str(provider_id or "").strip().lower())
+    bare = _strip_provider_hint_for_reasoning(model_id).lower().rsplit("/", 1)[-1]
+    if provider == "openai-codex":
+        if bare.startswith(("o1", "o3", "o4")):
+            return [eff for eff in normalized if eff in {"low", "medium", "high"}]
+        if bare.startswith("gpt-5"):
+            return [eff for eff in normalized if eff != "max"]
+    return normalized
+
+
 def _heuristic_reasoning_efforts(model_id: str, provider_id: str) -> list[str]:
     """Fallback when hermes_cli is unavailable."""
     model = _strip_provider_hint_for_reasoning(model_id).lower()
@@ -2244,7 +2264,9 @@ def _heuristic_reasoning_efforts(model_id: str, provider_id: str) -> list[str]:
     if provider == "openai-codex" and bare.startswith(("gpt-5", "o1", "o3", "o4")):
         if bare.startswith(("o1", "o3", "o4")):
             return ["low", "medium", "high"]
-        return list(VALID_REASONING_EFFORTS)
+        return _filter_reasoning_efforts_for_provider(
+            list(VALID_REASONING_EFFORTS), model, provider
+        )
     if provider in {"copilot", "github-copilot"}:
         if bare.startswith(("gpt-5", "o1", "o3", "o4")):
             if bare.startswith(("o1", "o3", "o4")):
@@ -2298,7 +2320,9 @@ def _models_dev_reasoning_efforts(model_id: str, provider_id: str) -> list[str] 
 
     supports_reasoning = getattr(capabilities, "supports_reasoning", None)
     if supports_reasoning is True:
-        return list(VALID_REASONING_EFFORTS)
+        return _filter_reasoning_efforts_for_provider(
+            list(VALID_REASONING_EFFORTS), model, provider
+        )
     if supports_reasoning is False:
         return []
     return None
@@ -2338,7 +2362,9 @@ def resolve_model_reasoning_efforts(
             return _heuristic_reasoning_efforts(hinted_model, provider)
     else:
         if provider in {"copilot", "github-copilot"}:
-            return github_model_reasoning_efforts(hinted_model)
+            return _filter_reasoning_efforts_for_provider(
+                github_model_reasoning_efforts(hinted_model), hinted_model, provider
+            )
 
         if provider == "lmstudio":
             probe_base = resolved_base_url or _get_provider_base_url(provider)
@@ -2348,16 +2374,48 @@ def resolve_model_reasoning_efforts(
                 return []
             level_opts = [opt for opt in normalized if opt in VALID_REASONING_EFFORTS]
             if level_opts:
-                return list(dict.fromkeys(level_opts))
+                return _filter_reasoning_efforts_for_provider(
+                    level_opts, hinted_model, provider
+                )
             if set(normalized).issubset({"off", "on"}):
                 return []
             return []
 
     metadata_efforts = _models_dev_reasoning_efforts(hinted_model, provider)
     if metadata_efforts is not None:
-        return metadata_efforts
+        return _filter_reasoning_efforts_for_provider(
+            metadata_efforts, hinted_model, provider
+        )
 
     return _heuristic_reasoning_efforts(hinted_model, provider)
+
+
+def coerce_reasoning_effort_for_model(
+    effort: str | None,
+    model_id: str | None = None,
+    provider_id: str | None = None,
+    base_url: str | None = None,
+) -> str:
+    """Return the closest supported effort for the target model/provider."""
+    raw = str(effort or "").strip().lower()
+    if not raw:
+        return ""
+    if raw == "none":
+        return "none"
+    if raw not in VALID_REASONING_EFFORTS:
+        return ""
+    supported = resolve_model_reasoning_efforts(
+        model_id,
+        provider_id=provider_id,
+        base_url=base_url,
+    )
+    if raw in supported:
+        return raw
+    if raw == "max":
+        for fallback in ("xhigh", "high", "medium", "low", "minimal"):
+            if fallback in supported:
+                return fallback
+    return ""
 
 
 def get_reasoning_status(
