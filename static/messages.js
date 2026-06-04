@@ -208,7 +208,11 @@ if(typeof document!=='undefined'){
 let _sendInProgress = false;
 let _sendInProgressSid = null;  // session_id of the in-flight send
 const _sessionTitleProvisionalBySid = new Map();
-const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp']);
+// Agent commands that are safe to execute directly in the WebUI even though
+// their canonical command is registered on the backend (for example
+// /reload-mcp). Keep this intentionally narrow and include underscore variants
+// observed by users so typing either form still routes through executeAgentCommand.
+const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp', 'reload_mcp']);
 
 function _clearStaleBusyStateBeforeSend({compressionRunning=false}={}){
   if(!S||!S.busy||compressionRunning) return false;
@@ -425,13 +429,13 @@ async function send(){
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
       const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();
-      if(_agentCmd&&_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){
+      if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){
         if(!S.session){await newSession();await renderSessionList();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         let _agentOutput='(no output)';
         try{
           _agentOutput=typeof executeAgentCommand==='function'
-            ? await executeAgentCommand(text,_agentCmd)
+            ? await executeAgentCommand(text,_agentCmd||{name:_agentCmdName})
             : 'Agent command runtime unavailable in WebUI.';
         }catch(e){
           _agentOutput=`Agent command error: ${e&&e.message||e}`;
