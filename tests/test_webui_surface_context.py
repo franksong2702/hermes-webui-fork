@@ -79,6 +79,30 @@ def test_prefill_no_longer_adds_session_context_user_message():
     assert "Connected Platforms" not in result[0].get("content", "")
 
 
+def test_prefill_boundary_normalizer_removes_terminal_user_tail():
+    from api.streaming import _normalize_prefill_messages_before_user_turn
+
+    raw = [
+        {"role": "assistant", "content": "recall summary"},
+        {"role": "user", "content": "session context"},
+    ]
+
+    assert _normalize_prefill_messages_before_user_turn(raw) == [
+        {"role": "assistant", "content": "recall summary"},
+    ]
+    assert _normalize_prefill_messages_before_user_turn([
+        {"role": "assistant", "content": "prefill"},
+        {"role": "user", "content": "legacy user"},
+        {"role": "assistant", "content": "assistant follow-up"},
+    ]) == [
+        {"role": "assistant", "content": "prefill"},
+        {"role": "user", "content": "legacy user"},
+        {"role": "assistant", "content": "assistant follow-up"},
+    ]
+    assert _normalize_prefill_messages_before_user_turn([]) == []
+    assert _normalize_prefill_messages_before_user_turn([{"role": "user", "content": "only user"}]) == []
+
+
 def test_prefill_preserves_empty_and_none_messages():
     """Edge cases: empty prefill stays empty, missing key returns empty."""
     assert _prefill_messages_with_webui_context({"messages": []}) == []

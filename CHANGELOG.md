@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+### Fixed
+- Normalized WebUI recall/session prefill in both streaming and Gateway chat paths so
+  a trailing `user` context message is removed before appending the live user turn.
+  This prevents adjacent user roles from reaching strict chat templates (for example
+  Mistral/Gemma/Jinja 500s) and fixes #3432.
+
 ## [v0.51.252] — 2026-06-03 — Release HT (stage-q24 — selection-bleed fix + compatibility docs)
 
 ### Fixed
