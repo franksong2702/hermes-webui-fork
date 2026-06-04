@@ -40,6 +40,31 @@ def test_openai_codex_max_effort_is_clamped_before_streaming():
     ) == "xhigh"
 
 
+def test_unsupported_xhigh_degrades_to_high_not_disabled():
+    # o1/o3/o4 on openai-codex cap at low/medium/high. A configured xhigh (or
+    # max) must clamp DOWN to the highest supported level (high), not silently
+    # disable reasoning by returning "".
+    assert cfg.coerce_reasoning_effort_for_model(
+        "xhigh",
+        "o3-mini",
+        provider_id="openai-codex",
+    ) == "high"
+    assert cfg.coerce_reasoning_effort_for_model(
+        "max",
+        "o3-mini",
+        provider_id="openai-codex",
+    ) == "high"
+
+
+def test_coerce_never_escalates_above_configured_effort():
+    # A supported lower effort is returned verbatim; coercion only degrades.
+    assert cfg.coerce_reasoning_effort_for_model(
+        "low",
+        "gpt-5.5",
+        provider_id="openai-codex",
+    ) == "low"
+
+
 def test_github_copilot_gpt5_supports_reasoning_effort_levels():
     efforts = cfg.resolve_model_reasoning_efforts(
         "gpt-5.5",

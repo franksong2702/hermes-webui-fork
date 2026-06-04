@@ -2148,6 +2148,8 @@ def _strip_provider_hint_for_reasoning(model_id: str) -> str:
     if model.startswith("@") and ":" in model:
         return model.split(":", 1)[1]
     return model
+
+
 def _reasoning_name_candidates(model_id: str) -> list[str]:
     """Return normalized model-name candidates for heuristic capability checks."""
     bare = str(model_id or "").strip().lower().rsplit("/", 1)[-1]
@@ -2381,11 +2383,12 @@ def resolve_model_reasoning_efforts(
                 return []
             return []
 
+    # _models_dev_reasoning_efforts already applies the provider/model filter
+    # internally, so it is returned as-is here (filtering again would be
+    # redundant — the filter is idempotent but the double pass obscures flow).
     metadata_efforts = _models_dev_reasoning_efforts(hinted_model, provider)
     if metadata_efforts is not None:
-        return _filter_reasoning_efforts_for_provider(
-            metadata_efforts, hinted_model, provider
-        )
+        return metadata_efforts
 
     return _heuristic_reasoning_efforts(hinted_model, provider)
 
@@ -2411,10 +2414,17 @@ def coerce_reasoning_effort_for_model(
     )
     if raw in supported:
         return raw
-    if raw == "max":
-        for fallback in ("xhigh", "high", "medium", "low", "minimal"):
-            if fallback in supported:
-                return fallback
+    # Degrade to the closest *lower* supported level instead of silently
+    # disabling reasoning. e.g. max -> xhigh -> high, or xhigh -> high when the
+    # target model caps below the configured effort. Never escalate.
+    ladder = list(VALID_REASONING_EFFORTS)  # ascending: minimal..max
+    try:
+        raw_idx = ladder.index(raw)
+    except ValueError:
+        return ""
+    for level in reversed(ladder[:raw_idx]):  # strictly lower, highest first
+        if level in supported:
+            return level
     return ""
 
 
