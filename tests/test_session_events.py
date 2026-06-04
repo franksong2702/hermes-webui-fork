@@ -41,14 +41,15 @@ def test_session_events_publish_for_minimal_sidebar_mutations():
     assert 'publish_session_list_changed("session_duplicate", profile=getattr(copied_session, "profile", None))' in ROUTES
     assert 'publish_session_list_changed("session_rename", profile=getattr(s, "profile", None))' in ROUTES
     assert 'publish_session_list_changed("session_title_regenerate", profile=getattr(s, "profile", None))' in ROUTES
-    assert 'publish_session_list_changed("session_delete", profile=getattr(s, "profile", None))' in ROUTES
+    assert 'event_profile = getattr(get_session(sid, metadata_only=True), "profile", None)' in ROUTES
+    assert '_publish_session_list_changed("session_delete", profile=event_profile)' in ROUTES
     assert 'publish_session_list_changed("session_branch", profile=getattr(branch, "profile", None))' in ROUTES
     assert 'publish_session_list_changed("session_pin", profile=getattr(s, "profile", None))' in ROUTES
     assert 'publish_session_list_changed("session_archive", profile=getattr(s, "profile", None))' in ROUTES
     assert 'publish_session_list_changed("session_move", profile=getattr(s, "profile", None))' in ROUTES
     assert 'profile=getattr(s, "profile", None)' in ROUTES
     assert 'publish_session_list_changed("chat_start")' not in ROUTES
-    assert 'publish_session_list_changed("cron_complete",' in ROUTES
+    assert '_publish_session_list_changed("cron_complete",' in ROUTES
     assert 'publish_session_list_changed("cron_complete",' in PROFILES
 
 

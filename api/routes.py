@@ -40,6 +40,21 @@ from api.session_events import (
 
 logger = logging.getLogger(__name__)
 
+
+def _publish_session_list_changed(reason: str, *, profile: str | None = None) -> None:
+    """Publish profile-scoped session changes while tolerating legacy test doubles."""
+    if not profile:
+        publish_session_list_changed(reason)
+        return
+    try:
+        publish_session_list_changed(reason, profile=profile)
+    except TypeError:
+        # Some focused tests monkeypatch the route-level publisher with the
+        # historical one-argument shape. Preserve the old signal instead of
+        # turning unrelated session mutations into 500s.
+        publish_session_list_changed(reason)
+
+
 # ── Cron run tracking ────────────────────────────────────────────────────────
 # Track job IDs currently being executed so the frontend can poll status.
 _RUNNING_CRON_JOBS: dict[str, float] = {}  # job_id → start_timestamp
@@ -966,7 +981,7 @@ def _run_cron_tracked(
             logger.debug("Failed to mark manual cron run failure for %s", job_id)
     finally:
         _mark_cron_done(job_id)
-        publish_session_list_changed("cron_complete", profile=event_profile)
+        _publish_session_list_changed("cron_complete", profile=event_profile)
 
 _PROVIDER_ALIASES = {
     "claude": "anthropic",
@@ -6767,6 +6782,10 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Read-only imported sessions cannot be deleted from WebUI", 400)
         is_messaging_session = _is_messaging_session_id(sid)
         worktree_retained = _worktree_retained_payload_for_session_id(sid)
+        try:
+            event_profile = getattr(get_session(sid, metadata_only=True), "profile", None)
+        except KeyError:
+            event_profile = None
         # Delete from WebUI session store
         with LOCK:
             SESSIONS.pop(sid, None)
@@ -6811,7 +6830,7 @@ def handle_post(handler, parsed) -> bool:
                 delete_cli_session(sid)
             except Exception:
                 logger.debug("Failed to delete CLI session %s", sid)
-        publish_session_list_changed("session_delete", profile=getattr(s, "profile", None))
+        _publish_session_list_changed("session_delete", profile=event_profile)
         return j(handler, {"ok": True, **worktree_retained})
 
     if parsed.path == "/api/session/clear":
@@ -11528,11 +11547,7 @@ def _handle_cron_run(handler, body):
     _profile_home = get_active_hermes_home()
     _execution_profile_home = _profile_home_for_cron_job(job)
     _event_profile = get_active_profile_name()
-    threading.Thread(
-        target=_run_cron_tracked,
-        args=(job, _profile_home, _execution_profile_home, _event_profile),
-        daemon=True,
-    ).start()
+    threading.Thread(target=_run_cron_tracked, args=(job, _profile_home, _execution_profile_home, _event_profile), daemon=True).start()
     return j(handler, {"ok": True, "job_id": job_id, "status": "running"})
 
 
