@@ -787,6 +787,16 @@ def _profile_home_for_cron_job(job: dict):
     return get_hermes_home_for_profile(raw)
 
 
+def _event_profile_for_cron_job(job: dict) -> str | None:
+    """Return the profile identity browsers should refresh for a manual cron run."""
+    raw = str((job or {}).get("profile") or "").strip()
+    if not raw:
+        return None
+    if raw not in _available_cron_profile_names():
+        return None
+    return raw
+
+
 def _cron_job_subprocess_main(job, execution_profile_home, result_queue):
     """Run one cron job inside a child process pinned to a profile home."""
     try:
@@ -11545,11 +11555,10 @@ def _handle_cron_run(handler, body):
     # rather let any unexpected exception 500 the request than corrupt
     # cross-profile state.
     from api.profiles import get_active_hermes_home
-    from api.profiles import get_active_profile_name
 
     _profile_home = get_active_hermes_home()
     _execution_profile_home = _profile_home_for_cron_job(job)
-    _event_profile = get_active_profile_name()
+    _event_profile = _event_profile_for_cron_job(job)
     threading.Thread(target=_run_cron_tracked, args=(job, _profile_home, _execution_profile_home, _event_profile), daemon=True).start()
     return j(handler, {"ok": True, "job_id": job_id, "status": "running"})
 
