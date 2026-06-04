@@ -8,6 +8,14 @@
 - Streaming finalization now treats compression-exhausted or tool-tail agent results as errors instead of completed turns, so long tool-heavy sessions do not appear done when Hermes Agent failed before writing a final assistant answer. When Hermes Agent rotated the session id during automatic compression before that terminal failure, WebUI now preserves the pre-compression snapshot, migrates continuation state first, and persists the final error on the continuation session instead of the stale parent row.
 - Completed transcripts no longer render internal `[CONTEXT COMPACTION — REFERENCE ONLY]` reference cards; compression-exhausted runs now surface as explicit errors instead.
 
+## [v0.51.252] — 2026-06-03 — Release HT (stage-q24 — selection-bleed fix + compatibility docs)
+
+### Fixed
+- The floating "selected-text reply" button no longer lets its own label get caught in a text selection (`user-select:none`), so dragging a selection near the button doesn't bleed into it. (#2481, @rodboev)
+
+### Docs
+- README now has a **Compatibility** section documenting that the WebUI is tested against the matching hermes-agent release and that both should be upgraded together (until the stable agent API #2491 lands). (@rodboev)
+
 ## [v0.51.251] — 2026-06-03 — Release HS (stage-q23 — composer ~/ path autocomplete)
 
 ### Fixed
