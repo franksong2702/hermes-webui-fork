@@ -944,7 +944,7 @@
     .pull-to-refresh-indicator.active{opacity:1;transform:translateY(0);}
     .pull-to-refresh-indicator .ptr-icon{display:inline-block;transition:transform .2s;font-size:16px;}
     .pull-to-refresh-indicator .ptr-icon.ready{transform:rotate(180deg);color:var(--accent);}
-    /* Reload button — visible only in PWA standalone / fullscreen */
+    /* Reload and mobile new-chat titlebar controls with shared icon-button styles */
     .app-titlebar-new-chat,
     .app-titlebar-reload{display:none;align-items:center;justify-content:center;width:32px;height:32px;flex-shrink:0;background:none;border:none;color:var(--muted);border-radius:8px;cursor:pointer;padding:0;-webkit-tap-highlight-color:transparent;transition:background-color .15s,color .15s;}
     .app-titlebar-new-chat:hover,
