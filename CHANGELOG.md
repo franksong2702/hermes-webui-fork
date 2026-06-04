@@ -3,6 +3,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- WebUI streaming retries after credential self-heal now rebuild the per-request `SessionDB` handle instead of reusing a closed handle from the prior agent construction, preventing silent conversation/search state loss after auth refresh on retry. (#3548, @franksong2702)
+
 ## [v0.51.252] — 2026-06-03 — Release HT (stage-q24 — selection-bleed fix + compatibility docs)
 
 ### Fixed
