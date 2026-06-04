@@ -22,9 +22,13 @@ async function cancelStream(){
   try{
     const r=await fetch(new URL(`api/chat/cancel?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{credentials:'include'});
     try{respBody=await r.json();}catch(_){}
-  }catch(e){}
-  // Always close the SSE EventSource for the (sid, streamId) we just tried
-  // to cancel — mirrors cancelSessionStream() so the old source cannot leak
+  }catch(e){
+    if(typeof console !== 'undefined' && console.debug){
+      console.debug('cancelStream: /api/chat/cancel request failed', e);
+    }
+  }
+  // Close the SSE EventSource for the (sid, streamId) we just tried
+  // to cancel when possible — mirrors cancelSessionStream() so the old source
   // events into a subsequent turn's UI.
   if(sid && typeof closeLiveStream==='function'){ closeLiveStream(sid, streamId); }
   // Owner guard: only clear the local active state if WE still own the
@@ -1228,6 +1232,13 @@ $('msg').addEventListener('input',()=>{
       if(matches.length)showCmdDropdown(matches); else hideCmdDropdown();
     }
     if(typeof ensureSkillCommandsLoadedForAutocomplete==='function') ensureSkillCommandsLoadedForAutocomplete();
+  } else if(typeof getComposerPathAutocompleteMatches==='function'){
+    const cursor=$('msg').selectionStart;
+    getComposerPathAutocompleteMatches(text,cursor).then(matches=>{
+      const ta=$('msg');
+      if(!ta||ta.value!==text||ta.selectionStart!==cursor) return;
+      if(matches.length)showCmdDropdown(matches); else hideCmdDropdown();
+    }).catch(()=>hideCmdDropdown());
   } else {
     hideCmdDropdown();
   }
@@ -1489,6 +1500,7 @@ const _SKINS=[
   {name:'Nous',     colors:['#4682B4','#3A6E9A','#2C5F88']},
   {name:'Neon',     colors:['#B347FF','#C76BFF','#00DDFF']},
   {name:'Geist Contrast', value:'geist-contrast', colors:['#000000','#ffffff','#FFF175']},
+  {name:'Zeus',     colors:['#FFD700','#FFBF00','#1A1A00']},
 ];
 const _VALID_THEMES=new Set((_THEMES||[]).map(t=>t.value));
 const _VALID_SKINS=new Set((_SKINS||[]).map(s=>(s.value||s.name).toLowerCase()));
@@ -1706,6 +1718,7 @@ function applyBotName(){
     window._whatsNewSummaryEnabled=!!s.whats_new_summary_enabled;
     window._showThinking=s.show_thinking!==false;
     window._simplifiedToolCalling=s.simplified_tool_calling!==false;
+    window._terminalAutoExpandOnOutput=!!s.terminal_auto_expand_on_output;
     window._activityFeedExpandedDefault=!!s.activity_feed_expanded_default;
     window._sidebarDensity=(s.sidebar_density==='detailed'?'detailed':'compact');
     window._pinnedSessionsLimit=parseInt(s.pinned_sessions_limit||3,10)||3;
@@ -1803,6 +1816,7 @@ function applyBotName(){
     window._whatsNewSummaryEnabled=false;
     window._showThinking=true;
     window._simplifiedToolCalling=true;
+    window._terminalAutoExpandOnOutput=false;
     window._sessionJumpButtonsEnabled=false;
     window._sidebarDensity='compact';
     window._pinnedSessionsLimit=3;

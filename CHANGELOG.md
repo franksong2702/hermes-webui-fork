@@ -6,6 +6,29 @@
 ### Fixed
 - `cancelStream()` now (1) closes the SSE EventSource for the `(sid, streamId)` pair it just tried to cancel, (2) reads the `/api/chat/cancel` response and only clears local busy state when the active stream id still matches the one we asked to cancel, so a new turn that started while the cancel request was in flight is no longer wiped, and (3) surfaces a short `Stream is no longer active` toast when the backend returns `cancelled:false`. The change is owner-aware and mirrors the existing `cancelSessionStream()` cleanup path.
 
+## [v0.51.252] — 2026-06-03 — Release HT (stage-q24 — selection-bleed fix + compatibility docs)
+
+### Fixed
+- The floating "selected-text reply" button no longer lets its own label get caught in a text selection (`user-select:none`), so dragging a selection near the button doesn't bleed into it. (#2481, @rodboev)
+
+### Docs
+- README now has a **Compatibility** section documenting that the WebUI is tested against the matching hermes-agent release and that both should be upgraded together (until the stable agent API #2491 lands). (@rodboev)
+
+## [v0.51.251] — 2026-06-03 — Release HS (stage-q23 — composer ~/ path autocomplete)
+
+### Fixed
+- Typing a `~/` path token in the composer (e.g. `check this file ~/`) now opens a home-directory path-suggestion dropdown, matching the TUI's path completion. It reuses the existing slash-command dropdown (positioning + keyboard nav) and the server's trusted `/api/workspaces/suggest` endpoint, and only replaces the matched path token on selection (surrounding message text is preserved). Slash-command autocomplete still takes precedence for `/`-prefixed input. (#3433, @puneetdixit200)
+
+## [v0.51.250] — 2026-06-03 — Release HR (stage-q22 — Zeus appearance skin)
+
+### Added
+- New **Zeus** appearance skin (Settings → Appearance, or `/theme skin zeus`) — OLED-near-black dark surfaces that keep the default gold accent, for a high-contrast "gold on black" look that no existing skin offered. All visual changes are scoped to `data-skin="zeus"`; it's dark-focused and falls back to the default light palette in light mode. (#3328, @heagandev)
+
+## [v0.51.249] — 2026-06-03 — Release HQ (stage-q21 — auto-expand terminal on output toggle)
+
+### Added
+- New **"Auto-expand terminal on output"** preference (Settings → Preferences, **off by default**). When enabled, the collapsed embedded terminal panel surfaces itself automatically the first time a running command emits output, so long-running command output isn't silently collected behind a collapsed panel. The auto-expand does not steal focus from the composer, and fires once per stream (not per output chunk). Mirrors the existing `simplified_tool_calling` setting pattern; default-off means no behavior change on upgrade. (#2974, @rodboev)
+
 ## [v0.51.248] — 2026-06-03 — Release HP (stage-q20 — self-heal deleted WebUI sessions instead of bricking the chat)
 
 ### Fixed
