@@ -644,7 +644,7 @@ def test_mobile_titlebar_has_new_conversation_button():
     assert "data-i18n-aria-label=\"new_conversation\"" in header_html
     assert "aria-label=\"New conversation\"" in header_html
     assert "title=\"New conversation\"" in header_html
-    assert "$('btnNewChat').onclick && $('btnNewChat').onclick()" in header_html
+    assert "$('btnNewChat').click()" in header_html
 
 
 def test_titlebar_new_chat_button_mobile_visibility_css():
