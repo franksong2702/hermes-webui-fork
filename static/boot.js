@@ -23,8 +23,8 @@ async function cancelStream(){
     const r=await fetch(new URL(`api/chat/cancel?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{credentials:'include'});
     try{respBody=await r.json();}catch(_){}
   }catch(e){
-    if(typeof console !== 'undefined' && console.debug){
-      console.debug('cancelStream: /api/chat/cancel request failed', e);
+    if(typeof console !== 'undefined' && console.warn){
+      console.warn('cancelStream: /api/chat/cancel request failed', e);
     }
   }
   // Close the SSE EventSource for the (sid, streamId) we just tried
