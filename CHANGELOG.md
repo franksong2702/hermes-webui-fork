@@ -53,6 +53,7 @@
 
 ### Docs
 - Documented an explicit WebUI–Agent compatibility policy: separate the displayed WebUI runtime version from the tested/pinned pair compatibility contract, and clarified Docker upgrade pinning guidance to keep releases aligned until the stable boundary work in #1925/#2491 lands. (#3232, @franksong2702)
+
 ## [v0.51.252] — 2026-06-03 — Release HT (stage-q24 — selection-bleed fix + compatibility docs)
 
 ### Fixed
