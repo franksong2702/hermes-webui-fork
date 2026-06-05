@@ -4,8 +4,8 @@
 ## [Unreleased]
 
 ### Fixed
-- `cancelStream()` now (1) closes the SSE EventSource for the `(sid, streamId)` pair it just tried to cancel, (2) reads the `/api/chat/cancel` response and only clears local busy state when the active stream id still matches the one we asked to cancel, so a new turn that started while the cancel request was in flight is no longer wiped, and (3) surfaces a short `Stream is no longer active` toast when the backend returns `cancelled:false`. The change is owner-aware and mirrors the existing `cancelSessionStream()` cleanup path.
- 
+- `cancelStream()` now keeps the active session's SSE open after an accepted Stop so the backend `cancel` event can settle and render the cancelled transcript, while still closing stale old streams and guarding local busy-state cleanup so a newer in-flight turn is not wiped.
+
 ## [v0.51.262] — 2026-06-04 — Release ID (stage-r12 — zh localization + Docker reveal-path + recall-prefill role fix)
 
 ### Fixed

@@ -13,7 +13,7 @@
 
 // cancelStream: stop the active chat stream.
 // See docs/rfcs/webui-run-state-consistency-contract.md (Invariants #2, #4)
-// for the owner-aware + SSE-close rationale.
+// for the owner-aware + terminal-settle rationale.
 async function cancelStream(){
   const sid = S.session && S.session.session_id;
   const streamId = S.activeStreamId;
@@ -34,21 +34,19 @@ async function cancelStream(){
   if(sid && S.activeStreamId !== streamId && typeof closeLiveStream==='function'){
     closeLiveStream(sid, streamId);
   }
-  // Owner guard: only clear the local active state if WE still own the
-  // stream we asked to cancel. A new turn may have started while the
-  // cancel request was in flight; clearing in that case would wipe the
-  // new turn's busy state and desync UI from the worker.
-  if(S.activeStreamId===streamId){
+  // Owner guard: if the backend accepted the active-session cancel, leave
+  // the current SSE transport and owner state intact so the terminal
+  // `cancel` event can clear INFLIGHT, render "Task cancelled", and refresh
+  // the sidebar. Only clear locally when the backend says there is no active
+  // stream left to settle.
+  if(respBody && respBody.cancelled===false && S.activeStreamId===streamId){
     S.activeStreamId=null;
     setBusy(false);
     if(typeof setComposerStatus==='function') setComposerStatus('');
     else setStatus('');
-  }
-  // Surface a lightweight signal when the backend rejected the cancel.
-  // /api/chat/cancel only exposes `cancelled:bool`, so we cannot
-  // distinguish reasons — keep the toast generic and short.
-  if(respBody && respBody.cancelled===false && S.activeStreamId===null && typeof showToast==='function'){
-    showToast('Stream is no longer active',2000);
+    // /api/chat/cancel only exposes `cancelled:bool`, so we cannot
+    // distinguish reasons — keep the toast generic and short.
+    if(typeof showToast==='function') showToast('Stream is no longer active',2000);
   }
 }
 

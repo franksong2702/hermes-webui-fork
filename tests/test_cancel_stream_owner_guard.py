@@ -1,11 +1,11 @@
-"""Regression tests for cancelStream() owner-aware + SSE-close behavior.
+"""Regression tests for cancelStream() owner-aware cancel behavior.
 
 Covers the runtime/control-plane bug where ``cancelStream()`` in
 ``static/boot.js`` cleared frontend busy state unconditionally after
 issuing ``/api/chat/cancel``:
 
-  1. Did not call ``closeLiveStream(sid, streamId)`` — the SSE EventSource
-     stayed open in ``LIVE_STREAMS[sid]`` and could still emit events.
+  1. Treated active-session Stop like session-switch teardown and could close
+     the SSE before the backend ``cancel`` event settled the visible transcript.
   2. Did not read the cancel response, so a ``cancelled:false`` from the
      backend (stream already finalized, stream rotated, or session lock
      held by a newer turn) could not surface to the user.
@@ -149,7 +149,7 @@ class TestCancelStreamOwnerGuardStructural:
         # The fix keeps the existing try/catch around fetch.
         assert "catch" in CANCEL_STREAM_SRC, (
             "cancelStream() must keep the try/catch around fetch to swallow "
-            "network errors and continue local cleanup"
+            "network errors without tearing down the active owner path"
         )
 
 
@@ -235,7 +235,8 @@ async function runAll() {
     toastCalls: [...M.toastCalls],
   };
 
-  // T3 — cancelled:false: toast surfaced, SSE closed, local state still cleared.
+  // T3 — cancelled:false: toast surfaced, local state cleared because the
+  // backend says there is no active stream left to settle.
   reset();
   globalThis.S = { activeStreamId: 'stream-1', session: { session_id: 'sid-1' } };
   _fetchResponse = {
@@ -253,7 +254,8 @@ async function runAll() {
     toastCalls: [...M.toastCalls],
   };
 
-  // T4 — network error: no throw, SSE closed, local state still cleared.
+  // T4 — network error: no throw, active owner kept because we do not know
+  // whether the cancel landed.
   reset();
   globalThis.S = { activeStreamId: 'stream-1', session: { session_id: 'sid-1' } };
   _fetchResponse = null;
@@ -368,7 +370,7 @@ class TestCancelStreamOwnerGuardRuntime:
             f"got {r['composerCalls']}"
         )
 
-    def test_t2_happy_path_clears_state_and_closes_sse(self, runtime_results):
+    def test_t2_happy_path_keeps_owner_for_sse_cancel_settle(self, runtime_results):
         r = runtime_results["t2_happy_path"]
         assert r["fetchCalls"] == 1, (
             f"cancelStream() with active stream should call fetch exactly once, "
@@ -380,17 +382,17 @@ class TestCancelStreamOwnerGuardRuntime:
             f"cancelStream() must keep owned active SSE open for settle on happy path, "
             f"got {r['closeCalls']}"
         )
-        # Local state cleared.
-        assert r["finalActiveStreamId"] is None, (
-            f"cancelStream() must clear S.activeStreamId on the happy path, "
+        # Keep local owner state until the backend cancel SSE event settles.
+        assert r["finalActiveStreamId"] == "stream-1", (
+            f"cancelStream() must keep S.activeStreamId for SSE cancel settle, "
             f"got {r['finalActiveStreamId']!r}"
         )
-        assert r["busyCalls"] == [False], (
-            f"cancelStream() must call setBusy(false) on the happy path, "
+        assert r["busyCalls"] == [], (
+            f"cancelStream() must not call setBusy(false) before SSE cancel settle, "
             f"got {r['busyCalls']}"
         )
-        assert len(r["composerCalls"]) == 1 and r["composerCalls"][0] == "", (
-            f"cancelStream() must call setComposerStatus('') on the happy path, "
+        assert r["composerCalls"] == [], (
+            f"cancelStream() must not reset composer status before SSE cancel settle, "
             f"got {r['composerCalls']}"
         )
         # No toast on the happy path.
@@ -437,16 +439,16 @@ class TestCancelStreamOwnerGuardRuntime:
         assert r["fetchCalls"] == 1, (
             f"cancelStream() must attempt the fetch, got {r['fetchCalls']}"
         )
-        assert r["finalActiveStreamId"] is None, (
-            f"cancelStream() must still clear S.activeStreamId on network error, "
+        assert r["finalActiveStreamId"] == "stream-1", (
+            f"cancelStream() must keep S.activeStreamId on network error, "
             f"got {r['finalActiveStreamId']!r}"
         )
         assert r["closeCalls"] == [], (
             f"cancelStream() must keep owned SSE open on network error, "
             f"got {r['closeCalls']}"
         )
-        assert r["busyCalls"] == [False], (
-            f"cancelStream() must still call setBusy(false) on network error, "
+        assert r["busyCalls"] == [], (
+            f"cancelStream() must not call setBusy(false) on network error, "
             f"got {r['busyCalls']}"
         )
         # No toast for network error (we don't know if the cancel landed).
@@ -490,20 +492,22 @@ class TestCancelStreamOwnerGuardRuntime:
         )
 
     def test_owner_guard_surfaces_issue_reference(self, runtime_results):
-        """Sanity check: T2-T4 all clear local state; T5 does not.
-        Catches the regression where the owner guard accidentally clears
-        the new turn's state in some path."""
-        for key in ("t2_happy_path", "t3_cancelled_false", "t4_network_error"):
-            assert runtime_results[key]["finalActiveStreamId"] is None, (
-                f"{key} should clear S.activeStreamId"
+        """Sanity check: active owner paths preserve the SSE settle contract,
+        while no-active-stream and stale-owner paths still clean up locally."""
+        for key in ("t2_happy_path", "t4_network_error"):
+            assert runtime_results[key]["finalActiveStreamId"] == "stream-1", (
+                f"{key} should preserve S.activeStreamId for active owner path"
             )
-            assert runtime_results[key]["busyCalls"] == [False], (
-                f"{key} should call setBusy(false)"
+            assert runtime_results[key]["busyCalls"] == [], (
+                f"{key} should not call setBusy(false) before terminal settle"
             )
-        # T5 is the owner-guard case and must diverge from the above.
+        assert runtime_results["t3_cancelled_false"]["finalActiveStreamId"] is None
+        assert runtime_results["t3_cancelled_false"]["busyCalls"] == [False]
+        # T5 is the owner-rotation case and must preserve the new turn.
         assert runtime_results["t5_owner_guard"]["finalActiveStreamId"] == "stream-2"
         assert runtime_results["t5_owner_guard"]["busyCalls"] == []
-        # All four paths must close the OLD SSE — this is the leak fix.
+        # Only the stale-owner path closes the old SSE; active owned paths
+        # keep it open so the backend terminal event can settle/render.
         for key in ("t2_happy_path", "t3_cancelled_false", "t4_network_error", "t5_owner_guard"):
             if key == "t5_owner_guard":
                 assert runtime_results[key]["closeCalls"] == [["sid-1", "stream-1"]], (
