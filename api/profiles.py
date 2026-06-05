@@ -990,6 +990,7 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
     return {
         'profiles': list_profiles_api(),
         'active': name,
+        'is_default': _is_root_profile(name),
         'default_model': default_model,
         'default_model_provider': default_model_provider,
         'default_workspace': default_workspace,

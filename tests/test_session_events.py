@@ -54,16 +54,49 @@ def test_session_events_publish_for_minimal_sidebar_mutations():
     assert 'publish_session_list_changed("cron_complete",' in PROFILES
 
 
-def test_session_event_queue_is_bounded_and_latest_wins():
+def test_session_event_queue_same_profile_is_bounded_and_latest_wins():
     from api import session_events
 
     q = session_events.subscribe_session_events()
     try:
-        session_events.publish_session_list_changed("first")
-        session_events.publish_session_list_changed("second")
+        session_events.publish_session_list_changed("first", profile="profile-a")
+        session_events.publish_session_list_changed("second", profile="profile-a")
         payload = q.get_nowait()
         assert payload["type"] == "sessions_changed"
         assert payload["reason"] == "second"
+        assert payload["profile"] == "profile-a"
+        assert q.empty()
+    finally:
+        session_events.unsubscribe_session_events(q)
+
+
+def test_session_event_queue_profile_mismatch_coalesces_to_unscoped_refresh_all():
+    from api import session_events
+
+    q = session_events.subscribe_session_events()
+    try:
+        session_events.publish_session_list_changed("profile_a", profile="profile-a")
+        session_events.publish_session_list_changed("profile_b", profile="profile-b")
+        payload = q.get_nowait()
+        assert payload["type"] == "sessions_changed"
+        assert payload["reason"] == "profile_b"
+        assert "profile" not in payload
+        assert q.empty()
+    finally:
+        session_events.unsubscribe_session_events(q)
+
+
+def test_session_event_queue_unscoped_pending_stays_unscoped_when_followed_by_scoped():
+    from api import session_events
+
+    q = session_events.subscribe_session_events()
+    try:
+        session_events.publish_session_list_changed("all_profiles")
+        session_events.publish_session_list_changed("profile_b", profile="profile-b")
+        payload = q.get_nowait()
+        assert payload["type"] == "sessions_changed"
+        assert payload["reason"] == "profile_b"
+        assert "profile" not in payload
         assert q.empty()
     finally:
         session_events.unsubscribe_session_events(q)
@@ -85,5 +118,21 @@ def test_session_events_payload_tracks_profile_when_available():
         assert payload["type"] == "sessions_changed"
         assert payload["reason"] == "with_profile"
         assert payload["profile"] == "profile-b"
+    finally:
+        session_events.unsubscribe_session_events(q)
+
+
+def test_session_events_payload_omits_profile_for_default_root_alias(monkeypatch):
+    from api import session_events
+
+    monkeypatch.setattr(session_events, "_profile_is_root_alias", lambda profile: profile == "kinni")
+
+    q = session_events.subscribe_session_events()
+    try:
+        session_events.publish_session_list_changed("renamed_root", profile="kinni")
+        payload = q.get_nowait()
+        assert payload["type"] == "sessions_changed"
+        assert payload["reason"] == "renamed_root"
+        assert "profile" not in payload
     finally:
         session_events.unsubscribe_session_events(q)

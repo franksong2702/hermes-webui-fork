@@ -33,6 +33,18 @@ let _draftSaveTimer = null;
 const _DRAFT_SAVE_DELAY_MS = 400;
 const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
 
+function _profileMatchesActiveProfile(profile, activeProfile){
+  const eventName = (typeof profile === 'string' && profile.trim()) ? profile.trim() : 'default';
+  const activeName = (typeof activeProfile === 'string' && activeProfile.trim()) ? activeProfile.trim() : 'default';
+  if(eventName === activeName) return true;
+  return eventName === 'default' && !!S.activeProfileIsDefault;
+}
+
+function _sessionEventProfilesMatch(eventProfile, activeProfile){
+  if(!(typeof eventProfile === 'string' && eventProfile.trim())) return true;
+  return _profileMatchesActiveProfile(eventProfile, activeProfile);
+}
+
 function _isRestorableNewChatDraftSession(session, requireDraft=false) {
   if (!session || !session.session_id) return false;
   const messageCount = Number(session.message_count || 0);
@@ -42,7 +54,7 @@ function _isRestorableNewChatDraftSession(session, requireDraft=false) {
   if (title !== 'Untitled' && title !== 'New Chat') return false;
   const activeProfile = S.activeProfile || 'default';
   const sessionProfile = session.profile || 'default';
-  if (sessionProfile !== activeProfile) return false;
+  if (!_profileMatchesActiveProfile(sessionProfile, activeProfile)) return false;
   if (!requireDraft) return true;
   const draft = session.composer_draft || {};
   const text = (typeof draft.text === 'string') ? draft.text : '';
@@ -3046,7 +3058,7 @@ function ensureSessionEventsSSE(){
       try {
         const payload = typeof ev?.data === 'string' ? JSON.parse(ev.data) : {};
         const eventProfile = payload && typeof payload.profile === 'string' ? payload.profile : '';
-        if (eventProfile && eventProfile !== activeProfile) {
+        if (!_sessionEventProfilesMatch(eventProfile, activeProfile)) {
           return;
         }
       } catch (_err) {

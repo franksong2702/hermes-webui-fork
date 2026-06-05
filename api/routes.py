@@ -5902,11 +5902,20 @@ def handle_get(handler, parsed) -> bool:
         )
 
     if parsed.path == "/api/profile/active":
-        from api.profiles import get_active_profile_name, get_active_hermes_home
+        from api.profiles import (
+            _is_root_profile,
+            get_active_hermes_home,
+            get_active_profile_name,
+        )
 
+        active_profile_name = get_active_profile_name()
         return j(
             handler,
-            {"name": get_active_profile_name(), "path": str(get_active_hermes_home())},
+            {
+                "name": active_profile_name,
+                "path": str(get_active_hermes_home()),
+                "is_default": _is_root_profile(active_profile_name),
+            },
         )
 
     # ── Gateway Status (GET) ──
