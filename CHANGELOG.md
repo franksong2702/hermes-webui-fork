@@ -3,6 +3,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **WebUI now classifies WeCom and WeCom Callback sources as messaging sources instead of CLI/other.** `wecom` and `wecom_callback` are included in the shared messaging source allowlist and label maps, so gateway/sidecar rows (including stale or callback variants) keep messaging classification and readable channel labels in sidebar and chat metadata paths. (#3622)
+
 ## [v0.51.283] — 2026-06-05 — Release IY (stage-w2 — composer queue hint during auto-compaction)
 
 ### Fixed
@@ -103,6 +106,7 @@
 ### Internal
 - **Added a static-analysis contract test pinning the DOM-INFLIGHT reattach persistence invariant** (#3040): every `INFLIGHT[activeSid]` write in `send()` is paired with a `saveInflightState()` call so a reconnect/session-switch reseeds from durable state. (#3572, @rodboev)
 - **Added a regression test asserting `MiniMax-M3` is present in the MiniMax fallback model catalog.** (#3627, @rodboev)
+
 
 ## [v0.51.267] — 2026-06-04 — Release II (stage-r17 — TTS + CSRF forwarded-header security hardening)
 
