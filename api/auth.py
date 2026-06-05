@@ -105,6 +105,7 @@ def _save_sessions(sessions: dict[str, float]) -> None:
 
 # Active sessions: token -> expiry timestamp (persisted across restarts via STATE_DIR)
 _sessions = _load_sessions()
+_SESSIONS_LOCK = threading.Lock()
 
 # ── Login rate limiter ──────────────────────────────────────────────────────
 _LOGIN_ATTEMPTS_FILE = STATE_DIR / '.login_attempts.json'
@@ -184,6 +185,14 @@ def _record_login_attempt(ip: str) -> None:
         attempts.append(now)
         _login_attempts[ip] = attempts
         _save_login_attempts(_login_attempts)
+
+
+def _clear_login_attempts(ip: str) -> None:
+    """Clear failed login attempts after a successful login (thread-safe)."""
+    with _LOGIN_ATTEMPTS_LOCK:
+        if ip in _login_attempts:
+            _login_attempts.pop(ip, None)
+            _save_login_attempts(_login_attempts)
 
 
 def _load_key(filename: str) -> bytes:
@@ -380,8 +389,9 @@ def verify_password(plain: str) -> bool:
 def create_session() -> str:
     """Create a new auth session. Returns signed cookie value."""
     token = secrets.token_hex(32)
-    _sessions[token] = time.time() + _resolve_session_ttl()
-    _save_sessions(_sessions)
+    with _SESSIONS_LOCK:
+        _sessions[token] = time.time() + _resolve_session_ttl()
+        _save_sessions(_sessions)
     sig = hmac.new(_signing_key(), token.encode(), hashlib.sha256).hexdigest()
     return f"{token}.{sig}"
 
@@ -389,11 +399,12 @@ def create_session() -> str:
 def _prune_expired_sessions():
     """Remove all expired session entries to prevent unbounded memory growth."""
     now = time.time()
-    expired = [t for t, exp in _sessions.items() if now > exp]
-    if expired:
-        for token in expired:
-            _sessions.pop(token, None)
-        _save_sessions(_sessions)
+    with _SESSIONS_LOCK:
+        expired = [t for t, exp in _sessions.items() if now > exp]
+        if expired:
+            for token in expired:
+                _sessions.pop(token, None)
+            _save_sessions(_sessions)
 
 
 def verify_session(cookie_value: str) -> bool:
@@ -411,10 +422,12 @@ def verify_session(cookie_value: str) -> bool:
     )
     if not valid:
         return False
-    expiry = _sessions.get(token)
-    if not expiry or time.time() > expiry:
-        _sessions.pop(token, None)
-        return False
+    with _SESSIONS_LOCK:
+        expiry = _sessions.get(token)
+        if not expiry or time.time() > expiry:
+            _sessions.pop(token, None)
+            _save_sessions(_sessions)
+            return False
     return True
 
 
@@ -453,9 +466,10 @@ def invalidate_session(cookie_value) -> None:
     """Remove a session token."""
     if cookie_value and '.' in cookie_value:
         token = cookie_value.rsplit('.', 1)[0]
-        if token in _sessions:
-            _sessions.pop(token, None)
-            _save_sessions(_sessions)
+        with _SESSIONS_LOCK:
+            if token in _sessions:
+                _sessions.pop(token, None)
+                _save_sessions(_sessions)
 
 
 def parse_cookie(handler) -> str | None:
@@ -526,21 +540,36 @@ def check_auth(handler, parsed) -> bool:
     return False
 
 
+def _is_loopback(addr: str) -> bool:
+    """Return True if *addr* is a loopback address (127.x.x.x, ::1, or ::ffff:127.x.x.x)."""
+    import ipaddress as _ipaddress
+    try:
+        ip = _ipaddress.ip_address(addr)
+        if ip.is_loopback:
+            return True
+        # Python < 3.12: is_loopback is False for ::ffff:127.x.x.x (gh-117566)
+        if hasattr(ip, 'ipv4_mapped') and ip.ipv4_mapped is not None:
+            return ip.ipv4_mapped.is_loopback
+        return False
+    except ValueError:
+        return False
+
+
 def _is_secure_context(handler=None) -> bool:
     """Return True if cookies should carry the Secure flag.
 
-    Behaviour is overridable via HERMES_WEBUI_SECURE env var for
-    reverse-proxy setups where TLS terminates at a frontend proxy
-    (nginx, Cloudflare, etc.) and Python only sees plain HTTP.
-    1/true/yes → force Secure on; 0/false/no → force Secure off.
-    When unset, fall back to heuristics: direct TLS socket (getpeercert)
-    or X-Forwarded-Proto header from the request.
+    Priority order:
+    1. ``HERMES_WEBUI_SECURE`` env var: 1/true/yes -> True; 0/false/no -> False.
+    2. Direct TLS socket (handler.request.getpeercert present) -> True.
+    3. ``HERMES_WEBUI_TRUST_FORWARDED_PROTO=1`` opt-in: trust
+       ``X-Forwarded-Proto: https`` header from a known reverse proxy.
+    4. Otherwise -> False (loopback or non-loopback, plain HTTP is not secure).
 
     .. warning::
-       The ``X-Forwarded-Proto`` header is only trustworthy when a
-       reverse proxy (nginx, Cloudflare, etc.) is deployed in front
-       of the application.  Without a proxy, any client can forge the
-       header and cause the Secure flag to be set on plain HTTP.
+       ``X-Forwarded-Proto`` is only trustworthy behind a reverse proxy.
+       It is ignored unless ``HERMES_WEBUI_TRUST_FORWARDED_PROTO=1`` is
+       set explicitly, preventing header-injection attacks on plain-HTTP
+       deployments.
     """
     env = os.getenv('HERMES_WEBUI_SECURE', '').strip().lower()
     if env in ('1', 'true', 'yes'):
@@ -550,8 +579,10 @@ def _is_secure_context(handler=None) -> bool:
     if handler is not None:
         if getattr(handler.request, 'getpeercert', None) is not None:
             return True
-        if handler.headers.get('X-Forwarded-Proto', '') == 'https':
-            return True
+        trust_fwd = os.getenv('HERMES_WEBUI_TRUST_FORWARDED_PROTO', '').strip().lower()
+        if trust_fwd in ('1', 'true', 'yes'):
+            if handler.headers.get('X-Forwarded-Proto', '') == 'https':
+                return True
     return False
 
 
