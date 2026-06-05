@@ -55,6 +55,8 @@ def _coalesced_sessions_changed_payload(pending: dict | None, incoming: dict) ->
     an A tab ignore the queued event and miss the refresh entirely. On any
     scope mismatch, fall back to an unscoped refresh-all event.
     """
+    if pending is None:
+        return incoming
     pending_profile = _payload_profile(pending)
     incoming_profile = _payload_profile(incoming)
     if pending_profile == incoming_profile:

@@ -1,3 +1,4 @@
+import queue
 from pathlib import Path
 
 
@@ -100,6 +101,38 @@ def test_session_event_queue_unscoped_pending_stays_unscoped_when_followed_by_sc
         assert q.empty()
     finally:
         session_events.unsubscribe_session_events(q)
+
+
+def test_session_event_queue_drain_race_preserves_incoming_profile():
+    from api import session_events
+
+    class DrainedQueue:
+        def __init__(self):
+            self.payloads = []
+            self.put_attempts = 0
+
+        def put_nowait(self, payload):
+            self.put_attempts += 1
+            if self.put_attempts == 1:
+                raise queue.Full()
+            self.payloads.append(payload)
+
+        def get_nowait(self):
+            raise queue.Empty()
+
+    q = DrainedQueue()
+    with session_events._SESSION_EVENTS_LOCK:
+        session_events._SESSION_EVENTS_SUBSCRIBERS.add(q)
+    try:
+        session_events.publish_session_list_changed("profile_b", profile="profile-b")
+        assert len(q.payloads) == 1
+        payload = q.payloads[0]
+        assert payload["type"] == "sessions_changed"
+        assert payload["reason"] == "profile_b"
+        assert payload["profile"] == "profile-b"
+    finally:
+        with session_events._SESSION_EVENTS_LOCK:
+            session_events._SESSION_EVENTS_SUBSCRIBERS.discard(q)
 
 
 def test_session_events_payload_tracks_profile_when_available():
