@@ -93,11 +93,11 @@ class TestCancelStreamOwnerGuardStructural:
         )
 
     def test_calls_close_live_stream(self):
-        """The fix must close the SSE EventSource for the cancelled
-        stream, regardless of whether the cancel succeeded."""
+        """The fix must close stale owned-path SSE streams, but not the
+        active owned stream before backend terminal settle."""
         assert "closeLiveStream" in CANCEL_STREAM_SRC, (
-            "cancelStream() must call closeLiveStream(sid, streamId) so the "
-            "old SSE EventSource does not leak into a subsequent turn"
+            "cancelStream() must conditionally call closeLiveStream(sid, streamId) "
+            "only when the stream is no longer owned"
         )
         # Must pass the captured streamId, not S.activeStreamId (which may
         # have rotated by the time the fetch resolves).
@@ -107,6 +107,10 @@ class TestCancelStreamOwnerGuardStructural:
         assert "S.activeStreamId" not in call_args, (
             "closeLiveStream() must use the captured streamId, not the current "
             "S.activeStreamId (which may have rotated to a new turn)"
+        )
+        assert "S.activeStreamId !== streamId" in CANCEL_STREAM_SRC, (
+            "cancelStream() should keep owned active SSE open but close stale streams "
+            "where ownership changed"
         )
 
     def test_owner_guard_before_clearing_active_state(self):
@@ -370,10 +374,11 @@ class TestCancelStreamOwnerGuardRuntime:
             f"cancelStream() with active stream should call fetch exactly once, "
             f"got {r['fetchCalls']}"
         )
-        # SSE closed for the captured (sid, streamId) pair.
-        assert r["closeCalls"] == [["sid-1", "stream-1"]], (
-            f"cancelStream() must call closeLiveStream('sid-1', 'stream-1') "
-            f"on the happy path, got {r['closeCalls']}"
+        # Active owned stop keeps SSE open so backend cancellation terminal event
+        # can drive settle/render directly.
+        assert r["closeCalls"] == [], (
+            f"cancelStream() must keep owned active SSE open for settle on happy path, "
+            f"got {r['closeCalls']}"
         )
         # Local state cleared.
         assert r["finalActiveStreamId"] is None, (
@@ -400,14 +405,14 @@ class TestCancelStreamOwnerGuardRuntime:
             f"cancelStream() must call fetch even when the backend will "
             f"return cancelled:false, got {r['fetchCalls']}"
         )
-        assert r["closeCalls"] == [["sid-1", "stream-1"]], (
-            f"cancelStream() must still call closeLiveStream when the backend "
-            f"returns cancelled:false, got {r['closeCalls']}"
-        )
         # Local state still cleared (this is the turn we wanted to cancel).
         assert r["finalActiveStreamId"] is None, (
             f"cancelStream() must clear S.activeStreamId even on cancelled:false, "
             f"got {r['finalActiveStreamId']!r}"
+        )
+        assert r["closeCalls"] == [], (
+            f"cancelStream() must keep owned SSE open on cancelled:false, "
+            f"got {r['closeCalls']}"
         )
         assert r["busyCalls"] == [False], (
             f"cancelStream() must still call setBusy(false) on cancelled:false, "
@@ -432,13 +437,13 @@ class TestCancelStreamOwnerGuardRuntime:
         assert r["fetchCalls"] == 1, (
             f"cancelStream() must attempt the fetch, got {r['fetchCalls']}"
         )
-        assert r["closeCalls"] == [["sid-1", "stream-1"]], (
-            f"cancelStream() must still call closeLiveStream on network error, "
-            f"got {r['closeCalls']}"
-        )
         assert r["finalActiveStreamId"] is None, (
             f"cancelStream() must still clear S.activeStreamId on network error, "
             f"got {r['finalActiveStreamId']!r}"
+        )
+        assert r["closeCalls"] == [], (
+            f"cancelStream() must keep owned SSE open on network error, "
+            f"got {r['closeCalls']}"
         )
         assert r["busyCalls"] == [False], (
             f"cancelStream() must still call setBusy(false) on network error, "
@@ -500,7 +505,13 @@ class TestCancelStreamOwnerGuardRuntime:
         assert runtime_results["t5_owner_guard"]["busyCalls"] == []
         # All four paths must close the OLD SSE — this is the leak fix.
         for key in ("t2_happy_path", "t3_cancelled_false", "t4_network_error", "t5_owner_guard"):
-            assert runtime_results[key]["closeCalls"] == [["sid-1", "stream-1"]], (
-                f"{key} must close the old SSE for ('sid-1', 'stream-1'), "
+            if key == "t5_owner_guard":
+                assert runtime_results[key]["closeCalls"] == [["sid-1", "stream-1"]], (
+                    f"{key} must close stale old SSE for ('sid-1', 'stream-1'), "
+                    f"got {runtime_results[key]['closeCalls']}"
+                )
+                continue
+            assert runtime_results[key]["closeCalls"] == [], (
+                f"{key} must keep owned SSE open for terminal settlement path, "
                 f"got {runtime_results[key]['closeCalls']}"
             )

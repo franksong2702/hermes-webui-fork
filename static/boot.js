@@ -27,15 +27,18 @@ async function cancelStream(){
       console.warn('cancelStream: /api/chat/cancel request failed', e);
     }
   }
-  // Close the SSE EventSource for the (sid, streamId) we just tried
-  // to cancel when possible — mirrors cancelSessionStream() so the old source
-  // events into a subsequent turn's UI.
-  if(sid && typeof closeLiveStream==='function'){ closeLiveStream(sid, streamId); }
+  // Active-session cancel should not tear down the current SSE transport before
+  // the backend emits its terminal event; do that only for stale owner paths
+  // where the user moved on to a different stream before this request
+  // completed.
+  if(sid && S.activeStreamId !== streamId && typeof closeLiveStream==='function'){
+    closeLiveStream(sid, streamId);
+  }
   // Owner guard: only clear the local active state if WE still own the
   // stream we asked to cancel. A new turn may have started while the
   // cancel request was in flight; clearing in that case would wipe the
   // new turn's busy state and desync UI from the worker.
-  if(!S.activeStreamId || S.activeStreamId===streamId){
+  if(S.activeStreamId===streamId){
     S.activeStreamId=null;
     setBusy(false);
     if(typeof setComposerStatus==='function') setComposerStatus('');
@@ -44,7 +47,7 @@ async function cancelStream(){
   // Surface a lightweight signal when the backend rejected the cancel.
   // /api/chat/cancel only exposes `cancelled:bool`, so we cannot
   // distinguish reasons — keep the toast generic and short.
-  if(respBody && respBody.cancelled===false && typeof showToast==='function'){
+  if(respBody && respBody.cancelled===false && S.activeStreamId===null && typeof showToast==='function'){
     showToast('Stream is no longer active',2000);
   }
 }
