@@ -8,6 +8,32 @@
 - Streaming finalization now treats compression-exhausted or tool-tail agent results as errors instead of completed turns, so long tool-heavy sessions do not appear done when Hermes Agent failed before writing a final assistant answer. When Hermes Agent rotated the session id during automatic compression before that terminal failure, WebUI now preserves the pre-compression snapshot, migrates continuation state first, and persists the final error on the continuation session instead of the stale parent row.
 - Completed transcripts no longer render internal `[CONTEXT COMPACTION — REFERENCE ONLY]` reference cards; compression-exhausted runs now surface as explicit errors instead.
 
+## [v0.51.266] — 2026-06-04 — Release IH (stage-r16 — profile-chip active fix + intermediate reasoning + session-event scoping)
+
+### Fixed
+- **The composer profile chip now always matches the active profile (and message routing).** A #3331 regression keyed the chip label on the loaded session's profile, so opening a cross-profile session made the chip disagree with the profile-dropdown checkmark and misrepresent where the next message would route. The chip reads `S.activeProfile` again (#3331's project/session operation scoping is unaffected). (#3635, @nesquena-hermes; reported by @b3nw)
+- **Reasoning/thinking traces are persisted to the correct intermediate assistant message in multi-turn tool flows.** The per-message reasoning index only advanced in `on_interim_assistant`, which the agent suppresses for contentless tool-call assistant messages — so post-tool reasoning was mis-attributed to the previous turn. The index now also advances at the tool-call boundary (`on_tool`), guarded against over-incrementing. (#3587, @rodboev)
+- **Session-event SSE broadcasts no longer wake every connected tab across profiles, and never drop a relevant refresh.** Profile identity is attached when known; root/`default` aliases stay unscoped (a browser tab can't infer every renamed-root alias); and the bounded (`maxsize=1`) subscriber queue now falls back to an unscoped refresh-all when coalescing would replace a pending event with a different-profile one (so an A-tab can't miss its refresh). (#2660, @franksong2702)
+
+## [v0.51.265] — 2026-06-04 — Release IG (stage-r15 — owner-aware cancelStream(), un-held)
+
+### Fixed
+- **Stop/Cancel no longer leaves the UI falsely idle, drops the cancellation transcript, or leaks the old stream's tokens into the next turn.** `cancelStream()` is now owner-aware and terminal-settle-aware: for the *active* session it leaves the live SSE transport open so the backend's terminal `cancel` event clears INFLIGHT, renders "Task cancelled", and refreshes the sidebar; it only tears down the SSE for *stale* owner paths (a different stream started before the cancel returned); and it clears local busy state only on exact ownership (`S.activeStreamId===streamId`), so a new turn started mid-cancel is never clobbered. (#3344, @franksong2702)
+
+## [v0.51.264] — 2026-06-04 — Release IF (stage-r14 — sidebar cron-overflow + messaging source labels, un-held)
+
+### Fixed
+- **Cron sessions no longer flood the CLI session window in the sidebar** (so Discord/Telegram/Slack sessions stop vanishing from it). `_load_cli_sessions_uncached()` passed `exclude_sources=None`, overriding the default `("cron","webui")` exclusion, so hundreds of cron rows filled the 20-row visible limit. (#3585, @rodboev)
+- **Imported messaging sessions keep their source label after a sidebar refresh, and open + send correctly.** `_load_cli_sessions_uncached()` hardcoded `is_cli_session: True` for every state.db row; it now uses `is_cli_session_row()` so Discord/Telegram/Slack rows classify correctly, and the sidebar open/import path was extended (`_isMessagingSession()`) so opening a reclassified messaging session still imports it (no transient stub → no `/api/chat/start` 404 on the next send). (#3586, @rodboev)
+
+## [v0.51.263] — 2026-06-04 — Release IE (stage-r13 — codex-runtime slash command + activity-default test)
+
+### Fixed
+- **`/codex-runtime` (and `/codex_runtime`) now run as a WebUI slash command** instead of being sent to the model as a normal chat message — routed through the slash-command executor reusing the agent's shared `codex_runtime_switch` parser/apply logic. (#3621, @luanxu-dev)
+
+### Tests
+- Added regression coverage for the already-shipped `activity_feed_expanded_default` setting (default Activity-group expansion). (#3595, @rodboev)
+
 ## [v0.51.262] — 2026-06-04 — Release ID (stage-r12 — zh localization + Docker reveal-path + recall-prefill role fix)
 
 ### Fixed
