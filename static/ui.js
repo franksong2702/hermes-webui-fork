@@ -4855,6 +4855,13 @@ function _compactInflightState(state){
     messages,
     uploaded:Array.isArray(state.uploaded)?state.uploaded.slice(-20):[],
     toolCalls,
+    lastAssistantText:state.lastAssistantText||'',
+    lastReasoningText:state.lastReasoningText||'',
+    lastRunJournalSeq:state.lastRunJournalSeq||0,
+    journalReplayFromStart:!!state.journalReplayFromStart,
+    currentActivityBurstId:state.currentActivityBurstId||0,
+    currentLiveSegmentSeq:state.currentLiveSegmentSeq||0,
+    activityBurstAnchors:Array.isArray(state.activityBurstAnchors)?state.activityBurstAnchors.slice(-50):[],
     todos,
     todoStateMeta,
   }, limits.stringChars);

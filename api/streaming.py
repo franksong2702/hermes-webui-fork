@@ -4624,6 +4624,7 @@ def _run_agent_streaming(
         # If cancelled, drop all further events except the cancel event itself
         if cancel_event.is_set() and event not in ('cancel', 'error'):
             return
+        event_id = None
         if run_journal is not None:
             try:
                 journaled = run_journal.append_sse_event(event, data)
@@ -4640,8 +4641,13 @@ def _run_agent_streaming(
                     STREAM_LAST_EVENT_ID[stream_id] = event_id
             except Exception:
                 logger.debug("Failed to append run journal event %s for stream %s", event, stream_id, exc_info=True)
+        if event_id and hasattr(q, "note_last_event_id"):
+            try:
+                q.note_last_event_id(event_id)
+            except Exception:
+                logger.debug("Failed to note event_id %s for stream %s", event_id, stream_id, exc_info=True)
         try:
-            q.put_nowait((event, data, event_id))
+            q.put_nowait((event, data))
         except Exception:
             logger.debug("Failed to put event to queue")
 
@@ -7798,8 +7804,14 @@ def cancel_stream(stream_id: str) -> bool:
                 logger.debug("Failed to clear session state on cancel for %s", _cancel_session_id)
 
     if _emit_cancel_event and q:
+        _cancel_event_id = STREAM_LAST_EVENT_ID.get(stream_id)
+        if _cancel_event_id and hasattr(q, "note_last_event_id"):
+            try:
+                q.note_last_event_id(_cancel_event_id)
+            except Exception:
+                logger.debug("Failed to note cancel event_id %s for stream %s", _cancel_event_id, stream_id, exc_info=True)
         try:
-            q.put_nowait(('cancel', {'message': 'Cancelled by user'}, STREAM_LAST_EVENT_ID.get(stream_id)))
+            q.put_nowait(('cancel', {'message': 'Cancelled by user'}))
         except Exception:
             logger.debug("Failed to put cancel event to queue")
 
