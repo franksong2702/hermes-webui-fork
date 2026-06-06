@@ -1115,7 +1115,10 @@ async function loadSession(sid){
       setStatus('');
       setComposerStatus('');
       // syncTopbar();renderMessages();appendThinking();loadDir('.');
-      syncTopbar();renderMessages(sameSessionForceReload?{preserveScroll:true}:undefined);appendThinking();loadDir('.');
+      syncTopbar();renderMessages(sameSessionForceReload?{preserveScroll:true}:undefined);
+      if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
+      else appendThinking();
+      loadDir('.');
       updateQueueBadge(sid);
       startApprovalPolling(sid);
       if(typeof startClarifyPolling==='function') startClarifyPolling(sid);

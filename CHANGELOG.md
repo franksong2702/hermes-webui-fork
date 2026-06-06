@@ -7,7 +7,10 @@
 - **Live stream turns show the bottom timer immediately after starting.** The
   first chat-start path now places the live footer timer as soon as the backend
   returns `stream_id` and `pending_started_at`, instead of only restoring it
-  after a session switch or reconnect. (#3401, @franksong2702)
+  after a session switch or reconnect. Reloading a currently running session
+  also recreates the live worklog shell after the transcript DOM rebuild, so the
+  stream no longer stays invisible until you switch away and back. (#3401,
+  @franksong2702)
 - **Sidebar no longer crashes with `ReferenceError: _sessionAttentionState is not defined`.** The session-attention helper was declared *inside* `renderSessionListFromCache()` and relied on function hoisting, but the top-level `_sidebarRowHasVisibleMessages` (reached via `renderSessionListFromCache` → `_partitionSidebarSessionRows`) called it bare — and hoisting is scoped to the enclosing function, so every sidebar cache-render threw and the session list went blank. `_sessionAttentionState` is now a top-level function reachable by both call sites. Regressed in #3672 (v0.51.269). (#3696)
 - **Stale-stream terminal events no longer risk a `ReferenceError: source is not defined`.** `_bailOutOfTerminalEventsFromStaleStream` (declared inside `attachLiveStream`) called `_closeSource(source)` against a `source` that was not in its lexical scope — it would have thrown on the late-finalizing-stream path when the user is back in an active session. `source` is now threaded as an explicit parameter. Found by the new scope gate below during review. (#3696)
 

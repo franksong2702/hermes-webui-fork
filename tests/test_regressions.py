@@ -570,6 +570,19 @@ def test_reload_path_restores_pending_message_and_reattaches_live_stream(cleanup
             'const activeStreamId=S.session.active_stream_id||null;' in sessions_src)
     assert 'attachLiveStream(sid, activeStreamId' in sessions_src
     assert 'if (S.activeStreamId && S.activeStreamId === streamId) return;' in ui_src
+    active_branch_start = sessions_src.index("if(activeStreamId){\n      S.busy=true;")
+    active_branch_end = sessions_src.index("}else{\n      S.busy=false;", active_branch_start)
+    active_branch = sessions_src[active_branch_start:active_branch_end]
+    render_pos = active_branch.index("renderMessages(")
+    shell_pos = active_branch.index("ensureLiveWorklogShell")
+    assert render_pos < shell_pos, (
+        "Reloading an active stream must recreate the live worklog shell after "
+        "renderMessages() rebuilds msgInner; otherwise the stream stays invisible "
+        "until a session switch triggers another restore path."
+    )
+    assert "else appendThinking();" in active_branch, (
+        "Non-simplified tool-calling must keep the legacy fallback."
+    )
 
 
 # ── R16: Switching away/back must preserve live partial assistant output ─────
