@@ -7045,26 +7045,6 @@ function appendLiveCompressionCard(state){
   if(typeof scrollIfPinned==='function') scrollIfPinned();
   return true;
 }
-function settleLiveCompressionCards(sessionId){
-  const sid=String(sessionId||'');
-  const turn=$('liveAssistantTurn');
-  if(!turn) return false;
-  if(sid&&turn.dataset&&turn.dataset.sessionId&&String(turn.dataset.sessionId)!==sid) return false;
-  let changed=false;
-  turn.querySelectorAll('[data-live-compression-card="1"]').forEach(node=>{
-    const group=node.closest('.live-worklog,.tool-worklog,.tool-call-group');
-    node.remove();
-    if(group&&typeof _syncToolCallGroupSummary==='function') _syncToolCallGroupSummary(group);
-    changed=true;
-  });
-  if(changed){
-    if(typeof _removeEmptyLiveWorklogShells==='function') _removeEmptyLiveWorklogShells(_assistantTurnBlocks(turn));
-    _clearCompressionElapsedTimer();
-    if(typeof snapshotLiveTurnHtmlForSession==='function') snapshotLiveTurnHtmlForSession(sid);
-    if(typeof scrollIfPinned==='function') scrollIfPinned();
-  }
-  return changed;
-}
 function _isHandoffSummaryToolPayload(value){
   if(!value||typeof value!=='object'||Array.isArray(value)) return false;
   return value._handoff_summary_card === true;

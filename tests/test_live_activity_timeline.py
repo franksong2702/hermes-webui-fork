@@ -52,7 +52,9 @@ def test_per_segment_tool_activity_does_not_include_run_metadata_rows():
     assert "_appendActivityEvent(group" not in tool_fn
     assert "Tool finished: ${toolName}" not in UI_JS
     assert "Running tool: ${toolName}" not in UI_JS
-    assert "_worklogReasonNodeFromText(thinkingText" in UI_JS
+    assert "_worklogReasonNodeFromText(thinkingText" not in UI_JS
+    assert "_thinkingActivityNode(clean, false)" in UI_JS
+    assert "data-live-thinking-key" in UI_JS
 
 
 def test_tool_activity_uses_tool_cards_and_run_activity_owns_timer():

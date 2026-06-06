@@ -2989,7 +2989,6 @@ from api.models import (
     merge_session_messages_append_only,
     _active_stream_ids,
     _session_message_merge_key,
-    _active_stream_ids,
     _is_empty_partial_activity_message,
     _hide_from_default_sidebar,
     prune_session_from_index,

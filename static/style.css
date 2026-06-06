@@ -994,7 +994,7 @@
   .session-state-indicator.is-streaming,.session-state-indicator.is-unread,.session-state-indicator.is-attention-approval,.session-state-indicator.is-attention-clarify,.session-state-indicator.is-attention-generic{visibility:visible;}
   .session-state-indicator.is-attention-approval{color:var(--error);}
   .session-state-indicator.is-attention-clarify{color:var(--warning);}
-  .session-state-indicator.is-attention-generic{color:var(--accent);}
+  .session-state-indicator.is-attention-generic{color:var(--warning);}
   .session-state-indicator::before{content:"";display:block;flex-shrink:0;}
   .session-state-indicator.is-streaming::before{
     width:100%;
