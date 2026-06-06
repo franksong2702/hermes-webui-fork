@@ -2836,6 +2836,8 @@ body.resizing .sidebar{transition:none!important;}
   background:transparent;
 }
 .tool-worklog-list > .agent-activity-thinking .thinking-card-header{
+  display:flex;
+  align-items:center;
   gap:7px;
   padding:3px 8px;
   margin-left:-8px;
@@ -2863,9 +2865,16 @@ body.resizing .sidebar{transition:none!important;}
 }
 .tool-worklog-list > .agent-activity-thinking .thinking-card.open .thinking-card-body{
   margin-top:4px;
+  padding:6px 8px 7px 8px;
   border-top-color:transparent;
   border-radius:8px;
   background:var(--code-bg);
+}
+.tool-worklog-list > .agent-activity-thinking .thinking-card-body pre{
+  font-family:var(--font-mono);
+  font-size:var(--message-body-font-size);
+  line-height:var(--message-body-line-height);
+  color:var(--muted);
 }
 .wl-reason{
   color:var(--text);

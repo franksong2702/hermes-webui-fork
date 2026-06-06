@@ -500,13 +500,27 @@ class TestToolCardDesignTokens:
             "",
             CSS.split(".tool-worklog-list > .agent-activity-thinking .thinking-card-icon,", 1)[1].split("}", 1)[0],
         )
+        body_rule = re.sub(
+            r"\s+",
+            "",
+            CSS.split(".tool-worklog-list > .agent-activity-thinking .thinking-card.open .thinking-card-body{", 1)[1].split("}", 1)[0],
+        )
+        pre_rule = re.sub(
+            r"\s+",
+            "",
+            CSS.split(".tool-worklog-list > .agent-activity-thinking .thinking-card-body pre{", 1)[1].split("}", 1)[0],
+        )
 
         assert "background:transparent" in card_rule
         assert "border:0" in card_rule
         assert "border-radius:0" in card_rule
+        assert "display:flex" in header_rule and "align-items:center" in header_rule
         assert "color:var(--muted)" in header_rule
         assert "font-size:var(--message-body-font-size)" in header_rule
         assert "font-weight:400" in header_rule
         assert "font-weight:400" in label_rule
         assert "letter-spacing:0" in label_rule
         assert "color:var(--muted)" in icon_rule
+        assert "padding:6px8px7px8px" in body_rule
+        assert "font-size:var(--message-body-font-size)" in pre_rule
+        assert "line-height:var(--message-body-line-height)" in pre_rule
