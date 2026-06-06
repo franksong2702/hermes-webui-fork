@@ -112,7 +112,7 @@ class TestReasoningContentPreference:
         src = read('static/ui.js')
         helper = src.split("function _worklogReasoningTextFromMessage", 1)[1].split("function _thinkingCardHtml", 1)[0]
         assert "_assistantReasoningPayloadText(m)" in helper
-        assert "_sanitizeThinkingDisplayText" in helper
+        assert "_stripVisibleAssistantEchoFromThinking" in helper
 
     def test_no_direct_reasoning_content_to_inline_thinking_assignment(self):
         """Provider reasoning should not be promoted into inline assistant prose."""

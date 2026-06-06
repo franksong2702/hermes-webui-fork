@@ -837,8 +837,8 @@ def test_messages_js_supports_live_reasoning_and_tool_completion(cleanup_test_se
         "messages.js must listen for live reasoning SSE events"
     assert "liveReasoningText += text" in src, \
         "live reasoning SSE events must update the active Worklog Thinking Card text"
-    assert "updateThinking(_liveThinkingText())" in src, \
-        "live reasoning SSE events must refresh the Worklog Thinking Card"
+    assert "_updateLiveThinkingCard(_liveThinkingText())" in src, \
+        "live reasoning SSE events must refresh the current segment's Worklog Thinking Card"
     assert "source.addEventListener('tool_complete'" in src or 'source.addEventListener("tool_complete"' in src, \
         "messages.js must listen for live tool completion SSE events"
     assert "function _parseStreamState()" in src, \
@@ -869,8 +869,9 @@ def test_ui_js_can_upgrade_thinking_spinner_into_live_reasoning_card(cleanup_tes
     src = (REPO_ROOT / "static/ui.js").read_text()
     assert "function _thinkingMarkup(text='')" in src or 'function _thinkingMarkup(text="")' in src, \
         "ui.js must centralize thinking row markup so it can switch between spinner and live text"
-    assert "function updateThinking(text=''){appendThinking(text);}" in src or 'function updateThinking(text=""){appendThinking(text);}' in src, \
-        "ui.js must expose an updateThinking helper for legacy/non-simplified thinking rendering"
+    assert ("function updateThinking(text='', options){appendThinking(text, options);}" in src
+            or 'function updateThinking(text="", options){appendThinking(text, options);}' in src), \
+        "ui.js must expose an updateThinking helper that preserves live Thinking placement metadata"
     assert "function finalizeThinkingCard()" in src, \
         "ui.js must expose a helper to finalize one live thinking card before starting another"
 
@@ -912,8 +913,8 @@ def test_ui_js_does_not_hide_anchor_segments_that_contain_thinking(cleanup_test_
     helper_end = src.find("function _thinkingCardHtml", helper_start)
     assert helper_start != -1 and helper_end != -1
     helper = src[helper_start:helper_end]
-    assert "return _sanitizeThinkingDisplayText(_assistantReasoningPayloadText(m));" in helper, \
-        "provider reasoning metadata should feed the Worklog Thinking Card"
+    assert "_assistantReasoningPayloadText(m)" in helper and "_stripVisibleAssistantEchoFromThinking" in helper, \
+        "provider reasoning metadata should feed the Worklog Thinking Card after exact duplicate suppression"
     assert "data-worklog-thinking-card" in src, \
         "Thinking Cards should be explicit Worklog items, not tool cards"
     assert "_thinkingActivityNode(thinkingText, false)" in src, \

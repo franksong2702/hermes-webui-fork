@@ -3163,14 +3163,19 @@ function _sanitizeThinkingDisplayText(text){
   return stripped.trim();
 }
 
-function _stripVisibleAssistantEchoFromThinking(thinkingText, visibleText){
-  let out=String(thinkingText||'');
-  const visible=String(visibleText||'');
-  if(!out||!visible) return out.trim();
-  visible.split(/\n{2,}/).map(s=>s.trim()).filter(s=>s.length>=20).forEach(snippet=>{
-    out=out.split(snippet).join('');
-  });
-  return out.trim();
+function _normalizeThinkingEchoCompare(text){
+  return String(text||'').replace(/\s+/g,' ').trim();
+}
+
+function _stripVisibleAssistantEchoFromThinking(thinkingText, ...visibleTexts){
+  const clean=_sanitizeThinkingDisplayText(thinkingText);
+  const thinkingNorm=_normalizeThinkingEchoCompare(clean);
+  if(!thinkingNorm) return '';
+  for(const visibleText of visibleTexts){
+    const visibleNorm=_normalizeThinkingEchoCompare(visibleText);
+    if(visibleNorm&&visibleNorm===thinkingNorm) return '';
+  }
+  return clean;
 }
 
 function renderMd(raw){
@@ -6146,8 +6151,77 @@ function _assistantReasoningPayloadText(m){
   if(turnMatch) return turnMatch[1].trim();
   return '';
 }
-function _worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, visibleContent){
-  return _sanitizeThinkingDisplayText(_assistantReasoningPayloadText(m));
+function _stripLeadingAssistantThinkingMarkup(content){
+  let out=String(content||'');
+  const thinkMatch=out.match(/^\s*<think>([\s\S]*?)<\/think>\s*/);
+  if(thinkMatch) out=out.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'').trimStart();
+  const thoughtMatch=out.match(/^\s*<\|channel\|?>thought\n?([\s\S]*?)<channel\|>\s*/);
+  if(thoughtMatch) out=out.replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'').trimStart();
+  const turnMatch=out.match(/^\s*<\|turn\|>thinking\n([\s\S]*?)<turn\|>\s*/);
+  if(turnMatch) out=out.replace(/^\s*<\|turn\|>thinking\n[\s\S]*?<turn\|>\s*/,'').trimStart();
+  return out;
+}
+function _assistantVisibleContentForReasoningCompare(m){
+  if(!m||m.role!=='assistant') return '';
+  let content=m.content||'';
+  if(Array.isArray(content)){
+    content=content.filter(p=>p&&p.type==='text').map(p=>p.text||p.content||'').join('\n');
+  }
+  if(typeof content==='string') content=_stripLeadingAssistantThinkingMarkup(content);
+  if(_isMarkerOnlyAssistantCompressionMessage(m)){
+    content='**Error:** No response received after context compression. Please retry.';
+  }
+  if(_isAssistantEmptyPlaceholderContent(m, content)) return '';
+  return String(content||'');
+}
+function _assistantTurnFinalVisibleContentMap(visWithIdx){
+  const out=new Map();
+  let runIdxs=[];
+  let finalVisible='';
+  const flush=()=>{
+    for(const idx of runIdxs) out.set(idx, finalVisible);
+    runIdxs=[];
+    finalVisible='';
+  };
+  for(const entry of visWithIdx||[]){
+    const m=entry&&entry.m;
+    if(m&&m.role==='assistant'){
+      runIdxs.push(entry.rawIdx);
+      const visible=_assistantVisibleContentForReasoningCompare(m);
+      if(String(visible||'').trim()) finalVisible=visible;
+    }else{
+      flush();
+    }
+  }
+  flush();
+  return out;
+}
+function _assistantTurnVisibleContentMap(visWithIdx){
+  const out=new Map();
+  let runIdxs=[];
+  let visibleTexts=[];
+  const flush=()=>{
+    for(const idx of runIdxs) out.set(idx, visibleTexts.slice());
+    runIdxs=[];
+    visibleTexts=[];
+  };
+  for(const entry of visWithIdx||[]){
+    const m=entry&&entry.m;
+    if(m&&m.role==='assistant'){
+      runIdxs.push(entry.rawIdx);
+      const visible=_assistantVisibleContentForReasoningCompare(m);
+      if(String(visible||'').trim()) visibleTexts.push(visible);
+    }else{
+      flush();
+    }
+  }
+  flush();
+  return out;
+}
+function _worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, visibleContent, turnFinalVisibleContent, turnVisibleContents){
+  const thinkingText=_assistantReasoningPayloadText(m);
+  const visibleTexts=Array.isArray(turnVisibleContents)?turnVisibleContents:[];
+  return _stripVisibleAssistantEchoFromThinking(thinkingText, visibleContent, turnFinalVisibleContent, ...visibleTexts);
 }
 function _thinkingCardHtml(text, open){
   const clean=_sanitizeThinkingDisplayText(text);
@@ -7727,6 +7801,8 @@ function renderMessages(options){
   const hiddenBeforeCount=windowStart;
   const renderVisWithIdx=visWithIdx.slice(windowStart);
   const firstRenderedRawIdx=renderVisWithIdx.length?renderVisWithIdx[0].rawIdx:Infinity;
+  const assistantTurnFinalVisibleContentByRawIdx=_assistantTurnFinalVisibleContentMap(visWithIdx);
+  const assistantTurnVisibleContentByRawIdx=_assistantTurnVisibleContentMap(visWithIdx);
   const hasServerOlder=!!(typeof _messagesTruncated!=='undefined' && _messagesTruncated && S.messages.length>0);
   const serverOlderCount=hasServerOlder&&Number.isFinite(Number(_oldestIdx))?Math.max(0,Number(_oldestIdx)):0;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
@@ -7854,7 +7930,9 @@ function renderMessages(options){
       content='';
     }
     if(!isUser&&isSimplifiedToolCalling()&&!thinkingText){
-      thinkingText=_worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, displayContent);
+      const turnFinalVisibleContent=assistantTurnFinalVisibleContentByRawIdx.get(rawIdx)||'';
+      const turnVisibleContents=assistantTurnVisibleContentByRawIdx.get(rawIdx)||[];
+      thinkingText=_worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, displayContent, turnFinalVisibleContent, turnVisibleContents);
     }
     const isLastAssistant=!isUser&&vi===renderVisWithIdx.length-1;
     const nextRendered=renderVisWithIdx[vi+1];

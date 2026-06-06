@@ -4,8 +4,10 @@ These tests intentionally follow the repo's existing pytest style: read static
 source files, isolate the relevant function/rule, and assert implementation
 invariants before changing the UI.
 """
+import json
 import pathlib
 import re
+import subprocess
 
 REPO = pathlib.Path(__file__).parent.parent
 UI_JS = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
@@ -68,6 +70,86 @@ def _function_body(src: str, name: str) -> str:
         i += 1
     assert depth == 0, f"{name}() body did not close"
     return src[brace + 1:i - 1]
+
+
+def _function_src(src: str, name: str) -> str:
+    match = re.search(rf"function\s+{re.escape(name)}\s*\(", src)
+    assert match, f"{name}() not found"
+    brace = src.find("{", match.end())
+    assert brace != -1, f"{name}() has no body"
+    depth = 1
+    i = brace + 1
+    in_string = None
+    escaped = False
+    in_line_comment = False
+    in_block_comment = False
+    while i < len(src) and depth:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < len(src) else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in "'\"`":
+            in_string = ch
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        i += 1
+    assert depth == 0, f"{name}() body did not close"
+    return src[match.start():i]
+
+
+def _run_thinking_echo_helper(*args: str) -> str:
+    helpers = "\n".join(
+        _function_src(UI_JS, name)
+        for name in (
+            "_stripXmlToolCallsDisplay",
+            "_sanitizeThinkingDisplayText",
+            "_normalizeThinkingEchoCompare",
+            "_stripVisibleAssistantEchoFromThinking",
+        )
+    )
+    script = (
+        helpers
+        + "\nconst args=JSON.parse(process.argv[1]);"
+        + "\nprocess.stdout.write(JSON.stringify(_stripVisibleAssistantEchoFromThinking(...args)));"
+    )
+    out = subprocess.run(
+        ["node", "-e", script, json.dumps(list(args))],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return json.loads(out)
 
 
 class TestToolCallGroupingStatic:
@@ -299,10 +381,58 @@ class TestToolCallGroupingStatic:
             "Live Thinking should render the provider reasoning text as-is after normal trimming."
         )
 
-    def test_settled_thinking_does_not_rewrite_visible_assistant_echoes(self):
+    def test_settled_exact_duplicate_thinking_suppressed(self):
+        assert _run_thinking_echo_helper(
+            "  I will check the PR status.\nThen inspect the diff. ",
+            "I will check the PR status. Then inspect the diff.",
+            "The final answer is different.",
+        ) == "", (
+            "Settled Thinking should be suppressed when normalized text exactly "
+            "matches visible process prose."
+        )
+
+    def test_genuine_reasoning_preserved_when_not_exact(self):
+        reasoning = "I need to inspect the stream state before deciding."
+        assert _run_thinking_echo_helper(
+            reasoning,
+            "I need to inspect the stream state.",
+            "The stream was running.",
+        ) == reasoning, (
+            "Non-exact reasoning should stay available as a Worklog Thinking Card."
+        )
+        helper = _function_body(UI_JS, "_stripVisibleAssistantEchoFromThinking")
+        assert ".split(snippet).join('')" not in helper
+        assert ".includes(" not in helper
+
+    def test_reasoning_first_interim_later_does_not_duplicate_settled_worklog(self):
         render_fn = _function_body(UI_JS, "renderMessages")
+        helper = _function_body(UI_JS, "_worklogReasoningTextFromMessage")
+        assert "assistantTurnFinalVisibleContentByRawIdx" in render_fn, (
+            "renderMessages must compute current assistant-turn final text so "
+            "reasoning-first/interim-later turns can be compared at settlement."
+        )
+        assert "assistantTurnVisibleContentByRawIdx" in render_fn, (
+            "If done-time reasoning is attached to the final assistant message, "
+            "settlement must still compare against earlier visible process prose "
+            "from the same assistant turn."
+        )
+        assert "_worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, displayContent, turnFinalVisibleContent, turnVisibleContents)" in render_fn
+        assert "_stripVisibleAssistantEchoFromThinking(thinkingText, visibleContent, turnFinalVisibleContent, ...visibleTexts)" in helper
+        assert _run_thinking_echo_helper(
+            "I am checking the 3401 review blocker.",
+            "I am checking the 3401 review blocker.",
+            "Conclusion: Thinking dedupe needs a small fix.",
+        ) == ""
+
+    def test_settled_thinking_uses_exact_dedupe_not_live_rewrite(self):
+        render_fn = _function_body(UI_JS, "renderMessages")
+        helper = _function_body(UI_JS, "_stripVisibleAssistantEchoFromThinking")
         assert "_stripVisibleAssistantEchoFromThinking(thinkingText, displayContent)" not in render_fn, (
-            "Settled Thinking should not run content-level dedupe; it is hidden in collapsed Worklog detail."
+            "Settled Thinking dedupe needs process prose plus turn-final answer, "
+            "not the old single visible-text input."
+        )
+        assert "_normalizeThinkingEchoCompare" in helper and "visibleNorm===thinkingNorm" in helper, (
+            "Settled Thinking dedupe must be exact / normalized-exact only."
         )
 
     def test_compact_activity_keeps_thinking_cards_after_session_switch(self):
@@ -318,8 +448,9 @@ class TestToolCallGroupingStatic:
             "Compact settled transcript rendering should keep reasoning metadata available without promoting it to visible prose."
         )
         helper = _function_body(UI_JS, "_worklogReasoningTextFromMessage")
-        assert "_assistantReasoningPayloadText(m)" in helper and "_sanitizeThinkingDisplayText" in helper, (
-            "Provider reasoning metadata should feed a sanitized Worklog Thinking Card."
+        assert "_assistantReasoningPayloadText(m)" in helper and "_stripVisibleAssistantEchoFromThinking" in helper, (
+            "Provider reasoning metadata should feed a sanitized Worklog Thinking Card "
+            "after settled exact-duplicate suppression."
         )
         assert "data-worklog-thinking-card" in UI_JS, (
             "Thinking should be an explicit Worklog item, independent from Tool Cards."
