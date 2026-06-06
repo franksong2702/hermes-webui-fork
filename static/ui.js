@@ -6124,7 +6124,7 @@ function _assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs, vis
   return false;
 }
 function _assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs){
-  return _assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs);
+  return !!_assistantReasoningPayloadText(m)||_assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs);
 }
 function _assistantReasoningPayloadText(m){
   if(!m||m.role!=='assistant') return '';
@@ -6147,7 +6147,7 @@ function _assistantReasoningPayloadText(m){
   return '';
 }
 function _worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, visibleContent){
-  return '';
+  return _sanitizeThinkingDisplayText(_assistantReasoningPayloadText(m));
 }
 function _thinkingCardHtml(text, open){
   const clean=_sanitizeThinkingDisplayText(text);
@@ -6161,6 +6161,7 @@ function isSimplifiedToolCalling(){
 function _thinkingActivityNode(text, open){
   const row=document.createElement('div');
   row.className='agent-activity-thinking';
+  row.setAttribute('data-worklog-thinking-card','1');
   row.innerHTML=_thinkingCardHtml(text, open);
   _renderThinkingInto(row,text);
   return row;
@@ -6409,9 +6410,9 @@ function _appendWorklogStep(group, anchor, cards, thinkingText, opts){
   if(thinkingText){
     const thinkingKey=(opts&&opts.thinkingKey)||`reason:${String(thinkingText).trim()}`;
     if(!seenReasons||!seenReasons.has(thinkingKey)){
-      const reason=_worklogReasonNodeFromText(thinkingText);
-      if(reason){
-        list.appendChild(reason);
+      const thinking=_thinkingActivityNode(thinkingText, false);
+      if(thinking){
+        list.appendChild(thinking);
         wroteProse=true;
         if(seenReasons) seenReasons.add(thinkingKey);
       }
@@ -6534,7 +6535,10 @@ function ensureActivityGroup(inner, opts){
     group.classList.toggle('open',!collapsed);
     group.innerHTML=`<button type="button" class="tool-call-group-summary tool-worklog-summary activity-summary" aria-expanded="${collapsed?'false':'true'}" onclick="_toggleActivityGroup(this)"><span class="as-dot"></span><span class="tool-call-group-label tool-worklog-label as-text">Running</span><span class="tool-call-group-duration"></span><span class="tool-call-group-chevron as-caret">${li('chevron-right',12)}</span></button><div class="tool-call-group-body tool-worklog-body activity-body"><div class="worklog"><div class="tool-worklog-list"></div></div></div>`;
     const anchor=opts.anchor||null;
-    if(anchor&&anchor.parentElement===inner) anchor.insertAdjacentElement('afterend', group);
+    if(anchor&&anchor.parentElement===inner){
+      if(opts.beforeAnchor) inner.insertBefore(group, anchor);
+      else anchor.insertAdjacentElement('afterend', group);
+    }
     else inner.appendChild(group);
   }else if(activityKey&&!group.getAttribute('data-activity-disclosure-key')){
     group.setAttribute('data-activity-disclosure-key',activityKey);
@@ -6545,10 +6549,14 @@ function ensureActivityGroup(inner, opts){
   if(opts.turnDuration!==undefined&&opts.turnDuration!==null) group.setAttribute('data-turn-duration',String(opts.turnDuration));
   if(opts.turnStartedAt!==undefined&&opts.turnStartedAt!==null) group.setAttribute('data-turn-started-at',String(opts.turnStartedAt));
   const anchor=opts.anchor||null;
-  if(anchor&&anchor.parentElement===inner&&group.parentElement===inner&&group.previousElementSibling!==anchor){
-    anchor.insertAdjacentElement('afterend',group);
+  if(anchor&&anchor.parentElement===inner&&group.parentElement===inner){
+    if(opts.beforeAnchor){
+      if(group.nextElementSibling!==anchor) inner.insertBefore(group,anchor);
+    }else if(group.previousElementSibling!==anchor){
+      anchor.insertAdjacentElement('afterend',group);
+    }
   }
-  if(anchor) _syncWorklogReasonFromAnchor(group, anchor);
+  if(anchor&&opts.syncAnchorReason!==false) _syncWorklogReasonFromAnchor(group, anchor);
   _syncToolCallGroupSummary(group);
   return group;
 }
@@ -7848,9 +7856,6 @@ function renderMessages(options){
     if(!isUser&&isSimplifiedToolCalling()&&!thinkingText){
       thinkingText=_worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, displayContent);
     }
-    if(thinkingText&&!isUser){
-      thinkingText=_stripVisibleAssistantEchoFromThinking(thinkingText, displayContent);
-    }
     const isLastAssistant=!isUser&&vi===renderVisWithIdx.length-1;
     const nextRendered=renderVisWithIdx[vi+1];
     const isTurnFinalAssistant=!isUser&&(!nextRendered||!nextRendered.m||nextRendered.m.role!=='assistant');
@@ -8310,12 +8315,6 @@ function renderMessages(options){
       const anchorReasonHtml=_worklogReasonHtmlFromAnchor(anchorRow);
       const thinkingText=thinkingIdx!==null?assistantThinking.get(thinkingIdx):'';
       if(!cards.length&&!anchorReasonHtml&&!thinkingText) continue;
-      if(!cards.length&&assistantThinking.has(aIdx)){
-        if(anchorRow&&window._showThinking!==false){
-          anchorRow.insertAdjacentHTML('beforeend',_thinkingCardHtml(assistantThinking.get(aIdx)));
-        }
-        continue;
-      }
       const anchorTurn=anchorRow.closest('.assistant-turn');
       if(!anchorTurn) continue;
       let state=activityByTurn.get(anchorTurn);
@@ -8323,9 +8322,12 @@ function renderMessages(options){
         const includeTurnDuration=!durationAssignedTurns.has(anchorTurn);
         if(includeTurnDuration) durationAssignedTurns.add(anchorTurn);
         const activityKey=`assistant:${aIdx}`;
+        const anchorIsWorklogSource=anchorRow.classList&&anchorRow.classList.contains('assistant-segment-worklog-source');
         const group=ensureActivityGroup(anchorParent,{
           collapsed:true,
           anchor:anchorRow,
+          beforeAnchor:!!thinkingText&&!anchorIsWorklogSource,
+          syncAnchorReason:anchorIsWorklogSource,
           activityKey,
           burstId:burstId||'',
           segmentSeq:segmentSeq||'',
@@ -8365,14 +8367,11 @@ function renderMessages(options){
       const failoverText=_gatewayRoutingFailoverText(routing);
       const modelWarningText=_gatewayModelWarningText(routing);
       const hasTurnUsage=!!msg._turnUsage;
-      // The activity-group summary owns the "Done in …" duration ONLY when a
-      // group is actually created. A tool-call turn always builds one. A
-      // thinking-only turn under Simplified Tool Calling now renders thinking
-      // inline (no group — see the `continue` at the activityIdxs loop, #3592),
-      // so it must keep its footer duration; suppressing it there would silently
-      // drop "Done in …" for thinking-only turns (#3592 review).
-      const compactActivityForMessage=isSimplifiedToolCalling()&&toolCallAssistantIdxs.has(mi);
-      const durationText=compactActivityForMessage?'':_formatTurnDuration(msg._turnDuration);
+      // The Worklog summary owns the "Done in …" duration whenever this
+      // assistant message contributes tool or thinking detail to a folded
+      // Worklog above the final answer.
+      const compactWorklogForMessage=isSimplifiedToolCalling()&&(toolCallAssistantIdxs.has(mi)||assistantThinking.has(mi));
+      const durationText=compactWorklogForMessage?'':_formatTurnDuration(msg._turnDuration);
       if(!hasTurnUsage&&!durationText&&!gatewayText&&!failoverText&&!modelWarningText) continue;
       const seg=assistantSegments.get(mi);
       const row=seg?seg.closest('.assistant-turn'):null;
@@ -9121,7 +9120,7 @@ function clearLiveToolCards(){
 function _removeEmptyLiveWorklogShells(inner){
   if(!inner) return;
   inner.querySelectorAll('.live-worklog[data-live-worklog-shell="1"],.tool-worklog-group[data-live-worklog-shell="1"],.tool-call-group[data-live-worklog-shell="1"]').forEach(group=>{
-    if(!group.querySelector('.tool-card-row,.wl-reason')) group.remove();
+    if(!group.querySelector('.tool-card-row,.wl-reason,.agent-activity-thinking')) group.remove();
   });
 }
 function ensureLiveWorklogShell(){
@@ -9904,7 +9903,7 @@ function finalizeThinkingCard(){
     return;
   }
   const turn=$('liveAssistantTurn');
-  const group=turn&&turn.querySelector('.tool-call-group[data-live-tool-call-group="1"]');
+  const group=turn&&turn.querySelector('.live-worklog[data-live-tool-call-group="1"],.tool-worklog-group[data-live-tool-call-group="1"],.tool-call-group[data-live-tool-call-group="1"]');
   if(group){
     const activeReason=turn.querySelector('.wl-reason[data-worklog-reason-active="1"]');
     if(activeReason) activeReason.removeAttribute('data-worklog-reason-active');
@@ -9921,12 +9920,49 @@ function appendThinking(text='', options){
   if(!S.session||(!S.activeStreamId&&!allowPendingPlaceholder)) return;
   const empty=$('emptyState');
   if(empty) empty.style.display='none';
-  const diagnosticActivityKey='live:'+(S.activeStreamId||'pending');
-  void diagnosticActivityKey;
-  void text;
-  // Provider reasoning/thinking is retained as diagnostics in INFLIGHT and the
-  // final assistant metadata. It is intentionally not rendered as live prose:
-  // visible interim assistant text owns Worklog prose and Activity boundaries.
+  if(!isSimplifiedToolCalling()){
+    let row=$('thinkingRow');
+    if(!row){
+      row=document.createElement('div');
+      row.id='thinkingRow';
+      row.className='thinking-card-row';
+      const inner=$('msgInner');
+      if(inner) inner.appendChild(row);
+    }
+    row.setAttribute('data-thinking-active','1');
+    _renderThinkingInto(row,text);
+    if(typeof scrollIfPinned==='function') scrollIfPinned();
+    return;
+  }
+  let turn=$('liveAssistantTurn');
+  if(!turn){
+    turn=_createAssistantTurn();
+    turn.id='liveAssistantTurn';
+    if(S.session) turn.dataset.sessionId=S.session.session_id;
+    const inner=$('msgInner');
+    if(inner) inner.appendChild(turn);
+  }
+  const blocks=_assistantTurnBlocks(turn);
+  if(!blocks) return;
+  const clean=_sanitizeThinkingDisplayText(text);
+  if(clean&&window._showThinking!==false){
+    const group=ensureLiveWorklogContainer(blocks,{
+      activityKey:S.activeStreamId?'live:'+S.activeStreamId:null,
+    });
+    const list=_toolWorklogListEl(group);
+    if(list){
+      let row=list.querySelector('.agent-activity-thinking[data-live-thinking="1"]');
+      if(!row){
+        row=_thinkingActivityNode(clean, false);
+        row.setAttribute('data-live-thinking','1');
+        row.setAttribute('data-thinking-active','1');
+        list.appendChild(row);
+      }else{
+        _renderThinkingInto(row, clean);
+      }
+      _syncToolCallGroupSummary(group);
+    }
+  }
   if(typeof scrollIfPinned==='function') scrollIfPinned();
 }
 function updateThinking(text=''){appendThinking(text);}

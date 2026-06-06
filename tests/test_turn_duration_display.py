@@ -59,8 +59,8 @@ def test_ui_formats_and_renders_turn_duration_in_footer_and_activity_summary():
         "Settled compact activity should put turn duration on the first spec Activity row, "
         "not resurrect the legacy top Run Activity."
     )
-    assert "compactActivityForMessage" in UI_JS, (
-        "When compact activity is present, duration should live on the Activity row "
+    assert "compactWorklogForMessage" in UI_JS, (
+        "When folded Worklog detail is present, duration should live on the Worklog row "
         "instead of being duplicated in the assistant footer."
     )
     assert ".msg-duration-inline" in CSS and ".tool-call-group-duration" in CSS, (

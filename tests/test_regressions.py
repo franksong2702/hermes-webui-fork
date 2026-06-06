@@ -835,6 +835,10 @@ def test_messages_js_supports_live_reasoning_and_tool_completion(cleanup_test_se
         "messages.js must track the currently active reasoning segment separately from cumulative reasoning"
     assert "source.addEventListener('reasoning'" in src or 'source.addEventListener("reasoning"' in src, \
         "messages.js must listen for live reasoning SSE events"
+    assert "liveReasoningText += text" in src, \
+        "live reasoning SSE events must update the active Worklog Thinking Card text"
+    assert "updateThinking(_liveThinkingText())" in src, \
+        "live reasoning SSE events must refresh the Worklog Thinking Card"
     assert "source.addEventListener('tool_complete'" in src or 'source.addEventListener("tool_complete"' in src, \
         "messages.js must listen for live tool completion SSE events"
     assert "function _parseStreamState()" in src, \
@@ -859,8 +863,8 @@ def test_messages_js_supports_interim_assistant_events(cleanup_test_sessions):
 
 
 def test_ui_js_can_upgrade_thinking_spinner_into_live_reasoning_card(cleanup_test_sessions):
-    """R19: ui.js keeps the legacy thinking helpers available without showing
-    provider reasoning in the simplified Worklog.
+    """R19: ui.js keeps the thinking helpers available while simplified mode
+    renders provider reasoning as a Worklog Thinking Card.
     """
     src = (REPO_ROOT / "static/ui.js").read_text()
     assert "function _thinkingMarkup(text='')" in src or 'function _thinkingMarkup(text="")' in src, \
@@ -897,8 +901,8 @@ def test_ui_js_keeps_reasoning_only_assistant_messages_visible(cleanup_test_sess
 
 
 def test_ui_js_does_not_hide_anchor_segments_that_contain_thinking(cleanup_test_sessions):
-    """R19c2/R19c3: reasoning-only metadata must remain preserved but hidden in
-    the shared compact timeline activity UI.
+    """R19c2/R19c3: reasoning-only metadata must remain preserved as a
+    collapsed Worklog Thinking Card.
     """
     src = (REPO_ROOT / "static" / "ui.js").read_text()
     compact = src.replace(' ', '').replace('\n', '')
@@ -908,8 +912,12 @@ def test_ui_js_does_not_hide_anchor_segments_that_contain_thinking(cleanup_test_
     helper_end = src.find("function _thinkingCardHtml", helper_start)
     assert helper_start != -1 and helper_end != -1
     helper = src[helper_start:helper_end]
-    assert "return '';" in helper, \
-        "provider reasoning metadata should not render as Worklog prose in the shared timeline"
+    assert "return _sanitizeThinkingDisplayText(_assistantReasoningPayloadText(m));" in helper, \
+        "provider reasoning metadata should feed the Worklog Thinking Card"
+    assert "data-worklog-thinking-card" in src, \
+        "Thinking Cards should be explicit Worklog items, not tool cards"
+    assert "_thinkingActivityNode(thinkingText, false)" in src, \
+        "settled reasoning should render as a collapsed Worklog Thinking Card"
 
 
 def test_messages_js_live_assistant_segment_reuses_live_turn_wrapper(cleanup_test_sessions):
@@ -932,12 +940,20 @@ def test_messages_js_live_assistant_segment_reuses_live_turn_wrapper(cleanup_tes
 
 
 def test_messages_js_finalizes_thinking_card_before_tool_card(cleanup_test_sessions):
-    """R19e: later reasoning after a tool call must render in a fresh card."""
+    """R19e: later reasoning after a tool call must render in a fresh Worklog
+    Thinking Card without discarding durable reasoning.
+    """
     src = (REPO_ROOT / "static/messages.js").read_text()
-    assert "finalizeThinkingCard" in src, \
+    tool_start = src.find("source.addEventListener('tool'")
+    tool_complete_start = src.find("source.addEventListener('tool_complete'", tool_start + 1)
+    assert tool_start >= 0 and tool_complete_start > tool_start
+    body = src[tool_start:tool_complete_start]
+    assert "finalizeThinkingCard()" in body, \
         "tool handler must finalize the current live thinking card before appending a tool card"
-    assert "liveReasoningText='';" in src or 'liveReasoningText = "";' in src, \
+    assert "liveReasoningText='';" in body or 'liveReasoningText = "";' in body, \
         "tool handler must reset the active reasoning segment before post-tool reasoning arrives"
+    assert "reasoningText=''" not in body and 'reasoningText = ""' not in body, \
+        "tool handler must not discard durable reasoning already assigned to the Worklog"
 
 
 # ── R17: Stack traces must not leak to clients in 500 responses ────────────

@@ -1090,8 +1090,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return out.trim();
   }
   function _liveThinkingText(){
-    const clean=_stripLiveVisibleAssistantEchoFromThinking(liveReasoningText, visibleInterimSnippets);
-    return clean || 'Thinking…';
+    return String(liveReasoningText||'').trim() || 'Thinking…';
   }
   // Split a content string into {reasoning, content} by extracting any <think>...
   // blocks (or other known reasoning-tag pairs). If reasoning is already
@@ -2259,7 +2258,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!visible){
         return;
       }
-      reasoningText='';
       liveReasoningText='';
       if(alreadyStreamed){
         if(!S.session||S.session.session_id!==activeSid){
@@ -2300,9 +2298,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     source.addEventListener('reasoning',e=>{
       if(_terminalStateReached||_streamFinalized) return;
       const d=JSON.parse(e.data);
-      reasoningText += d.text || '';
+      const text=d.text||'';
+      reasoningText += text;
+      liveReasoningText += text;
       if(d.text&&S.session&&S.session.session_id===activeSid) _completeAutomaticCompressionOnLiveProgress(activeSid);
       syncInflightAssistantMessage();
+      if(text&&S.session&&S.session.session_id===activeSid){
+        if(typeof updateThinking==='function') updateThinking(_liveThinkingText());
+        else appendThinking(_liveThinkingText());
+      }
     });
 
     source.addEventListener('tool',e=>{
@@ -2316,10 +2320,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
       if(S.session&&S.session.session_id===activeSid&&typeof scheduleRenderSessionArtifacts==='function') scheduleRenderSessionArtifacts();
       if(!S.session||S.session.session_id!==activeSid) return;
-      // Provider reasoning/thinking is diagnostic-only. Visible interim
-      // assistant text is flushed below; do not finalize a Thinking card here.
+      // Provider reasoning/thinking is a Worklog Thinking Card, separate from
+      // tool cards. Close the current live card before appending a tool row.
+      if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
       liveReasoningText='';
-      reasoningText='';
       const oldRow=$('toolRunningRow');if(oldRow)oldRow.remove();
       const pendingDisplayText=segmentStart===0
         ? (_parseStreamState().displayText||'')
@@ -2600,8 +2604,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           }
           // Find the last assistant message once for both reasoning persistence and timestamp
           const lastAsst=[...S.messages].reverse().find(m=>m.role==='assistant');
-          // Persist reasoning trace for diagnostics; normal transcript rendering
-          // keeps provider reasoning hidden unless it is emitted as visible text.
+          // Persist reasoning trace for Worklog Thinking Cards; normal transcript
+          // rendering keeps provider reasoning out of the final answer.
           if(reasoningText&&lastAsst&&!lastAsst.reasoning) lastAsst.reasoning=reasoningText;
           // Strip any inline <think> blocks still embedded in the server-side
           // content (M3 OpenAI-compat doesn't separate reasoning). Move them

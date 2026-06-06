@@ -751,7 +751,7 @@ def test_done_handler_patches_reasoning_field():
     src = (REPO / 'static' / 'messages.js').read_text()
 
     # The persistence comment must be present inside the done handler
-    assert "Persist reasoning trace for diagnostics" in src, \
+    assert "Persist reasoning trace for Worklog Thinking Cards" in src, \
         "Reasoning persistence comment not found in messages.js done handler"
 
     # The guard and assignment must be present
@@ -763,7 +763,7 @@ def test_done_handler_patches_reasoning_field():
 
     # Verify the patch is inside the done handler (after 'source.addEventListener' for done)
     done_handler_idx = src.index("source.addEventListener('done'")
-    persist_idx = src.index("Persist reasoning trace for diagnostics")
+    persist_idx = src.index("Persist reasoning trace for Worklog Thinking Cards")
     assert done_handler_idx < persist_idx, \
         "Reasoning persistence patch must be inside the done SSE handler"
 

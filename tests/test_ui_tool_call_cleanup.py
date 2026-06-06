@@ -283,30 +283,26 @@ class TestToolCallGroupingStatic:
             "summary instead of falling back to the bare 'command' title."
         )
 
-    def test_live_thinking_suppresses_visible_interim_echoes(self):
+    def test_live_thinking_does_not_rewrite_visible_interim_echoes(self):
         interim_match = re.search(r"source\.addEventListener\('interim_assistant',e=>\{(.*?)\n\s*\}\);", MESSAGES_JS, re.S)
         assert interim_match, "interim_assistant listener not found"
         interim_fn = interim_match.group(1)
         live_thinking_fn = _function_body(MESSAGES_JS, "_liveThinkingText")
 
         assert "visibleInterimSnippets.push(visible)" in interim_fn, (
-            "Visible interim commentary should be remembered so the live Thinking card does not echo it."
+            "Visible interim commentary should remain available for process-prose boundaries."
         )
-        assert "_stripLiveVisibleAssistantEchoFromThinking" in live_thinking_fn, (
-            "Live Thinking text should suppress exact visible interim commentary echoes."
+        assert "_stripLiveVisibleAssistantEchoFromThinking" not in live_thinking_fn, (
+            "Live Thinking should not run content-level echo suppression; the card is already low-priority Worklog detail."
+        )
+        assert "String(liveReasoningText||'').trim()" in live_thinking_fn, (
+            "Live Thinking should render the provider reasoning text as-is after normal trimming."
         )
 
-    def test_settled_thinking_suppresses_visible_assistant_echoes(self):
+    def test_settled_thinking_does_not_rewrite_visible_assistant_echoes(self):
         render_fn = _function_body(UI_JS, "renderMessages")
-        helper = _function_body(UI_JS, "_stripVisibleAssistantEchoFromThinking")
-        assert "_stripVisibleAssistantEchoFromThinking(thinkingText, displayContent)" in render_fn, (
-            "Settled Thinking cards should not repeat text already rendered as visible assistant content."
-        )
-        assert "s.length>=20" in helper, (
-            "Thinking echo suppression should ignore tiny snippets to avoid over-stripping reasoning."
-        )
-        assert "out.split(snippet).join('')" in helper, (
-            "Thinking echo suppression should remove exact visible assistant snippets from reasoning display."
+        assert "_stripVisibleAssistantEchoFromThinking(thinkingText, displayContent)" not in render_fn, (
+            "Settled Thinking should not run content-level dedupe; it is hidden in collapsed Worklog detail."
         )
 
     def test_compact_activity_keeps_thinking_cards_after_session_switch(self):
@@ -322,11 +318,14 @@ class TestToolCallGroupingStatic:
             "Compact settled transcript rendering should keep reasoning metadata available without promoting it to visible prose."
         )
         helper = _function_body(UI_JS, "_worklogReasoningTextFromMessage")
-        assert "return '';" in helper, (
-            "Provider reasoning metadata should not render as Worklog prose."
+        assert "_assistantReasoningPayloadText(m)" in helper and "_sanitizeThinkingDisplayText" in helper, (
+            "Provider reasoning metadata should feed a sanitized Worklog Thinking Card."
+        )
+        assert "data-worklog-thinking-card" in UI_JS, (
+            "Thinking should be an explicit Worklog item, independent from Tool Cards."
         )
         assert "_appendWorklogStep" in render_fn, (
-            "Visible assistant anchors and tools should still build the compact Activity disclosure."
+            "Visible assistant anchors, Thinking Cards, and tools should still build the compact Worklog disclosure."
         )
         assert ".wl-reason[data-worklog-reason-source=\"reasoning\"]" in render_fn, (
             "Settled rerenders must remove previously inserted reasoning Worklog rows before rebuilding."
@@ -339,20 +338,17 @@ class TestToolCallGroupingStatic:
         live_thinking_fn = _function_body(UI_JS, "appendThinking")
         live_tool_fn = _function_body(UI_JS, "appendLiveToolCard")
         helper = _function_body(UI_JS, "ensureActivityGroup")
-        assert "isSimplifiedToolCalling()" not in live_thinking_fn, (
-            "Live provider thinking should not render through either compact or legacy thinking-card UI."
-        )
         assert "_worklogReasonNodeFromText(thinkingText" not in live_thinking_fn, (
-            "Provider reasoning should not render as live Worklog prose."
+            "Provider reasoning should not render as live Worklog process prose."
         )
-        assert "thinking-card-row" not in live_thinking_fn and "_renderThinkingInto" not in live_thinking_fn, (
-            "Live provider thinking should stay diagnostic-only instead of leaking as a thinking card."
+        assert "_thinkingActivityNode(clean, false)" in live_thinking_fn and "data-live-thinking" in live_thinking_fn, (
+            "Live provider thinking should render as a collapsed Worklog Thinking Card."
         )
-        assert "Provider reasoning/thinking is retained as diagnostics" in live_thinking_fn, (
-            "The live Thinking path should document that visible interim assistant text is the Worklog prose source."
+        assert "ensureLiveWorklogContainer" in live_thinking_fn, (
+            "Live Thinking Cards should use the shared Worklog container, not a Tool Card group."
         )
         assert "removeAttribute('data-live-activity-current')" not in live_thinking_fn, (
-            "Reasoning/Thinking updates alone should not split consecutive tools into one-tool Activity rows."
+            "Reasoning/Thinking updates alone should not split consecutive tools into one-tool Worklog rows."
         )
         assert '.tool-call-group[data-live-tool-call-group="1"][data-live-activity-current="1"]' in helper, (
             "Live tool cards should only reuse the current Activity burst, not the first group in the turn."
