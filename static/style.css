@@ -991,7 +991,10 @@
   .session-state-indicator{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;width:10px;height:10px;color:var(--accent);visibility:hidden;}
   .session-attention-indicator{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:26px;height:26px;z-index:1;pointer-events:none;transition:opacity .15s ease,visibility .15s ease;}
   .session-item:hover .session-attention-indicator,.session-item:focus-within .session-attention-indicator,.session-item.menu-open .session-attention-indicator{opacity:0;visibility:hidden;}
-  .session-state-indicator.is-streaming,.session-state-indicator.is-unread{visibility:visible;}
+  .session-state-indicator.is-streaming,.session-state-indicator.is-unread,.session-state-indicator.is-attention-approval,.session-state-indicator.is-attention-clarify,.session-state-indicator.is-attention-generic{visibility:visible;}
+  .session-state-indicator.is-attention-approval{color:var(--error);}
+  .session-state-indicator.is-attention-clarify{color:var(--warning);}
+  .session-state-indicator.is-attention-generic{color:var(--accent);}
   .session-state-indicator::before{content:"";display:block;flex-shrink:0;}
   .session-state-indicator.is-streaming::before{
     width:100%;
@@ -1007,6 +1010,13 @@
     height:8px;
     border-radius:50%;
     background:currentColor;
+  }
+  .session-state-indicator.is-attention-approval::before,.session-state-indicator.is-attention-clarify::before,.session-state-indicator.is-attention-generic::before{
+    width:8px;
+    height:8px;
+    border-radius:50%;
+    background:currentColor;
+    box-shadow:0 0 0 3px color-mix(in srgb,currentColor 18%,transparent);
   }
   .session-attention-indicator.is-streaming::before{
     width:10px;
@@ -2899,7 +2909,7 @@ body.resizing .sidebar{transition:none!important;}
     animation:none;
   }
 }
-.tool-card,
+.tool-card{background:var(--surface-subtle);border:1px solid var(--border);border-left:2px solid var(--border-muted);border-radius:8px;margin:0;overflow:hidden;transition:border-color .15s,background .15s;}
 .tl{background:transparent;border:0;border-left:0;border-radius:0;margin:0;overflow:visible;transition:none;}
 .tool-card.tool-card-subagent{border-left:0;margin-left:0;}
 .tool-card:hover,.tl:hover{border-color:transparent;background:transparent;}

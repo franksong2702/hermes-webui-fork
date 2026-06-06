@@ -849,6 +849,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(!Array.isArray(INFLIGHT[activeSid].activityBurstAnchors)) INFLIGHT[activeSid].activityBurstAnchors=[];
   if(INFLIGHT[activeSid].currentActivityBurstId===undefined) INFLIGHT[activeSid].currentActivityBurstId=0;
   if(INFLIGHT[activeSid].currentLiveSegmentSeq===undefined) INFLIGHT[activeSid].currentLiveSegmentSeq=0;
+  let assistantText='';
+  let reasoningText='';
   if(S.session&&S.session.session_id===activeSid&&S.activeStreamId===streamId&&typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
   const existingLive=LIVE_STREAMS[activeSid];
   if(
@@ -907,8 +909,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       || (INFLIGHT[activeSid]&&INFLIGHT[activeSid].lastReasoningText)
       || ''
     : '';
-  let assistantText = _lastLiveAssistant ? _lastLiveAssistant : '';
-  let reasoningText=_lastLiveReasoning ? _lastLiveReasoning : '';
+  assistantText = _lastLiveAssistant ? _lastLiveAssistant : '';
+  reasoningText=_lastLiveReasoning ? _lastLiveReasoning : '';
   let liveReasoningText = reasoningText;
   let visibleInterimSnippets=[];
   let _latestGoalStatus=null;
@@ -2664,16 +2666,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             return hasTc||hasPartialTc||hasTu;
           });
           if(!hasMessageToolMetadata&&d.session.tool_calls&&d.session.tool_calls.length){
+            S.toolCalls=d.session.tool_calls.map(tc=>tc);
             S.toolCalls=_mergeSettledToolCallsWithLiveMetadata(d.session.tool_calls);
           } else {
             if(hasMessageToolMetadata) S._settledLiveToolMetadata=S.toolCalls.map(tc=>({...tc,done:true}));
             S.toolCalls=hasMessageToolMetadata?[]:S.toolCalls.map(tc=>({...tc,done:true}));
           }
           if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
-          if(typeof _copyActivityDisclosureState==='function'&&lastAsst){
-            const assistantIdx=S.messages.indexOf(lastAsst);
-            if(assistantIdx>=0) _copyActivityDisclosureState('live:'+streamId, 'assistant:'+assistantIdx);
-          }
           if(uploaded.length){
             const lastUser=[...S.messages].reverse().find(m=>m.role==='user');
             if(lastUser)lastUser.attachments=uploaded;

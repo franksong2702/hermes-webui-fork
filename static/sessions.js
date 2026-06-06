@@ -413,8 +413,23 @@ function _reconcileActiveSessionIdleStateFromList(serverRows) {
   }
   _sessionStreamingById.set(sid, false);
   _forgetObservedStreamingSession(sid);
+  if (typeof hideApprovalCard==='function') hideApprovalCard(true);
+  if (typeof hideLiveRunStatus==='function') hideLiveRunStatus(sid);
+  if (typeof clearLiveToolCards==='function') clearLiveToolCards();
   if (changed&&typeof updateSendBtn==='function') updateSendBtn();
+  if (changed&&typeof _scheduleActiveSessionIdleReload==='function') _scheduleActiveSessionIdleReload(sid);
   return changed;
+}
+
+function _scheduleActiveSessionIdleReload(sid) {
+  if(!sid) return;
+  setTimeout(async () => {
+    if(!S||!S.session||S.session.session_id !== sid) return;
+    if(S.busy || S.activeStreamId) return;
+    try{
+      await loadSession(sid, {force:true, externalRefreshReason:'idle-reconcile'});
+    }catch(_){}
+  },0);
 }
 
 function _purgeStaleInflightEntries() {

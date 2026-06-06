@@ -2955,6 +2955,13 @@ function _shouldFollowMessagesOnDomReplace(){
   // a little to read mid-stream to get snapped back to the bottom on completion.
   return !_messageUserUnpinned && (_scrollPinned || _isMessagePaneNearBottom(120));
 }
+function _followMessagesAfterDomReplace(){
+  if(_shouldFollowMessagesOnDomReplace()){
+    scrollToBottom();
+    return true;
+  }
+  return false;
+}
 function _settleMessageScrollToBottom(force){
   // Markdown post-processing (Prism, tables, Mermaid/KaTeX/PDF placeholders)
   // can grow the transcript after the first scroll write. Re-apply the bottom
@@ -6155,6 +6162,7 @@ function _thinkingActivityNode(text, open){
   const row=document.createElement('div');
   row.className='agent-activity-thinking';
   row.innerHTML=_thinkingCardHtml(text, open);
+  _renderThinkingInto(row,text);
   return row;
 }
 // ── Activity-group user expand intent (#1298) ──────────────────────────────
@@ -6510,7 +6518,6 @@ function ensureActivityGroup(inner, opts){
     else if(live && _liveActivityUserExpanded === false) collapsed=true;
     if(live && savedState==='open') collapsed=false;
     else if(live && savedState==='closed') collapsed=true;
-    if(live) collapsed=false;
     group.className='agent-activity-group tool-worklog-group activity'+(collapsed?' tool-call-group-collapsed':'');
     group.setAttribute('data-tool-call-group','1');
     group.setAttribute('data-agent-activity-group','1');
@@ -7567,8 +7574,8 @@ function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
   // pinned users stay at bottom; users who manually scrolled up get their
   // pre-render scrollTop restored after the DOM replacement.
   if(preserveScroll){
-    if(_scrollPinned) scrollIfPinned();
-    else _restoreMessageScrollSnapshot(scrollSnapshot);
+    if(_followMessagesAfterDomReplace()) return;
+    _restoreMessageScrollSnapshot(scrollSnapshot);
     return;
   }
   if(S.activeStreamId){
@@ -8516,12 +8523,31 @@ function _toolVisibleTargetLabel(tc, opts){
   if(!target) return '';
   return _shortToolLabel(target, opts.limit||112);
 }
+function _toolCommandTitle(command){
+  const normalized=String(command||'').replace(/\s+/g,' ').trim();
+  if(!normalized) return '';
+  if(/^git\s+fetch\b/i.test(normalized)) return 'git fetch';
+  if(/^git\s+(?:status|rev-list|branch)\b/i.test(normalized)) return 'git ahead/behind';
+  if(/^git\s+log\b/i.test(normalized)) return 'git log';
+  if(/\bcurl\b/i.test(normalized)&&/\/health\b/i.test(normalized)) return 'health check';
+  if(/\b(?:ps|pgrep)\b/i.test(normalized)) return 'process check';
+  const m=normalized.match(/\blsof\b.*(?:-i|:)(\d{2,5})\b/i);
+  if(m) return `port ${m[1]} check`;
+  if(/\blaunchctl\b/i.test(normalized)) return 'launchctl';
+  return _shortToolLabel(normalized,72);
+}
+function _toolQueryTitle(query){
+  const normalized=String(query||'').replace(/\s+/g,' ').trim();
+  return _shortToolLabel(normalized,72);
+}
 function _toolActionLabelText(tc, opts){
   opts=opts||{};
   const kind=_toolActionKind(tc);
   const done=tc&&tc.done!==false;
   const isErr=tc&&tc.is_error;
-  const target=opts.generic?'':_toolVisibleTargetLabel(tc, opts);
+  let target=opts.generic?'':_toolVisibleTargetLabel(tc, opts);
+  if(kind==='shell'&&target) target=_toolCommandTitle(target);
+  else if((kind==='search'||kind==='web')&&target) target=_toolQueryTitle(target);
   const verbs={
     shell:   {ing:'Running',   ed:'Ran'},
     read:    {ing:'Reading',   ed:'Read'},
@@ -9880,15 +9906,8 @@ function finalizeThinkingCard(){
   const turn=$('liveAssistantTurn');
   const group=turn&&turn.querySelector('.tool-call-group[data-live-tool-call-group="1"]');
   if(group){
-    // Respect the user's explicit expand intent (#1298) — only force-collapse
-    // when the user has not manually expanded this turn's activity group, or
-    // has manually collapsed it. Otherwise the panel snaps shut whenever new
-    // activity arrives, even mid-read.
-    if(_liveActivityUserExpanded !== true && !(window._activityFeedExpandedDefault === true && _liveActivityUserExpanded !== false)){
-      group.classList.add('tool-call-group-collapsed');
-      const summary=group.querySelector('.tool-call-group-summary');
-      if(summary) summary.setAttribute('aria-expanded','false');
-    }
+    const activeReason=turn.querySelector('.wl-reason[data-worklog-reason-active="1"]');
+    if(activeReason) activeReason.removeAttribute('data-worklog-reason-active');
     const active=turn.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
     if(active) active.removeAttribute('data-thinking-active');
     _syncToolCallGroupSummary(group);
@@ -9900,105 +9919,15 @@ function appendThinking(text='', options){
   // without this check they would pollute the new session's DOM.
   const allowPendingPlaceholder=!!(options&&options.pending===true);
   if(!S.session||(!S.activeStreamId&&!allowPendingPlaceholder)) return;
-  $('emptyState').style.display='none';
-  let turn=$('liveAssistantTurn');
-  if(!turn){
-    turn=_createAssistantTurn();
-    turn.id='liveAssistantTurn';
-    if(S.session) turn.dataset.sessionId=S.session.session_id;  // see #1366
-    $('msgInner').appendChild(turn);
-  }
-  const blocks=_assistantTurnBlocks(turn);
-  if(!blocks) return;
-  if(!isSimplifiedToolCalling()){
-    let row=$('thinkingRow');
-    if(!row){
-      row=document.createElement('div');
-      row.className='assistant-segment';
-      row.id='thinkingRow';
-      row.setAttribute('data-thinking-active','1');
-      // Insert after whichever comes last: a live assistant segment or a tool card.
-      // This mirrors appendLiveToolCard's anchor logic so thinking always appears
-      // in the right position in the interleaved sequence.
-      // Also skip #toolRunningRow (dots) — thinking should go before dots, not after.
-      const allChildren=Array.from(blocks.children);
-      const anchor=allChildren.filter(el=>
-        el.id!=='toolRunningRow' &&
-        el.matches('[data-live-assistant="1"],.tool-card-row')
-      ).pop();
-      if(anchor) anchor.insertAdjacentElement('afterend', row);
-      else blocks.appendChild(row);
-    }
-    const clean=_sanitizeThinkingDisplayText(text);
-    const hasClean=!!String(clean||'').trim();
-    row.className=hasClean?'assistant-segment thinking-card-row':'assistant-segment';
-    _renderThinkingInto(row,text);
-    scrollIfPinned();
-    // Auto-scroll the thinking card body to bottom if the user is watching
-    // (scroll pinned). If the user scrolled up to read history, leave it alone.
-    if(_scrollPinned){
-      const body=row&&row.querySelector('.thinking-card-body');
-      if(body) body.scrollTop=body.scrollHeight;
-    }
-    return;
-  }
-  const thinkingText=String(text||'').trim()||'Thinking…';
-  const cleanThinking=_sanitizeThinkingDisplayText(thinkingText);
-  const allChildren=Array.from(blocks.children);
-  const anchor=allChildren.filter(el=>
-    el.id!=='toolRunningRow' &&
-    el.matches('[data-live-assistant="1"],.tool-call-group,.tool-card-row')
-  ).pop();
-  const group=ensureActivityGroup(blocks,{live:true,collapsed:true,anchor,activityKey:_activityKeyForLiveTurn()});
-  const body=group&&group.querySelector('.tool-call-group-body');
-  if(!body) return;
-  if(!cleanThinking||cleanThinking==='Thinking…'){
-    const hasRunningTool=!!body.querySelector('.tool-card.tool-card-running');
-    const hasToolCard=!!body.querySelector('.tool-card-row');
-    let label;
-    let detail;
-    if(!S.activeStreamId && options && options.pending){
-      label='Starting agent';
-      detail='Creating the stream and sending your message…';
-    }else if(hasRunningTool){
-      label='Waiting on tool result';
-      detail=_activityWaitingDetail(group,label);
-    }else if(hasToolCard){
-      label='Waiting on model';
-      detail=_activityWaitingDetail(group,label);
-    }else{
-      label='Waiting for first model token';
-      detail='Stream connected; no model output has arrived yet.';
-    }
-    _appendActivityEvent(group,{id:'thinking-placeholder',kind:'waiting',label,detail,status:'waiting',ts:_activityNowSeconds()});
-    const active=body.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
-    if(active) active.removeAttribute('data-thinking-active');
-    _syncToolCallGroupSummary(group);
-    scrollIfPinned();
-    return;
-  }
-  const placeholder=body.querySelector('.agent-activity-status[data-activity-event-id="thinking-placeholder"]');
-  if(placeholder) placeholder.remove();
-  let row=body.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
-  if(!row){
-    const thinkingCards=Array.from(body.querySelectorAll('.agent-activity-thinking'));
-    row=thinkingCards.pop()||null;
-    if(row) row.setAttribute('data-thinking-active','1');
-  }
-  if(!row){
-    row=_thinkingActivityNode(thinkingText, false);
-    row.setAttribute('data-thinking-active','1');
-    body.appendChild(row);
-  }else{
-    _renderThinkingInto(row,thinkingText);
-  }
-  _activityMarkObserved(group);
-  _syncToolCallGroupSummary(group);
-  scrollIfPinned();
-  if(_scrollPinned){
-    const body=row&&row.querySelector('.thinking-card-body');
-    if(body) body.scrollTop=body.scrollHeight;
-  }
+  const empty=$('emptyState');
+  if(empty) empty.style.display='none';
+  const diagnosticActivityKey='live:'+(S.activeStreamId||'pending');
+  void diagnosticActivityKey;
+  void text;
+  // Provider reasoning/thinking is retained as diagnostics in INFLIGHT and the
+  // final assistant metadata. It is intentionally not rendered as live prose:
+  // visible interim assistant text owns Worklog prose and Activity boundaries.
+  if(typeof scrollIfPinned==='function') scrollIfPinned();
 }
 function updateThinking(text=''){appendThinking(text);}
 function removeThinking(){
