@@ -3,6 +3,8 @@
 
 ## [Unreleased]
 
+## [v0.51.289] — 2026-06-06 — Release JE (hotfix — sidebar ReferenceError #3696 + scope-undef prevention gate)
+
 ### Fixed
 - **Live stream turns show the bottom timer immediately after starting.** The
   first chat-start path now places the live footer timer as soon as the backend
