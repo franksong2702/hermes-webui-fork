@@ -7060,7 +7060,7 @@ function settleLiveCompressionCards(sessionId){
   if(changed){
     if(typeof _removeEmptyLiveWorklogShells==='function') _removeEmptyLiveWorklogShells(_assistantTurnBlocks(turn));
     _clearCompressionElapsedTimer();
-    if(typeof snapshotLiveTurn==='function') snapshotLiveTurn();
+    if(typeof snapshotLiveTurnHtmlForSession==='function') snapshotLiveTurnHtmlForSession(sid);
     if(typeof scrollIfPinned==='function') scrollIfPinned();
   }
   return changed;
@@ -7110,7 +7110,7 @@ function _collectHandoffSummaryStates(messages){
 function _isContextCompactionMessage(m){
   if(!m||!m.role||m.role==='tool') return false;
   const text=msgContent(m)||String(m.content||'');
-  return /^\s*\[context compaction/i.test(text) || /^\s*context compaction/i.test(text);
+  return _isContextCompactionText(text);
 }
 function _isContextCompactionText(text){
   return /^\s*\[context compaction/i.test(String(text||'')) || /^\s*context compaction/i.test(String(text||''));
@@ -7862,6 +7862,39 @@ function renderMessages(options){
     if(role==='user') lastQuestionRawIdx=entry.rawIdx;
     else if(role==='assistant') questionRawIdxByAssistantRawIdx.set(entry.rawIdx,lastQuestionRawIdx);
   }
+  // #3709 (defect B): build a per-turn combined visible-answer text so the
+  // thinking echo-strip can de-dupe a thinking-only message (whose own visible
+  // body is empty) against the answer prose carried by a SIBLING message in the
+  // same turn. A turn = the run of assistant messages between two user messages.
+  // Map every assistant rawIdx in a run to the run's combined visible text.
+  const _turnVisibleTextByRawIdx=new Map();
+  {
+    let _run=[]; let _runText=[];
+    const _flush=()=>{
+      if(_run.length){
+        const combined=_runText.join('\n\n');
+        for(const ri of _run) _turnVisibleTextByRawIdx.set(ri, combined);
+      }
+      _run=[]; _runText=[];
+    };
+    for(const entry of renderVisWithIdx){
+      const em=entry&&entry.m; const role=em&&em.role;
+      if(role==='assistant'){
+        _run.push(entry.rawIdx);
+        // Visible prose = content with any leading <think>…</think> /channel-thought
+        // block stripped (the same blocks the per-message extractor removes below).
+        let vis=typeof em.content==='string'?em.content:'';
+        vis=vis.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'')
+               .replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'')
+               .replace(/^\s*<\|turn\|>thinking\n[\s\S]*?<turn\|>\s*/,'').trim();
+        if(vis) _runText.push(vis);
+      }else{
+        _flush();
+      }
+    }
+    _flush();
+  }
+
   const assistantSegments=new Map();
   const assistantThinking=new Map();
   const userRows=new Map();
@@ -8421,7 +8454,7 @@ function renderMessages(options){
       _appendWorklogStep(state.group, anchorRow, cards, thinkingText, {
         live:false,
         includeAnchorReason:!!includeAnchorReason&&!!anchorReasonHtml,
-        thinkingKey:thinkingIdx!==null?`thinking:${thinkingIdx}`:'',
+        thinkingKey:thinkingText?`thinking:${_normalizeThinkingEchoCompare(thinkingText)}`:'',
         seenReasons:state.seenReasons,
         seenTools:state.seenTools,
       });

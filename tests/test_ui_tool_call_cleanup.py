@@ -455,6 +455,11 @@ class TestToolCallGroupingStatic:
         assert "data-worklog-thinking-card" in UI_JS, (
             "Thinking should be an explicit Worklog item, independent from Tool Cards."
         )
+        render_min = re.sub(r"\s+", "", render_fn)
+        assert "thinkingKey:thinkingText?`thinking:${_normalizeThinkingEchoCompare(thinkingText)}`:''" in render_min, (
+            "Settled Worklog should key Thinking Cards by normalized content so exact duplicate "
+            "Thinking from sibling messages does not render twice."
+        )
         assert "_appendWorklogStep" in render_fn, (
             "Visible assistant anchors, Thinking Cards, and tools should still build the compact Worklog disclosure."
         )
