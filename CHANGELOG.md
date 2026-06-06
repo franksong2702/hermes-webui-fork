@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Live stream turns show the bottom timer immediately after starting.** The
+  first chat-start path now places the live footer timer as soon as the backend
+  returns `stream_id` and `pending_started_at`, instead of only restoring it
+  after a session switch or reconnect. (#3401, @franksong2702)
+
 ## [v0.51.287] — 2026-06-06 — Release JC (stage-r22 — WeCom session classification + worker-profile picker hiding)
 
 ### Fixed

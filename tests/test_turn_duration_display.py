@@ -77,6 +77,11 @@ def test_active_compact_activity_elapsed_timer_uses_persisted_start_time():
         "send() should copy chat-start pending_started_at into S.session before "
         "attaching the live stream."
     )
+    assert "showLiveRunStatus(activeSid,{startedAt:_startedAt});" in MESSAGES_JS, (
+        "The first chat-start path should show the bottom live footer timer as soon "
+        "as stream_id and pending_started_at are known; reconnect should not be the "
+        "only path that restores it."
+    )
     assert "function _formatActiveElapsedTimer" in UI_JS and "padStart(2,'0')" in UI_JS, (
         "ui.js should format the running timer in MM:SS form."
     )
