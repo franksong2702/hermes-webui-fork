@@ -3,6 +3,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Switching back to a reconnecting live session no longer leaves restored tool cards missing.** When a live turn was restored from the in-memory DOM snapshot and the SSE stream reattached, the restore-success path could skip replaying persisted live tool calls, so tool cards could disappear until a later stream event or final render rebuilt the turn. Reconnect now replays the persisted live tool cards after successful restore as well as on the existing fallback path. (#3707)
+
 ## [v0.51.307] — 2026-06-06 — Release JW (stage-a3 — onboarding forwarded-IP spoof fix + update-check CSRF hardening)
 
 ### Security
