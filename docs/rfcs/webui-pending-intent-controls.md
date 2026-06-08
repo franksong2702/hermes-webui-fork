@@ -124,15 +124,17 @@ Legacy migration:
 
 - current `queue` -> `Queue by default`
 - current `steer` -> `Steer by default`
-- current `interrupt` -> `Steer by default`
+- current `interrupt` -> `Queue by default`
 
-The reason is that old `interrupt` users usually intended busy-time input to
-affect execution quickly, not to wait until the current task naturally ends. In
-the new model, Steer is the safest closest behavior: it delivers the new input
-to the active run without automatically cancelling it.
+The reason is that old `interrupt` combined two behaviors: it preserved the new
+input as the next user turn and cancelled the active run. Migrating those users
+to Steer would preserve urgency, but it would drop the cancel-and-send part of
+their old intent. Queue by default is the safer migration because it never
+injects a message into the active run without an explicit Steer action.
 
 If the user explicitly wants to stop the current run and send a waiting queued
-message, they can use Stop-and-send.
+message, they can use Stop-and-send. Stop-and-send is the explicit replacement
+for the old cancel-and-send behavior that `interrupt` tried to provide.
 
 ## Composer Interaction Model
 
@@ -328,11 +330,10 @@ This RFC defines product semantics, not a permanent WebUI-private runtime
 protocol.
 
 This boundary is necessary because Hermes WebUI also has the #1925
-RuntimeAdapter direction. Michael's RuntimeAdapter work moves WebUI toward
-clearer runtime interfaces instead of permanently owning all Agent runtime
-behavior directly. Hermes Desktop / TUI Gateway already exposes related
-surfaces such as `session.steer`, `session.interrupt`, active session status,
-and event streams.
+RuntimeAdapter direction. The RuntimeAdapter contract moves WebUI toward clearer
+runtime interfaces instead of permanently owning all Agent runtime behavior
+directly. Hermes Desktop / TUI Gateway already exposes related surfaces such as
+`session.steer`, `session.interrupt`, active session status, and event streams.
 
 WebUI may own:
 

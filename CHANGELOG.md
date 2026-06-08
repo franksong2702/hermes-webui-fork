@@ -3,6 +3,11 @@
 
 ## [Unreleased]
 
+### Added
+- **RFC for pending intent controls** documents Queue, Steer, Stop-and-send, and
+  the legacy Interrupt migration path for user input submitted while an agent
+  run is active. (#3061)
+
 ## [v0.51.326] — 2026-06-08 — Release KP (mic STT probe + journal cleanup + schema guard + help hover)
 
 ### Fixed
