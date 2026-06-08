@@ -4,441 +4,461 @@
 - **Author:** @franksong2702
 - **Created:** 2026-05-28
 - **Tracking issue:** [#3058](https://github.com/nesquena/hermes-webui/issues/3058)
-- **Related issues:** [#2555](https://github.com/nesquena/hermes-webui/issues/2555), [NousResearch/hermes-agent#28172](https://github.com/NousResearch/hermes-agent/issues/28172)
+- **Parent RFC:** [`live-to-final-assistant-replies.md`](live-to-final-assistant-replies.md) / [#3400](https://github.com/nesquena/hermes-webui/issues/3400)
+- **Related issues/PRs:** [#2555](https://github.com/nesquena/hermes-webui/issues/2555), [#3108](https://github.com/nesquena/hermes-webui/issues/3108), [#3808](https://github.com/nesquena/hermes-webui/issues/3808), [#3822](https://github.com/nesquena/hermes-webui/pull/3822), [NousResearch/hermes-agent#28172](https://github.com/NousResearch/hermes-agent/issues/28172)
 - **Related docs:** [`webui-run-state-consistency-contract.md`](webui-run-state-consistency-contract.md), [`hermes-run-adapter-contract.md`](hermes-run-adapter-contract.md), [`turn-journal.md`](turn-journal.md)
+
+## RFC Positioning
+
+This RFC is a child RFC under the Hermes WebUI Live-to-Final product line.
+
+The Live-to-Final parent RFC defines how a running agent turn moves from live
+process, tool activity, recovery state, and replay into a settled final answer
+or terminal outcome.
+
+This RFC covers one specific part of that model: what user input means when the
+agent is already busy. In that state, a new user input must be interpreted
+clearly as Queue, Steer, or Stop-and-send.
+
+This RFC does not redefine the whole Live-to-Final model. It defines the product
+semantics for user intervention during an active run.
 
 ## Problem
 
-Hermes WebUI currently lets the user choose what happens when they send a
-message while an agent run is active: queue, interrupt, or steer. The settings
-surface describes three modes, but the underlying state model is not yet one
-coherent product contract.
+Hermes WebUI currently treats user input during a running agent turn as one of
+three busy modes: Queue, Interrupt, or Steer. These look like equivalent send
+modes, but they are not the same kind of action.
 
-The most visible failure is `steer`: a successful steer is delivered through
-`POST /api/chat/steer` and shown with a transient browser-only indicator. That
-indicator is not part of the session transcript, not part of the run journal,
-and not a durable pending item. If the user switches sessions and comes back,
-or if the active pane re-renders from the server session, the visible evidence
-that the user sent the steer can disappear.
+Queue means: wait, then send this as the next normal user turn.
 
-Queue and interrupt have related ambiguity. Queue is session-scoped and partly
-persisted in browser `sessionStorage`, but older manual testing still describes
-session switching as "clearing" the queue. Interrupt is implemented as
-queue-then-cancel, which is practical, but the user-facing intent is different
-from an ordinary queued follow-up. Leftover steer text may also be converted to
-queue after a run ends, which makes sense only if the product explains that
-transition.
+Steer means: guide the currently running turn without starting a new turn.
 
-The current Settings wording reinforces the old model. The setting is named
-`Busy input mode`, offers three values (`Queue follow-up`, `Interrupt current
-turn`, `Steer (mid-turn correction)`), and describes the choice as "what
-happens when you send a message while the agent is running." The proposed model
-changes that product contract: Settings should choose the default waiting mode
-for a new pending message, not whether the send action is permanently Queue,
-Interrupt, or Steer.
+Interrupt is currently a compound behavior: queue the message, cancel the
+current run, then drain the queued message as the next turn. It is not a simple
+send mode.
 
-The missing product primitive is a durable running-message submission model.
-When the user sends while the agent is running, WebUI should not treat Queue,
-Steer, and Interrupt as three unrelated permanent settings. Settings should
-choose the default behavior for a new running-time message:
+This mixed model has caused real failures:
 
-- Queue creates a pending message that waits for the current agent run to
-  finish.
-- Steer immediately delivers guidance to the active agent so it can be consumed
-  in the agent's next processing window.
+- Queue can be lost across refresh, session switch, or restore paths.
+- Steer can be transient and hard to trace.
+- Interrupt-and-send can race with cancellation, so WebUI shows a user message
+  that never reaches the Agent durable conversation chain.
+- The composer primary button is ambiguous while busy.
 
-Queue and Steer are not mutually reversible after submission. A queued message
-may be upgraded to Steer while it is still waiting, but that action is
-irreversible because the message has been delivered to the active run. Once a
-message has been sent as Steer, it cannot be turned back into Queue or
-withdrawn. If the user presses Stop while a Queue message is still waiting, Stop
-should cancel the currently running agent turn and immediately send that queued
-message as the next user turn. In other words, Interrupt is not necessarily a
-default message mode; it is the Stop-driven promotion of a waiting Queue message
-into "stop the old run and process this now."
+This RFC defines a clearer pending-intent model for user input while the agent
+is busy.
 
-## Goals
-
-- Define the user semantics for running-time messages that either wait as Queue
-  or deliver immediately as Steer.
-- Make the state ownership explicit: which inputs belong to the session, which
-  belong to the active run, and which can transition between the two.
-- Make it explicit that Queue can upgrade to Steer while waiting, but Steer
-  cannot be recalled or converted back into Queue after delivery.
-- Define Stop on a waiting Queue message as the action that cancels the current
-  run and sends that queued message immediately.
-- Ensure session switching, browser refresh, SSE reconnect, and settled
-  re-render do not make accepted user intent disappear.
-- Give implementation PRs a small acceptance checklist for pending-input
-  behavior.
-- Preserve Hermes CLI parity where steer injects a mid-turn correction instead
-  of starting a new user turn.
-
-## Non-goals
-
-- Do not implement the feature in this RFC.
-- Do not redesign the whole composer or settings UI.
-- Do not introduce a new runner, scheduler, or long-lived server queue.
-- Do not make steer a normal user message when it was accepted as a mid-turn
-  correction.
-- Do not decide final storage schema for a future run adapter. This RFC defines
-  product semantics and minimum durability expectations.
-
-## Product Principle
-
-When the agent is running, user input is not disposable UI state. It is a
-pending message against a specific session and, sometimes, a specific active
-run.
-
-The WebUI may present that intent as a chip, inline control row, timeline event,
-or queued draft, but it must not rely only on a toast, a transient DOM node, or
-the current browser route.
-
-A Codex-like experience should satisfy three properties:
-
-1. **Visible:** the user can see what they submitted and what will happen to it.
-2. **Scoped:** the input cannot accidentally apply to another session after a
-   session switch.
-3. **Recoverable:** refresh, reconnect, or session re-render can restore either
-   the intent or a clear terminal explanation.
-
-## Settings Semantics
-
-### Current behavior
-
-Current Settings expose:
-
-- label: `Busy input mode`,
-- values:
-  - `Queue follow-up`,
-  - `Interrupt current turn`,
-  - `Steer (mid-turn correction)`,
-- description: Queue waits, Interrupt cancels and starts fresh, Steer injects a
-  mid-turn correction without interrupting.
-
-That wording makes Queue, Interrupt, and Steer look like three mutually
-exclusive send behaviors. It also makes Interrupt a persistent default mode,
-even though the intended Codex-like interaction is that interrupt happens when
-the user escalates a waiting message by pressing Stop.
-
-### Proposed behavior
-
-Settings should instead choose the default behavior for new messages sent while
-the agent is running:
-
-- label: `While agent is running`,
-- values:
-  - `Queue by default`,
-  - `Steer by default`,
-- description: New messages sent while the agent is running either queue until
-  the current run finishes, or are delivered as Steer guidance to the active
-  run. A waiting Queue message can be upgraded to Steer, but that action cannot
-  be undone. Pressing Stop while a queued message is still waiting cancels the
-  current run and sends that queued message immediately.
-
-Under this model, Interrupt is no longer a normal default in Settings. It is the
-Stop-driven action applied to an existing pending message.
-
-Compatibility note: users who previously selected `interrupt` need an explicit
-migration decision. Reasonable options are to migrate them to `queue` and show
-the new stop-and-send affordance, or keep a temporary hidden/legacy setting
-until the UI transition is complete. The implementation PR should choose one and
-document it.
-
-## Terminology
-
-| Term | Meaning |
-|---|---|
-| Pending message | A queued user input that has been accepted by WebUI but has not yet been sent as a normal user turn. |
-| Running-message behavior | The default handling for a message sent while the agent is running: queue or steer. |
-| Session intent | Pending input that should become a future user turn in the same session. |
-| Run intent | Pending input that should affect the currently active run without creating a new user turn. |
-| Control event | A visible timeline record for non-message input such as steer, cancel, or interrupt. |
-| Stop-and-send | User action that cancels the current run and sends a waiting Queue message immediately. |
-| Leftover steer | A steer accepted for a run but not consumed before the run completed. |
-
-## Unified Pending Message Semantics
-
-The Codex-like interaction model should be:
-
-1. User sends a message while the agent is running.
-2. WebUI chooses the behavior from Settings or the user's explicit send action.
-3. If the behavior is Queue, WebUI creates one visible pending message in the
-   current session.
-4. If the behavior is Steer, WebUI delivers the message immediately to the
-   active agent and records a visible control event.
-5. While a Queue message is still waiting, the user may upgrade it to Steer.
-   After that delivery, it cannot be converted back into Queue.
-6. While a Queue message is still waiting, the user may press Stop to cancel the
-   current run and send the queued message immediately.
-7. Once processed, the running-time message becomes either:
-   - an ordinary user turn,
-   - a run control event,
-   - a visible terminal failure/fallback,
-   - or a leftover queued message with source metadata.
-
-This keeps the mental model simple: the user wrote one message. Queue waits
-until the current agent finishes; Steer is delivered to the active agent right
-away; a queued message can still become Steer, but that delivery is irreversible;
-Stop can promote a waiting Queue message into "cancel current run and run this
-now."
-
-## Waiting Modes
+## Terms
 
 ### Queue
 
-Queue means: "send this after the current run finishes."
+Queue means the user submitted a message while the agent is running, but the
+message does not affect the current run. It waits until the current run ends,
+then sends as the next normal user turn.
 
-Expected behavior:
-
-- The pending message is a session intent attached to the current session.
-- The current run continues uninterrupted.
-- The user can see, edit, reorder, merge, cancel, upgrade to Steer, or
-  stop-and-send queued inputs where the UI supports those controls.
-- Switching to another session hides that session's queue but does not delete it.
-- Returning to the original session restores the queue display.
-- The queued input must not send into a different session.
-- When drained, it becomes an ordinary user turn and leaves the pending queue.
-
-### Interrupt
-
-Interrupt means: "stop the current run and start from this queued message."
-
-Interrupt is a derived action, not necessarily a default waiting mode. In the
-Codex-like flow, Queue is the waiting state. If the user hits Stop while a Queue
-message is still waiting, WebUI promotes it to interrupt: cancel the currently
-running turn, then send the queued message immediately.
-
-Expected behavior:
-
-- The waiting Queue message is marked as a stop-and-send replacement intent.
-- WebUI asks the active run to cancel.
-- The UI shows that a restart is pending or in progress.
-- If cancellation succeeds, WebUI sends the replacement input as the next user
-  turn in the same session.
-- If cancellation fails or the stream is already gone, WebUI either sends the
-  replacement when the session is safe to send or leaves a visible recoverable
-  pending state.
-- Refresh or session switch during cancel must not drop the replacement input.
-
-Implementation may continue to use queue-then-cancel internally, but the
-contract should treat interrupt as a distinct user intent because the expected
-outcome is different from "wait your turn."
+Queue belongs to the current session.
 
 ### Steer
 
-Steer means: "apply this correction to the current run without interrupting it."
+Steer means the user submitted mid-run guidance. It is delivered to the current
+active run so the run can use it in later processing.
 
-Expected behavior:
+In the UI, Steer should render like a normal user message. In runtime semantics,
+it is not the next normal user turn. It is mid-run input for the active run.
 
-- If an active steer-capable agent accepts the message, the message is delivered
-  immediately as a run intent attached to the active stream/run.
-- The agent should see it in the next processing window where steer can be
-  consumed.
-- The transcript should show a quiet control event inside or adjacent to the
-  active assistant turn, for example `Steer: use the narrower scope`.
-- The control event must survive session switching, pane re-render, and replay.
-- The accepted steer should move to a clear terminal state:
-  - `accepted` / `delivered` when WebUI has passed it to the active agent,
-  - `applied` when the runtime can prove it was consumed,
-  - `leftover queued` when the run ended before consumption and WebUI converted
-    it into a future session intent,
-  - `failed` / `fallback` when WebUI could not steer and chose another mode.
-- A successful steer must not also create a normal user message unless it later
-  becomes leftover queue.
-- A successful steer is no longer a pending Queue item and cannot be converted
-  back into Queue or withdrawn.
-- A failed steer may fall back to interrupt or queue, but the UI should explain
-  the fallback and preserve the text.
+Steer belongs to the current active run.
 
-## Mode Selection And Escalation
+### Stop
 
-Queue and Steer are selected before submission, or while a Queue message is
-still waiting. They are not reversible states for a delivered message.
+Stop means the user stops the current active run. Stop by itself does not send a
+new message.
 
-Examples:
+If the current session has a waiting Queue message, Stop may be upgraded into
+Stop-and-send.
 
-- If Settings default to Queue, the composer affordance may offer `Steer` /
-  `引导` as the alternate send action.
-- If Settings default to Steer, the composer affordance may offer `Queue` as the
-  alternate send action before the message is submitted.
-- A waiting Queue message may be upgraded to Steer if the original run is still
-  active and steer is available.
-- Once WebUI accepts a Steer submission, the text has been delivered to the
-  active run and cannot become Queue again.
-- A waiting Queue message can become stop-and-send if the user presses Stop
-  before it drains.
-- Once cancel has been requested, conversion may be disabled or limited because
-  the side effect has already begun.
-- Once steer is delivered to the agent, it is no longer an editable pending
-  message; it becomes a run control event.
+If the current run has already received a Steer, Stop only stops that run. The
+delivered Steer does not automatically become Queue and is not sent as the next
+turn.
 
-The UI can still make the pre-submit choice lightweight, but the state model
-must not imply that a delivered Steer and a waiting Queue are freely
-interchangeable.
+### Stop-and-send
+
+Stop-and-send means there is already a waiting queued message, and the user
+chooses to stop the current run and send that queued message as the next normal
+user turn.
+
+Stop-and-send is an upgrade action for Queue.
+
+### Interrupt
+
+Interrupt is a legacy term from the current implementation and older UI copy. It
+was previously treated as a default busy send mode, but its behavior is closer
+to Queue + Cancel + Send.
+
+This RFC no longer defines Interrupt as a user-facing default busy mode. If the
+term remains, it should be legacy/internal wording or an implementation detail
+of Stop-and-send.
+
+## Settings Model
+
+Current Settings expose `Busy input mode` with three choices:
+
+- Queue follow-up
+- Interrupt current turn
+- Steer mid-turn correction
+
+This puts Queue, Interrupt, and Steer at the same level, as if they were
+equivalent default send modes.
+
+This RFC proposes replacing that with:
+
+- Queue by default
+- Steer by default
+
+The setting should only decide what happens when the agent is running and the
+user directly sends new input: either queue the input, or deliver it as Steer.
+
+`Interrupt current turn` should no longer appear as a default busy mode. Its
+capability is represented by Stop-and-send when a waiting Queue message exists.
+
+Legacy migration:
+
+- current `queue` -> `Queue by default`
+- current `steer` -> `Steer by default`
+- current `interrupt` -> `Steer by default`
+
+The reason is that old `interrupt` users usually intended busy-time input to
+affect execution quickly, not to wait until the current task naturally ends. In
+the new model, Steer is the safest closest behavior: it delivers the new input
+to the active run without automatically cancelling it.
+
+If the user explicitly wants to stop the current run and send a waiting queued
+message, they can use Stop-and-send.
+
+## Composer Interaction Model
+
+When the agent is idle, Composer keeps the existing behavior:
+
+- input has content: primary button is Send
+- input is empty: primary button is disabled
+
+When the agent is busy:
+
+- input has content and default is Queue: primary button queues the message
+- input has content and default is Steer: primary button sends Steer
+- input is empty: primary button is Stop
+
+Queued messages should appear as a compact strip/card attached above Composer,
+reusing the existing Terminal collapsed-card pattern.
+
+The queued strip should:
+
+- sit directly above Composer
+- show truncated message text with `...` when needed
+- stay compact for mobile
+- avoid large text buttons
+
+The right side should expose icon controls:
+
+- Delete: trash icon
+- Edit: pencil icon
+- Steer: dedicated steer icon
+
+Edit moves the queued message back into Composer for editing.
+
+Steer upgrades the queued message into Steer. After success, it disappears from
+the queued strip and appears in the transcript/live area as a user Steer
+message.
+
+Open questions:
+
+- When a waiting Queue exists, should the existing Stop button remain plain
+  Stop, or should tooltip/state explain Stop-and-send behavior?
+- Should Stop-and-send remain tied to the primary Stop affordance, or does it
+  need a separate scoped affordance later?
+- The current preference is not to change the Stop icon in the first version.
+
+## Steer Live-to-Final Rendering
+
+Steer is not only a temporary live UI state. It must preserve meaning in both
+live and settled views.
+
+### Live phase
+
+Steer renders like a normal user message.
+
+It visually inserts into the middle of the current assistant live run. It splits
+the visible Assistant Worklog, but does not stop the active run. Assistant
+Worklog continues after the Steer.
+
+The Worklog should show explicit feedback, such as "guidance received," or
+equivalent natural assistant process text.
+
+A Steer message is user-visible because it is user-authored input, not an
+internal recovery or runtime-control prompt. It renders like a user message, but
+it remains metadata-marked as Steer so replay and settled Worklog do not treat
+it as a normal next-turn user message.
+
+### Settled phase
+
+Steer must not disappear after Final Answer appears.
+
+The collapsed Activity / Worklog must retain Steer as a timeline boundary.
+Expanding Worklog should show what happened before Steer, what the user sent,
+what happened after Steer, and how the final answer followed.
+
+A delivered Steer is not a running-only marker. It is part of the causal
+timeline of the active run, so it must remain visible or inspectable after
+settle.
+
+Steer must not exist only as a toast or transient DOM state. It must survive
+refresh, session switch, replay, and settled render.
+
+### Relationship to system control events
+
+Steer is similar to system-delivered control events such as tool-iteration-limit
+notices. The difference is source:
+
+- Steer is user-delivered.
+- Tool iteration limit is system-delivered.
+
+Both are causal timeline events. Neither is the final answer. This RFC only
+defines the user-delivered Steer side; tool-limit terminal semantics remain
+owned by the Live-to-Final / terminal-state track.
 
 ## State Ownership
 
-| Intent type | Owner | Durable/replay expectation |
-|---|---|---|
-| Queue message | Session | Stored with text, attachments, model/profile metadata, and creation time until drained, cancelled, edited, upgraded to Steer, or promoted to stop-and-send. |
-| Steer message | Active run | Delivered immediately as a run control event and replayable with the active turn. |
-| Stop-and-send / interrupt | Session plus active run | Promotes a waiting Queue message to a replacement input; cancel/control status is run-scoped once cancellation starts. |
-| Leftover steer | Session | Converts from run intent to session intent with source metadata. |
+Queue belongs to the session.
 
-This RFC does not require one final storage backend. A first implementation may
-reuse existing browser queue state plus run-journal events, but it must name the
-source of truth for each state and test the recovery behavior it claims.
+A queued message must stay bound to the session where it was created. It must
+not drain into another session after session switch, refresh, or background
+completion.
 
-Durability should be staged honestly:
+Queue is waiting intent until drained. It should not render as an already-sent
+normal user message before dispatch.
 
-- First slice: browser-backed pending Queue state may continue to use the
-  existing session-scoped queue plus `sessionStorage`, as long as it has
-  session-ownership and recovery tests.
-- Later slice: if stronger guarantees are needed, move pending messages into
-  server/session-sidecar state or another durable WebUI store.
-- Steer visibility can become replayable by writing a WebUI-owned run
-  control event for `delivered`, without waiting for a server-side queue.
+Steer belongs to the active run.
 
-## Steer Traceability Boundary
+Once delivered, Steer is no longer Queue. It cannot be edited, deleted as
+pending Queue, or used for Stop-and-send.
 
-WebUI can own a replayable `delivered` state today: `/api/chat/steer` accepted
-the steer text and passed it to the active agent. That is enough for the UI to
-show a persistent "steer delivered" control event.
+Steer renders like a user message, but metadata must preserve that it is Steer,
+not a next-turn user message.
 
-WebUI cannot currently prove `applied` as a distinct fact. True "the runtime
-consumed this steer here" traceability depends on Hermes Agent emitting or
-persisting steer metadata. That upstream boundary is tracked in
-[NousResearch/hermes-agent#28172](https://github.com/NousResearch/hermes-agent/issues/28172),
-with the WebUI mirror/follow-up tracked in
-[#2555](https://github.com/nesquena/hermes-webui/issues/2555).
+Stop belongs to the active run.
 
-Until that agent-side signal exists, implementation PRs should use `delivered`
-wording for WebUI-owned events and reserve `applied` for a future runtime-backed
-state.
+Stop only stops the active run unless the interaction clearly becomes
+Stop-and-send.
 
-## Visible Timeline Contract
+Stop-and-send involves two objects:
 
-Pending intents should be quiet but visible.
+- the waiting Queue message, owned by the session
+- the active run cancellation, owned by the active run
 
-- Before a Queue message is dispatched, it should appear as a
-  composer-attached pending-message card rather than a settled transcript bubble.
-- The card sits above or attached to the composer so it reads as "this message
-  is waiting to be handled," not as already-sent conversation history.
-- The card should show the pending message text, its current waiting state, and
-  lightweight actions such as delete / more.
-- The queued message card may expose an upgrade action such as `Steer` / `引导`
-  when steer is still available for the active run.
-- When the default behavior is Steer, the composer may expose `Queue` as an
-  alternate pre-submit action; after the user sends as Steer, there is no
-  composer-attached Queue card to convert back to.
-- The queued message row may expose a Stop affordance. When activated, that
-  affordance should read as "stop current run and send this message," not as
-  "discard this pending message."
-- Stop-and-send can use the pending-message surface while cancel is pending, but
-  should carry interrupt wording or metadata so it does not read like an
-  ordinary delayed message.
-- Steer should be rendered as a control event for the active assistant turn, not
-  as a standalone user bubble, after it has been delivered.
-- Control events are lower priority than assistant prose but higher priority
-  than hidden debug logs because they represent user input.
-- Settled history may keep control events compact, but they should remain
-  inspectable.
+It must preserve order:
 
-## Recovery And Replay Invariants
+1. mark the queued message as the next user turn
+2. request cancellation of the active run
+3. wait until the session is safe
+4. send the queued message
+5. never show a user message in WebUI that the Agent durable conversation did
+   not receive
 
-1. An accepted steer must remain visible after switching away from the session
-   and back.
-2. An accepted steer must remain visible after `renderMessages()` rebuilds the
-   transcript from the server session.
-3. A pending queue item must remain attached to its originating session across
-   session switches.
-4. A pending stop-and-send replacement must remain recoverable across cancel,
-   refresh, or reconnect boundaries.
-5. A leftover steer must either become a queued next-turn message or show a
-   visible terminal failure; it must not disappear silently.
-6. Replaying run events must be idempotent: it should not duplicate steer rows,
-   queue chips, or replacement inputs.
-7. Session switching may hide pending intent for non-active sessions, but it
-   must not erase it.
-8. A delivered Steer must not be represented as a still-editable Queue item.
-9. A waiting Queue message may be upgraded to Steer, but that delivery is
-   irreversible.
-10. Pressing Stop on a waiting Queue message promotes that message to
-    stop-and-send instead of dropping it.
+## Durability And Recovery
 
-## Rollout Plan
+Pending intent must not be only current-page UI state.
 
-### Slice 1: Contract and regression targets
+Queue requirements:
 
-- Add this RFC and update the RFC index.
-- Add product-semantics tests that describe pending-intent behavior without
-  requiring the final storage backend.
-- Require the first implementation PR to state how saved legacy `interrupt`
-  settings migrate into the new Queue/Steer default waiting-mode model.
-- Update stale manual testing text that says switching sessions clears queue.
+- survives refresh
+- survives session switch
+- restores above Composer when returning to the session
+- drains only into its original session
+- respects Edit/Delete after recovery
+- protects zero-message sessions that still contain draft or queued intent
 
-### Slice 2: Durable steer visibility
+Steer requirements:
 
-- Model active-run Steer input as an immediate run control event.
-- Convert successful steer from transient DOM-only indicator to a replayable run
-  control event.
-- Use `delivered` wording for that WebUI-owned control event until Hermes Agent
-  exposes a reliable `applied` / consumed signal.
-- Restore that event after session switch, refresh, SSE reconnect, and settled
-  re-render.
-- Keep successful steer out of normal user messages unless it becomes leftover
-  queue.
+- survives session switch
+- survives refresh/replay
+- remains inspectable after settled render
+- does not duplicate as two user messages
+- does not remain editable as Queue after delivery
+- if delivery fails, preserves user input through Queue fallback or visible
+  failure state
 
-### Slice 3: Queue, Stop, and interrupt alignment
+Stop-and-send requirements:
 
-- Make Queue, Interrupt, and leftover Steer all use consistent pending-intent
-  metadata.
-- Preserve existing queue editing controls where possible.
-- Distinguish Stop-promoted interrupt replacement from ordinary delayed queue in
-  UI copy and state.
-- Support one-way Queue-to-Steer upgrade while the Queue message is still
-  waiting and steer remains available.
-- Make Stop on a waiting Queue message cancel the current run and send the
-  queued message immediately.
+- queued message must not be lost during cancel
+- old run must reach a clear terminal state
+- exactly one successor run owns the queued message
+- queued message must exist in WebUI transcript and Agent durable conversation
+- if the session is not safe yet, the message must remain pending instead of
+  forcing a successor run
 
-### Slice 4: Adapter-compatible control path
+Replay should rebuild the same causal timeline:
 
-- Align the pending-intent contract with the runtime adapter direction so
-  `queue_message(...)` and future control methods can delegate without creating
-  a second scheduler or hidden queue.
+1. run start
+2. Worklog
+3. user intervention
+4. runtime acknowledgement or handling
+5. terminal state
+6. final answer or error state
+
+Recovery after replay does not need to reproduce every live animation, but it
+must preserve event order and meaning.
+
+## Leftover Steer
+
+Leftover Steer is a Steer that could not be consumed by the active run before
+that run ended.
+
+The RFC distinguishes three cases:
+
+- Not delivered: preserve the text through Queue fallback or visible failure.
+- Delivered but returned by runtime as leftover: convert it into Queue with
+  source metadata.
+- Delivered but not proven applied: show only delivered, not applied.
+
+WebUI must not silently discard leftover Steer. It also must not claim the
+runtime applied the Steer without Agent/TUI Gateway evidence.
+
+## Runtime Boundary
+
+This RFC defines product semantics, not a permanent WebUI-private runtime
+protocol.
+
+This boundary is necessary because Hermes WebUI also has the #1925
+RuntimeAdapter direction. Michael's RuntimeAdapter work moves WebUI toward
+clearer runtime interfaces instead of permanently owning all Agent runtime
+behavior directly. Hermes Desktop / TUI Gateway already exposes related
+surfaces such as `session.steer`, `session.interrupt`, active session status,
+and event streams.
+
+WebUI may own:
+
+- pending intent presentation
+- session-scoped Queue state
+- queued message edit/delete/upgrade controls
+- Steer rendering as user message
+- WebUI-confirmed delivered state
+- Stop / Stop-and-send presentation
+- fallback, recovery, replay, and settled Worklog rendering
+
+WebUI should not invent:
+
+- a long-lived server-side queue scheduler
+- runtime-level applied detection
+- proof that Agent consumed a Steer
+- a private interrupt model independent of Hermes Agent / TUI Gateway
+- a control protocol that cannot map to RuntimeAdapter later
+
+Delivered vs Applied:
+
+- `delivered`: WebUI has sent Steer to the active run/runtime endpoint
+- `applied`: Agent/runtime proves the model consumed or applied the Steer
+
+WebUI may claim delivered. WebUI must not claim applied without Agent/TUI
+Gateway evidence.
+
+## Implementation Slices
+
+Each slice must satisfy this RFC and the Live-to-Final parent requirements
+around live rendering, settled Worklog, replay/recovery, and final answer
+boundary.
+
+### Slice 1: RFC and routing update
+
+- update #3061
+- define Queue / Steer / Stop / Stop-and-send / legacy Interrupt
+- update docs/contracts routing
+- clarify #3822 is a legacy interrupt safety fix, not endorsement of Interrupt
+  as default busy mode
+
+### Slice 2: Queue durability
+
+- address #3108
+- preserve queue and draft across refresh, session switch, tab restore, and
+  zero-message restore
+
+### Slice 3: Steer delivered visibility and replay
+
+- render Steer as a user message
+- keep active run alive
+- preserve Steer in replay and settled Worklog
+- claim delivered only, not applied
+
+### Slice 4: Stop-and-send UI
+
+- replace legacy Interrupt behavior with explicit Stop-and-send
+- define Stop behavior when a waiting Queue exists
+- ensure delivered Steer is not resent by Stop-and-send
+- protect against cancel-race split-brain
+
+### Slice 5: Agent-side Steer applied / tool boundary
+
+- address #2555
+- define when remaining tool calls stop or continue after Steer
+- preserve Steer traceability
+- only show applied after Agent/TUI Gateway emits proof
 
 ## Testing Expectations
 
 Implementation PRs should include focused tests for:
 
-- accepted steer remains visible after session switch and replay,
-- accepted steer is not duplicated as a user turn,
-- accepted steer is not still editable as Queue,
-- leftover steer converts to queue with source metadata,
-- queued message stays session-scoped across switches,
+- queued message stays session-scoped across switches
+- queue survives refresh, tab restore, and zero-message draft restore
+- queue drains only into its original session
 - Queue can upgrade to Steer while still waiting, and the upgrade is
-  irreversible,
+  irreversible
+- accepted Steer renders as a user message in the live transcript
+- accepted Steer remains visible after session switch and replay
+- accepted Steer is not duplicated as a normal next-turn user message
+- accepted Steer is not still editable as Queue
+- delivered Steer remains inspectable in settled Activity / Worklog
+- leftover Steer converts to Queue with source metadata
 - Stop on a waiting Queue message cancels the current run and sends the queued
-  message,
-- stop-and-send replacement survives cancel/reconnect timing,
-- stale or unavailable steer fallback preserves user text and explains the
-  fallback,
-- settled render and live SSE replay produce one coherent timeline.
+  message
+- delivered Steer is not resent by Stop-and-send
+- stop-and-send replacement survives cancel/reconnect timing
+- stale or unavailable Steer fallback preserves user text and explains the
+  fallback
+- settled render and live SSE replay produce one coherent timeline
 
-Manual verification should cover desktop and narrow/mobile composer states when
-the visible queue/steer/interrupt surfaces change.
+Manual verification should cover desktop, narrow, and mobile composer states
+when the visible queue/steer/stop surfaces change.
+
+## Issue / PR Routing
+
+- [#3400](https://github.com/nesquena/hermes-webui/issues/3400): Live-to-Final
+  umbrella. Tracks live-to-final invariants affected by pending intent, but does
+  not own Queue/Steer/Stop-and-send command semantics.
+- [#3058](https://github.com/nesquena/hermes-webui/issues/3058): Pending intent
+  controls umbrella.
+- [#3061](https://github.com/nesquena/hermes-webui/pull/3061): RFC PR for this
+  contract.
+- [#3108](https://github.com/nesquena/hermes-webui/issues/3108): Queue/draft
+  durability.
+- [#2555](https://github.com/nesquena/hermes-webui/issues/2555): Steer runtime
+  behavior, tool-call boundary, traceability, applied signal.
+- [#3808](https://github.com/nesquena/hermes-webui/issues/3808): legacy
+  interrupt-and-send ownership bug.
+- [#3822](https://github.com/nesquena/hermes-webui/pull/3822): focused safety
+  fix for #3808. It does not preserve Interrupt as default busy mode and does
+  not complete pending intent controls.
+- [#1925](https://github.com/nesquena/hermes-webui/issues/1925):
+  RuntimeAdapter / runtime ownership boundary.
+- Hermes Agent / TUI Gateway follow-up: required for reliable applied/consumed
+  Steer evidence.
 
 ## Open Questions
 
-- Should successful steer be persisted in the session sidecar, run journal, or
-  both?
-- Can Hermes Agent expose a reliable "steer applied" signal, or should WebUI
-  stop at "delivered" until the runtime contract grows that event?
-- Should interrupt replacement be editable while cancellation is still pending?
-- Should non-active sessions with pending intent show a sidebar marker, or is
-  restoring the queue/control event on return sufficient for the first slice?
-- How should pending intents behave when a user manually changes model/profile
-  before the queued or replacement input drains?
-- Should Stop on a waiting Queue message use the same visual button as global
-  Stop, or should the queued message row expose a scoped stop-and-send action?
+- When a waiting Queue exists, should the existing Stop button remain plain
+  Stop, or should tooltip/state explain Stop-and-send behavior?
+- Should Stop-and-send remain tied to the primary Stop affordance, or does it
+  need a separate scoped affordance later?
+- What steer icon best communicates "guide current run" without looking like
+  Send or fast-forward?
+- Should mobile hide Edit behind a menu, keeping only Delete and Steer visible?
+  Or should all three icons stay visible in the attached queued strip?
+- What exact Hermes Agent event shape, ordering, and metadata should prove
+  `applied` after WebUI has already recorded `delivered`?

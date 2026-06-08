@@ -55,5 +55,6 @@ First-time contributor RFCs should be discussed in an issue before opening a PR.
 - [`turn-journal.md`](turn-journal.md) — Crash-safe WebUI turn journal for
   recovering interrupted chat submissions.
 - [`webui-pending-intent-controls.md`](webui-pending-intent-controls.md) —
-  proposed product contract for Queue, Interrupt, and Steer inputs submitted
-  while an agent run is active.
+  #3058 control-surface companion to #3400 for Queue, Steer, Stop-and-send,
+  Interrupt, and leftover-steer inputs submitted while a long-running agent
+  session is active.
