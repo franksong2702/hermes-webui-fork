@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`stream_end` no longer clears an active live assistant row before the settled transcript is ready.** When `stream_end` arrives while live text, Worklog, Thinking, or tool activity is still displayed, the browser now waits for the persisted session to leave its active/pending state before replacing the live DOM. This avoids a terminal-settle race where the assistant area could briefly go blank or only recover after switching sessions. (refs #3877)
+
 ## [v0.51.346] — 2026-06-09 — Release LJ (PWA notification controls)
 
 ### Added
