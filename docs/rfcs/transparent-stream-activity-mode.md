@@ -55,9 +55,11 @@ discoverability problem** and **cannot be fixed by the existing
    DOM" is **not** equivalent to "the concrete tool call is the primary,
    readable item in the transcript flow."
 
-The conclusion — agreed by the issue author (@ai-ag2026), the maintainer
-(@nesquena), and reflected in the issue thread — is that this should be a real
-**display-mode split**, not another overloaded disclosure default.
+The issue discussion has converged on treating this as a real
+**display-mode split**, not another overloaded disclosure default. The
+maintainer has invited a PR that rebuilds the desired visual behavior on top of
+the refactored codebase, and this RFC records the proposed product boundary for
+that work.
 
 ## Goals
 
@@ -129,14 +131,16 @@ function isTransparentStream(){ return chatActivityMode() === 'transparent_strea
 
 ### 2. Decouple "event sequence" from "grouping strategy"
 
-The backend already emits ordered SSE events (`token`, `interim_assistant`,
-`reasoning`, `tool`, `tool_complete`, `done`, …). The data is already
-chronological. The only thing Compact Worklog adds is a *grouping/summarizing
-strategy* on top. Transparent Stream is, in effect, the **identity grouping
-strategy**: render each event as its own first-class row, in order.
+The live backend emits ordered SSE events (`token`, `interim_assistant`,
+`reasoning`, `tool`, `tool_complete`, `done`, ...). Transparent Stream should
+preserve that order instead of applying the Compact Worklog grouping strategy on
+top. Settled messages and replay snapshots may not already expose the exact same
+event shape, so each implementation slice must normalize the available
+transcript, journal, reasoning, and tool-call metadata into an ordered activity
+event sequence before rendering.
 
-So the fix is not new data — it is a strategy seam queried at the three render
-paths, all feeding a single shared renderer:
+The fix should therefore be a strategy seam queried at the three render paths,
+all feeding a shared renderer where the data is sufficiently normalized:
 
 ```text
 SSE live ─────────┐
@@ -149,19 +153,21 @@ live-vs-static asymmetry that #3820 keeps hitting.
 
 ### 3. Concrete integration points (current tree, `static/ui.js`)
 
-These are the three regions that currently fail the criteria above:
+These are the three regions that currently fail the criteria above. Line
+numbers refer to the tree observed when this RFC was written and are expected to
+drift; the function names are the durable anchors.
 
-- **A. Settled rebuild** — the tool-call loop in `renderMessages()` (around
-  `ui.js:8609`–`8653`). It has **no transparent-stream branch at all** today.
+- **A. Settled rebuild** — the tool-call loop in `renderMessages()`. It has
+  **no transparent-stream branch at all** today.
   Add `if(isTransparentStream())`: for each `tc`, build a standalone card with
-  the existing `buildToolCard(tc)` (`ui.js:9093`), anchor it to its assistant
-  segment via `_assistantAnchorForActivity(...)` (`ui.js:8520`), and insert it
+  the existing `buildToolCard(tc)`, anchor it to its assistant segment via
+  `_assistantAnchorForActivity(...)`, and insert it
   inline in `aIdx/segmentSeq/burstId` order — bypassing `ensureActivityGroup`
   and `_syncToolCallGroupSummary`. This is the "missing half" the maintainer
   identified, and the highest-value fix because it kills the settle/reload
   collapse.
 
-- **B. Live** — `ensureLiveWorklogShell()` (`ui.js:9427`) and the live
+- **B. Live** — `ensureLiveWorklogShell()` and the live
   `reasoning`/`tool`/`interim_assistant` handlers. The transparent branch must
   **not** just fall back to the old `thinkingRow` (that is the path that pushed
   the running tool card off-screen). It must append each event as an
@@ -169,9 +175,9 @@ These are the three regions that currently fail the criteria above:
   visible item**, with Thinking shown as a preview above it rather than the
   dominant block.
 
-- **C. Summary bypass** — in transparent mode, `_syncToolCallGroupSummary()`
-  (`ui.js:9195`) / `_toolWorklogSummary()` (`ui.js:8901`) do not run. No
-  "Checked the web 6 times" aggregation rows.
+- **C. Summary bypass** — in transparent mode, `_syncToolCallGroupSummary()` /
+  `_toolWorklogSummary()` do not run. No "Checked the web 6 times" aggregation
+  rows.
 
 ### 4. Reload/replay consistency
 
@@ -203,15 +209,17 @@ Shipped as independently-mergeable slices. Ordering principle: **certain,
 testable, small-footprint changes first; subjective, hard-to-test, viewport-feel
 changes later.**
 
-1. **PR-1 — Setting scaffold (no behavior change).** Add
-   `chat_activity_display_mode` preference, the Settings segmented control, and
-   the `isTransparentStream()` predicate. Selecting transparent mode does
-   nothing visible yet. Safest to land first.
-2. **PR-2 — Settled/reload path (integration point A).** The highest-value,
-   most testable fix: after settle and after reload, tool calls render as
-   inline chronological cards instead of a collapsed Activity summary.
-   Deterministic test: reload a transparent-mode session → tool calls remain
-   per-tool and in order.
+1. **PR-1 — Internal mode scaffold (no user-facing selector yet).** Add the
+   `chat_activity_display_mode` preference, boot-time plumbing, and the
+   `isTransparentStream()` predicate behind tests, but do **not** expose a
+   Settings control that appears to do nothing. This keeps the first slice safe
+   without creating a confusing empty toggle.
+2. **PR-2 — Settled/reload path + visible selector (integration point A).** Add
+   the Settings segmented control when transparent mode has at least one visible
+   behavior: after settle and after reload, tool calls render as inline
+   chronological cards instead of a collapsed Activity summary. Deterministic
+   test: reload a transparent-mode session -> tool calls remain per-tool and in
+   order.
 3. **PR-3 — Live path (integration points B + C).** Interleaved per-event live
    rendering with the running tool card as the primary visible item; bypass the
    summary aggregation. Includes the viewport acceptance check from the issue
