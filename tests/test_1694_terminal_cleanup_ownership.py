@@ -99,7 +99,9 @@ def test_stream_end_without_done_restores_settled_session_before_closing():
     never replaces the pane with the persisted transcript when done is missing.
     """
     body = _event_body("stream_end")
-    restore_idx = body.find("_restoreSettledSession(source)")
+    restore_idx = body.find("_restoreSettledSession(source,{status:true})")
+    if restore_idx == -1:
+        restore_idx = body.find("_restoreSettledSession(source)")
     close_idx = body.rfind("_closeSource(source)")
     finalized_idx = body.find("_streamFinalized=true")
     assert restore_idx != -1, "stream_end handler must restore settled session when done is absent"
