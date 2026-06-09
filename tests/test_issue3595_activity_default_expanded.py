@@ -96,6 +96,8 @@ def test_setting_controls_worklog_item_details_not_only_outer_group():
     legacy_thinking_fn = _function_body(src, "_thinkingMarkup")
     assert "_worklogDetailsExpandedDefault()" in legacy_thinking_fn, \
         "Thinking update fallback markup should not overwrite the Worklog details default"
+    assert "!isSimplifiedToolCalling()" not in legacy_thinking_fn, \
+        "The deprecated compact-tool toggle should not keep dead branches in Thinking markup"
 
     tool_fn = _function_body(src, "buildToolCard")
     assert "_worklogDetailsExpandedDefault()" in tool_fn and "openClass" in tool_fn, \
