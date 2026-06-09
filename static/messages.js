@@ -1616,6 +1616,27 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _pendingStreamEndRecovery=true;
     _streamEndRecoveryTimer=setTimeout(()=>{void _runStreamEndRecovery(source);},delay);
   }
+  function _finalizeStreamEndFallback(source){
+    _clearStreamEndRecovery();
+    if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+    _terminalStateReached=true;
+    _streamFinalized=true;
+    _cancelAnimationFramePendingStreamRender();
+    _streamFadeCleanupReduceMotionListener();
+    _smdEndParser();
+    if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
+    _clearOwnerInflightState();
+    _clearApprovalForOwner();
+    _clearClarifyForOwner('terminal');
+    if(_isActiveSession()){
+      S.activeStreamId=null;
+      clearLiveToolCards();if(!assistantText)removeThinking();
+      renderMessages({preserveScroll:true});
+    }
+    renderSessionList();
+    _setActivePaneIdleIfOwner();
+    _closeSource(source);
+  }
   async function _runStreamEndRecovery(source){
     if(_streamFinalized || _terminalStateReached || !_pendingStreamEndRecovery){
       _clearStreamEndRecovery();
@@ -1632,15 +1653,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _scheduleStreamEndRecovery(source,200);
       return;
     }
-    _clearStreamEndRecovery();
-    _terminalStateReached=true;
-    if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
-    _streamFinalized=true;
-    _cancelAnimationFramePendingStreamRender();
-    _streamFadeCleanupReduceMotionListener();
-    _smdEndParser();
-    if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
-    _closeSource(source);
+    _finalizeStreamEndFallback(source);
   }
   function _stripLiveVisibleAssistantEchoFromThinking(text, snippets){
     let out=String(text||'');
@@ -3346,14 +3359,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _scheduleStreamEndRecovery(source,200);
         return;
       }
-      if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
-      _terminalStateReached=true;
-      _streamFinalized=true;
-      _cancelAnimationFramePendingStreamRender();
-      _streamFadeCleanupReduceMotionListener();
-      _smdEndParser();
-      if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
-      _closeSource(source);
+      _finalizeStreamEndFallback(source);
     });
 
     source.addEventListener('pending_steer_leftover',e=>{
@@ -3700,8 +3706,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     window._carryForwardEphemeralTurnFields=_carryForwardEphemeralTurnFields;
   }
 
-  async function _restoreSettledSession(source){
-    const options=arguments.length>1?arguments[1]:null;
+  async function _restoreSettledSession(source, options=null){
     const returnStatus=!!(options&&options.status);
     if(_isActiveSession() && S.activeStreamId!==streamId){
       _closeSource(source);

@@ -72,7 +72,7 @@ def test_stream_end_fallback_does_not_finalize_when_session_is_still_active():
     assert "const status=await _restoreSettledSession(source,{status:true});" in body
     assert "if(status==='active'&&S.activeStreamId===streamId)" in body
     assert "_scheduleStreamEndRecovery(source,200);" in body
-    assert "_terminalStateReached=true;" in body
+    assert "_finalizeStreamEndFallback(source);" in body
 
 
 def test_stream_end_recovery_helper_retries_while_session_is_still_active():
@@ -81,7 +81,18 @@ def test_stream_end_recovery_helper_retries_while_session_is_still_active():
     assert "_restoreSettledSession(source,{status:true})" in fn
     assert "if(status==='active'&&_streamEndRecoveryAttempts<10)" in fn
     assert "_scheduleStreamEndRecovery(source,200);" in fn
+    assert "_finalizeStreamEndFallback(source);" in fn
+
+
+def test_stream_end_fallback_helper_clears_owner_state_before_closing():
+    fn = _function_body("_finalizeStreamEndFallback")
     assert "_terminalStateReached=true;" in fn
+    assert "_streamFinalized=true;" in fn
+    assert "_clearOwnerInflightState();" in fn
+    assert "_clearApprovalForOwner();" in fn
+    assert "_clearClarifyForOwner('terminal');" in fn
+    assert "renderMessages({preserveScroll:true});" in fn
+    assert "_setActivePaneIdleIfOwner();" in fn
     assert "_closeSource(source)" in fn
 
 
@@ -96,6 +107,8 @@ def test_stream_end_live_scene_detection_includes_empty_text_activity():
 
 def test_restore_settled_session_can_report_active_pending_status():
     fn = _function_body("_restoreSettledSession")
+    assert "async function _restoreSettledSession(source, options=null)" in MESSAGES_JS
+    assert "arguments[1]" not in fn
     assert "const returnStatus=!!(options&&options.status);" in fn
     assert "return returnStatus?'active':false;" in fn
     assert "return returnStatus?'restored':true;" in fn
