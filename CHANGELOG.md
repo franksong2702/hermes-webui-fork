@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Queued follow-up messages and draft-only sessions are more durable across refresh and tab restore.** Session queues now mirror to both `sessionStorage` and `localStorage`, restore through one shared helper, clear stale queue state from both storage layers, and keep zero-message sessions when they still own unsent composer draft text or files. (#3108)
+
 ## [v0.51.347] — 2026-06-09 — Release LK (streaming & render reliability cluster)
 
 ### Fixed
