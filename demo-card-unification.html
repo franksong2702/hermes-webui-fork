@@ -321,11 +321,21 @@
   .pill.bad  { color: var(--error); }
   .pill.good { color: var(--success); }
 
-  /* ── Visibility helpers ── */
+  /* ── Both views always visible, stacked (no JS needed) ── */
   .before-view, .after-view { display: flex; flex-direction: column; gap: 18px; }
-  .after-view  { display: none; }
-  body.show-after .before-view { display: none; }
-  body.show-after .after-view  { display: flex; }
+
+  /* ── Big banner separating the two halves ── */
+  .view-banner {
+    width: 100%; max-width: 680px;
+    margin: 28px 0 4px;
+    padding: 10px 16px;
+    border-radius: 10px;
+    font-size: 13px; font-weight: 600;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .view-banner.before { background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.25); color: var(--error); }
+  .view-banner.after  { background: rgba(74,222,128,.1);  border: 1px solid rgba(74,222,128,.25); color: var(--success); }
+  .view-banner .tag { font-size: 10px; opacity: .7; font-weight: 400; margin-left: auto; }
 
   /* ── Diff summary table ── */
   .diff-table {
@@ -354,10 +364,9 @@
   <p class="subtitle">Before: 6 card types, 4 different border-radius values, 3 different padding scales, no design tokens.<br>After: 2-tier system (inline vs modal), all values from shared tokens.</p>
 </header>
 
-<!-- Toggle -->
-<div class="toggle-bar">
-  <button class="toggle-btn active" id="btnBefore" onclick="showBefore()">Before — current</button>
-  <button class="toggle-btn" id="btnAfter"  onclick="showAfter()">After — unified</button>
+<div class="view-banner before">
+  ✗ BEFORE — current (inconsistent)
+  <span class="tag">4 radius values · 3 padding scales · no tokens</span>
 </div>
 
 <div class="stage">
@@ -435,6 +444,14 @@
     </div>
 
   </div><!-- /before-view -->
+</div><!-- /stage -->
+
+<div class="view-banner after">
+  ✓ AFTER — unified (2-tier token system)
+  <span class="tag">inline 8px / modal 12px · compact / standard padding</span>
+</div>
+
+<div class="stage">
 
   <!-- ════ AFTER ════ -->
   <div class="after-view">
@@ -532,19 +549,6 @@
     <tr><td>Detail card</td>  <td class="val-bad">12px</td> <td class="val-good">12px ✓</td> <td class="val-bad">16px 18px</td>    <td class="val-good">12px 14px</td></tr>
   </tbody>
 </table>
-
-<script>
-  function showBefore() {
-    document.body.classList.remove('show-after');
-    document.getElementById('btnBefore').classList.add('active');
-    document.getElementById('btnAfter').classList.remove('active');
-  }
-  function showAfter() {
-    document.body.classList.add('show-after');
-    document.getElementById('btnAfter').classList.add('active');
-    document.getElementById('btnBefore').classList.remove('active');
-  }
-</script>
 
 </body>
 </html>
