@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Card Design Unification — Before / After</title>
+<style>
+  :root {
+    --bg: #151515;
+    --surface: #1e1e1e;
+    --surface-subtle: #1a1a1a;
+    --border: rgba(255,255,255,.08);
+    --border-muted: rgba(255,255,255,.05);
+    --text: #e8e8e8;
+    --muted: rgba(232,232,232,.42);
+    --accent: #7c6af7;
+    --accent-bg: rgba(124,106,247,.1);
+    --accent-bg-strong: rgba(124,106,247,.22);
+    --accent-text: #a89ffa;
+    --error: #f87171;
+    --success: #4ade80;
+    --warning: #fb923c;
+    --hover-bg: rgba(255,255,255,.05);
+    --font-mono: 'SF Mono', ui-monospace, monospace;
+    --font-size-xs: 11px;
+
+    /* ── Current (inconsistent) values ── */
+    --cur-tool-radius: 8px;
+    --cur-thinking-radius: 8px;
+    --cur-approval-radius: 14px;
+    --cur-clarify-radius: 12px;
+    --cur-cron-radius: 10px;
+    --cur-detail-radius: 12px;
+
+    /* ── Proposed unified tokens ── */
+    --card-radius-inline: 8px;
+    --card-radius-modal: 12px;
+    --card-padding-compact: 8px 10px;
+    --card-padding-standard: 12px 14px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    line-height: 1.6;
+    padding: 32px 20px 60px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 36px;
+  }
+
+  /* ── Header ── */
+  header { text-align: center; display: flex; flex-direction: column; gap: 8px; }
+  h1 { font-size: 18px; font-weight: 600; }
+  .subtitle { font-size: 12px; color: var(--muted); max-width: 520px; line-height: 1.7; }
+
+  /* ── Toggle ── */
+  .toggle-bar {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 3px;
+  }
+  .toggle-btn {
+    padding: 7px 20px;
+    border-radius: 8px;
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: 13px;
+    cursor: pointer;
+    transition: background .15s, color .15s;
+  }
+  .toggle-btn.active { background: var(--accent); color: #fff; }
+
+  /* ── Layout ── */
+  .stage {
+    width: 100%;
+    max-width: 680px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .section-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .8px;
+    color: var(--muted);
+    opacity: .5;
+    padding: 0 2px;
+  }
+
+  /* ── Token reference box ── */
+  .token-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 24px;
+  }
+  .token-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; }
+  .token-name { color: var(--muted); font-family: var(--font-mono); }
+  .token-val { color: var(--accent-text); font-family: var(--font-mono); }
+  .token-swatch {
+    width: 28px; height: 14px; border-radius: 4px;
+    border: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  /* ════════════════════════════════════
+     BEFORE: Current inconsistent cards
+  ════════════════════════════════════ */
+
+  /* Tool card — BEFORE */
+  .b-tool-card {
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--border-muted);
+    border-radius: var(--cur-tool-radius); /* 8px */
+    padding: 0;
+  }
+  .b-tool-header {
+    display: flex; align-items: center; gap: 7px;
+    padding: 3px 8px; /* minimal */
+    color: var(--muted); font-size: 12px;
+  }
+  .b-tool-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: spin-dot 1s linear infinite; flex-shrink:0; }
+  @keyframes spin-dot { to { transform: rotate(360deg); } }
+
+  /* Thinking card — BEFORE */
+  .b-thinking-card {
+    background: var(--accent-bg);
+    border: 1px solid var(--accent-bg-strong);
+    border-radius: var(--cur-thinking-radius); /* 8px — same as tool */
+    padding: 0;
+  }
+  .b-thinking-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 10px; /* slightly larger than tool */
+    color: var(--accent-text); font-size: 12px; font-weight: 600;
+  }
+
+  /* Approval card — BEFORE */
+  .b-approval-card {
+    background: var(--surface);
+    border: 1px solid var(--accent-bg-strong);
+    border-radius: var(--cur-approval-radius); /* 14px — biggest */
+    padding: 16px 18px 40px; /* massive bottom padding */
+    position: relative;
+  }
+  .b-approval-title { color: var(--error); font-size: 12px; font-weight: 600; margin-bottom: 8px; }
+  .b-approval-cmd {
+    background: var(--surface-subtle); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px;
+    font-family: var(--font-mono); font-size: 11px; color: var(--muted);
+    margin-bottom: 12px;
+  }
+  .b-approval-btns { display: flex; gap: 6px; position: absolute; bottom: 14px; left: 18px; right: 18px; }
+  .b-btn {
+    flex: 1; padding: 6px 8px; border-radius: 7px; border: 1px solid var(--border);
+    background: var(--hover-bg); color: var(--text); font-size: 11px; cursor: pointer;
+    text-align: center;
+  }
+  /* All "allow" buttons look the same — BEFORE bug */
+  .b-btn.deny { background: rgba(248,113,113,.15); border-color: rgba(248,113,113,.3); color: var(--error); }
+
+  /* Clarify card — BEFORE */
+  .b-clarify-card {
+    background: var(--surface);
+    border: 1px solid var(--accent-bg-strong);
+    border-radius: var(--cur-clarify-radius); /* 12px */
+    padding: 12px 14px 36px; /* large bottom */
+  }
+  .b-clarify-q { font-size: 13px; color: var(--text); margin-bottom: 10px; }
+  .b-clarify-opts { display: flex; flex-direction: column; gap: 6px; }
+  .b-clarify-opt {
+    padding: 8px 12px; border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--hover-bg); font-size: 12px; color: var(--muted); cursor: pointer;
+  }
+
+  /* Cron card — BEFORE */
+  .b-cron-card {
+    background: rgba(255,255,255,.02);
+    border: 1px solid var(--border);
+    border-radius: var(--cur-cron-radius); /* 10px */
+    padding: 10px 12px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .b-cron-name { font-size: 12px; flex: 1; }
+  .b-cron-badge { font-size: 10px; background: var(--accent-bg); color: var(--accent-text); padding: 2px 7px; border-radius: 20px; }
+
+  /* Detail card — BEFORE */
+  .b-detail-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--cur-detail-radius); /* 12px */
+    padding: 16px 18px;
+  }
+  .b-detail-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 8px; }
+  .b-detail-body { font-size: 12px; color: var(--text); line-height: 1.7; }
+
+  /* ════════════════════════════════════
+     AFTER: Unified card tokens
+  ════════════════════════════════════ */
+
+  /* Shared base */
+  .a-inline-card {
+    border-radius: var(--card-radius-inline); /* 8px for all inline */
+  }
+  .a-modal-card {
+    border-radius: var(--card-radius-modal); /* 12px for modal-like */
+  }
+
+  /* Tool card — AFTER */
+  .a-tool-card {
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+    border-left: 2px solid rgba(124,106,247,.35);
+  }
+  .a-tool-header {
+    display: flex; align-items: center; gap: 7px;
+    padding: var(--card-padding-compact); /* 8px 10px — unified */
+    color: var(--muted); font-size: 12px;
+  }
+  .a-tool-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: spin-dot 1s linear infinite; flex-shrink:0; }
+
+  /* Thinking card — AFTER */
+  .a-thinking-card {
+    background: var(--accent-bg);
+    border: 1px solid var(--accent-bg-strong);
+    /* radius: same 8px as tool — now consistent */
+  }
+  .a-thinking-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: var(--card-padding-compact); /* 8px 10px — now same as tool */
+    color: var(--accent-text); font-size: 12px; font-weight: 600;
+  }
+
+  /* Approval card — AFTER */
+  .a-approval-card {
+    background: var(--surface);
+    border: 1px solid var(--accent-bg-strong);
+    /* radius: 12px */
+    padding: var(--card-padding-standard); /* 12px 14px — no more 40px bottom */
+  }
+  .a-approval-title { color: var(--error); font-size: 12px; font-weight: 600; margin-bottom: 8px; }
+  .a-approval-cmd {
+    background: var(--surface-subtle); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px;
+    font-family: var(--font-mono); font-size: 11px; color: var(--muted);
+    margin-bottom: 12px;
+  }
+  .a-approval-btns { display: flex; gap: 6px; }
+  .a-btn {
+    flex: 1; padding: 6px 8px; border-radius: 7px; border: 1px solid var(--border);
+    background: var(--hover-bg); color: var(--text); font-size: 11px; cursor: pointer;
+    text-align: center;
+  }
+  /* Clear visual hierarchy — AFTER fix */
+  .a-btn.deny  { background: rgba(248,113,113,.15); border-color: rgba(248,113,113,.3); color: var(--error); }
+  .a-btn.once  { background: rgba(74,222,128,.1);   border-color: rgba(74,222,128,.3);  color: var(--success); font-weight: 500; }
+  .a-btn.session { background: rgba(124,106,247,.1); border-color: rgba(124,106,247,.25); color: var(--accent-text); }
+  .a-btn.always { background: rgba(251,146,60,.1);  border-color: rgba(251,146,60,.3);  color: var(--warning); }
+
+  /* Clarify card — AFTER */
+  .a-clarify-card {
+    background: var(--surface);
+    border: 1px solid var(--accent-bg-strong);
+    padding: var(--card-padding-standard); /* 12px 14px — no more 36px bottom */
+  }
+  .a-clarify-q { font-size: 13px; color: var(--text); margin-bottom: 10px; }
+  .a-clarify-opts { display: flex; flex-direction: column; gap: 6px; }
+  .a-clarify-opt {
+    padding: 8px 12px; border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--hover-bg); font-size: 12px; color: var(--muted); cursor: pointer;
+    transition: border-color .15s, color .15s;
+  }
+  .a-clarify-opt:hover { border-color: var(--accent-bg-strong); color: var(--text); }
+
+  /* Cron card — AFTER */
+  .a-cron-card {
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+    /* radius: 8px — now same as tool/thinking */
+    padding: var(--card-padding-compact); /* 8px 10px */
+    display: flex; align-items: center; gap: 10px;
+  }
+  .a-cron-name { font-size: 12px; flex: 1; }
+  .a-cron-badge { font-size: 10px; background: var(--accent-bg); color: var(--accent-text); padding: 2px 7px; border-radius: 20px; }
+
+  /* Detail card — AFTER */
+  .a-detail-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    /* radius: 12px — same as clarify/approval */
+    padding: var(--card-padding-standard);
+  }
+  .a-detail-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 8px; }
+  .a-detail-body { font-size: 12px; color: var(--text); line-height: 1.7; }
+
+  /* ── Annotation badges ── */
+  .card-wrap { display: flex; flex-direction: column; gap: 4px; }
+  .card-label { font-size: 10px; color: var(--muted); opacity: .55; display: flex; align-items: center; justify-content: space-between; padding: 0 2px; }
+  .pill {
+    font-size: 9px; padding: 1px 7px; border-radius: 20px;
+    border: 1px solid currentColor; opacity: .7;
+  }
+  .pill.bad  { color: var(--error); }
+  .pill.good { color: var(--success); }
+
+  /* ── Visibility helpers ── */
+  .before-view, .after-view { display: flex; flex-direction: column; gap: 18px; }
+  .after-view  { display: none; }
+  body.show-after .before-view { display: none; }
+  body.show-after .after-view  { display: flex; }
+
+  /* ── Diff summary table ── */
+  .diff-table {
+    width: 100%; max-width: 680px;
+    border-collapse: collapse;
+    font-size: 11px;
+  }
+  .diff-table th {
+    text-align: left; padding: 6px 10px;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--muted); font-weight: 600;
+  }
+  .diff-table td {
+    padding: 6px 10px; border: 1px solid var(--border);
+    vertical-align: middle;
+  }
+  .diff-table tr:nth-child(even) td { background: rgba(255,255,255,.02); }
+  .val-bad  { color: var(--error); font-family: var(--font-mono); }
+  .val-good { color: var(--success); font-family: var(--font-mono); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Card Design Unification</h1>
+  <p class="subtitle">Before: 6 card types, 4 different border-radius values, 3 different padding scales, no design tokens.<br>After: 2-tier system (inline vs modal), all values from shared tokens.</p>
+</header>
+
+<!-- Toggle -->
+<div class="toggle-bar">
+  <button class="toggle-btn active" id="btnBefore" onclick="showBefore()">Before — current</button>
+  <button class="toggle-btn" id="btnAfter"  onclick="showAfter()">After — unified</button>
+</div>
+
+<div class="stage">
+
+  <!-- ════ BEFORE ════ -->
+  <div class="before-view">
+
+    <div class="section-label">Inline message cards</div>
+
+    <div class="card-wrap">
+      <div class="card-label">Tool card <span class="pill bad">radius: 8px · padding: 3px 8px · border-left: 2px</span></div>
+      <div class="b-tool-card">
+        <div class="b-tool-header">
+          <span class="b-tool-dot"></span>
+          <span>🔧</span>
+          <span style="opacity:.56;font-weight:600;color:#a89ffa">read_file</span>
+          <span style="opacity:.38;font-family:var(--font-mono);font-size:11px">~/project/config.yaml</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-wrap">
+      <div class="card-label">Thinking card <span class="pill bad">radius: 8px · padding: 5px 10px (different scale)</span></div>
+      <div class="b-thinking-card">
+        <div class="b-thinking-header">
+          <span>💭</span>
+          <span>Thinking…</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-wrap">
+      <div class="card-label">Cron item <span class="pill bad">radius: 10px · padding: 10px 12px (3rd scale)</span></div>
+      <div class="b-cron-card">
+        <span>⏱</span>
+        <span class="b-cron-name">daily-backup</span>
+        <span class="b-cron-badge">next: 02:00</span>
+      </div>
+    </div>
+
+    <div class="section-label" style="margin-top:4px">Modal / interrupt cards</div>
+
+    <div class="card-wrap">
+      <div class="card-label">Approval card <span class="pill bad">radius: 14px · padding: 16px 18px 40px (excessive bottom)</span></div>
+      <div class="b-approval-card">
+        <div class="b-approval-title">⚠ Tool requires approval</div>
+        <div class="b-approval-cmd">rm -rf /tmp/build_cache/</div>
+        <div class="b-approval-btns">
+          <div class="b-btn deny">Deny</div>
+          <div class="b-btn">Allow once</div>
+          <div class="b-btn">Allow session</div>
+          <div class="b-btn">Always allow</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-wrap">
+      <div class="card-label">Clarify card <span class="pill bad">radius: 12px · padding: 12px 14px 36px (excessive bottom)</span></div>
+      <div class="b-clarify-card">
+        <div class="b-clarify-q">Which output format do you prefer?</div>
+        <div class="b-clarify-opts">
+          <div class="b-clarify-opt">Markdown report</div>
+          <div class="b-clarify-opt">JSON data</div>
+          <div class="b-clarify-opt">Plain text summary</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-wrap">
+      <div class="card-label">Detail card <span class="pill bad">radius: 12px · padding: 16px 18px (4th scale)</span></div>
+      <div class="b-detail-card">
+        <div class="b-detail-title">Session info</div>
+        <div class="b-detail-body">Model: claude-sonnet-4-6 · Profile: default · 3 tools active</div>
+      </div>
+    </div>
+
+  </div><!-- /before-view -->
+
+  <!-- ════ AFTER ════ -->
+  <div class="after-view">
+
+    <div class="section-label">Inline message cards — radius: 8px · padding: 8px 10px</div>
+
+    <div class="card-wrap">
+      <div class="card-label">Tool card <span class="pill good">radius: --card-radius-inline (8px) · padding: --card-padding-compact</span></div>
+      <div class="a-tool-card a-inline-card">
+        <div class="a-tool-header">
+          <span class="a-tool-dot"></span>
+          <span>🔧</span>
+          <span style="opacity:.56;font-weight:600;color:#a89ffa">read_file</span>
+          <span style="opacity:.38;font-family:var(--font-mono);font-size:11px">~/project/config.yaml</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-wrap">
+      <div class="card-label">Thinking card <span class="pill good">radius: --card-radius-inline (8px) · padding: --card-padding-compact</span></div>
+      <div class="a-thinking-card a-inline-card">
+        <div class="a-thinking-header">
+          <span>💭</span>
+          <span>Thinking…</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-wrap">
+      <div class="card-label">Cron item <span class="pill good">radius: --card-radius-inline (8px) · padding: --card-padding-compact</span></div>
+      <div class="a-cron-card a-inline-card">
+        <span>⏱</span>
+        <span class="a-cron-name">daily-backup</span>
+        <span class="a-cron-badge">next: 02:00</span>
+      </div>
+    </div>
+
+    <div class="section-label" style="margin-top:4px">Modal / interrupt cards — radius: 12px · padding: 12px 14px</div>
+
+    <div class="card-wrap">
+      <div class="card-label">Approval card <span class="pill good">radius: --card-radius-modal (12px) · padding: --card-padding-standard · color hierarchy</span></div>
+      <div class="a-approval-card a-modal-card">
+        <div class="a-approval-title">⚠ Tool requires approval</div>
+        <div class="a-approval-cmd">rm -rf /tmp/build_cache/</div>
+        <div class="a-approval-btns">
+          <div class="a-btn deny">Deny</div>
+          <div class="a-btn once">Allow once</div>
+          <div class="a-btn session">Session</div>
+          <div class="a-btn always">Always</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-wrap">
+      <div class="card-label">Clarify card <span class="pill good">radius: --card-radius-modal (12px) · padding: --card-padding-standard</span></div>
+      <div class="a-clarify-card a-modal-card">
+        <div class="a-clarify-q">Which output format do you prefer?</div>
+        <div class="a-clarify-opts">
+          <div class="a-clarify-opt">Markdown report</div>
+          <div class="a-clarify-opt">JSON data</div>
+          <div class="a-clarify-opt">Plain text summary</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-wrap">
+      <div class="card-label">Detail card <span class="pill good">radius: --card-radius-modal (12px) · padding: --card-padding-standard</span></div>
+      <div class="a-detail-card a-modal-card">
+        <div class="a-detail-title">Session info</div>
+        <div class="a-detail-body">Model: claude-sonnet-4-6 · Profile: default · 3 tools active</div>
+      </div>
+    </div>
+
+  </div><!-- /after-view -->
+
+</div><!-- /stage -->
+
+<!-- Diff table -->
+<table class="diff-table">
+  <thead>
+    <tr>
+      <th>Card type</th>
+      <th>Radius — before</th>
+      <th>Radius — after</th>
+      <th>Padding — before</th>
+      <th>Padding — after</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>Tool card</td>    <td class="val-bad">8px</td>  <td class="val-good">8px ✓</td>  <td class="val-bad">3px 8px</td>      <td class="val-good">8px 10px</td></tr>
+    <tr><td>Thinking card</td><td class="val-bad">8px</td>  <td class="val-good">8px ✓</td>  <td class="val-bad">5px 10px</td>     <td class="val-good">8px 10px</td></tr>
+    <tr><td>Cron item</td>    <td class="val-bad">10px</td> <td class="val-good">8px</td>    <td class="val-bad">10px 12px</td>    <td class="val-good">8px 10px</td></tr>
+    <tr><td>Approval card</td><td class="val-bad">14px</td> <td class="val-good">12px</td>   <td class="val-bad">16px 18px 40px</td><td class="val-good">12px 14px</td></tr>
+    <tr><td>Clarify card</td> <td class="val-bad">12px</td> <td class="val-good">12px ✓</td> <td class="val-bad">12px 14px 36px</td><td class="val-good">12px 14px</td></tr>
+    <tr><td>Detail card</td>  <td class="val-bad">12px</td> <td class="val-good">12px ✓</td> <td class="val-bad">16px 18px</td>    <td class="val-good">12px 14px</td></tr>
+  </tbody>
+</table>
+
+<script>
+  function showBefore() {
+    document.body.classList.remove('show-after');
+    document.getElementById('btnBefore').classList.add('active');
+    document.getElementById('btnAfter').classList.remove('active');
+  }
+  function showAfter() {
+    document.body.classList.add('show-after');
+    document.getElementById('btnAfter').classList.add('active');
+    document.getElementById('btnBefore').classList.remove('active');
+  }
+</script>
+
+</body>
+</html>

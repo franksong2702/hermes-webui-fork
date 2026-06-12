@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inter-tool Processing Hint — Demo</title>
+<style>
+  :root {
+    --bg: #1a1a1a;
+    --surface: #242424;
+    --surface-subtle: #1e1e1e;
+    --border: rgba(255,255,255,.08);
+    --text: #e8e8e8;
+    --muted: rgba(232,232,232,.45);
+    --accent: #7c6af7;
+    --accent-bg: rgba(124,106,247,.12);
+    --accent-text: #a89ffa;
+    --success: #4ade80;
+    --error: #f87171;
+    --hover-bg: rgba(255,255,255,.05);
+    --font-mono: 'SF Mono', ui-monospace, monospace;
+    --msg-max: 740px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px;
+    gap: 32px;
+  }
+
+  h1 { font-size: 16px; font-weight: 600; color: var(--text); opacity: .8; }
+  p.sub { font-size: 12px; color: var(--muted); text-align: center; max-width: 500px; line-height: 1.6; }
+
+  /* ── Controls ── */
+  .controls {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  button {
+    padding: 8px 18px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  button:hover { background: var(--hover-bg); }
+  button.primary { background: var(--accent); border-color: transparent; color: #fff; }
+  button.primary:hover { opacity: .88; }
+  button:disabled { opacity: .35; cursor: not-allowed; }
+
+  /* ── Chat pane ── */
+  .chat-pane {
+    width: 100%;
+    max-width: var(--msg-max);
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    min-height: 320px;
+  }
+
+  .chat-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .status-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--muted);
+    transition: background .3s;
+  }
+  .status-dot.running { background: var(--accent); animation: pulse-dot 1.4s ease-in-out infinite; }
+  .status-dot.done { background: var(--success); animation: none; }
+  @keyframes pulse-dot { 0%,100%{opacity:.5;} 50%{opacity:1;} }
+
+  .msg-list {
+    padding: 20px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    flex: 1;
+  }
+
+  /* ── User message ── */
+  .user-msg {
+    align-self: flex-end;
+    background: var(--accent-bg);
+    border: 1px solid rgba(124,106,247,.2);
+    border-radius: 14px 14px 4px 14px;
+    padding: 10px 14px;
+    max-width: 80%;
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--accent-text);
+  }
+
+  /* ── Assistant turn ── */
+  .assistant-turn {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-width: 100%;
+  }
+
+  /* ── Tool card (matching hermes-webui style) ── */
+  .tool-card-row { display: flex; flex-direction: column; }
+  .tool-card {
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+    border-left: 2px solid rgba(255,255,255,.1);
+    border-radius: 8px;
+    overflow: hidden;
+    transition: border-color .2s;
+  }
+  .tool-card.running { border-left-color: var(--accent); }
+  .tool-card.done { border-left-color: rgba(74,222,128,.4); }
+  .tool-card.error { border-left-color: var(--error); }
+
+  .tool-card-header {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 10px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .tool-card-running-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    flex-shrink: 0;
+    animation: pulse-dot 1s ease-in-out infinite;
+  }
+  .tool-icon { font-size: 12px; opacity: .5; }
+  .tool-card-name {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--muted);
+    opacity: .7;
+    flex-shrink: 0;
+  }
+  .tool-card.running .tool-card-name { color: var(--accent-text); opacity: 1; font-weight: 600; }
+  .tool-card-preview {
+    font-size: 12px;
+    color: var(--muted);
+    opacity: .42;
+    font-family: var(--font-mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+
+  /* ── Live duration badge (Feature 1) ── */
+  .tool-card-live-duration {
+    font-size: 11px;
+    color: var(--muted);
+    opacity: .52;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+    transition: opacity .3s;
+  }
+  .tool-card-live-duration.final { opacity: .72; color: var(--success); }
+
+  .tool-card-done-icon { font-size: 11px; margin-left: auto; flex-shrink: 0; }
+
+  /* ── Prose text ── */
+  .prose-segment {
+    font-size: 13px;
+    line-height: 1.75;
+    color: var(--text);
+    padding: 4px 0;
+  }
+  .prose-cursor {
+    display: inline-block;
+    width: 2px;
+    height: 14px;
+    background: var(--accent);
+    animation: blink .9s step-end infinite;
+    vertical-align: middle;
+    margin-left: 1px;
+  }
+  @keyframes blink { 0%,100%{opacity:1;} 50%{opacity:0;} }
+
+  /* ── Inter-tool hint (Feature 2) ── */
+  .inter-tool-hint {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 6px 2px;
+    opacity: 0;
+    transition: opacity .25s ease;
+  }
+  .inter-tool-hint.visible { opacity: .4; }
+  .inter-tool-dot {
+    width: 4px; height: 4px;
+    border-radius: 50%;
+    background: var(--muted);
+    animation: inter-tool-pulse 1.2s ease-in-out infinite;
+  }
+  .inter-tool-dot:nth-child(2) { animation-delay: .2s; }
+  .inter-tool-dot:nth-child(3) { animation-delay: .4s; }
+  @keyframes inter-tool-pulse {
+    0%,80%,100% { opacity: .3; transform: scale(.8); }
+    40% { opacity: 1; transform: scale(1); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .inter-tool-dot { animation: none; opacity: .5; }
+    .tool-card-running-dot { animation: none; }
+    .status-dot.running { animation: none; }
+  }
+
+  /* ── Toast (Feature 3) ── */
+  .toast-container {
+    position: fixed;
+    top: 20px; right: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 100;
+    pointer-events: none;
+  }
+  .toast {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 12px;
+    color: var(--text);
+    box-shadow: 0 4px 20px rgba(0,0,0,.4);
+    pointer-events: all;
+    transform: translateX(120%);
+    transition: transform .22s cubic-bezier(.32,.72,.16,1), opacity .2s;
+    opacity: 0;
+    max-width: 280px;
+    line-height: 1.5;
+  }
+  .toast.show { transform: translateX(0); opacity: 1; }
+  .toast.info { border-left: 3px solid var(--accent); }
+  .toast-label { font-size: 10px; color: var(--muted); margin-bottom: 2px; text-transform: uppercase; letter-spacing: .5px; }
+
+  /* ── Timeline labels ── */
+  .timeline {
+    width: 100%;
+    max-width: var(--msg-max);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .tl-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--muted);
+    opacity: .4;
+    transition: opacity .3s;
+  }
+  .tl-row.active { opacity: 1; color: var(--accent-text); }
+  .tl-row.done-step { opacity: .6; color: var(--success); }
+  .tl-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+  .tl-label { flex: 1; }
+  .tl-time { font-variant-numeric: tabular-nums; }
+
+  .divider {
+    width: 100%;
+    max-width: var(--msg-max);
+    border: none;
+    border-top: 1px solid var(--border);
+  }
+  .section-label {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .6px;
+    opacity: .5;
+    align-self: flex-start;
+  }
+</style>
+</head>
+<body>
+
+<h1>Inter-tool Processing Hint — Live Demo</h1>
+<p class="sub">Simulates a two-tool assistant response. Watch the elapsed time badge on each tool card, the three-dot hint between tools, and the reconnect toast.</p>
+
+<div class="controls">
+  <button class="primary" id="btnRun" onclick="runDemo()">▶ Run full demo</button>
+  <button id="btnReset" onclick="resetDemo()">↺ Reset</button>
+  <button id="btnReconnect" onclick="showReconnectToast(42)">⚡ Simulate reconnect</button>
+</div>
+
+<div class="section-label">Live stream preview</div>
+
+<div class="chat-pane">
+  <div class="chat-header">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">Idle</span>
+  </div>
+  <div class="msg-list" id="msgList">
+    <div class="user-msg">Read the config file and then summarize the project structure.</div>
+    <div class="assistant-turn" id="assistantTurn"></div>
+  </div>
+</div>
+
+<hr class="divider">
+<div class="section-label">Event timeline</div>
+
+<div class="timeline" id="timeline">
+  <div class="tl-row" id="tl0"><span class="tl-dot"></span><span class="tl-label">Stream starts</span><span class="tl-time"></span></div>
+  <div class="tl-row" id="tl1"><span class="tl-dot"></span><span class="tl-label">tool event → read_file card appears, elapsed timer starts</span><span class="tl-time"></span></div>
+  <div class="tl-row" id="tl2"><span class="tl-dot"></span><span class="tl-label">tool_complete → elapsed timer stops, 800ms debounce starts</span><span class="tl-time"></span></div>
+  <div class="tl-row" id="tl3"><span class="tl-dot"></span><span class="tl-label">800ms silence → inter-tool hint appears ✦</span><span class="tl-time"></span></div>
+  <div class="tl-row" id="tl4"><span class="tl-dot"></span><span class="tl-label">tool event → hint removed, list_dir card appears</span><span class="tl-time"></span></div>
+  <div class="tl-row" id="tl5"><span class="tl-dot"></span><span class="tl-label">tool_complete → second card settles</span><span class="tl-time"></span></div>
+  <div class="tl-row" id="tl6"><span class="tl-dot"></span><span class="tl-label">token events → prose appears</span><span class="tl-time"></span></div>
+  <div class="tl-row" id="tl7"><span class="tl-dot"></span><span class="tl-label">done → stream finalized, all timers cleared</span><span class="tl-time"></span></div>
+</div>
+
+<!-- Toast container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+  let _running = false;
+  let _timers = [];
+
+  function delay(ms) {
+    return new Promise(r => {
+      const h = setTimeout(r, ms);
+      _timers.push(h);
+    });
+  }
+
+  function setStatus(text, state) {
+    document.getElementById('statusText').textContent = text;
+    const dot = document.getElementById('statusDot');
+    dot.className = 'status-dot' + (state ? ' ' + state : '');
+  }
+
+  function activateTl(id, done = false) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.remove('active', 'done-step');
+    el.classList.add(done ? 'done-step' : 'active');
+    const t = el.querySelector('.tl-time');
+    if (t) t.textContent = new Date().toLocaleTimeString('en', {hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  }
+
+  function makeToolCard(name, preview, state) {
+    // state: 'running' | 'done' | 'error'
+    const row = document.createElement('div');
+    row.className = 'tool-card-row';
+    row.id = 'tool_' + name;
+
+    const running = state === 'running';
+    const icons = { read_file: '📄', list_dir: '📁' };
+    const icon = icons[name] || '🔧';
+
+    row.innerHTML = `
+      <div class="tool-card ${state}">
+        <div class="tool-card-header">
+          ${running ? '<span class="tool-card-running-dot"></span>' : ''}
+          <span class="tool-icon">${icon}</span>
+          <span class="tool-card-name">${name.replace('_',' ')}</span>
+          ${running ? '<span class="tool-card-live-duration" id="dur_' + name + '"></span>' : ''}
+          <span class="tool-card-preview">${preview}</span>
+          ${!running ? '<span class="tool-card-done-icon">' + (state === 'done' ? '✓' : '✗') + '</span>' : ''}
+        </div>
+      </div>`;
+    return row;
+  }
+
+  function startElapsedTimer(name) {
+    const start = Date.now();
+    const handle = setInterval(() => {
+      const el = document.getElementById('dur_' + name);
+      if (!el) { clearInterval(handle); return; }
+      const s = (Date.now() - start) / 1000;
+      el.textContent = s < 60 ? Math.round(s) + 's' : (s / 60).toFixed(1) + 'm';
+    }, 500);
+    _timers.push(handle);
+    return handle;
+  }
+
+  function stopElapsedTimer(handle, name, finalSec) {
+    clearInterval(handle);
+    const el = document.getElementById('dur_' + name);
+    // Element will be replaced by the settled card — nothing to update.
+  }
+
+  function settleToolCard(name, preview, finalSec) {
+    const existing = document.getElementById('tool_' + name);
+    if (!existing) return;
+    const fresh = makeToolCard(name, preview, 'done');
+    fresh.id = 'tool_' + name + '_done';
+    // Append duration to header
+    const hdr = fresh.querySelector('.tool-card-header');
+    const doneSpan = document.createElement('span');
+    doneSpan.className = 'tool-card-live-duration final';
+    doneSpan.textContent = finalSec + 's';
+    hdr.insertBefore(doneSpan, hdr.querySelector('.tool-card-done-icon'));
+    existing.replaceWith(fresh);
+  }
+
+  let _hintTimer = null;
+  let _hintEl = null;
+
+  function showHint() {
+    const turn = document.getElementById('assistantTurn');
+    if (!turn) return;
+    _hintEl = document.createElement('div');
+    _hintEl.className = 'inter-tool-hint';
+    _hintEl.id = 'interToolHint';
+    _hintEl.innerHTML = '<span class="inter-tool-dot"></span><span class="inter-tool-dot"></span><span class="inter-tool-dot"></span>';
+    turn.appendChild(_hintEl);
+    // Trigger transition
+    requestAnimationFrame(() => { requestAnimationFrame(() => { _hintEl && _hintEl.classList.add('visible'); }); });
+  }
+
+  function clearHint() {
+    if (_hintTimer) { clearTimeout(_hintTimer); _hintTimer = null; }
+    const h = document.getElementById('interToolHint');
+    if (h) {
+      h.classList.remove('visible');
+      setTimeout(() => h.remove(), 250);
+    }
+  }
+
+  function scheduleHint() {
+    clearHint();
+    _hintTimer = setTimeout(() => {
+      showHint();
+      activateTl('tl3');
+    }, 800);
+    _timers.push(_hintTimer);
+  }
+
+  function showReconnectToast(events) {
+    const c = document.getElementById('toastContainer');
+    const el = document.createElement('div');
+    el.className = 'toast info';
+    el.innerHTML = `<div class="toast-label">Stream recovery</div>Reconnected — restoring response… (${events} events)`;
+    c.appendChild(el);
+    requestAnimationFrame(() => { requestAnimationFrame(() => el.classList.add('show')); });
+    setTimeout(() => {
+      el.classList.remove('show');
+      setTimeout(() => el.remove(), 300);
+    }, 3500);
+  }
+
+  async function typeText(el, text) {
+    for (const ch of text) {
+      el.textContent += ch;
+      await delay(18 + Math.random() * 22);
+    }
+  }
+
+  async function runDemo() {
+    if (_running) return;
+    _running = true;
+    document.getElementById('btnRun').disabled = true;
+    resetView();
+
+    const turn = document.getElementById('assistantTurn');
+    setStatus('Streaming…', 'running');
+    activateTl('tl0');
+    await delay(400);
+
+    // ── Tool 1: read_file ──────────────────────────
+    activateTl('tl1');
+    const card1 = makeToolCard('read_file', '~/project/hermes.conf', 'running');
+    turn.appendChild(card1);
+    const timer1 = startElapsedTimer('read_file');
+
+    await delay(2800); // tool runs for ~3s
+
+    // tool_complete for card1
+    activateTl('tl2');
+    stopElapsedTimer(timer1, 'read_file', 3);
+    settleToolCard('read_file', '~/project/hermes.conf', 3);
+
+    // Start 800ms debounce for hint
+    scheduleHint();
+    await delay(1100); // wait past 800ms so hint appears
+
+    // ── Tool 2: list_dir ──────────────────────────
+    activateTl('tl4');
+    clearHint(); // tool arrives → hint disappears
+    await delay(50);
+
+    const card2 = makeToolCard('list_dir', '~/project/', 'running');
+    turn.appendChild(card2);
+    const timer2 = startElapsedTimer('list_dir');
+
+    await delay(1600); // tool runs for ~1.6s
+
+    // tool_complete for card2
+    activateTl('tl5');
+    stopElapsedTimer(timer2, 'list_dir', 2);
+    settleToolCard('list_dir', '~/project/', 2);
+    // No hint this time — tokens arrive quickly
+
+    await delay(300);
+
+    // ── Prose tokens ──────────────────────────────
+    activateTl('tl6');
+    const prose = document.createElement('div');
+    prose.className = 'prose-segment';
+    const cursor = document.createElement('span');
+    cursor.className = 'prose-cursor';
+    prose.appendChild(cursor);
+    turn.appendChild(prose);
+
+    const fullText = "The project is structured as a Flask-style server with a vanilla JS frontend. The main config file sets the agent model, memory path, and tool permissions. No build step is required — just run bootstrap.py to launch.";
+
+    for (const ch of fullText) {
+      prose.insertBefore(document.createTextNode(ch), cursor);
+      await delay(14 + Math.random() * 16);
+    }
+
+    // ── Done ──────────────────────────────────────
+    activateTl('tl7');
+    cursor.remove();
+    clearHint();
+    setStatus('Done', 'done');
+    _running = false;
+    document.getElementById('btnRun').disabled = false;
+    document.getElementById('btnRun').textContent = '▶ Run again';
+  }
+
+  function resetView() {
+    const turn = document.getElementById('assistantTurn');
+    turn.innerHTML = '';
+    clearHint();
+    _timers.forEach(h => { clearTimeout(h); clearInterval(h); });
+    _timers = [];
+    setStatus('Idle', '');
+    ['tl0','tl1','tl2','tl3','tl4','tl5','tl6','tl7'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) { el.classList.remove('active','done-step'); const t=el.querySelector('.tl-time'); if(t) t.textContent=''; }
+    });
+  }
+
+  function resetDemo() {
+    _running = false;
+    resetView();
+    document.getElementById('btnRun').disabled = false;
+    document.getElementById('btnRun').textContent = '▶ Run full demo';
+  }
+</script>
+</body>
+</html>
