@@ -33,62 +33,115 @@ Do not write file scope in stone — follow the code.
 
 ### What to add
 
-**At `attachLiveStream` open (after `streamId` is known):**
+**At `attachLiveStream` open (after `streamId` and `runId` are known):**
 
 ```js
+// run_id is not available on S directly. Extract from the stream start response,
+// or from e.lastEventId parsed in the first event. Pass null until resolved;
+// _syncAnchorIdentity() inside applyAssistantTurnAnchorSourceEvent will backfill
+// run_id from the first event that carries it.
 const _anchorRegistry = (
   typeof HermesAssistantTurnAnchors !== 'undefined' &&
   typeof HermesAssistantTurnAnchors.createAssistantTurnAnchorRegistry === 'function'
 ) ? HermesAssistantTurnAnchors.createAssistantTurnAnchorRegistry({
   session_id: activeSid,
   stream_id: streamId,
-  run_id: S.activeRunId || null,
+  run_id: null,   // filled in by _syncAnchorIdentity on first event with run_id
 }) : null;
 
-function _applyToAnchor(sourceEventType, rawEventData) {
+// Store registry in module-level Map so renderMessages() can find it at settlement.
+// Key: streamId (stamped onto the settled assistant message in the done handler).
+if (_anchorRegistry) _liveAnchorRegistries.set(streamId, _anchorRegistry);
+
+// _applyToAnchor: accepts the SSE event object e to carry e.lastEventId (replay
+// cursor) as event_id into the anchor. rawEventData is d = JSON.parse(e.data).
+// For done/cancel/error, pass a slimmed payload — never spread the full d when
+// d.session is present (d.session.messages is the full transcript; storing it
+// in activity_events would inflate the anchor with irrelevant data).
+function _applyToAnchor(sourceEventType, rawEventData, sseEvent) {
   if (!_anchorRegistry) return;
   try {
     HermesAssistantTurnAnchors.applyAssistantTurnAnchorSourceEvent(
       _anchorRegistry,
       {
-        source_event_type: sourceEventType,   // named field, first checked by normalizer
-        ...rawEventData,
-        activitySegmentSeq: _assistantSegmentSeq,   // inject closure var — not in SSE payload
-        activityBurstId: _currentActivityBurstId,   // inject closure var — not in SSE payload
+        ...rawEventData,                                // spread first
+        source_event_type: sourceEventType,            // override — must come after spread
+        event_id: (sseEvent && sseEvent.lastEventId) || null,  // SSE transport cursor
+        activitySegmentSeq: _assistantSegmentSeq,      // inject closure var
+        activityBurstId: _currentActivityBurstId,      // inject closure var
       },
-      { session_id: activeSid,
-        stream_id: streamId,
-        run_id: S.activeRunId || null }
+      { session_id: activeSid, stream_id: streamId }
     );
   } catch (_) {}
 }
 ```
 
-**In each SSE event handler**, add one `_applyToAnchor` call before the existing
-logic. Covered events: `reasoning`, `token`, `tool`, `tool_complete`,
-`interim_assistant`, `done`, `cancel`, `error`, `compressing`, `compressed`,
+**Spread order is critical:** `source_event_type` must come **after** `...rawEventData`
+so that the explicit value overwrites any `source_event_type` / `type` / `event`
+field that `rawEventData` might carry. In JS, later keys in an object literal
+overwrite earlier ones.
+
+**In each SSE event handler**, add `_applyToAnchor` before the existing logic,
+passing `e` (the SSE event object) as the third argument so `e.lastEventId` is
+captured. Covered events: `reasoning`, `token`, `tool`, `tool_complete`,
+`interim_assistant`, `cancel`, `error`, `compressing`, `compressed`,
 `approval`, `clarify`, `pending_steer_leftover`, `goal_continue`.
 
 ```js
 source.addEventListener('reasoning', e => {
   const d = JSON.parse(e.data);
-  _applyToAnchor('reasoning', d);   // ← add; existing handler unchanged below
+  _applyToAnchor('reasoning', d, e);   // ← add; existing handler unchanged below
   // ...
 });
 ```
 
-**Note on `source_event_type` placement:** The normalizer's `_sourceEventType()`
-checks `source_event_type` before `type` and `event` in the input object.
-Spreading `rawEventData` after setting `source_event_type` is safe — the explicit
-field takes precedence if `rawEventData` happened to have a conflicting `type` key.
+**`done` event is special — do not spread `d` directly.** `d.session.messages`
+is the full session transcript. Spreading it would store megabytes of message data
+inside `anchor.activity_events`. Pass only the terminal fields:
 
-### Key constraint: segment/burst injection
+```js
+source.addEventListener('done', e => {
+  const d = JSON.parse(e.data);
+  _applyToAnchor('done', {
+    status: d.status || 'completed',
+    usage:  d.usage  || null,
+    created_at: d.created_at || null,
+    // do NOT spread d — d.session contains full messages array
+  }, e);
 
-`_assistantSegmentSeq` and `_currentActivityBurstId` are closure-local variables
-that the backend does NOT send in SSE payloads. They must be injected at the
-`_applyToAnchor` call site. Without this, `activity_rows[].group.group_key`
-falls back to `event:seq` for every row, collapsing all worklog cycles into a
-single flat group and breaking multi-cycle scenarios.
+  // Stamp the last assistant message so renderMessages() can find this registry.
+  // S.messages is updated from d.session.messages before renderMessages() runs.
+  if (_anchorRegistry) {
+    const lastAssistant = Array.isArray(d.session && d.session.messages)
+      ? d.session.messages.slice().reverse().find(m => m.role === 'assistant')
+      : null;
+    if (lastAssistant) lastAssistant._anchor_stream_id = streamId;
+  }
+
+  // ... existing done handler unchanged below ...
+});
+```
+
+### Key constraints
+
+**segment/burst injection:** `_assistantSegmentSeq` and `_currentActivityBurstId`
+are closure-local variables that the backend does NOT send in SSE payloads. They
+must be injected at the `_applyToAnchor` call site. Without this,
+`activity_rows[].group.group_key` falls back to `event:seq` for every row,
+collapsing all worklog cycles into a flat group and breaking multi-cycle scenarios.
+
+**run_id:** There is no stable `S.activeRunId` field in the current codebase.
+Do not reference it. The registry is created with `run_id: null`; the anchor's
+`_syncAnchorIdentity()` will backfill `run_id` from the first event that carries
+it (e.g. a `tool` event whose payload includes `run_id`). Alternatively, if the
+stream-start API response returns a `run_id`, it can be stored in the closure and
+passed at registry creation time.
+
+**`e.lastEventId`:** This field lives on the SSE `MessageEvent` object `e`, not
+in the parsed JSON `d`. It is the run-journal replay cursor already used by
+`_lastRunJournalSeq`. Always pass `e` as the third argument to `_applyToAnchor`
+so the anchor captures it as `event_id`. Without it, the dedupe key degrades to
+the weakest `local:` form and Slice 10's replay deduplication becomes unreliable.
 
 ### Diagnostic snapshot (for validation, remove before Slice 7 PR)
 
@@ -230,22 +283,33 @@ registry available for the same `run_id` or `stream_id`:
 4. If no matching registry is found (e.g. page reload), fall back to the existing
    `S.messages`-derived Worklog build — no regression
 
-**Registry retention across settlement:**
+**Registry retention and lookup across settlement:**
 
-The `_anchorRegistry` created in Slice 6 must be stored in a module-level Map
-(not just the closure) so `renderMessages()` can access it after `done` tears
-down the stream closure:
+The `_anchorRegistry` is stored in a module-level Map (done in Slice 6):
+`_liveAnchorRegistries.set(streamId, _anchorRegistry)`.
+
+The problem is that settled assistant messages in `S.messages` do not carry
+`_stream_id` natively. The lookup key must be stamped onto the settled message
+at settlement time. This is done in the `done` handler in Slice 6:
 
 ```js
-// In messages.js, when registry is created:
-_liveAnchorRegistries.set(streamId, _anchorRegistry);
-
-// In renderMessages / worklog build (ui.js):
-const reg = _liveAnchorRegistries && _liveAnchorRegistries.get(message._stream_id);
+if (lastAssistant) lastAssistant._anchor_stream_id = streamId;
 ```
 
-Entries in this Map are removed when the session is unloaded or after a
-configurable retention window (e.g. 10 minutes).
+In `renderMessages()` / worklog build path, the lookup becomes:
+
+```js
+const reg = _liveAnchorRegistries &&
+  _liveAnchorRegistries.get(message._anchor_stream_id);
+```
+
+Without this stamp, `renderMessages()` cannot find the registry and will always
+fall back to the S.messages-derived Worklog build. The stamp is ephemeral
+(in-memory only, lost on page reload) — that is intentional. On a fresh page
+load there is no live registry; the S.messages fallback is the correct behavior.
+
+Entries in `_liveAnchorRegistries` are removed when the session is unloaded
+or after a retention window (e.g. 10 minutes after settlement).
 
 ### What this does NOT do
 
