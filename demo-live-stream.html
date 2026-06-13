@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hermes — Live Stream Demo</title>
+<style>
+/* ── Real hermes-webui dark palette ── */
+:root {
+  --bg:#18140F;
+  --surface:#1E1A13;
+  --surface-subtle:rgba(255,255,255,.03);
+  --surface-subtle-hover:rgba(255,255,255,.06);
+  --border:rgba(255,255,255,.09);
+  --border-subtle:rgba(255,255,255,.06);
+  --border-muted:rgba(255,255,255,.13);
+  --text:#EDE8DF;
+  --muted:#8C8072;
+  --strong:#F5F0E8;
+  --accent:#D4A017;
+  --accent-bg:rgba(212,160,23,.1);
+  --accent-bg-strong:rgba(212,160,23,.18);
+  --accent-text:#D4A017;
+  --accent-hover:#B88A0F;
+  --success:#4ade80;
+  --error:#f87171;
+  --warning:#fb923c;
+  --info:#60a5fa;
+  --blue:#60a5fa;
+  --code-bg:#141008;
+  --code-text:#e2c27d;
+  --user-bubble-bg:rgba(212,160,23,.12);
+  --user-bubble-border:rgba(212,160,23,.22);
+  --user-bubble-text:#D4A017;
+  --hover-bg:rgba(255,255,255,.05);
+  --focus-ring:rgba(212,160,23,.35);
+  --font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+  --font-mono:'SF Mono',ui-monospace,'Cascadia Code',monospace;
+  --radius-sm:4px;--radius-md:8px;--radius-card:8px;--radius-lg:12px;
+  --space-1:4px;--space-2:8px;--space-3:12px;--space-4:16px;
+  --font-size-xs:11px;--font-size-sm:12px;--font-size-md:14px;
+  --msg-rail:30px;
+  --msg-max:680px;
+}
+
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+body {
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--font-ui);
+  font-size:14px;
+  line-height:1.6;
+  min-height:100vh;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  padding:0;
+}
+
+/* ── Top bar ── */
+.topbar {
+  width:100%;
+  background:rgba(24,20,15,.95);
+  border-bottom:1px solid var(--border);
+  padding:10px 20px;
+  display:flex;
+  align-items:center;
+  gap:12px;
+  position:sticky;
+  top:0;
+  z-index:50;
+  backdrop-filter:blur(8px);
+}
+.topbar-title { font-size:13px; font-weight:600; color:var(--text); opacity:.8; }
+.topbar-badge {
+  font-size:10px; padding:2px 8px; border-radius:99px;
+  background:var(--accent-bg); border:1px solid var(--accent-bg-strong);
+  color:var(--accent-text); font-weight:600;
+}
+.topbar-spacer { flex:1; }
+.ctrl-btn {
+  padding:6px 14px; border-radius:8px; border:1px solid var(--border);
+  background:var(--surface); color:var(--text); font-size:12px;
+  cursor:pointer; transition:background .15s, opacity .15s;
+  font-family:var(--font-ui);
+}
+.ctrl-btn:hover { background:var(--hover-bg); }
+.ctrl-btn.primary { background:var(--accent); border-color:transparent; color:#1a1000; font-weight:600; }
+.ctrl-btn.primary:hover { opacity:.88; }
+.ctrl-btn:disabled { opacity:.35; cursor:not-allowed; }
+.speed-wrap { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--muted); }
+.speed-wrap input[type=range] { width:70px; accent-color:var(--accent); }
+
+/* ── Chat layout ── */
+.chat-outer {
+  width:100%; max-width:800px;
+  flex:1;
+  display:flex;
+  flex-direction:column;
+  padding:24px 20px 120px;
+  gap:0;
+}
+
+/* ── Message rows ── */
+.msg-row { padding:12px 0; width:100%; display:flex; flex-direction:column; }
+.msg-row[data-role="user"] { align-self:flex-end; max-width:62%; }
+
+/* User bubble */
+.msg-row[data-role="user"] .msg-body {
+  background:var(--user-bubble-bg);
+  border:1px solid var(--user-bubble-border);
+  border-radius:14px;
+  padding:10px 14px;
+  color:var(--user-bubble-text);
+  font-size:14px;
+  line-height:1.6;
+  margin-left:0;
+  padding-left:14px;
+}
+
+/* Role header */
+.msg-role {
+  display:flex; align-items:center; gap:7px;
+  font-size:11px; font-weight:500; margin-bottom:6px;
+  opacity:.7; color:var(--muted);
+}
+.role-icon {
+  width:20px; height:20px;
+  border-radius:50%;
+  background:var(--accent-bg);
+  border:1px solid var(--accent-bg-strong);
+  display:flex; align-items:center; justify-content:center;
+  font-size:10px; color:var(--accent-text); flex-shrink:0;
+}
+
+/* Assistant body */
+.msg-body {
+  padding-left:var(--msg-rail);
+  padding-top:6px;
+  max-width:var(--msg-max);
+  font-size:14px;
+  line-height:1.75;
+  color:var(--text);
+}
+.msg-body p { margin-bottom:10px; }
+.msg-body p:last-child { margin-bottom:0; }
+.msg-body ul { margin:6px 0 10px 20px; }
+.msg-body li { margin-bottom:3px; }
+.msg-body strong { color:var(--strong); font-weight:600; }
+.msg-body code {
+  font-family:var(--font-mono);
+  font-size:12.5px;
+  background:var(--code-bg);
+  color:var(--code-text);
+  padding:1px 5px;
+  border-radius:4px;
+}
+.assistant-turn { width:100%; }
+.assistant-turn-blocks { display:flex; flex-direction:column; }
+
+/* ── Thinking card ── */
+.thinking-card {
+  margin-left:var(--msg-rail);
+  max-width:var(--msg-max);
+  background:var(--accent-bg);
+  border:1px solid var(--accent-bg-strong);
+  border-radius:var(--radius-md);
+  overflow:hidden;
+  margin-bottom:4px;
+}
+.thinking-card-header {
+  display:flex; align-items:center; gap:8px;
+  padding:5px 10px;
+  cursor:pointer;
+  color:var(--accent-text);
+  font-size:12px; font-weight:600;
+  opacity:.85;
+  user-select:none;
+}
+.thinking-card-header:hover { opacity:1; }
+.thinking-card-icon { opacity:.7; font-size:11px; }
+.thinking-card-label { flex:1; }
+.thinking-card-chevron {
+  font-size:10px; opacity:.5;
+  transition:transform .18s ease;
+  display:inline-flex; align-items:center;
+}
+.thinking-card.open .thinking-card-chevron { transform:rotate(90deg); }
+.thinking-card-body {
+  max-height:0; opacity:0; overflow:hidden;
+  transition:max-height .26s ease, opacity .2s ease, padding .22s ease;
+  border-top:1px solid transparent;
+  font-family:var(--font-mono);
+  font-size:11px; line-height:1.6;
+  color:var(--muted);
+  padding:0 12px;
+  white-space:pre-wrap;
+  word-break:break-word;
+}
+.thinking-card.open .thinking-card-body {
+  max-height:180px;
+  opacity:1;
+  padding:8px 12px;
+  border-top-color:var(--accent-bg-strong);
+  overflow-y:auto;
+}
+.thinking-card-dots { display:flex; gap:3px; align-items:center; }
+.thinking-card-dot {
+  width:4px; height:4px; border-radius:50%;
+  background:var(--accent-text);
+  animation:think-pulse 1.4s ease-in-out infinite;
+}
+.thinking-card-dot:nth-child(2){animation-delay:.2s;}
+.thinking-card-dot:nth-child(3){animation-delay:.4s;}
+@keyframes think-pulse{0%,80%,100%{opacity:.3;transform:scale(.7);}40%{opacity:1;transform:scale(1);}}
+
+/* ── Tool call worklog group ── */
+.tool-call-group {
+  margin:4px 0 4px var(--msg-rail);
+  max-width:var(--msg-max);
+  border-left:1px solid var(--border-subtle);
+}
+.tool-call-group-summary {
+  width:100%; display:flex; align-items:center; gap:6px;
+  padding:3px 10px; border:0; background:transparent;
+  color:var(--muted); cursor:pointer; text-align:left;
+  font:inherit; font-size:11px; line-height:1.4;
+  border-radius:var(--radius-card);
+}
+.tool-call-group-summary:hover { background:var(--surface-subtle-hover); color:var(--text); }
+.as-dot { width:5px; height:5px; border-radius:50%; background:currentColor; flex-shrink:0; opacity:.6; }
+.as-text { font-weight:600; }
+.as-caret {
+  opacity:.4; font-size:10px; margin-left:auto;
+  display:inline-flex; align-items:center;
+  transition:transform .16s ease;
+}
+.tool-call-group:not(.collapsed) .as-caret { transform:rotate(90deg); }
+.tool-call-group-duration { opacity:.55; font-variant-numeric:tabular-nums; }
+.tool-call-group-body { display:block; padding-left:10px; }
+.tool-call-group.collapsed .tool-call-group-body { display:none; }
+
+/* live run status (spinner line at bottom of group) */
+.live-run-status {
+  display:flex; align-items:center; gap:6px;
+  padding:3px 10px;
+  font-size:11px; color:var(--muted); opacity:.7;
+}
+.live-run-status-dot {
+  width:5px; height:5px; border-radius:50%;
+  background:var(--accent);
+  animation:think-pulse 1s ease-in-out infinite;
+  flex-shrink:0;
+}
+.live-run-status-text { font-variant-numeric:tabular-nums; }
+.lf-sep { opacity:.4; }
+.lf-status { opacity:.6; }
+
+/* ── Tool card ── */
+.tool-card {
+  background:transparent; border:0;
+  border-radius:0; margin-top:0; margin-bottom:0;
+}
+.tool-card-row { display:flex; flex-direction:column; }
+.tool-card-header {
+  display:flex; align-items:center; gap:7px;
+  padding:3px 8px; margin-left:-8px;
+  border-radius:7px; cursor:pointer; user-select:none;
+  color:var(--muted); font-size:14px; line-height:1.75; min-width:0;
+}
+.tool-card-header:hover { background:var(--hover-bg); color:var(--text); }
+.tool-card-running .tool-card-header { cursor:default; }
+.tool-card-running-dot {
+  width:6px; height:6px; border-radius:50%;
+  background:var(--accent); flex-shrink:0;
+  animation:think-pulse 1s ease-in-out infinite;
+}
+.tool-card-name {
+  font-size:14px; font-weight:400; color:var(--muted);
+  font-family:inherit; flex-shrink:0; opacity:.56;
+}
+.tool-card-running .tool-card-name { color:var(--accent-text); font-weight:600; opacity:1; }
+.tool-card-title {
+  min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  color:var(--muted); font-family:var(--font-mono); font-size:14px; opacity:.4;
+}
+.tool-card-live-duration {
+  font-size:11px; color:var(--muted); opacity:.52;
+  white-space:nowrap; font-variant-numeric:tabular-nums; flex-shrink:0;
+}
+.tool-done-check { margin-left:auto; font-size:11px; color:var(--success); opacity:.7; flex-shrink:0; }
+
+/* ── Interim progress note ── */
+.interim-note {
+  margin-left:var(--msg-rail);
+  max-width:var(--msg-max);
+  font-size:12px;
+  color:var(--muted);
+  opacity:.6;
+  padding:3px 0;
+  font-style:italic;
+  line-height:1.5;
+  border-left:2px solid var(--border-subtle);
+  padding-left:10px;
+  margin-bottom:4px;
+}
+.interim-note.collapsed { display:none; }
+
+/* ── Inter-tool hint (new feature) ── */
+.inter-tool-hint {
+  display:flex; align-items:center; gap:5px;
+  padding:5px var(--msg-rail);
+  opacity:0;
+  transition:opacity .25s ease;
+}
+.inter-tool-hint.visible { opacity:.4; }
+.inter-tool-dot {
+  width:4px; height:4px; border-radius:50%;
+  background:var(--muted);
+  animation:inter-tool-pulse 1.2s ease-in-out infinite;
+}
+.inter-tool-dot:nth-child(2){animation-delay:.2s;}
+.inter-tool-dot:nth-child(3){animation-delay:.4s;}
+@keyframes inter-tool-pulse{0%,80%,100%{opacity:.3;transform:scale(.8);}40%{opacity:1;transform:scale(1);}}
+@media(prefers-reduced-motion:reduce){
+  .inter-tool-dot,.thinking-card-dot,.tool-card-running-dot,.live-run-status-dot{animation:none;opacity:.6;}
+}
+
+/* ── Prose cursor ── */
+.prose-cursor {
+  display:inline-block; width:2px; height:14px;
+  background:var(--accent); animation:cur-blink .9s step-end infinite;
+  vertical-align:middle; margin-left:1px; border-radius:1px;
+}
+@keyframes cur-blink{0%,100%{opacity:1;}50%{opacity:0;}}
+
+/* ── Usage line ── */
+.msg-usage {
+  padding-left:var(--msg-rail);
+  margin-top:8px;
+  font-size:11px;
+  color:var(--muted);
+  opacity:0;
+  transition:opacity .4s ease;
+  display:flex; gap:8px; align-items:center;
+}
+.msg-usage.visible { opacity:.65; }
+.usage-sep { opacity:.4; }
+.msg-copy-btn {
+  margin-left:auto;
+  background:none; border:none;
+  color:var(--muted); font-size:11px;
+  cursor:pointer; opacity:.4; padding:2px 4px;
+  font-family:var(--font-ui);
+}
+.msg-copy-btn:hover { opacity:.9; }
+
+/* ── Settlement fade ── */
+.assistant-turn.settling .msg-body { animation:settle-in .25s ease forwards; }
+@keyframes settle-in{from{opacity:.7;}to{opacity:1;}}
+
+/* ── Composer bar (decorative) ── */
+.composer-bar {
+  position:fixed; bottom:0; left:0; right:0;
+  background:rgba(24,20,15,.97);
+  border-top:1px solid var(--border);
+  padding:12px 20px;
+  display:flex; justify-content:center;
+  backdrop-filter:blur(10px);
+}
+.composer-inner {
+  width:100%; max-width:800px;
+  display:flex; align-items:center; gap:10px;
+}
+.composer-input {
+  flex:1; background:var(--surface); border:1px solid var(--border);
+  border-radius:10px; padding:9px 14px;
+  color:var(--muted); font-size:13px; font-family:var(--font-ui);
+  outline:none;
+}
+.send-btn {
+  width:34px; height:34px; border-radius:8px;
+  background:var(--accent); border:none;
+  color:#1a1000; font-size:14px;
+  cursor:pointer; display:flex; align-items:center; justify-content:center;
+  transition:opacity .15s;
+}
+.send-btn:hover{opacity:.85;}
+.send-btn:disabled{opacity:.35;cursor:not-allowed;}
+
+/* ── Toast ── */
+.toast-wrap {
+  position:fixed; top:60px; right:20px;
+  display:flex; flex-direction:column; gap:8px; z-index:200;
+}
+.toast {
+  background:var(--surface); border:1px solid var(--border);
+  border-radius:10px; padding:9px 13px;
+  font-size:12px; color:var(--text);
+  box-shadow:0 4px 20px rgba(0,0,0,.5);
+  transform:translateX(110%); transition:transform .22s cubic-bezier(.32,.72,.16,1),opacity .2s;
+  opacity:0; max-width:270px; line-height:1.5;
+}
+.toast.show{transform:translateX(0);opacity:1;}
+.toast.info{border-left:3px solid var(--info);}
+.toast-tag{font-size:10px;color:var(--muted);margin-bottom:2px;text-transform:uppercase;letter-spacing:.5px;}
+</style>
+</head>
+<body>
+
+<!-- Top bar -->
+<div class="topbar">
+  <span class="topbar-title">Hermes</span>
+  <span class="topbar-badge">Live Stream Demo</span>
+  <div class="topbar-spacer"></div>
+  <div class="speed-wrap">
+    <span>Speed</span>
+    <input type="range" id="speedRange" min="0.5" max="3" step="0.5" value="1">
+    <span id="speedLabel">1×</span>
+  </div>
+  <button class="ctrl-btn primary" id="btnRun" onclick="runDemo()">▶ Run</button>
+  <button class="ctrl-btn" id="btnReset" onclick="resetDemo()">↺ Reset</button>
+</div>
+
+<!-- Chat pane -->
+<div class="chat-outer" id="chatOuter">
+
+  <!-- User message -->
+  <div class="msg-row" data-role="user">
+    <div class="msg-body">Analyze the codebase and write a summary of the architecture, then check for any obvious bugs in the streaming module.</div>
+  </div>
+
+  <!-- Assistant turn (built by JS) -->
+  <div class="msg-row" data-role="assistant" id="assistantRow" style="display:none">
+    <div class="msg-role">
+      <div class="role-icon">H</div>
+      <span>Hermes</span>
+      <span style="opacity:.4;font-size:10px;margin-left:4px" id="streamStatus"></span>
+    </div>
+    <div class="assistant-turn" id="assistantTurn">
+      <div class="assistant-turn-blocks" id="turnBlocks"></div>
+    </div>
+    <div class="msg-usage" id="msgUsage">
+      <span>1 247 tokens</span>
+      <span class="usage-sep">·</span>
+      <span>$0.004</span>
+      <span class="usage-sep">·</span>
+      <span>14.2s</span>
+      <button class="msg-copy-btn">Copy</button>
+    </div>
+  </div>
+
+</div>
+
+<!-- Composer (decorative) -->
+<div class="composer-bar">
+  <div class="composer-inner">
+    <div class="composer-input">Message Hermes…</div>
+    <button class="send-btn" disabled>↑</button>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script>
+/* ─────────────────────────────────────────────────────
+   Demo controller
+───────────────────────────────────────────────────── */
+let _running = false;
+let _handles = [];
+let _speed = 1;
+
+document.getElementById('speedRange').addEventListener('input', e => {
+  _speed = parseFloat(e.target.value);
+  document.getElementById('speedLabel').textContent = _speed + '×';
+});
+
+function ms(base) { return base / _speed; }
+
+function wait(base) {
+  return new Promise(res => {
+    const h = setTimeout(res, ms(base));
+    _handles.push(h);
+  });
+}
+
+function cancelAll() {
+  _handles.forEach(h => { clearTimeout(h); clearInterval(h); });
+  _handles = [];
+}
+
+/* ─── DOM helpers ─── */
+const $ = id => document.getElementById(id);
+const blocks = () => $('turnBlocks');
+
+function showRow() {
+  $('assistantRow').style.display = '';
+}
+
+function setStreamStatus(t) {
+  $('streamStatus').textContent = t;
+}
+
+/* ─── Thinking card ─── */
+let _thinkText = '';
+let _thinkOpen = true;
+
+function createThinkingCard() {
+  const card = document.createElement('div');
+  card.className = 'thinking-card open';
+  card.id = 'thinkCard';
+  card.innerHTML = `
+    <div class="thinking-card-header" onclick="this.closest('.thinking-card').classList.toggle('open')">
+      <span class="thinking-card-icon">💭</span>
+      <span class="thinking-card-label">Thinking</span>
+      <span class="thinking-card-dots" id="thinkDots">
+        <span class="thinking-card-dot"></span>
+        <span class="thinking-card-dot"></span>
+        <span class="thinking-card-dot"></span>
+      </span>
+      <span class="thinking-card-chevron">›</span>
+    </div>
+    <pre class="thinking-card-body" id="thinkBody"></pre>`;
+  blocks().appendChild(card);
+  return card;
+}
+
+async function typeThinking(text) {
+  const body = $('thinkBody');
+  for (const ch of text) {
+    body.textContent += ch;
+    await wait(12 + Math.random() * 10);
+  }
+}
+
+function finalizeThinkingCard() {
+  const card = $('thinkCard');
+  if (!card) return;
+  const dots = $('thinkDots');
+  if (dots) dots.remove();
+  // add token count
+  const hdr = card.querySelector('.thinking-card-header');
+  const countEl = document.createElement('span');
+  countEl.style.cssText = 'font-size:10px;opacity:.45;margin-left:4px;font-weight:400;';
+  countEl.textContent = '312 tokens';
+  hdr.insertBefore(countEl, hdr.querySelector('.thinking-card-chevron'));
+  // collapse
+  card.classList.remove('open');
+}
+
+/* ─── Tool worklog group ─── */
+function createWorklogGroup() {
+  const g = document.createElement('div');
+  g.className = 'tool-call-group';
+  g.id = 'toolGroup';
+  g.innerHTML = `
+    <button class="tool-call-group-summary" onclick="this.closest('.tool-call-group').classList.toggle('collapsed')">
+      <span class="as-dot"></span>
+      <span class="as-text">Running</span>
+      <span class="tool-call-group-duration" id="groupDur"></span>
+      <span class="as-caret">›</span>
+    </button>
+    <div class="tool-call-group-body" id="toolGroupBody"></div>`;
+  blocks().appendChild(g);
+  return g;
+}
+
+/* ─── Live run status line ─── */
+let _liveStatusTimer = null;
+function createLiveStatus() {
+  const div = document.createElement('div');
+  div.className = 'live-run-status';
+  div.id = 'liveStatus';
+  div.innerHTML = `<span class="live-run-status-dot"></span><span class="live-run-status-text" id="liveStatusTime">0:00</span><span class="lf-sep">·</span><span class="lf-status">Running</span>`;
+  const g = $('toolGroup');
+  if (g) g.appendChild(div);
+  const start = Date.now();
+  const h = setInterval(() => {
+    const el = $('liveStatusTime');
+    if (!el) { clearInterval(h); return; }
+    const s = Math.floor((Date.now() - start) / 1000);
+    el.textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+  }, 500);
+  _handles.push(h);
+  return div;
+}
+function removeLiveStatus() {
+  if (_liveStatusTimer) { clearInterval(_liveStatusTimer); _liveStatusTimer = null; }
+  const el = $('liveStatus');
+  if (el) el.remove();
+}
+
+/* ─── Tool cards ─── */
+const _elapsedTimers = new Map();
+
+function addToolCard(tid, name, preview) {
+  const body = $('toolGroupBody');
+  if (!body) return;
+  const row = document.createElement('div');
+  row.className = 'tool-card-row';
+  row.id = 'tc_' + tid;
+  row.innerHTML = `
+    <div class="tool-card tool-card-running">
+      <div class="tool-card-header">
+        <span class="tool-card-running-dot"></span>
+        <span class="tool-card-name">${name}</span>
+        <span class="tool-card-live-duration" id="dur_${tid}">0s</span>
+        <span class="tool-card-title">${preview}</span>
+      </div>
+    </div>`;
+  body.appendChild(row);
+
+  const startMs = Date.now();
+  const h = setInterval(() => {
+    const el = document.getElementById('dur_' + tid);
+    if (!el) { clearInterval(h); _elapsedTimers.delete(tid); return; }
+    const s = (Date.now() - startMs) / 1000;
+    el.textContent = s < 60 ? Math.round(s) + 's' : (s/60).toFixed(1) + 'm';
+  }, 500);
+  _handles.push(h);
+  _elapsedTimers.set(tid, h);
+}
+
+function settleToolCard(tid, name, preview, finalSec) {
+  const h = _elapsedTimers.get(tid);
+  if (h) { clearInterval(h); _elapsedTimers.delete(tid); }
+  const row = document.getElementById('tc_' + tid);
+  if (!row) return;
+  row.innerHTML = `
+    <div class="tool-card">
+      <div class="tool-card-header">
+        <span class="tool-card-name">${name}</span>
+        <span class="tool-card-live-duration" style="opacity:.6;color:var(--success)">${finalSec}s</span>
+        <span class="tool-card-title">${preview}</span>
+        <span class="tool-done-check">✓</span>
+      </div>
+    </div>`;
+}
+
+/* ─── Inter-tool hint ─── */
+let _hintTimer = null;
+let _hintEl = null;
+
+function scheduleHint() {
+  clearHint();
+  _hintTimer = setTimeout(() => {
+    _hintEl = document.createElement('div');
+    _hintEl.id = 'interToolHint';
+    _hintEl.className = 'inter-tool-hint';
+    _hintEl.innerHTML = '<span class="inter-tool-dot"></span><span class="inter-tool-dot"></span><span class="inter-tool-dot"></span>';
+    blocks().appendChild(_hintEl);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (_hintEl) _hintEl.classList.add('visible');
+    }));
+  }, ms(800));
+  _handles.push(_hintTimer);
+}
+
+function clearHint() {
+  if (_hintTimer) { clearTimeout(_hintTimer); _hintTimer = null; }
+  const h = document.getElementById('interToolHint');
+  if (h) { h.classList.remove('visible'); setTimeout(() => h.remove(), 250); }
+}
+
+/* ─── Interim progress note ─── */
+function addInterimNote(text) {
+  clearHint();
+  const div = document.createElement('div');
+  div.className = 'interim-note';
+  div.textContent = text;
+  blocks().appendChild(div);
+}
+
+/* ─── Prose segment ─── */
+let _proseEl = null;
+let _cursor = null;
+
+function createProseSegment() {
+  clearHint();
+  const div = document.createElement('div');
+  div.className = 'msg-body';
+  div.style.paddingTop = '8px';
+  _cursor = document.createElement('span');
+  _cursor.className = 'prose-cursor';
+  div.appendChild(_cursor);
+  blocks().appendChild(div);
+  _proseEl = div;
+}
+
+async function typeToken(text) {
+  if (!_proseEl || !_cursor) return;
+  for (const ch of text) {
+    _proseEl.insertBefore(document.createTextNode(ch), _cursor);
+    await wait(13 + Math.random() * 14);
+  }
+}
+
+function finalizeProse() {
+  if (_cursor) { _cursor.remove(); _cursor = null; }
+}
+
+/* ─── Settlement ─── */
+function settle() {
+  const turn = $('assistantTurn');
+  if (turn) turn.classList.add('settling');
+  const usage = $('msgUsage');
+  if (usage) usage.classList.add('visible');
+  const grp = $('toolGroup');
+  if (grp) grp.classList.add('collapsed');
+  // update group summary
+  const dur = $('groupDur');
+  if (dur) dur.textContent = '4.8s';
+  const label = grp && grp.querySelector('.as-text');
+  if (label) label.textContent = 'Used 2 tools';
+  setStreamStatus('');
+}
+
+/* ─── Toast ─── */
+function toast(msg, type = 'info', duration = 3500) {
+  const wrap = $('toastWrap');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.innerHTML = `<div class="toast-tag">${type}</div>${msg}`;
+  wrap.appendChild(el);
+  requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('show')));
+  setTimeout(() => {
+    el.classList.remove('show');
+    setTimeout(() => el.remove(), 300);
+  }, duration);
+}
+
+/* ─────────────────────────────────────────────────────
+   Full demo sequence
+───────────────────────────────────────────────────── */
+async function runDemo() {
+  if (_running) return;
+  _running = true;
+  $('btnRun').disabled = true;
+
+  showRow();
+  setStreamStatus('streaming…');
+
+  /* 1 ── Thinking phase ─────────────────────────── */
+  createThinkingCard();
+  await wait(200);
+
+  const thinkText =
+`The user wants two things:
+1. Analyze codebase → architecture summary
+2. Check streaming module for bugs
+
+I should start by reading the directory structure,
+then look at streaming.py specifically. Let me plan
+the tool calls I need to make first...`;
+
+  await typeThinking(thinkText);
+  await wait(400);
+
+  /* 2 ── First tool: list_dir ───────────────────── */
+  finalizeThinkingCard();
+  await wait(150);
+
+  createWorklogGroup();
+  createLiveStatus();
+  addToolCard('t1', 'list_directory', '~/project/');
+  await wait(2200);
+
+  settleToolCard('t1', 'list_directory', '~/project/', 2);
+  scheduleHint(); // 800ms debounce starts
+
+  /* 3 ── Inter-tool hint visible ────────────────── */
+  await wait(1100); // hint becomes visible at ~800ms
+
+  /* 4 ── Second tool: read_file ─────────────────── */
+  clearHint();
+  addToolCard('t2', 'read_file', 'api/streaming.py');
+  await wait(2800);
+
+  settleToolCard('t2', 'read_file', 'api/streaming.py', 3);
+
+  /* 5 ── Interim progress note ──────────────────── */
+  await wait(400);
+  addInterimNote('Read 842 lines of api/streaming.py — scanning for race conditions and error handling gaps…');
+  await wait(1200);
+
+  /* 6 ── Prose streaming ────────────────────────── */
+  removeLiveStatus();
+  createProseSegment();
+
+  const prose = [
+    '## Architecture Overview\n\n',
+    'The project follows a **three-layer pattern**: a thin stdlib HTTP server (`server.py`), ',
+    'a set of pure-Python API modules (`api/`), and a vanilla-JS frontend (`static/`). ',
+    'There is no build step — the server is launched directly with `python bootstrap.py`.\n\n',
+    '## Streaming Module — Findings\n\n',
+    'One potential issue in `api/streaming.py`: the `os.environ` mutation at line 312 ',
+    'is protected by `_ENV_LOCK`, but concurrent sessions can still observe each other\'s ',
+    'environment writes during the window between lock release and the subprocess inheriting ',
+    'the environment. This is a **known architectural limitation** tracked as Phase B cleanup.\n\n',
+    'No other critical bugs found in the module.',
+  ];
+
+  for (const chunk of prose) {
+    for (const ch of chunk) {
+      if (!_cursor) break;
+      _proseEl.insertBefore(document.createTextNode(ch), _cursor);
+      await wait(11 + Math.random() * 12);
+    }
+  }
+
+  /* 7 ── Done / settlement ──────────────────────── */
+  finalizeProse();
+  await wait(100);
+  settle();
+  setStreamStatus('');
+
+  // Simulate reconnect toast for demo (shows separately)
+  // toast('Reconnected — restoring response… (23 events)', 'info');
+
+  _running = false;
+  $('btnRun').textContent = '▶ Run again';
+  $('btnRun').disabled = false;
+}
+
+/* ─── Reset ─── */
+function resetDemo() {
+  cancelAll();
+  _running = false;
+  _elapsedTimers.forEach(h => clearInterval(h));
+  _elapsedTimers.clear();
+  _proseEl = null;
+  _cursor = null;
+  _hintEl = null;
+  _hintTimer = null;
+  $('turnBlocks').innerHTML = '';
+  $('assistantRow').style.display = 'none';
+  $('msgUsage').classList.remove('visible');
+  $('assistantTurn').classList.remove('settling');
+  $('streamStatus').textContent = '';
+  $('btnRun').textContent = '▶ Run';
+  $('btnRun').disabled = false;
+}
+
+/* ─── Reconnect toast button ─── */
+document.addEventListener('keydown', e => {
+  if (e.key === 'r' && !e.metaKey && !e.ctrlKey) {
+    toast('Reconnected — restoring response… (23 events)', 'info');
+  }
+});
+</script>
+
+<!-- Hint: press R to trigger the reconnect toast -->
+</body>
+</html>
