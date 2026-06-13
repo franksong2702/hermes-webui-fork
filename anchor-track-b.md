@@ -10,25 +10,26 @@ The anchor infrastructure is at `slice5-activity-scene` in upstream. The file
 - `projectAssistantTurnAnchorActivityScene(anchor, { mode })` — project all activity events
   into `activity_rows[]` with `display_hints`, `group`, `tool.*`, `thinking.*`
 - `projectAssistantTurnAnchorSettledMessageFinalAnswer(message, context)` — extract final
-  answer from a settled message (already wired in `renderMessages()`)
+  answer from a settled message (already wired in `renderMessages()` as of slice 4/5)
 
 **Nothing is wired into the live stream path yet.** The only active wiring is
-settled final-answer projection in `ui.js:9101`.
+settled final-answer projection in `ui.js`.
 
-The four slices below must be done in order. Each one is a prerequisite for the next.
+The five slices below must be done in order. Each one is a prerequisite for the next.
 
 ---
 
-## Slice 6 — Shadow Wiring
+## Slice 6 — Live Anchor Shadow Feed
 
 **Goal:** Wire the registry into `attachLiveStream` without touching any renderer.
-The anchor accumulates events in parallel with the existing render path.
-After this slice, `activity_rows` can be compared against the real DOM to validate
-correctness before any render changes are made.
+The anchor accumulates events in parallel with the existing render path. No
+visual change. This is the prerequisite for all subsequent slices.
 
 ### Files
 
-- `static/messages.js` only
+Primarily `static/messages.js`. May also touch `static/assistant_turn_anchors.js`
+for diagnostic helpers, and `tests/` for unit coverage of event shape and grouping.
+Do not write file scope in stone — follow the code.
 
 ### What to add
 
@@ -44,14 +45,17 @@ const _anchorRegistry = (
   run_id: S.activeRunId || null,
 }) : null;
 
-function _applyToAnchor(rawEventData, sourceEventType) {
+function _applyToAnchor(sourceEventType, rawEventData) {
   if (!_anchorRegistry) return;
   try {
     HermesAssistantTurnAnchors.applyAssistantTurnAnchorSourceEvent(
       _anchorRegistry,
-      { ...rawEventData, source_event_type: sourceEventType,
-        activitySegmentSeq: _assistantSegmentSeq,      // inject closure var
-        activityBurstId: _currentActivityBurstId },    // inject closure var
+      {
+        source_event_type: sourceEventType,   // named field, first checked by normalizer
+        ...rawEventData,
+        activitySegmentSeq: _assistantSegmentSeq,   // inject closure var — not in SSE payload
+        activityBurstId: _currentActivityBurstId,   // inject closure var — not in SSE payload
+      },
       { session_id: activeSid,
         stream_id: streamId,
         run_id: S.activeRunId || null }
@@ -60,284 +64,316 @@ function _applyToAnchor(rawEventData, sourceEventType) {
 }
 ```
 
-**In each SSE event handler** (`reasoning`, `token`, `tool`, `tool_complete`,
+**In each SSE event handler**, add one `_applyToAnchor` call before the existing
+logic. Covered events: `reasoning`, `token`, `tool`, `tool_complete`,
 `interim_assistant`, `done`, `cancel`, `error`, `compressing`, `compressed`,
-`approval`, `clarify`, `pending_steer_leftover`, `goal_continue`):
+`approval`, `clarify`, `pending_steer_leftover`, `goal_continue`.
 
 ```js
 source.addEventListener('reasoning', e => {
   const d = JSON.parse(e.data);
-  _applyToAnchor(d, 'reasoning');   // ← add this line
-  // ... existing handler unchanged ...
+  _applyToAnchor('reasoning', d);   // ← add; existing handler unchanged below
+  // ...
 });
 ```
 
-**In `done` handler, for validation only (remove before shipping render migration):**
+**Note on `source_event_type` placement:** The normalizer's `_sourceEventType()`
+checks `source_event_type` before `type` and `event` in the input object.
+Spreading `rawEventData` after setting `source_event_type` is safe — the explicit
+field takes precedence if `rawEventData` happened to have a conflicting `type` key.
+
+### Key constraint: segment/burst injection
+
+`_assistantSegmentSeq` and `_currentActivityBurstId` are closure-local variables
+that the backend does NOT send in SSE payloads. They must be injected at the
+`_applyToAnchor` call site. Without this, `activity_rows[].group.group_key`
+falls back to `event:seq` for every row, collapsing all worklog cycles into a
+single flat group and breaking multi-cycle scenarios.
+
+### Diagnostic snapshot (for validation, remove before Slice 7 PR)
 
 ```js
-if (_anchorRegistry && typeof HermesAssistantTurnAnchors !== 'undefined') {
-  const scene = HermesAssistantTurnAnchors.projectAssistantTurnAnchorActivityScene(
-    _anchorRegistry.anchor, { mode: 'compact_worklog' }
-  );
+// In done handler, after _applyToAnchor('done', d):
+if (_anchorRegistry && window.HermesAssistantTurnAnchors) {
+  const scene = window.HermesAssistantTurnAnchors
+    .projectAssistantTurnAnchorActivityScene(_anchorRegistry.anchor, { mode: 'compact_worklog' });
+  console.debug('[anchor] stats:', _anchorRegistry.stats);
   console.debug('[anchor] activity_rows:', scene.activity_rows.map(r =>
-    `${r.group.group_key} | ${r.kind} | ${r.display_hint} | ${r.tool?.name || r.text?.slice(0,40) || ''}`
+    `${r.group.group_key} | ${r.kind} | ${r.display_hint} | ` +
+    `${r.tool?.name || r.text?.slice(0, 40) || ''}`
   ));
 }
 ```
 
-### Key constraint
-
-`_assistantSegmentSeq` and `_currentActivityBurstId` are closure-local variables
-that the backend does NOT send in SSE payloads. They must be injected at the
-`_applyToAnchor` call site — this is what makes `activity_rows[].group.group_key`
-produce correct `segment:N` / `burst:N` keys instead of the fallback `event:seq`.
-
-Without this injection, all rows collapse into one flat group and multi-cycle
-worklog rendering (Scenario D) will be wrong.
-
 ### Validation criteria
 
-After wiring, run a multi-cycle session (model calls 2+ tool groups) and check the
-console output from the `done` debug log:
+Run a multi-cycle session (model calls 2+ separate tool groups) and inspect the
+console output:
 
-- Each worklog cycle should appear under a different `group_key` (`segment:1`,
-  `segment:2`, etc.)
-- Tool rows should show `kind=tool_started` / `kind=tool_completed`
-- Prose segments between cycles should show `kind=process_prose`
-- No duplicate rows (dedupe working)
-- `_anchorRegistry.stats` should show `skipped_duplicate: 0` on a clean run,
-  `> 0` on a reconnect run
+- Each worklog cycle has a distinct `group_key` (`segment:1`, `segment:2`, etc.)
+- Tool events show `kind=tool_started` / `kind=tool_completed`
+- `interim_assistant` shows `kind=process_prose`
+- `_anchorRegistry.stats.skipped_duplicate` is `0` on a clean run, `> 0` on reconnect
+- No errors thrown in the `_applyToAnchor` try/catch
 
-Do not proceed to Slice 7 until these pass.
+Do not start Slice 7 until group_key correctness is confirmed.
 
 ---
 
-## Slice 7 — Compact Worklog Render Migration
+## Slice 7 — Compact Worklog Scene Reconciler, Dual-Run
 
-**Goal:** Replace the imperative `appendThinking` / `appendLiveToolCard` calls with
-an anchor-driven reconciler. The worklog DOM is now synced from `activity_rows`
-on every significant event.
+**Goal:** Add an anchor-driven scene reconciler that runs **after** the existing
+imperative worklog mutations. In this slice, the imperative path (`appendThinking`,
+`appendLiveToolCard`) remains the primary renderer. The reconciler detects
+discrepancies and corrects them. No imperative calls are removed yet.
 
 ### Files
 
-- `static/messages.js` — remove imperative worklog calls, add reconciler trigger
-- `static/ui.js` — add `_reconcileLiveWorklogFromAnchor(turn, anchorRegistry)`
+Primarily `static/ui.js` (reconciler function). Minor additions in
+`static/messages.js` (trigger calls). Do not remove existing worklog code.
 
 ### What to build
 
 **`_reconcileLiveWorklogFromAnchor(turn, registry)` in `ui.js`:**
 
 ```
-1. Call projectAssistantTurnAnchorActivityScene(registry.anchor, {mode:'compact_worklog'})
-2. Filter rows where display_hint !== 'main_prose'  →  worklog rows
-3. Coalesce consecutive reasoning rows  →  one accumulated thinking text per group
-4. Group rows by group_key  →  Map<group_key, row[]>
-5. For each group_key (in order):
+1. projectAssistantTurnAnchorActivityScene(registry.anchor, {mode:'compact_worklog'})
+2. Filter rows: display_hint !== 'main_prose'   →  worklog rows only
+3. Coalesce consecutive reasoning rows by group_key  →  one accumulated text per group
+4. Group remaining rows by group_key  →  Map<group_key, row[]>
+5. For each group in order:
    a. ensureLiveWorklogContainer with activityKey matching group_key
-   b. Within the worklog, diff current DOM vs expected rows:
-      - thinking card: update text if changed
-      - tool_started: appendLiveToolCard if not present; skip if present
-      - tool_completed: update existing card to done state
-6. Move #liveRunStatus to end
+   b. Diff current worklog DOM vs expected rows:
+      - thinking card: if text changed, update .thinking-card-body pre
+      - tool_started: if card absent, appendLiveToolCard; if present, skip
+      - tool_completed: if card present but still shows running, update to done state
+   c. Remove any DOM rows not present in the scene (stale entries from earlier render)
+6. _moveLiveRunStatusToTurnEnd()
 ```
 
-**In `messages.js`:** Replace direct calls to `appendThinking` / `appendLiveToolCard`
-in the `reasoning`, `tool`, and `tool_complete` SSE handlers with:
+**In `messages.js`**, after each existing worklog mutation, add a reconciler call:
 
 ```js
-if (_anchorRegistry) {
-  _applyToAnchor(d, 'tool');
-  _reconcileLiveWorklogFromAnchor($('liveAssistantTurn'), _anchorRegistry);
-} else {
-  // existing imperative path as fallback
-  appendLiveToolCard(tc, ...);
-}
+// After the existing appendLiveToolCard call in the 'tool' handler:
+if (_anchorRegistry) _reconcileLiveWorklogFromAnchor($('liveAssistantTurn'), _anchorRegistry);
+
+// After the existing thinking card update in the 'reasoning' handler:
+if (_anchorRegistry) _reconcileLiveWorklogFromAnchor($('liveAssistantTurn'), _anchorRegistry);
 ```
 
-Keep the existing imperative path as a fallback (`_anchorRegistry` is null when
-the anchor API is unavailable). Remove the fallback only after Slice 9 is stable.
+The reconciler acts as a correction layer. On a clean run it should be a no-op
+(imperative render already did the right thing). On a reconnect or ordering
+anomaly, it fixes the DOM to match the anchor's view.
 
 ### Reasoning coalescing rule
 
-Group consecutive `reasoning` activity events by `group_key`. Within each group,
-concatenate all `event.payload.text` values in `order_index` order. Pass the
-concatenated string to the thinking card. This produces one card per worklog cycle,
-not one card per text chunk.
+For each `group_key`, collect all `activity_events` with `kind='reasoning'` in
+`order_index` order. Concatenate their `event.payload.text` values. Pass the
+result to the thinking card as the accumulated text. This produces one thinking
+card per worklog cycle, not one card per reasoning chunk.
 
 ### Elapsed timer
 
-The `tool-card-live-duration` timer currently tracks `Date.now()` at the moment
-the `tool` SSE event arrives. With anchor-driven render, set `data-live-started-ms`
-on the tool card row using `Date.now()` when `tool_started` is first applied, then
-read it in the existing `setInterval` timer. The timer logic in `_toolElapsedTimers`
-remains unchanged; only the ID source changes from the 5-fallback chain to
-`anchor_event.local_id`.
+The `tool-card-live-duration` timer reads `data-live-started-ms` from the card
+row. Set this attribute when the reconciler first creates a `tool_started` card,
+using `Date.now()`. On subsequent reconciler calls, skip if attribute already
+present (preserves the original start time). The existing `_toolElapsedTimers`
+interval logic is unchanged; only the card-creation source changes.
 
-### UX problems solved by this slice
+### UX problems corrected by this slice
 
-- Multi-cycle worklog grouping is now declarative (group_key), not inferred from DOM
-- Duplicate tool cards on reconnect are blocked at the apply layer (dedupe_key)
-- Tool card ID is stable (`local_id`) — elapsed timer always mounts
+- Multi-cycle worklog grouping discrepancies (reconciler enforces group_key boundaries)
+- Duplicate tool cards on reconnect (apply-layer dedupe blocked the event; reconciler
+  sees no duplicate row in the scene and removes any stale DOM card)
+- Stale running cards that were never completed (reconciler forces done state)
 
----
+### When to remove the imperative path
 
-## Slice 8 — Settlement Path Migration
-
-**Goal:** Replace the full `renderMessages()` DOM rebuild on `done` with an
-in-place settlement that patches `#liveAssistantTurn` directly.
-This eliminates the visible flash/jump when the stream ends.
-
-### Files
-
-- `static/messages.js` — modify `done` handler
-- `static/ui.js` — add `_settleLiveAssistantTurnFromAnchor(turn, registry)`
-
-### Current behavior (what we're replacing)
-
-```
-done fires
-  → _finishDone()
-  → renderMessages()         ← tears down all DOM, rebuilds from S.messages
-  → #liveAssistantTurn removed, replaced by new static .msg-row.assistant-turn
-```
-
-### Target behavior
-
-```
-done fires
-  → wait for settled message to arrive in S.messages (already happens today)
-  → _settleLiveAssistantTurnFromAnchor(turn, registry):
-      a. Remove data-live-* attributes, id="liveAssistantTurn"
-      b. Remove .live-run-status
-      c. Remove data-live-worklog-shell="1" on all worklogs  →  they become static
-      d. Remove data-thinking-active, data-live-thinking from thinking cards
-      e. Remove data-live-assistant="1", data-live-tid, data-interim from segments
-      f. Write final prose into the last .assistant-segment .msg-body
-         using anchor.content.final_answer (from projectAssistantTurnAnchorSettledMessageFinalAnswer)
-  → call a lightweight renderMessages() pass only to update timestamp/token-count
-    in the role header (or skip and update inline)
-```
-
-### Key constraint: settled message availability
-
-The `done` event arrives before `/api/session` returns the settled message. The
-current `_finishDone()` path already handles this with a timer/retry. The
-settlement patch must also wait for `S.messages` to include the final assistant
-message before writing `final_answer` into the DOM.
-
-Use the same retry mechanism already in `_finishDone()`, not a new one.
-
-### Fallback
-
-If the anchor's `content.final_answer` is empty (anchor not wired, or settled
-message not yet available after retry limit), fall back to the existing full
-`renderMessages()` rebuild. Never silently fail and leave stale live DOM.
-
-### UX problems solved by this slice
-
-- **Live → Final visual continuity**: the response text, worklog cards, and
-  thinking card all stay in place; only live indicators are removed
-- The scroll position is not reset (current rebuild often scrolls to bottom)
-- Token count and elapsed time appear in the right place without DOM teardown
+Not in this slice. The imperative path is removed in Slice 9 after dual-run
+stability is confirmed over several weeks.
 
 ---
 
-## Slice 9 — Replay Deduplication + INFLIGHT Simplification
+## Slice 8 — Settlement Continuity From Scene
 
-**Goal:** Wire the anchor into the reconnect/replay path so that replayed events
-are deduplicated, and remove INFLIGHT fields that are now redundant.
+**Goal:** After `renderMessages()` runs at settlement, the Worklog content must
+survive intact — rebuilt from anchor `activity_rows` rather than being re-derived
+from `S.messages` tool_use blocks. The full `renderMessages()` call is kept.
+No DOM teardown reduction yet.
 
-### Part A: Replay deduplication
+### Context: how `done` actually works
 
-**File:** `static/messages.js` — `_replay_run_journal` / `_reattachOrRestoreAfterDeferredStreamError`
+The `done` SSE event carries the updated session state directly in its payload
+(`d.session.messages`). Messages.js does `S.messages = d.session.messages || S.messages`
+synchronously, then calls `renderMessages()`. This is not an async GET — the
+settled messages are in the payload.
+
+The current problem: `renderMessages()` rebuilds the settled Worklog from the
+`tool_use` / `tool_result` content blocks in `S.messages`, which loses the
+live-stream grouping (which cycle each tool belonged to) and any UI state
+(expanded/collapsed, elapsed durations).
+
+### What to change
+
+**In `renderMessages()` / worklog build path in `ui.js`:**
+
+When rendering a settled (non-live) assistant turn that has a matching anchor
+registry available for the same `run_id` or `stream_id`:
+
+1. Retrieve the registry from a module-level Map keyed by `run_id || stream_id`
+2. Call `projectAssistantTurnAnchorActivityScene(registry.anchor, {mode:'compact_worklog'})`
+3. Use `activity_rows` to build the settled Worklog instead of re-deriving from
+   `S.messages` tool blocks:
+   - Worklog cycles are the distinct `group_key` values
+   - Tool cards use `tool.*` fields (name, args, result, duration, done, is_error)
+   - Thinking cards use `thinking.text`
+4. If no matching registry is found (e.g. page reload), fall back to the existing
+   `S.messages`-derived Worklog build — no regression
+
+**Registry retention across settlement:**
+
+The `_anchorRegistry` created in Slice 6 must be stored in a module-level Map
+(not just the closure) so `renderMessages()` can access it after `done` tears
+down the stream closure:
+
+```js
+// In messages.js, when registry is created:
+_liveAnchorRegistries.set(streamId, _anchorRegistry);
+
+// In renderMessages / worklog build (ui.js):
+const reg = _liveAnchorRegistries && _liveAnchorRegistries.get(message._stream_id);
+```
+
+Entries in this Map are removed when the session is unloaded or after a
+configurable retention window (e.g. 10 minutes).
+
+### What this does NOT do
+
+- Does not bypass `renderMessages()` — full rebuild still happens
+- Does not patch the live DOM before settlement — wait for renderMessages
+- Does not remove `renderMessages()` fallback for missing registry
+
+### UX problems solved by this slice
+
+- Worklog grouping (which tools belonged to which cycle) survives settlement
+- Elapsed durations and tool result state are carried from anchor into settled cards
+- No more "Worklog flattens to a single group" after done
+
+---
+
+## Slice 9 — In-place Settlement Optimization
+
+**Goal:** Reduce the DOM teardown on settlement so the live turn transitions
+in-place rather than being replaced. This requires Slice 8 to be stable.
+
+This is the more aggressive settlement work that was originally planned for Slice 8
+but correctly moved later because it requires `renderMessages()` to be trustworthy
+as a fallback before we start bypassing it.
+
+### What to change
+
+**In the `done` handler**, after `S.messages` is updated from the payload:
+
+1. Check if `#liveAssistantTurn` can be settled in-place:
+   - Anchor scene matches settled message final_answer
+   - Worklog rows in scene match settled S.messages tool blocks
+2. If yes: apply in-place patch:
+   - Remove `id="liveAssistantTurn"`, `data-live-*` attributes
+   - Remove `.live-run-status`
+   - Remove `data-live-worklog-shell`, `data-thinking-active`, `data-live-tid`
+   - Write `content.final_answer` into the last `.assistant-segment .msg-body`
+   - Run a lightweight `renderMessages({skipWorklog: true})` to update metadata only
+3. If no (mismatch or anchor missing): fall back to full `renderMessages()`
+
+The "check if in-place is safe" comparison must be conservative. Any doubt → full
+rebuild. The optimization is only applied when the anchor scene and settled data
+are in full agreement.
+
+### Fallback guarantee
+
+The full `renderMessages()` fallback must remain active indefinitely. In-place
+settlement is an optimization, not a replacement. Never remove the fallback.
+
+### UX problem solved
+
+- Eliminates the visual flash when stream ends (text, Worklog cards, and thinking
+  card stay in place; only live indicators are removed)
+- Scroll position is preserved for non-pinned users
+
+---
+
+## Slice 10 — Replay Deduplication + INFLIGHT Field Retirement
+
+**Goal:** Wire the anchor into the reconnect/replay path for event deduplication,
+then retire INFLIGHT fields made redundant by the anchor. These are two separate
+PRs within the slice.
+
+### Part A: Replay deduplication (PR 1)
 
 When replaying run journal events after reconnect, route each event through
 `applyAssistantTurnAnchorSourceEvent` before passing to the renderer. Events
-whose `dedupe_key` is already in `_anchorRegistry.event_index` are skipped.
+whose `dedupe_key` is already in the registry are skipped (not rendered).
 
-```js
-const result = HermesAssistantTurnAnchors.applyAssistantTurnAnchorSourceEvent(
-  _anchorRegistry, replayEvent, context
-);
-if (!result.applied) return; // skip duplicate
-// ... existing render call
-```
+The registry must survive the reconnect — **do not create a new registry on
+reconnect**. Reuse the existing one so its `event_index.dedupe_key_set` remains
+populated. If no in-memory registry exists (fresh page load hitting an in-progress
+run), rebuild the registry from `INFLIGHT.activityBurstAnchors` + the run journal
+snapshot, then replay.
 
-This requires the registry to be created at stream-start (Slice 6) and preserved
-across reconnect. On reconnect, do NOT create a new registry — reuse the existing
-one so its dedupe_key_set is still populated.
+Prove that rebuild-from-INFLIGHT produces correct `group_key` values before
+proceeding to Part B.
 
-If a fresh page load reconnects to an existing run (no in-memory registry), rebuild
-the registry from `INFLIGHT.activityBurstAnchors` + the run journal snapshot before
-replaying.
+### Part B: INFLIGHT field retirement (PR 2+, one field at a time)
 
-### Part B: INFLIGHT simplification
+After Part A is stable, retire redundant INFLIGHT fields one per PR:
 
-After Slice 7 and 8 are stable, the following INFLIGHT fields become redundant and
-can be removed:
-
-| Field | Replaced by |
-|-------|-------------|
-| `activityBurstAnchors` | `_anchorRegistry.anchor.activity_events` |
-| `currentLiveSegmentSeq` | `activity_rows[].group.activity_segment_seq` |
-| `currentActivityBurstId` | `activity_rows[].group.activity_burst_id` |
+| Field | Replaced by | Remove when |
+|-------|-------------|-------------|
+| `activityBurstAnchors` | `registry.anchor.activity_events` | After Part A is in production 2+ weeks |
+| `currentLiveSegmentSeq` | `activity_rows[].group.activity_segment_seq` | After worklog render uses scene |
+| `currentActivityBurstId` | `activity_rows[].group.activity_burst_id` | Same |
 
 Keep `lastRunJournalSeq` and `toolCalls` until the replay path is fully
-anchor-driven. Remove only after a full regression pass.
+anchor-driven. Each field removal is its own PR with its own regression pass.
 
-Do not remove INFLIGHT fields in the same PR as the deduplication wiring — keep
-them separate so each can be reverted independently.
-
-### UX problems solved by this slice
+### UX problems solved
 
 - Reconnect no longer shows duplicate tool cards
-- Reconnect no longer loses the thinking card (the DOM is rebuilt from
-  `activity_events`, not from a stale INFLIGHT snapshot)
-- Architecture debt reduced: INFLIGHT shrinks from ~7 tracked fields to ~2
+- Reconnect no longer loses thinking card content
+- INFLIGHT shrinks from ~7 tracked fields to ~2
 
 ---
 
 ## Dependency Graph
 
 ```
-Slice 6: Shadow wiring
-  │  validate group_key correctness, dedupe stats
+Slice 6: Live Anchor Shadow Feed
+  │  validate: group_key correct, dedupe stats, no errors
   ↓
-Slice 7: Compact worklog render migration
-  │  validate multi-cycle grouping, elapsed timers, reconnect behavior
+Slice 7: Compact Worklog Scene Reconciler, Dual-Run
+  │  validate: multi-cycle grouping, reconnect, elapsed timers
   ↓
-Slice 8: Settlement path migration
-  │  validate live-to-final continuity, scroll position, fallback path
+Slice 8: Settlement Continuity From Scene
+  │  validate: worklog survives settlement, fallback path works
   ↓
-Slice 9: Replay deduplication + INFLIGHT simplification
+Slice 9: In-place Settlement Optimization
+  │  validate: no visual flash, scroll preserved, fallback still works
+  ↓
+Slice 10: Replay Dedup + INFLIGHT Retirement (two PRs)
 ```
 
-Each slice should be its own PR. Slice 6 and 7 can be opened as draft PRs
-simultaneously since 7 depends on 6 being stable but not necessarily merged.
-Slices 8 and 9 must wait for their predecessor to be merged and regression-tested.
+Each slice is its own PR. Slices 6 and 7 can be drafted simultaneously.
+Slices 8–10 must wait for the predecessor to be merged and observed in production.
 
 ---
 
-## Risk Notes
+## Risk Summary
 
-**Slice 7 (medium risk)**
-The reconciler adds a new code path for every SSE event that touches the worklog.
-The imperative fallback must remain active until Slice 9 removes it. Test with:
-- Single tool call
-- 3+ tools in one cycle (Scenario C)
-- 3 cycles with interim_assistant (Scenario D)
-- Reconnect mid-stream
-
-**Slice 8 (high risk)**
-Settlement is the most complex path in the codebase. Edge cases:
-- `done` arrives before settled message is in S.messages
-- User switches session tab during stream
-- Stream errors out instead of completing
-- Multi-turn sessions with existing messages above the live turn
-
-The full `renderMessages()` fallback is mandatory. Only remove it after 2+ weeks
-of production observation.
-
-**Slice 9 (high risk)**
-INFLIGHT removal is irreversible once shipped. Remove fields one at a time, each
-behind its own PR, with full reconnect regression testing between each removal.
+| Slice | Risk | Key guard |
+|-------|------|-----------|
+| 6 | Low — inert shadow run | `_anchorRegistry` null-guarded everywhere |
+| 7 | Medium — new code path in hot render loop | Imperative path kept; reconciler is correction layer only |
+| 8 | Medium — `renderMessages()` must trust anchor for Worklog | Fallback to S.messages if no registry found |
+| 9 | High — bypasses full DOM rebuild | In-place only when anchor/settled data are in full agreement; full rebuild always available |
+| 10A | Medium — reconnect deduplication | Registry reuse across reconnect; rebuild-from-INFLIGHT proven first |
+| 10B | High — removes INFLIGHT fields | One field per PR; each independently revertable |
