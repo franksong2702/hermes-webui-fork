@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Hermes — Live Stream Scenarios</title>
+<style>
+/* ══ Exact Hermes dark palette ══ */
+:root{
+  --bg:#18140F;--border:rgba(255,255,255,.09);--border2:rgba(255,255,255,.15);
+  --text:#EDE8DF;--muted:#8C8072;--accent:#D4A017;--accent-text:#D4A017;
+  --accent-bg:rgba(212,160,23,.12);--accent-bg-strong:rgba(212,160,23,.22);
+  --blue:#4DA6C8;--code-bg:#141008;--surface:#1E1A13;--hover-bg:rgba(255,255,255,.04);
+  --error:#E05C5C;--msg-rail:0px;--msg-max:700px;
+  --message-body-font-size:14px;--font-size-xs:11px;
+  --font-mono:'SF Mono',ui-monospace,monospace;
+  --font-ui:system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;}
+body{background:var(--bg);color:var(--text);font-family:var(--font-ui);font-size:14px;line-height:1.5;display:flex;flex-direction:column;}
+
+/* ══ Demo chrome ══ */
+.demo-header{flex-shrink:0;background:var(--bg);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:12px;}
+.demo-title{font-weight:600;font-size:13px;color:var(--accent-text);}
+.demo-sub{font-size:11px;color:var(--muted);margin-left:4px;}
+.hdr-right{margin-left:auto;display:flex;align-items:center;gap:8px;}
+.speed-label{font-size:11px;color:var(--muted);}
+.spd{background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;font-family:var(--font-mono);}
+.spd.on{border-color:var(--accent);color:var(--accent-text);}
+
+.tabs{flex-shrink:0;display:flex;gap:2px;padding:0 20px;border-bottom:1px solid var(--border);background:var(--bg);}
+.tab{padding:8px 12px;font-size:12px;cursor:pointer;border-bottom:2px solid transparent;color:var(--muted);transition:color .15s;white-space:nowrap;}
+.tab.on{color:var(--accent-text);border-bottom-color:var(--accent);}
+.tab:hover:not(.on){color:var(--text);}
+
+.scenarios{flex:1;overflow:hidden;display:flex;}
+.scenario{display:none;flex:1;overflow:hidden;}
+.scenario.on{display:flex;}
+.sc-left{flex:1;overflow-y:auto;padding:20px;}
+.sc-right{width:240px;flex-shrink:0;border-left:1px solid var(--border);overflow-y:auto;padding:14px;}
+
+/* Controls */
+.controls{display:flex;align-items:center;gap:8px;margin-bottom:16px;}
+.btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:var(--font-ui);}
+.btn:hover{background:var(--hover-bg);}
+.btn.primary{background:var(--accent-bg);border-color:var(--accent);color:var(--accent-text);}
+.btn:disabled{opacity:.35;cursor:default;}
+.step-counter{font-size:11px;color:var(--muted);font-family:var(--font-mono);}
+
+/* Event log */
+.log-title{font-size:10px;font-weight:700;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px;}
+.ev{font-size:11px;padding:5px 8px;border-radius:4px;border-left:2px solid transparent;margin-bottom:3px;transition:background .15s;}
+.ev.past{color:var(--muted);opacity:.6;}
+.ev.now{background:var(--accent-bg);border-left-color:var(--accent);}
+.ev.future{color:var(--muted);opacity:.35;}
+.ev-name{font-family:var(--font-mono);font-weight:600;display:block;}
+.ev-desc{font-size:10px;color:var(--muted);margin-top:2px;display:block;line-height:1.35;}
+.ev.now .ev-desc{color:var(--accent-text);opacity:.8;}
+
+/* Conversation area */
+.convo{max-width:var(--msg-max);margin:0 auto;}
+.msg-row{padding:8px 0;}
+
+/* User bubble */
+.msg-row[data-role="user"]{display:flex;padding-left:var(--msg-rail);}
+.msg-row[data-role="user"] .msg-body{
+  background:var(--surface);border:1px solid var(--border2);border-radius:10px;
+  padding:10px 14px;font-size:var(--message-body-font-size);line-height:1.6;
+  margin-left:auto;max-width:80%;
+}
+
+/* Assistant turn */
+.msg-row.assistant-turn{display:flex;flex-direction:row;padding-left:var(--msg-rail);}
+.msg-role.assistant{
+  display:flex;align-items:flex-start;gap:6px;font-size:12px;color:var(--muted);
+  flex-shrink:0;width:0;overflow:hidden; /* msg-rail=0px → collapsed */
+}
+.role-icon.assistant{
+  width:24px;height:24px;border-radius:50%;background:var(--accent-bg);
+  border:1px solid var(--accent-bg-strong);color:var(--accent-text);
+  display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0;
+}
+.assistant-turn-blocks{flex:1;min-width:0;}
+
+/* ── Live worklog ── */
+.live-worklog{margin:4px 0 12px;}
+.tool-worklog-list{
+  --worklog-rail:var(--msg-rail); /* 0px in live mode */
+  display:flex;flex-direction:column;gap:1px;padding-left:0;
+}
+
+/* wl-reason: process text inside worklog list */
+.wl-reason{
+  color:var(--text);font-size:var(--message-body-font-size);line-height:1.6;
+  padding-left:var(--worklog-rail);padding-top:2px;padding-bottom:8px;overflow-wrap:anywhere;
+}
+.wl-reason p{margin:0 0 6px;}.wl-reason p:last-child{margin-bottom:0;}
+
+/* Thinking card inside worklog */
+.tool-worklog-list > .agent-activity-thinking .thinking-card,
+.tool-worklog-list > .agent-activity-thinking .thinking-card:hover{
+  margin:0;max-width:none;border:0;background:transparent;
+}
+.tool-worklog-list > .agent-activity-thinking .thinking-card-header{
+  display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:5px;cursor:pointer;
+  font-size:12px;opacity:.56;
+}
+.tool-worklog-list > .agent-activity-thinking .thinking-card-header:hover{background:var(--hover-bg);opacity:1;}
+.tool-worklog-list > .agent-activity-thinking .thinking-card-label{font-weight:400;letter-spacing:0;}
+.tool-worklog-list > .agent-activity-thinking .thinking-card-icon,
+.tool-worklog-list > .agent-activity-thinking .thinking-copy-btn,
+.tool-worklog-list > .agent-activity-thinking .thinking-card-toggle{opacity:.4;}
+.tool-worklog-list > .agent-activity-thinking .thinking-card.open .thinking-card-body{
+  margin-top:4px;padding:6px 8px 7px;max-height:120px;overflow-y:auto;background:var(--code-bg);
+  border-radius:0 0 5px 5px;
+}
+.tool-worklog-list > .agent-activity-thinking .thinking-card-body pre{
+  font-family:var(--font-mono);font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-word;margin:0;line-height:1.6;
+}
+
+/* Global thinking card styles */
+.thinking-card{border:1px solid var(--accent-bg-strong);border-radius:8px;overflow:hidden;background:var(--accent-bg);}
+.thinking-card-header{display:flex;align-items:center;gap:8px;padding:5px 10px;color:var(--accent-text);font-size:12px;font-weight:600;opacity:.85;cursor:pointer;}
+.thinking-card-header:hover{opacity:1;}
+.thinking-card-icon{opacity:.7;font-size:13px;}
+.thinking-card-body{max-height:0;opacity:0;overflow:hidden;transition:max-height .22s ease,opacity .18s ease,padding .22s ease;}
+.thinking-card.open .thinking-card-body{max-height:260px;overflow-y:auto;opacity:1;padding:8px 12px;}
+.thinking-card-body pre{font-family:var(--font-mono);font-size:11px;line-height:1.6;color:var(--muted);white-space:pre-wrap;word-break:break-word;margin:0;}
+.thinking-card-label{font-weight:600;letter-spacing:.02em;}
+.thinking-card-btn-row{margin-left:auto;display:inline-flex;align-items:center;gap:6px;}
+.thinking-card-toggle{font-size:10px;opacity:.5;transition:transform .2s;}
+.thinking-card.open .thinking-card-toggle{transform:rotate(90deg);}
+
+/* Thinking dots (no text yet) */
+.thinking{display:flex;align-items:center;gap:5px;color:var(--muted);font-size:13px;padding:4px 6px;}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--blue);opacity:.3;animation:pulse 1.4s ease-in-out infinite;}
+.dot:nth-child(2){animation-delay:.22s;}.dot:nth-child(3){animation-delay:.44s;}
+@keyframes pulse{0%,80%,100%{opacity:.2;transform:scale(.8)}40%{opacity:.8;transform:scale(1)}}
+
+/* ── Tool card row ── */
+@keyframes wlpulse{0%,100%{box-shadow:0 0 0 0 var(--accent-bg-strong);}50%{box-shadow:0 0 0 5px rgba(255,215,0,0);}}
+.tool-card-running-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);flex-shrink:0;vertical-align:middle;animation:wlpulse 1.3s ease-in-out infinite;}
+.tool-worklog-list .tool-card-row{margin:0;}
+.tool-worklog-list .tool-card{margin:0;border:0;background:transparent;}
+.tool-worklog-list .tool-card-row+.tool-card-row{border-top:0;}
+.tool-worklog-list .tool-card-header{display:flex;align-items:center;gap:7px;padding:4px 6px;border-radius:5px;cursor:pointer;}
+.tool-worklog-list .tool-card-name{flex-shrink:0;font-family:var(--font-mono);font-size:12px;color:var(--text);font-weight:500;}
+.tool-worklog-list .tool-card-preview{font-family:var(--font-mono);font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;}
+/* hide icon + preview inside worklog (real code does this) */
+.tool-worklog-list .tool-card-icon{display:none;}
+.tool-card-live-duration{font-size:var(--font-size-xs);color:var(--muted);opacity:.52;white-space:nowrap;font-variant-numeric:tabular-nums;flex-shrink:0;}
+.tool-card-done-icon{color:var(--muted);opacity:.45;font-size:12px;flex-shrink:0;}
+.tool-card-duration{font-size:var(--font-size-xs);color:var(--muted);opacity:.45;white-space:nowrap;font-variant-numeric:tabular-nums;flex-shrink:0;}
+
+/* Inter-tool hint */
+.inter-tool-hint{display:flex;align-items:center;gap:5px;padding:6px 10px;opacity:.4;}
+.inter-tool-dot{width:4px;height:4px;border-radius:50%;background:var(--muted);animation:itpulse 1.2s ease-in-out infinite;}
+.inter-tool-dot:nth-child(2){animation-delay:.2s;}.inter-tool-dot:nth-child(3){animation-delay:.4s;}
+@keyframes itpulse{0%,80%,100%{opacity:.3;transform:scale(.8);}40%{opacity:1;transform:scale(1);}}
+
+/* Prose segment */
+.assistant-segment{}
+.msg-body{font-size:var(--message-body-font-size);line-height:1.6;color:var(--text);}
+.msg-body p{margin:0 0 8px;}.msg-body p:last-child{margin-bottom:0;}
+.typing-cursor{display:inline-block;width:2px;height:14px;background:var(--accent);vertical-align:text-bottom;animation:blink .7s step-end infinite;margin-left:1px;}
+@keyframes blink{0%,100%{opacity:1;}50%{opacity:0;}}
+
+/* Interim notes (from interim_assistant event) */
+.assistant-segment[data-interim="1"]{border-left:2px solid var(--border2);padding-left:10px;margin:4px 0 8px;opacity:.8;}
+.interim-collapsed{display:none;}
+.interim-collapse-toggle{cursor:pointer;color:var(--blue);font-size:0.85em;margin:4px 0 6px;display:block;}
+.interim-collapse-toggle:hover{text-decoration:underline;}
+
+/* Live run status bar */
+.live-run-status{display:flex;align-items:center;gap:8px;margin:4px 0 6px;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums;line-height:1;}
+@keyframes lfspin{to{transform:rotate(360deg);}}
+.lf-spark{color:var(--accent);font-size:13px;display:inline-block;animation:lfspin 1.7s linear infinite;line-height:1;}
+.lf-time{color:var(--text);font-variant-numeric:tabular-nums;}
+.lf-sep{opacity:.4;}
+.lf-tokens{font-variant-numeric:tabular-nums;}
+.lf-status{color:var(--muted);opacity:.85;}
+
+/* Worklog summary (settled/closed) */
+.tool-worklog-summary{display:inline-flex;align-items:center;gap:6px;padding:3px 6px;border-radius:5px;cursor:pointer;font-size:12px;color:var(--muted);}
+.tool-worklog-summary:hover{background:var(--hover-bg);}
+.as-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);opacity:.45;flex-shrink:0;}
+
+/* Settled state (after done) */
+.settled-note{font-size:12px;color:var(--muted);border:1px dashed var(--border2);border-radius:6px;padding:8px 12px;margin-top:8px;text-align:center;opacity:.6;}
+
+/* Scenario label */
+.sc-scenario-title{font-size:13px;font-weight:600;color:var(--text);margin-bottom:4px;}
+.sc-scenario-desc{font-size:11px;color:var(--muted);margin-bottom:14px;line-height:1.5;}
+
+/* Step annotation badge */
+.step-badge{display:inline-block;background:var(--accent-bg);border:1px solid var(--accent-bg-strong);color:var(--accent-text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;border-radius:4px;margin-bottom:8px;}
+</style>
+</head>
+<body>
+
+<div class="demo-header">
+  <span class="demo-title">Hermes Live Stream</span>
+  <span class="demo-sub">— All assistant turn scenarios</span>
+  <div class="hdr-right">
+    <span class="speed-label">Speed:</span>
+    <button class="spd" data-s="2000">0.5×</button>
+    <button class="spd on" data-s="1000">1×</button>
+    <button class="spd" data-s="500">2×</button>
+    <button class="spd" data-s="250">4×</button>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab on" data-t="a">A: Pure Prose</div>
+  <div class="tab" data-t="b">B: Single Tool</div>
+  <div class="tab" data-t="c">C: Multi-Tool</div>
+  <div class="tab" data-t="d">D: Multi-Cycle</div>
+</div>
+
+<div class="scenarios">
+
+<!-- ══ TAB A: Pure Prose ══ -->
+<div class="scenario on" id="sc-a">
+  <div class="sc-left">
+    <div class="sc-scenario-title">A: Pure prose response (no tools)</div>
+    <div class="sc-scenario-desc">
+      <code>reasoning → token → done</code><br>
+      Model reasons briefly then streams prose directly. No tool calls.
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="a-play">▶ Play</button>
+      <button class="btn" id="a-prev" disabled>← Prev</button>
+      <button class="btn" id="a-next">Next →</button>
+      <span class="step-counter" id="a-step">Step 1 / 5</span>
+    </div>
+    <div class="step-badge" id="a-badge">submit</div>
+    <div class="convo" id="a-convo"></div>
+  </div>
+  <div class="sc-right">
+    <div class="log-title">SSE Events</div>
+    <div class="event-log" id="a-log"></div>
+  </div>
+</div>
+
+<!-- ══ TAB B: Single Tool ══ -->
+<div class="scenario" id="sc-b">
+  <div class="sc-left">
+    <div class="sc-scenario-title">B: Single tool call</div>
+    <div class="sc-scenario-desc">
+      <code>reasoning → tool → tool_complete → token → done</code><br>
+      One tool with elapsed timer, inter-tool hint (800 ms), then prose.
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="b-play">▶ Play</button>
+      <button class="btn" id="b-prev" disabled>← Prev</button>
+      <button class="btn" id="b-next">Next →</button>
+      <span class="step-counter" id="b-step">Step 1 / 7</span>
+    </div>
+    <div class="step-badge" id="b-badge">submit</div>
+    <div class="convo" id="b-convo"></div>
+  </div>
+  <div class="sc-right">
+    <div class="log-title">SSE Events</div>
+    <div class="event-log" id="b-log"></div>
+  </div>
+</div>
+
+<!-- ══ TAB C: Multi-Tool ══ -->
+<div class="scenario" id="sc-c">
+  <div class="sc-left">
+    <div class="sc-scenario-title">C: Multiple tools (same worklog cycle)</div>
+    <div class="sc-scenario-desc">
+      <code>reasoning → tool×3 → token → done</code><br>
+      Three sequential tool calls in one worklog. wl-reason shows process text. Then prose.
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="c-play">▶ Play</button>
+      <button class="btn" id="c-prev" disabled>← Prev</button>
+      <button class="btn" id="c-next">Next →</button>
+      <span class="step-counter" id="c-step">Step 1 / 9</span>
+    </div>
+    <div class="step-badge" id="c-badge">submit</div>
+    <div class="convo" id="c-convo"></div>
+  </div>
+  <div class="sc-right">
+    <div class="log-title">SSE Events</div>
+    <div class="event-log" id="c-log"></div>
+  </div>
+</div>
+
+<!-- ══ TAB D: Multi-Cycle ══ -->
+<div class="scenario" id="sc-d">
+  <div class="sc-left">
+    <div class="sc-scenario-title">D: Multi-cycle (interim_assistant + collapse)</div>
+    <div class="sc-scenario-desc">
+      <code>worklog1 → interim_assistant → worklog2 → interim_assistant → worklog3 → interim_assistant → token → done</code><br>
+      Three worklog cycles, each separated by interim prose notes. Shows collapse toggle at ≥3 notes.
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="d-play">▶ Play</button>
+      <button class="btn" id="d-prev" disabled>← Prev</button>
+      <button class="btn" id="d-next">Next →</button>
+      <span class="step-counter" id="d-step">Step 1 / 12</span>
+    </div>
+    <div class="step-badge" id="d-badge">submit</div>
+    <div class="convo" id="d-convo"></div>
+  </div>
+  <div class="sc-right">
+    <div class="log-title">SSE Events</div>
+    <div class="event-log" id="d-log"></div>
+  </div>
+</div>
+
+</div><!-- /scenarios -->
+
+<script>
+/* ══ Shared helpers ══ */
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+function userMsg(text){
+  return `<div class="msg-row" data-role="user"><div class="msg-body">${esc(text)}</div></div>`;
+}
+
+function liveHeader(){
+  return `<div class="msg-row assistant-turn" data-role="assistant" id="liveAssistantTurn">
+  <div class="msg-role assistant"><div class="role-icon assistant">H</div></div>
+  <div class="assistant-turn-blocks" id="atBlocks">`;
+}
+function liveFooter(time='0:01',tokens='0',status='Thinking…'){
+  return `<div class="live-run-status">
+    <span class="lf-spark">↻</span>
+    <span class="lf-time">${time}</span>
+    <span class="lf-sep">·</span>
+    <span class="lf-tokens">${tokens} tok</span>
+    <span class="lf-sep">·</span>
+    <span class="lf-status">${esc(status)}</span>
+  </div></div></div>`;
+}
+
+function thinkingDots(){
+  return `<div class="agent-activity-thinking" data-thinking-active="1" data-live-thinking="1">
+    <div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+  </div>`;
+}
+function thinkingCard(text, active=false){
+  return `<div class="agent-activity-thinking"${active?' data-thinking-active="1" data-live-thinking="1"':''}>
+    <div class="thinking-card open" onclick="this.classList.toggle('open')">
+      <div class="thinking-card-header">
+        <span class="thinking-card-icon">💡</span>
+        <span class="thinking-card-label">Thinking</span>
+        <span class="thinking-card-btn-row"><span class="thinking-card-toggle">▶</span></span>
+      </div>
+      <div class="thinking-card-body"><pre>${esc(text)}</pre></div>
+    </div>
+  </div>`;
+}
+
+function wlReason(text){
+  return `<div class="wl-reason" data-worklog-reason-source="reasoning"><p>${esc(text)}</p></div>`;
+}
+
+function toolRunning(name, arg, tid, elapsed=''){
+  return `<div class="tool-card-row" data-live-tid="${esc(tid)}">
+    <div class="tool-card"><div class="tool-card-header">
+      <span class="tool-card-running-dot"></span>
+      <span class="tool-card-name">${esc(name)}</span>
+      ${elapsed?`<span class="tool-card-live-duration">${esc(elapsed)}</span>`:''}
+      <span class="tool-card-preview">${esc(arg)}</span>
+    </div></div>
+  </div>`;
+}
+function toolDone(name, arg, tid, dur){
+  return `<div class="tool-card-row" data-live-tid="${esc(tid)}">
+    <div class="tool-card"><div class="tool-card-header">
+      <span class="tool-card-done-icon">✓</span>
+      <span class="tool-card-name">${esc(name)}</span>
+      <span class="tool-card-duration">${esc(dur)}</span>
+      <span class="tool-card-preview">${esc(arg)}</span>
+    </div></div>
+  </div>`;
+}
+
+function worklog(content){
+  return `<div class="live-worklog worklog" data-live-worklog-shell="1" data-live-activity-current="1">
+    <div class="tool-worklog-list">${content}</div>
+  </div>`;
+}
+function worklogClosed(label, content){
+  return `<div class="live-worklog worklog">
+    <div class="tool-worklog-summary">
+      <span class="as-dot"></span>
+      <span class="tool-worklog-label">${esc(label)}</span>
+    </div>
+    <div class="tool-worklog-list">${content}</div>
+  </div>`;
+}
+
+function interToolHint(){
+  return `<div class="inter-tool-hint">
+    <span class="inter-tool-dot"></span><span class="inter-tool-dot"></span><span class="inter-tool-dot"></span>
+  </div>`;
+}
+
+function interimNote(text){
+  return `<div class="assistant-segment" data-live-assistant="1" data-interim="1">
+    <div class="msg-body"><p>${esc(text)}</p></div>
+  </div>`;
+}
+
+function proseSegment(text, cursor=false){
+  return `<div class="assistant-segment" data-live-assistant="1">
+    <div class="msg-body"><p>${esc(text)}${cursor?'<span class="typing-cursor"></span>':''}</p></div>
+  </div>`;
+}
+
+function settledNote(){
+  return `<div class="settled-note">✓ done — renderMessages() replaces live turn with settled messages</div>`;
+}
+
+/* ══ Scenario definitions ══ */
+
+/* ─── A: Pure prose ─── */
+const stepsA = [
+  {
+    event:'submit',desc:'User sends message',
+    html: userMsg('请解释一下这段代码的作用') + liveHeader() + liveFooter()
+  },
+  {
+    event:'(pending)',desc:'Live turn created, thinking dots',
+    html: userMsg('请解释一下这段代码的作用') +
+      liveHeader() + worklog(thinkingDots()) + liveFooter('0:01','0','Thinking…')
+  },
+  {
+    event:'reasoning',desc:'Reasoning text streams into thinking card',
+    html: userMsg('请解释一下这段代码的作用') +
+      liveHeader() + worklog(thinkingCard('这段代码看起来是一个简单的排序实现。让我仔细分析一下算法的逻辑…', true)) +
+      liveFooter('0:03','0','Thinking…')
+  },
+  {
+    event:'token (×N)',desc:'Thinking finalizes; prose starts streaming',
+    html: userMsg('请解释一下这段代码的作用') +
+      liveHeader() +
+      worklog(thinkingCard('这段代码看起来是一个简单的排序实现。让我仔细分析一下算法的逻辑…')) +
+      proseSegment('这段代码实现了一个冒泡排序算法。外层循环控制遍历轮数，内层循环逐一比较相邻元素…', true) +
+      liveFooter('0:05','312','Streaming…')
+  },
+  {
+    event:'done → settled',desc:'Stream ends; renderMessages() replaces live turn',
+    html: userMsg('请解释一下这段代码的作用') +
+      liveHeader() +
+      worklog(thinkingCard('这段代码看起来是一个简单的排序实现。让我仔细分析一下算法的逻辑…')) +
+      proseSegment('这段代码实现了一个冒泡排序算法。外层循环控制遍历轮数，内层循环逐一比较相邻元素，当前一个元素大于后一个时交换位置。时间复杂度为 O(n²)。') +
+      settledNote()
+  },
+];
+
+/* ─── B: Single tool ─── */
+const stepsB = [
+  {
+    event:'submit',desc:'User sends message',
+    html: userMsg('帮我找一下项目里有没有 TODO 注释') + liveHeader() + liveFooter()
+  },
+  {
+    event:'reasoning',desc:'Thinking card appears',
+    html: userMsg('帮我找一下项目里有没有 TODO 注释') +
+      liveHeader() + worklog(thinkingCard('需要搜索项目中的 TODO 注释，使用 grep 工具来扫描文件。', true)) +
+      liveFooter('0:02','0','Thinking…')
+  },
+  {
+    event:'tool',desc:'tool event: thinking finalizes, tool card appears running',
+    html: userMsg('帮我找一下项目里有没有 TODO 注释') +
+      liveHeader() +
+      worklog(thinkingCard('需要搜索项目中的 TODO 注释，使用 grep 工具来扫描文件。') +
+        toolRunning('grep_search', 'pattern="TODO"', 't1')) +
+      liveFooter('0:03','0','Running tool…')
+  },
+  {
+    event:'(timer +2s)',desc:'Elapsed timer ticks on running card',
+    html: userMsg('帮我找一下项目里有没有 TODO 注释') +
+      liveHeader() +
+      worklog(thinkingCard('需要搜索项目中的 TODO 注释，使用 grep 工具来扫描文件。') +
+        toolRunning('grep_search', 'pattern="TODO"', 't1', '2s')) +
+      liveFooter('0:05','0','Running tool…')
+  },
+  {
+    event:'tool_complete',desc:'Tool done; card settles with duration',
+    html: userMsg('帮我找一下项目里有没有 TODO 注释') +
+      liveHeader() +
+      worklog(thinkingCard('需要搜索项目中的 TODO 注释，使用 grep 工具来扫描文件。') +
+        toolDone('grep_search', 'pattern="TODO"', 't1', '3s')) +
+      liveFooter('0:06','0','Processing…')
+  },
+  {
+    event:'(800 ms later)',desc:'Inter-tool hint: no new tool in 800 ms',
+    html: userMsg('帮我找一下项目里有没有 TODO 注释') +
+      liveHeader() +
+      worklog(thinkingCard('需要搜索项目中的 TODO 注释，使用 grep 工具来扫描文件。') +
+        toolDone('grep_search', 'pattern="TODO"', 't1', '3s')) +
+      interToolHint() +
+      liveFooter('0:07','0','Processing…')
+  },
+  {
+    event:'token (×N)',desc:'Model streams prose; hint cleared',
+    html: userMsg('帮我找一下项目里有没有 TODO 注释') +
+      liveHeader() +
+      worklog(thinkingCard('需要搜索项目中的 TODO 注释，使用 grep 工具来扫描文件。') +
+        toolDone('grep_search', 'pattern="TODO"', 't1', '3s')) +
+      proseSegment('找到了 7 处 TODO 注释，主要集中在 src/auth.js 和 utils/db.js 中，建议优先处理认证模块里的待办项…', true) +
+      liveFooter('0:09','287','Streaming…')
+  },
+  {
+    event:'done → settled',desc:'Stream ends, messages settle',
+    html: userMsg('帮我找一下项目里有没有 TODO 注释') +
+      liveHeader() +
+      worklog(thinkingCard('需要搜索项目中的 TODO 注释，使用 grep 工具来扫描文件。') +
+        toolDone('grep_search', 'pattern="TODO"', 't1', '3s')) +
+      proseSegment('找到了 7 处 TODO 注释，主要集中在 src/auth.js 和 utils/db.js 中，建议优先处理认证模块里的待办项。') +
+      settledNote()
+  },
+];
+
+/* ─── C: Multi-tool (same cycle) ─── */
+const thinkC = '需要分三步进行：首先搜索源文件，然后读取关键配置，最后检查测试覆盖率。';
+const stepsC = [
+  {
+    event:'submit',desc:'User sends message',
+    html: userMsg('帮我分析一下这个项目的整体结构') + liveHeader() + liveFooter()
+  },
+  {
+    event:'reasoning',desc:'Thinking card builds up',
+    html: userMsg('帮我分析一下这个项目的整体结构') +
+      liveHeader() + worklog(thinkingCard(thinkC, true)) +
+      liveFooter('0:02','0','Thinking…')
+  },
+  {
+    event:'tool (t1)',desc:'wl-reason + tool 1 running; thinking finalizes',
+    html: userMsg('帮我分析一下这个项目的整体结构') +
+      liveHeader() +
+      worklog(thinkingCard(thinkC) +
+        wlReason('让我先列出源文件结构…') +
+        toolRunning('list_directory', 'path="src/"', 't1')) +
+      liveFooter('0:03','0','Running tool…')
+  },
+  {
+    event:'tool_complete (t1)',desc:'Tool 1 settles (1s). Tool 2 starts immediately.',
+    html: userMsg('帮我分析一下这个项目的整体结构') +
+      liveHeader() +
+      worklog(thinkingCard(thinkC) +
+        wlReason('让我先列出源文件结构…') +
+        toolDone('list_directory', 'path="src/"', 't1', '1s') +
+        toolRunning('read_file', 'path="package.json"', 't2')) +
+      liveFooter('0:04','0','Running tool…')
+  },
+  {
+    event:'(timer +2s)',desc:'Elapsed timer ticks on tool 2',
+    html: userMsg('帮我分析一下这个项目的整体结构') +
+      liveHeader() +
+      worklog(thinkingCard(thinkC) +
+        wlReason('让我先列出源文件结构…') +
+        toolDone('list_directory', 'path="src/"', 't1', '1s') +
+        toolRunning('read_file', 'path="package.json"', 't2', '2s')) +
+      liveFooter('0:06','0','Running tool…')
+  },
+  {
+    event:'tool_complete (t2)',desc:'Tool 2 settles. Tool 3 starts.',
+    html: userMsg('帮我分析一下这个项目的整体结构') +
+      liveHeader() +
+      worklog(thinkingCard(thinkC) +
+        wlReason('让我先列出源文件结构…') +
+        toolDone('list_directory', 'path="src/"', 't1', '1s') +
+        toolDone('read_file', 'path="package.json"', 't2', '2s') +
+        toolRunning('run_tests', 'coverage=true', 't3', '1s')) +
+      liveFooter('0:09','0','Running tool…')
+  },
+  {
+    event:'tool_complete (t3)',desc:'All tools done; inter-tool hint shows briefly',
+    html: userMsg('帮我分析一下这个项目的整体结构') +
+      liveHeader() +
+      worklog(thinkingCard(thinkC) +
+        wlReason('让我先列出源文件结构…') +
+        toolDone('list_directory', 'path="src/"', 't1', '1s') +
+        toolDone('read_file', 'path="package.json"', 't2', '2s') +
+        toolDone('run_tests', 'coverage=true', 't3', '3s')) +
+      interToolHint() +
+      liveFooter('0:12','0','Processing…')
+  },
+  {
+    event:'token (×N)',desc:'Prose streams in; hint cleared',
+    html: userMsg('帮我分析一下这个项目的整体结构') +
+      liveHeader() +
+      worklog(thinkingCard(thinkC) +
+        wlReason('让我先列出源文件结构…') +
+        toolDone('list_directory', 'path="src/"', 't1', '1s') +
+        toolDone('read_file', 'path="package.json"', 't2', '2s') +
+        toolDone('run_tests', 'coverage=true', 't3', '3s')) +
+      proseSegment('根据我的分析：src/ 包含 12 个模块，package.json 显示使用 Express + Prisma，测试覆盖率为 67%，主要缺口在 API 层…', true) +
+      liveFooter('0:14','541','Streaming…')
+  },
+  {
+    event:'done → settled',desc:'Stream ends, messages settle',
+    html: userMsg('帮我分析一下这个项目的整体结构') +
+      liveHeader() +
+      worklog(thinkingCard(thinkC) +
+        wlReason('让我先列出源文件结构…') +
+        toolDone('list_directory', 'path="src/"', 't1', '1s') +
+        toolDone('read_file', 'path="package.json"', 't2', '2s') +
+        toolDone('run_tests', 'coverage=true', 't3', '3s')) +
+      proseSegment('根据我的分析：src/ 包含 12 个模块，package.json 显示使用 Express + Prisma，测试覆盖率为 67%，主要缺口在 API 层。') +
+      settledNote()
+  },
+];
+
+/* ─── D: Multi-cycle (interim_assistant + collapse) ─── */
+const thinkD1 = '先检索相关文档，找到 API 规格说明。';
+const thinkD2 = '找到了文档。现在需要对比现有实现和规格的差异。';
+const thinkD3 = '发现了差异。验证一下测试来确认问题。';
+function wl1(tools){ return worklog(thinkingCard(thinkD1) + tools); }
+function wl2(tools){ return worklog(thinkingCard(thinkD2) + tools); }
+function wl3(tools){ return worklog(thinkingCard(thinkD3) + tools); }
+
+const stepsD = [
+  {
+    event:'submit',desc:'User sends message',
+    html: userMsg('请帮我找出这个模块的所有 bug') + liveHeader() + liveFooter()
+  },
+  {
+    event:'reasoning + tool (cycle 1)',desc:'Worklog 1: thinking + tool 1 running',
+    html: userMsg('请帮我找出这个模块的所有 bug') +
+      liveHeader() +
+      wl1(toolRunning('search_docs', 'query="API spec"', 't1', '2s')) +
+      liveFooter('0:05','0','Running tool…')
+  },
+  {
+    event:'tool_complete (t1)',desc:'Tool 1 done in cycle 1',
+    html: userMsg('请帮我找出这个模块的所有 bug') +
+      liveHeader() +
+      wl1(toolDone('search_docs', 'query="API spec"', 't1', '2s')) +
+      liveFooter('0:07','0','Processing…')
+  },
+  {
+    event:'interim_assistant',desc:'Cycle 1 closes. Interim prose note appears.',
+    note:'assistantText += visible; worklog closes; assistantRow marked data-interim="1"; closeCurrentLiveActivityGroup()',
+    html: userMsg('请帮我找出这个模块的所有 bug') +
+      liveHeader() +
+      wl1(toolDone('search_docs', 'query="API spec"', 't1', '2s')) +
+      interimNote('找到了 API 规格文档。返回类型和现有代码不一致，让我进一步对比具体差异。') +
+      liveFooter('0:08','84','Processing…')
+  },
+  {
+    event:'reasoning + tool (cycle 2)',desc:'Worklog 2 opens. Thinking + tool 2.',
+    html: userMsg('请帮我找出这个模块的所有 bug') +
+      liveHeader() +
+      wl1(toolDone('search_docs', 'query="API spec"', 't1', '2s')) +
+      interimNote('找到了 API 规格文档。返回类型和现有代码不一致，让我进一步对比具体差异。') +
+      wl2(toolRunning('read_file', 'path="src/api/users.js"', 't2', '1s')) +
+      liveFooter('0:11','84','Running tool…')
+  },
+  {
+    event:'tool_complete (t2) + interim_assistant',desc:'Cycle 2 closes. 2nd interim note.',
+    html: userMsg('请帮我找出这个模块的所有 bug') +
+      liveHeader() +
+      wl1(toolDone('search_docs', 'query="API spec"', 't1', '2s')) +
+      interimNote('找到了 API 规格文档。返回类型和现有代码不一致，让我进一步对比具体差异。') +
+      wl2(toolDone('read_file', 'path="src/api/users.js"', 't2', '1s')) +
+      interimNote('代码在第 47 行使用了 string 返回，但规格要求 number。还需要确认测试是否也有问题。') +
+      liveFooter('0:14','184','Processing…')
+  },
+  {
+    event:'reasoning + tool (cycle 3)',desc:'Worklog 3 opens. Thinking + tool 3.',
+    html: userMsg('请帮我找出这个模块的所有 bug') +
+      liveHeader() +
+      wl1(toolDone('search_docs', 'query="API spec"', 't1', '2s')) +
+      interimNote('找到了 API 规格文档。返回类型和现有代码不一致，让我进一步对比具体差异。') +
+      wl2(toolDone('read_file', 'path="src/api/users.js"', 't2', '1s')) +
+      interimNote('代码在第 47 行使用了 string 返回，但规格要求 number。还需要确认测试是否也有问题。') +
+      wl3(toolRunning('run_tests', 'path="tests/api"', 't3', '3s')) +
+      liveFooter('0:19','184','Running tool…')
+  },
+  {
+    event:'tool_complete + interim_assistant',desc:'3rd interim note. Collapse toggle appears (≥3 notes).',
+    note:'visibleInterimSnippets.length > INTERIM_COLLAPSE_THRESHOLD(3) → old notes get .interim-collapsed; .interim-collapse-toggle inserted.',
+    html: userMsg('请帮我找出这个模块的所有 bug') +
+      liveHeader() +
+      wl1(toolDone('search_docs', 'query="API spec"', 't1', '2s')) +
+      // collapse toggle appears before the first note
+      `<span class="interim-collapse-toggle" data-threshold="3">Show 1 earlier update</span>` +
+      `<div class="assistant-segment" data-live-assistant="1" data-interim="1" style="display:none">
+        <div class="msg-body"><p>找到了 API 规格文档。返回类型和现有代码不一致，让我进一步对比具体差异。</p></div>
+      </div>` +
+      wl2(toolDone('read_file', 'path="src/api/users.js"', 't2', '1s')) +
+      interimNote('代码在第 47 行使用了 string 返回，但规格要求 number。还需要确认测试是否也有问题。') +
+      wl3(toolDone('run_tests', 'path="tests/api"', 't3', '3s')) +
+      interimNote('测试也有错误：test_user_id_type 断言失败，符合预期。现在可以给出修复建议了。') +
+      liveFooter('0:24','274','Processing…')
+  },
+  {
+    event:'token (×N)',desc:'Final prose streams in',
+    html: userMsg('请帮我找出这个模块的所有 bug') +
+      liveHeader() +
+      wl1(toolDone('search_docs', 'query="API spec"', 't1', '2s')) +
+      `<span class="interim-collapse-toggle" data-threshold="3">Show 1 earlier update</span>` +
+      `<div class="assistant-segment" data-live-assistant="1" data-interim="1" style="display:none">
+        <div class="msg-body"><p>找到了 API 规格文档。返回类型和现有代码不一致，让我进一步对比具体差异。</p></div>
+      </div>` +
+      wl2(toolDone('read_file', 'path="src/api/users.js"', 't2', '1s')) +
+      interimNote('代码在第 47 行使用了 string 返回，但规格要求 number。还需要确认测试是否也有问题。') +
+      wl3(toolDone('run_tests', 'path="tests/api"', 't3', '3s')) +
+      interimNote('测试也有错误：test_user_id_type 断言失败，符合预期。现在可以给出修复建议了。') +
+      proseSegment('发现了 2 个 bug：\n\n1. src/api/users.js:47 返回类型应为 number 而非 string\n2. 对应测试 test_user_id_type 断言条件有误\n\n修复方式：将 return String(userId) 改为 return Number(userId)，并更新断言为 toBeNumber()。', true) +
+      liveFooter('0:26','612','Streaming…')
+  },
+  {
+    event:'done → settled',desc:'Stream ends; live turn replaced by settled messages',
+    html: userMsg('请帮我找出这个模块的所有 bug') +
+      liveHeader() +
+      wl1(toolDone('search_docs', 'query="API spec"', 't1', '2s')) +
+      `<span class="interim-collapse-toggle" data-threshold="3">Show 1 earlier update</span>` +
+      `<div class="assistant-segment" data-live-assistant="1" data-interim="1" style="display:none">
+        <div class="msg-body"><p>找到了 API 规格文档。返回类型和现有代码不一致，让我进一步对比具体差异。</p></div>
+      </div>` +
+      wl2(toolDone('read_file', 'path="src/api/users.js"', 't2', '1s')) +
+      interimNote('代码在第 47 行使用了 string 返回，但规格要求 number。还需要确认测试是否也有问题。') +
+      wl3(toolDone('run_tests', 'path="tests/api"', 't3', '3s')) +
+      interimNote('测试也有错误：test_user_id_type 断言失败，符合预期。现在可以给出修复建议了。') +
+      proseSegment('发现了 2 个 bug：\n\n1. src/api/users.js:47 返回类型应为 number 而非 string\n2. 对应测试 test_user_id_type 断言条件有误\n\n修复方式：将 return String(userId) 改为 return Number(userId)，并更新断言为 toBeNumber()。') +
+      settledNote()
+  },
+];
+
+/* ══ Player engine ══ */
+let speed = 1000;
+document.querySelectorAll('.spd').forEach(b=>{
+  b.onclick=()=>{
+    speed=parseInt(b.dataset.s);
+    document.querySelectorAll('.spd').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on');
+  };
+});
+
+function makePlayer(id, steps){
+  const convo = document.getElementById(id+'-convo');
+  const badge = document.getElementById(id+'-badge');
+  const stepEl = document.getElementById(id+'-step');
+  const logEl  = document.getElementById(id+'-log');
+  const playBtn= document.getElementById(id+'-play');
+  const prevBtn= document.getElementById(id+'-prev');
+  const nextBtn= document.getElementById(id+'-next');
+
+  let cur = 0;
+  let timer = null;
+
+  function render(){
+    const s = steps[cur];
+    convo.innerHTML = s.html;
+    badge.textContent = s.event;
+    stepEl.textContent = `Step ${cur+1} / ${steps.length}`;
+    prevBtn.disabled = cur === 0;
+    nextBtn.disabled = cur === steps.length-1;
+    // Update log
+    logEl.innerHTML = steps.map((st,i)=>{
+      const cls = i < cur ? 'past' : i === cur ? 'now' : 'future';
+      return `<div class="ev ${cls}">
+        <span class="ev-name">${esc(st.event)}</span>
+        <span class="ev-desc">${esc(st.desc)}</span>
+      </div>`;
+    }).join('');
+    // Scroll active into view
+    const nowEl = logEl.querySelector('.now');
+    if(nowEl) nowEl.scrollIntoView({block:'nearest'});
+    // Auto-stop at end
+    if(cur === steps.length-1 && timer){
+      clearInterval(timer);
+      timer=null;
+      playBtn.textContent='▶ Play';
+    }
+  }
+
+  function play(){
+    if(cur>=steps.length-1){ cur=0; render(); }
+    timer = setInterval(()=>{
+      if(cur<steps.length-1){ cur++; render(); }
+      else { clearInterval(timer); timer=null; playBtn.textContent='▶ Play'; }
+    }, speed);
+    playBtn.textContent='⏸ Pause';
+  }
+  function pause(){ clearInterval(timer); timer=null; playBtn.textContent='▶ Play'; }
+
+  playBtn.onclick=()=>{ timer ? pause() : play(); };
+  prevBtn.onclick=()=>{ pause(); if(cur>0){cur--;render();} };
+  nextBtn.onclick=()=>{ pause(); if(cur<steps.length-1){cur++;render();} };
+
+  render();
+}
+
+makePlayer('a', stepsA);
+makePlayer('b', stepsB);
+makePlayer('c', stepsC);
+makePlayer('d', stepsD);
+
+/* ══ Tab switching ══ */
+document.querySelectorAll('.tab').forEach(t=>{
+  t.onclick=()=>{
+    document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
+    document.querySelectorAll('.scenario').forEach(x=>x.classList.remove('on'));
+    t.classList.add('on');
+    document.getElementById('sc-'+t.dataset.t).classList.add('on');
+  };
+});
+
+/* Collapse toggle interactivity */
+document.addEventListener('click', e=>{
+  const toggle = e.target.closest('.interim-collapse-toggle');
+  if(!toggle) return;
+  const blocks = toggle.parentElement;
+  const hidden = blocks.querySelectorAll('.interim-collapsed');
+  const threshold = parseInt(toggle.dataset.threshold||3);
+  if(hidden.length){
+    hidden.forEach(el=>el.classList.remove('interim-collapsed'));
+    toggle.dataset.expanded='1'; toggle.textContent='Collapse';
+  } else {
+    const all = Array.from(blocks.querySelectorAll('[data-interim="1"]'));
+    const toHide = all.slice(0, all.length-threshold);
+    toHide.forEach(el=>el.classList.add('interim-collapsed'));
+    toggle.dataset.expanded='';
+    toggle.textContent='Show '+toHide.length+' earlier update'+(toHide.length===1?'':'s');
+  }
+});
+</script>
+</body>
+</html>
