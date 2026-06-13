@@ -49,9 +49,13 @@ const _anchorRegistry = (
   run_id: null,   // filled in by _syncAnchorIdentity on first event with run_id
 }) : null;
 
-// Store registry in module-level Map so renderMessages() can find it at settlement.
-// Key: streamId (stamped onto the settled assistant message in the done handler).
-if (_anchorRegistry) _liveAnchorRegistries.set(streamId, _anchorRegistry);
+// Store registry in a window-level Map so renderMessages() (ui.js) can find it at
+// settlement. These files are NOT ES modules — the established pattern is a
+// window-attached global (cf. window._carryForwardEphemeralTurnFields,
+// window.HermesAssistantTurnAnchors). A bare module-level const in messages.js
+// would not be reachable from ui.js.
+window._liveAnchorRegistries = window._liveAnchorRegistries || new Map();
+if (_anchorRegistry) window._liveAnchorRegistries.set(streamId, _anchorRegistry);
 
 // _applyToAnchor: accepts the SSE event object e to carry e.lastEventId (replay
 // cursor) as event_id into the anchor. rawEventData is d = JSON.parse(e.data).
@@ -66,7 +70,11 @@ function _applyToAnchor(sourceEventType, rawEventData, sseEvent) {
       {
         ...rawEventData,                                // spread first
         source_event_type: sourceEventType,            // override — must come after spread
-        event_id: (sseEvent && sseEvent.lastEventId) || null,  // SSE transport cursor
+        // SSE transport cursor (run_id:seq). Fall back to any event_id already on
+        // the raw payload — do NOT clobber an existing id with null when
+        // lastEventId is absent.
+        event_id: (sseEvent && sseEvent.lastEventId)
+          || rawEventData.event_id || rawEventData.lastEventId || null,
         activitySegmentSeq: _assistantSegmentSeq,      // inject closure var
         activityBurstId: _currentActivityBurstId,      // inject closure var
       },
@@ -129,23 +137,32 @@ existing `_finishDone` closure**, not at the top of the `done` handler:
   message into a local `lastAsst` variable. **Reuse that `lastAsst`** — do not do a
   second `find` on `d.session.messages`.
 
+The `done` handler is `source.addEventListener('done', e => {...})`. Capture `e`
+so it survives into `_finishDone` (which may run later, on the fade path):
+
 ```js
-// INSIDE _finishDone, after the existing line:
-//   const lastAsst = [...S.messages].reverse().find(m => m.role === 'assistant');
+source.addEventListener('done', e => {
+  // ...
+  const _doneEvent = e;   // closure-captured; valid even if _finishDone is deferred
+  const _finishDone = () => {
+    // ... existing body, including:
+    //   const lastAsst = [...S.messages].reverse().find(m => m.role === 'assistant');
 
-const d = _doneData;   // already in scope inside _finishDone
-_applyToAnchor('done', {
-  status: d.status || 'completed',
-  usage:  d.usage  || null,
-  created_at: d.created_at || null,
-  // do NOT spread d — d.session contains the full messages array
-}, /* no SSE event object here; pass null or the done event if available */ null);
+    const d = _doneData;   // already in scope inside _finishDone
+    _applyToAnchor('done', {
+      status: d.status || 'completed',
+      usage:  d.usage  || null,
+      created_at: d.created_at || null,
+      // do NOT spread d — d.session contains the full messages array
+    }, _doneEvent);   // pass the done event so the terminal row gets event_id/run_id/seq
 
-// Stamp the registry lookup key onto the settled assistant message that
-// renderMessages() will read. lastAsst is already the correct S.messages object
-// reference (carry-forward mutates and returns d.session.messages in place, so
-// S.messages entries share identity with d.session.messages entries).
-if (_anchorRegistry && lastAsst) lastAsst._anchor_stream_id = streamId;
+    // Stamp the registry lookup key onto the settled assistant message that
+    // renderMessages() will read. lastAsst is already the correct S.messages object
+    // reference (carry-forward mutates and returns d.session.messages in place, so
+    // S.messages entries share identity with d.session.messages entries).
+    if (_anchorRegistry && lastAsst) lastAsst._anchor_stream_id = streamId;
+  };
+});
 ```
 
 Note: `_carryForwardEphemeralTurnFields` only preserves fields listed in
@@ -336,8 +353,8 @@ registry available for the same `run_id` or `stream_id`:
 
 **Registry retention and lookup across settlement:**
 
-The `_anchorRegistry` is stored in a module-level Map (done in Slice 6):
-`_liveAnchorRegistries.set(streamId, _anchorRegistry)`.
+The `_anchorRegistry` is stored in a window-level Map (done in Slice 6):
+`window._liveAnchorRegistries.set(streamId, _anchorRegistry)`.
 
 The problem is that settled assistant messages in `S.messages` do not carry
 `_stream_id` natively. The lookup key must be stamped onto the settled message
@@ -350,8 +367,8 @@ if (lastAssistant) lastAssistant._anchor_stream_id = streamId;
 In `renderMessages()` / worklog build path, the lookup becomes:
 
 ```js
-const reg = _liveAnchorRegistries &&
-  _liveAnchorRegistries.get(message._anchor_stream_id);
+const reg = window._liveAnchorRegistries &&
+  window._liveAnchorRegistries.get(message._anchor_stream_id);
 ```
 
 Without this stamp, `renderMessages()` cannot find the registry and will always
@@ -359,7 +376,7 @@ fall back to the S.messages-derived Worklog build. The stamp is ephemeral
 (in-memory only, lost on page reload) — that is intentional. On a fresh page
 load there is no live registry; the S.messages fallback is the correct behavior.
 
-Entries in `_liveAnchorRegistries` are removed when the session is unloaded
+Entries in `window._liveAnchorRegistries` are removed when the session is unloaded
 or after a retention window (e.g. 10 minutes after settlement).
 
 ### What this does NOT do
