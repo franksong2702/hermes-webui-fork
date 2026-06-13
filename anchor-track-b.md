@@ -83,7 +83,7 @@ overwrite earlier ones.
 
 **In each SSE event handler**, add `_applyToAnchor` before the existing logic,
 passing `e` (the SSE event object) as the third argument so `e.lastEventId` is
-captured. Covered events: `reasoning`, `token`, `tool`, `tool_complete`,
+captured. Covered events: `reasoning`, `tool`, `tool_complete`,
 `interim_assistant`, `cancel`, `error`, `compressing`, `compressed`,
 `approval`, `clarify`, `pending_steer_leftover`, `goal_continue`.
 
@@ -95,32 +95,63 @@ source.addEventListener('reasoning', e => {
 });
 ```
 
-**`done` event is special — do not spread `d` directly.** `d.session.messages`
-is the full session transcript. Spreading it would store megabytes of message data
-inside `anchor.activity_events`. Pass only the terminal fields:
+**Do NOT feed `token` per-event.** The `token` handler fires once per token
+(`assistantText += d.text`, verified in `messages.js`). Feeding each token would
+create one frozen `activity_event` per token — thousands per long response, each
+with a unique `event_id` (unique seq) and therefore a unique dedupe key, so none
+are collapsed. This is unbounded growth with no consumer:
+
+- The Slice 7 compact-worklog reconciler filters out `display_hint === 'main_prose'`
+  rows (which is what `process_prose` maps to), so token-derived rows are never
+  rendered in the worklog.
+- The final answer comes from `projectAssistantTurnAnchorSettledMessageFinalAnswer`
+  (settled message), not from accumulated token events.
+
+`interim_assistant` (the prose between worklog cycles) IS fed — it fires only at
+cycle boundaries, so volume is bounded. If a future slice needs the live prose
+stream as anchor activity (e.g. transparent-stream mode), feed **coalesced segment
+text on segment boundaries**, never raw per-token events.
+
+**`done` event is special — two distinct concerns, both go INSIDE `_finishDone`.**
+
+`d.session.messages` is the full session transcript. Spreading it would store the
+whole transcript inside `anchor.activity_events`. Pass only the terminal fields.
+
+Critically, the terminal feed and the registry stamp must both run **inside the
+existing `_finishDone` closure**, not at the top of the `done` handler:
+
+- `_finishDone` may be **deferred** — on the stream-fade path the handler calls
+  `_drainStreamFadeBeforeDone(_finishDone)` and returns, so `_finishDone` runs
+  asynchronously after the fade. Code at the top of the handler runs before
+  `S.messages` is settled.
+- `_finishDone` already assigns `S.messages` (via `_carryForwardEphemeralTurnFields`,
+  then `_filterRecoveryControlMessages`) and already computes the last assistant
+  message into a local `lastAsst` variable. **Reuse that `lastAsst`** — do not do a
+  second `find` on `d.session.messages`.
 
 ```js
-source.addEventListener('done', e => {
-  const d = JSON.parse(e.data);
-  _applyToAnchor('done', {
-    status: d.status || 'completed',
-    usage:  d.usage  || null,
-    created_at: d.created_at || null,
-    // do NOT spread d — d.session contains full messages array
-  }, e);
+// INSIDE _finishDone, after the existing line:
+//   const lastAsst = [...S.messages].reverse().find(m => m.role === 'assistant');
 
-  // Stamp the last assistant message so renderMessages() can find this registry.
-  // S.messages is updated from d.session.messages before renderMessages() runs.
-  if (_anchorRegistry) {
-    const lastAssistant = Array.isArray(d.session && d.session.messages)
-      ? d.session.messages.slice().reverse().find(m => m.role === 'assistant')
-      : null;
-    if (lastAssistant) lastAssistant._anchor_stream_id = streamId;
-  }
+const d = _doneData;   // already in scope inside _finishDone
+_applyToAnchor('done', {
+  status: d.status || 'completed',
+  usage:  d.usage  || null,
+  created_at: d.created_at || null,
+  // do NOT spread d — d.session contains the full messages array
+}, /* no SSE event object here; pass null or the done event if available */ null);
 
-  // ... existing done handler unchanged below ...
-});
+// Stamp the registry lookup key onto the settled assistant message that
+// renderMessages() will read. lastAsst is already the correct S.messages object
+// reference (carry-forward mutates and returns d.session.messages in place, so
+// S.messages entries share identity with d.session.messages entries).
+if (_anchorRegistry && lastAsst) lastAsst._anchor_stream_id = streamId;
 ```
+
+Note: `_carryForwardEphemeralTurnFields` only preserves fields listed in
+`_EPHEMERAL_TURN_FIELDS` across turns. `_anchor_stream_id` does not need to be in
+that list — it is stamped fresh on each settlement and only needs to survive until
+the immediately following `renderMessages()` call.
 
 ### Key constraints
 
@@ -131,22 +162,26 @@ must be injected at the `_applyToAnchor` call site. Without this,
 collapsing all worklog cycles into a flat group and breaking multi-cycle scenarios.
 
 **run_id:** There is no stable `S.activeRunId` field in the current codebase.
-Do not reference it. The registry is created with `run_id: null`; the anchor's
-`_syncAnchorIdentity()` will backfill `run_id` from the first event that carries
-it (e.g. a `tool` event whose payload includes `run_id`). Alternatively, if the
-stream-start API response returns a `run_id`, it can be stored in the closure and
-passed at registry creation time.
+Do not reference it. The registry is created with `run_id: null`. It gets
+backfilled automatically — see the next note: `e.lastEventId` has the form
+`run_id:seq`, and the normalizer's `_eventIdRunId()` extracts run_id from it, which
+`_syncAnchorIdentity()` then writes onto the anchor identity. So as long as `e` is
+passed, run_id resolves itself on the first event.
 
 **`e.lastEventId`:** This field lives on the SSE `MessageEvent` object `e`, not
-in the parsed JSON `d`. It is the run-journal replay cursor already used by
-`_lastRunJournalSeq`. Always pass `e` as the third argument to `_applyToAnchor`
-so the anchor captures it as `event_id`. Without it, the dedupe key degrades to
-the weakest `local:` form and Slice 10's replay deduplication becomes unreliable.
+in the parsed JSON `d`. It is the run-journal cursor already consumed by
+`_rememberRunJournalCursor` / `_lastRunJournalSeq`, and it IS populated on live
+events (not just on reconnect) — verified: every run-journal event type, including
+`token`, registers `_rememberRunJournalCursor`. Its format is `run_id:seq`, so
+passing it as `event_id` backfills BOTH run_id and seq into the anchor for free
+(`_eventIdRunId` / `_eventIdSeq`). Always pass `e` as the third argument to
+`_applyToAnchor`. Without it, the dedupe key degrades to the weakest `local:` form
+and Slice 10's replay deduplication becomes unreliable.
 
 ### Diagnostic snapshot (for validation, remove before Slice 7 PR)
 
 ```js
-// In done handler, after _applyToAnchor('done', d):
+// Inside _finishDone, after the terminal feed + stamp:
 if (_anchorRegistry && window.HermesAssistantTurnAnchors) {
   const scene = window.HermesAssistantTurnAnchors
     .projectAssistantTurnAnchorActivityScene(_anchorRegistry.anchor, { mode: 'compact_worklog' });
@@ -166,6 +201,9 @@ console output:
 - Each worklog cycle has a distinct `group_key` (`segment:1`, `segment:2`, etc.)
 - Tool events show `kind=tool_started` / `kind=tool_completed`
 - `interim_assistant` shows `kind=process_prose`
+- No `token`-derived rows (tokens are not fed) — `activity_events` count stays
+  proportional to tool calls + reasoning + interim notes, NOT to response length
+- `run_id` on the anchor identity is populated (backfilled from `event_id`)
 - `_anchorRegistry.stats.skipped_duplicate` is `0` on a clean run, `> 0` on reconnect
 - No errors thrown in the `_applyToAnchor` try/catch
 
@@ -257,14 +295,27 @@ No DOM teardown reduction yet.
 ### Context: how `done` actually works
 
 The `done` SSE event carries the updated session state directly in its payload
-(`d.session.messages`). Messages.js does `S.messages = d.session.messages || S.messages`
-synchronously, then calls `renderMessages()`. This is not an async GET — the
-settled messages are in the payload.
+(`d.session.messages`). Inside `_finishDone`, messages.js assigns
+`S.messages = _carryForwardEphemeralTurnFields(S.messages || [], d.session.messages || [])`
+then `S.messages = _filterRecoveryControlMessages(S.messages || [])`, then later
+calls `renderMessages()`. This is not an async GET — the settled messages are in
+the payload. `_carryForwardEphemeralTurnFields` mutates and returns the next array
+in place, so `S.messages` entries share object identity with `d.session.messages`
+entries (this is why stamping `lastAsst._anchor_stream_id` in Slice 6 works).
 
 The current problem: `renderMessages()` rebuilds the settled Worklog from the
 `tool_use` / `tool_result` content blocks in `S.messages`, which loses the
 live-stream grouping (which cycle each tool belonged to) and any UI state
 (expanded/collapsed, elapsed durations).
+
+**There is more than one settlement path.** Besides `done` → `_finishDone`, the
+`stream_end` event settles via `_restoreSettledSession()` (network re-fetch), and
+the #3018 paths also reassign `S.messages`. This slice scopes the anchor-driven
+worklog rebuild to turns that have a registry stamped via the `done` path. Turns
+settled through `_restoreSettledSession` (e.g. a tab that was backgrounded during
+the stream) will not have the stamp and fall back to the S.messages-derived
+worklog — acceptable, no regression. If those paths later need anchor continuity,
+stamp them the same way, reusing whatever last-assistant variable they compute.
 
 ### What to change
 
