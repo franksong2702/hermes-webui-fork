@@ -2,408 +2,192 @@
 <html lang="en" class="dark">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Hermes — Live Stream Demo</title>
 <style>
-/* ── Real hermes-webui dark palette ── */
+/* ══ Hermes dark palette (exact from style.css) ══ */
 :root {
   --bg:#18140F;
+  --sidebar:#1A1610;
+  --border:rgba(255,255,255,.09);
+  --border2:rgba(255,255,255,.15);
+  --text:#EDE8DF;
+  --muted:#8C8072;
+  --accent:#D4A017;
+  --blue:#4DA6C8;
+  --code-bg:#141008;
   --surface:#1E1A13;
   --surface-subtle:rgba(255,255,255,.03);
   --surface-subtle-hover:rgba(255,255,255,.06);
-  --border:rgba(255,255,255,.09);
-  --border-subtle:rgba(255,255,255,.06);
-  --border-muted:rgba(255,255,255,.13);
-  --text:#EDE8DF;
-  --muted:#8C8072;
+  --hover-bg:rgba(255,255,255,.05);
   --strong:#F5F0E8;
-  --accent:#D4A017;
+  --code-text:#C8A45A;
+  --code-inline-bg:rgba(255,255,255,.07);
+  --accent-hover:#B88A0F;
   --accent-bg:rgba(212,160,23,.1);
   --accent-bg-strong:rgba(212,160,23,.18);
   --accent-text:#D4A017;
-  --accent-hover:#B88A0F;
-  --success:#4ade80;
   --error:#f87171;
+  --success:#4ade80;
   --warning:#fb923c;
   --info:#60a5fa;
-  --blue:#60a5fa;
-  --code-bg:#141008;
-  --code-text:#e2c27d;
-  --user-bubble-bg:rgba(212,160,23,.12);
-  --user-bubble-border:rgba(212,160,23,.22);
-  --user-bubble-text:#D4A017;
-  --hover-bg:rgba(255,255,255,.05);
-  --focus-ring:rgba(212,160,23,.35);
+  --border-subtle:rgba(255,255,255,.06);
+  --border-muted:rgba(255,255,255,.13);
   --font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
   --font-mono:'SF Mono',ui-monospace,'Cascadia Code',monospace;
   --radius-sm:4px;--radius-md:8px;--radius-card:8px;--radius-lg:12px;
   --space-1:4px;--space-2:8px;--space-3:12px;--space-4:16px;
   --font-size-xs:11px;--font-size-sm:12px;--font-size-md:14px;
-  --msg-rail:30px;
-  --msg-max:680px;
+  /* 3401 layout variables */
+  --msg-rail:0px;
+  --msg-max:780px;
+  --user-bubble-bg:var(--accent-bg-strong);
+  --user-bubble-border:var(--accent-bg-strong);
+  --user-bubble-text:var(--text);
+  --message-body-font-size:14px;
+  --message-body-line-height:1.75;
+  --message-code-font-size:12.5px;
+  --worklog-rail:var(--msg-rail);
 }
-
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
-body {
-  background:var(--bg);
-  color:var(--text);
-  font-family:var(--font-ui);
-  font-size:14px;
-  line-height:1.6;
-  min-height:100vh;
-  display:flex;
-  flex-direction:column;
-  align-items:center;
-  padding:0;
-}
+body{background:var(--bg);color:var(--text);font-family:var(--font-ui);font-size:14px;line-height:1.6;min-height:100vh;display:flex;flex-direction:column;align-items:center;}
 
-/* ── Top bar ── */
-.topbar {
-  width:100%;
-  background:rgba(24,20,15,.95);
-  border-bottom:1px solid var(--border);
-  padding:10px 20px;
-  display:flex;
-  align-items:center;
-  gap:12px;
-  position:sticky;
-  top:0;
-  z-index:50;
-  backdrop-filter:blur(8px);
-}
-.topbar-title { font-size:13px; font-weight:600; color:var(--text); opacity:.8; }
-.topbar-badge {
-  font-size:10px; padding:2px 8px; border-radius:99px;
-  background:var(--accent-bg); border:1px solid var(--accent-bg-strong);
-  color:var(--accent-text); font-weight:600;
-}
-.topbar-spacer { flex:1; }
-.ctrl-btn {
-  padding:6px 14px; border-radius:8px; border:1px solid var(--border);
-  background:var(--surface); color:var(--text); font-size:12px;
-  cursor:pointer; transition:background .15s, opacity .15s;
-  font-family:var(--font-ui);
-}
-.ctrl-btn:hover { background:var(--hover-bg); }
-.ctrl-btn.primary { background:var(--accent); border-color:transparent; color:#1a1000; font-weight:600; }
-.ctrl-btn.primary:hover { opacity:.88; }
-.ctrl-btn:disabled { opacity:.35; cursor:not-allowed; }
-.speed-wrap { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--muted); }
-.speed-wrap input[type=range] { width:70px; accent-color:var(--accent); }
+/* ── Top control bar ── */
+.topbar{width:100%;background:rgba(24,20,15,.96);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:50;backdrop-filter:blur(8px);}
+.topbar-title{font-size:13px;font-weight:600;color:var(--text);opacity:.75;}
+.topbar-badge{font-size:10px;padding:2px 8px;border-radius:99px;background:var(--accent-bg);border:1px solid var(--accent-bg-strong);color:var(--accent-text);font-weight:600;}
+.topbar-spacer{flex:1;}
+.speed-wrap{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);}
+.speed-wrap input{width:65px;accent-color:var(--accent);}
+.ctrl-btn{padding:5px 13px;border-radius:7px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px;cursor:pointer;font-family:var(--font-ui);transition:background .15s;}
+.ctrl-btn:hover{background:var(--hover-bg);}
+.ctrl-btn.primary{background:var(--accent);border-color:transparent;color:#1a1000;font-weight:600;}
+.ctrl-btn.primary:hover{opacity:.88;}
+.ctrl-btn:disabled{opacity:.35;cursor:not-allowed;}
 
-/* ── Chat layout ── */
-.chat-outer {
-  width:100%; max-width:800px;
-  flex:1;
-  display:flex;
-  flex-direction:column;
-  padding:24px 20px 120px;
-  gap:0;
-}
+/* ── Chat outer ── */
+.chat-outer{width:100%;max-width:860px;flex:1;display:flex;flex-direction:column;padding:20px 40px 140px;}
+.msg-list{display:flex;flex-direction:column;gap:0;}
 
-/* ── Message rows ── */
-.msg-row { padding:12px 0; width:100%; display:flex; flex-direction:column; }
-.msg-row[data-role="user"] { align-self:flex-end; max-width:62%; }
+/* ══ Exact hermes-webui message styles (from style.css ~4294) ══ */
+.msg-row{padding:12px 0;width:100%;display:flex;flex-direction:column;}
+.msg-body{padding-left:var(--msg-rail);padding-top:8px;max-width:var(--msg-max);font-size:var(--message-body-font-size);line-height:var(--message-body-line-height);color:var(--text);overflow-wrap:anywhere;}
+.msg-body:empty{display:none;}
+.msg-body p{margin-bottom:10px;}
+.msg-body p:last-child{margin-bottom:0;}
+.msg-body ul{margin:6px 0 10px 18px;}
+.msg-body li{margin-bottom:3px;}
+.msg-body strong{color:var(--strong);font-weight:600;}
+.msg-body code{font-family:var(--font-mono);font-size:var(--message-code-font-size);background:var(--code-inline-bg);color:var(--strong);padding:1px 5px;border-radius:4px;}
+.assistant-turn{width:100%;}
+.assistant-turn-blocks{display:flex;flex-direction:column;}
 
-/* User bubble */
-.msg-row[data-role="user"] .msg-body {
-  background:var(--user-bubble-bg);
-  border:1px solid var(--user-bubble-border);
-  border-radius:14px;
-  padding:10px 14px;
-  color:var(--user-bubble-text);
-  font-size:14px;
-  line-height:1.6;
-  margin-left:0;
-  padding-left:14px;
-}
+/* User: right-aligned bubble */
+.msg-row[data-role="user"]{align-self:flex-end;max-width:62%;}
+.msg-row[data-role="user"] .msg-body{background:var(--user-bubble-bg);border:1px solid var(--user-bubble-border);border-radius:14px;padding:10px 14px;margin-left:0;padding-left:14px;max-width:none;color:var(--user-bubble-text);}
 
 /* Role header */
-.msg-role {
-  display:flex; align-items:center; gap:7px;
-  font-size:11px; font-weight:500; margin-bottom:6px;
-  opacity:.7; color:var(--muted);
-}
-.role-icon {
-  width:20px; height:20px;
-  border-radius:50%;
-  background:var(--accent-bg);
-  border:1px solid var(--accent-bg-strong);
-  display:flex; align-items:center; justify-content:center;
-  font-size:10px; color:var(--accent-text); flex-shrink:0;
-}
+.msg-role{display:flex;align-items:center;gap:7px;font-size:11px;font-weight:500;margin-bottom:6px;opacity:.8;letter-spacing:0;color:var(--muted);}
+.msg-role:hover{opacity:1;}
+.role-icon{width:20px;height:20px;font-size:9px;border-radius:50%;background:var(--accent-bg);border:1px solid var(--accent-bg-strong);display:inline-flex;align-items:center;justify-content:center;color:var(--accent-text);font-weight:700;flex-shrink:0;}
+.msg-tps-inline{display:inline-flex;align-items:center;margin-left:2px;padding:1px 6px;border:1px solid var(--border);border-radius:999px;color:var(--muted);background:var(--surface);font-size:10.5px;font-weight:500;font-variant-numeric:tabular-nums;line-height:1.4;}
 
-/* Assistant body */
-.msg-body {
-  padding-left:var(--msg-rail);
-  padding-top:6px;
-  max-width:var(--msg-max);
-  font-size:14px;
-  line-height:1.75;
-  color:var(--text);
-}
-.msg-body p { margin-bottom:10px; }
-.msg-body p:last-child { margin-bottom:0; }
-.msg-body ul { margin:6px 0 10px 20px; }
-.msg-body li { margin-bottom:3px; }
-.msg-body strong { color:var(--strong); font-weight:600; }
-.msg-body code {
-  font-family:var(--font-mono);
-  font-size:12.5px;
-  background:var(--code-bg);
-  color:var(--code-text);
-  padding:1px 5px;
-  border-radius:4px;
-}
-.assistant-turn { width:100%; }
-.assistant-turn-blocks { display:flex; flex-direction:column; }
+/* ══ Live worklog (from style.css ~2825) ══ */
+.live-worklog{margin:4px 0 14px;max-width:var(--msg-max);}
+.tool-worklog-list{--worklog-rail:var(--msg-rail);margin:3px 0 0 0;padding-left:0;border-left:0;background:transparent;display:flex;flex-direction:column;gap:1px;}
+.live-worklog .tool-worklog-list{--worklog-rail:var(--msg-rail);}
 
-/* ── Thinking card ── */
-.thinking-card {
-  margin-left:var(--msg-rail);
-  max-width:var(--msg-max);
-  background:var(--accent-bg);
-  border:1px solid var(--accent-bg-strong);
-  border-radius:var(--radius-md);
-  overflow:hidden;
-  margin-bottom:4px;
-}
-.thinking-card-header {
-  display:flex; align-items:center; gap:8px;
-  padding:5px 10px;
-  cursor:pointer;
-  color:var(--accent-text);
-  font-size:12px; font-weight:600;
-  opacity:.85;
-  user-select:none;
-}
-.thinking-card-header:hover { opacity:1; }
-.thinking-card-icon { opacity:.7; font-size:11px; }
-.thinking-card-label { flex:1; }
-.thinking-card-chevron {
-  font-size:10px; opacity:.5;
-  transition:transform .18s ease;
-  display:inline-flex; align-items:center;
-}
-.thinking-card.open .thinking-card-chevron { transform:rotate(90deg); }
-.thinking-card-body {
-  max-height:0; opacity:0; overflow:hidden;
-  transition:max-height .26s ease, opacity .2s ease, padding .22s ease;
-  border-top:1px solid transparent;
-  font-family:var(--font-mono);
-  font-size:11px; line-height:1.6;
-  color:var(--muted);
-  padding:0 12px;
-  white-space:pre-wrap;
-  word-break:break-word;
-}
-.thinking-card.open .thinking-card-body {
-  max-height:180px;
-  opacity:1;
-  padding:8px 12px;
-  border-top-color:var(--accent-bg-strong);
-  overflow-y:auto;
-}
-.thinking-card-dots { display:flex; gap:3px; align-items:center; }
-.thinking-card-dot {
-  width:4px; height:4px; border-radius:50%;
-  background:var(--accent-text);
-  animation:think-pulse 1.4s ease-in-out infinite;
-}
-.thinking-card-dot:nth-child(2){animation-delay:.2s;}
-.thinking-card-dot:nth-child(3){animation-delay:.4s;}
-@keyframes think-pulse{0%,80%,100%{opacity:.3;transform:scale(.7);}40%{opacity:1;transform:scale(1);}}
+/* thinking card inside worklog — flattened style */
+.tool-worklog-list>.agent-activity-thinking{margin:0;}
+.tool-worklog-list>.agent-activity-thinking .thinking-card{margin:0;max-width:none;border:0;border-radius:0;background:transparent;}
+.tool-worklog-list>.agent-activity-thinking .thinking-card-header{display:flex;align-items:center;gap:7px;padding:3px 8px;margin-left:-8px;border-radius:7px;color:var(--muted);font-size:var(--message-body-font-size);font-weight:400;line-height:var(--message-body-line-height);opacity:.56;cursor:pointer;user-select:none;}
+.tool-worklog-list>.agent-activity-thinking .thinking-card-header:hover{background:var(--hover-bg);color:var(--text);opacity:1;}
+.tool-worklog-list>.agent-activity-thinking .thinking-card-label{font-weight:400;letter-spacing:0;}
+.tool-worklog-list>.agent-activity-thinking .thinking-card-icon,.tool-worklog-list>.agent-activity-thinking .thinking-card-toggle{color:var(--muted);opacity:.4;}
+.tool-worklog-list>.agent-activity-thinking .thinking-card-body{max-height:0;opacity:0;overflow:hidden;padding:0;border-top:1px solid transparent;transition:max-height .22s ease,opacity .18s ease,padding .22s ease;}
+.tool-worklog-list>.agent-activity-thinking .thinking-card.open .thinking-card-body{max-height:200px;overflow-y:auto;opacity:1;margin-top:4px;padding:6px 8px 7px 8px;border-top-color:transparent;border-radius:8px;background:var(--code-bg);}
+.tool-worklog-list>.agent-activity-thinking .thinking-card-body pre{font-family:var(--font-mono);font-size:var(--message-body-font-size);line-height:var(--message-body-line-height);color:var(--muted);white-space:pre-wrap;word-break:break-word;margin:0;}
+.thinking-card-btn-row{display:inline-flex;align-items:center;gap:4px;margin-left:auto;}
+.thinking-card-toggle{display:inline-flex;align-items:center;font-size:10px;transition:transform .16s ease;}
+.thinking-card.open .thinking-card-toggle{transform:rotate(90deg);}
 
-/* ── Tool call worklog group ── */
-.tool-call-group {
-  margin:4px 0 4px var(--msg-rail);
-  max-width:var(--msg-max);
-  border-left:1px solid var(--border-subtle);
-}
-.tool-call-group-summary {
-  width:100%; display:flex; align-items:center; gap:6px;
-  padding:3px 10px; border:0; background:transparent;
-  color:var(--muted); cursor:pointer; text-align:left;
-  font:inherit; font-size:11px; line-height:1.4;
-  border-radius:var(--radius-card);
-}
-.tool-call-group-summary:hover { background:var(--surface-subtle-hover); color:var(--text); }
-.as-dot { width:5px; height:5px; border-radius:50%; background:currentColor; flex-shrink:0; opacity:.6; }
-.as-text { font-weight:600; }
-.as-caret {
-  opacity:.4; font-size:10px; margin-left:auto;
-  display:inline-flex; align-items:center;
-  transition:transform .16s ease;
-}
-.tool-call-group:not(.collapsed) .as-caret { transform:rotate(90deg); }
-.tool-call-group-duration { opacity:.55; font-variant-numeric:tabular-nums; }
-.tool-call-group-body { display:block; padding-left:10px; }
-.tool-call-group.collapsed .tool-call-group-body { display:none; }
+/* ══ Tool cards inside worklog (from style.css ~2902) ══ */
+.tool-worklog-list .tool-card-row{margin:0;}
+.tool-worklog-list .tool-card{margin:0;border:0;border-left:0;border-radius:0;background:transparent;}
+.tool-worklog-list .tool-card:hover{border:0;background:transparent;}
+.tool-worklog-list .tool-card-header,.tl-head{display:flex;align-items:center;padding:3px 8px;margin-left:-8px;border-radius:7px;min-width:0;overflow:hidden;white-space:nowrap;gap:7px;cursor:pointer;user-select:none;}
+.tool-worklog-list .tool-card-header:hover{background:var(--hover-bg);}
+.tool-worklog-list .tool-card-name,.tl-verb{flex-shrink:0;color:var(--muted);font-family:inherit;font-size:var(--message-body-font-size);font-weight:400;line-height:var(--message-body-line-height);letter-spacing:0;opacity:.56;}
+.tool-worklog-list .tool-card-running .tool-card-name{color:var(--accent-text);font-weight:600;opacity:1;}
+.tool-worklog-list .tool-card-title,.tl-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-family:var(--font-mono);font-size:var(--message-body-font-size);font-weight:400;opacity:.42;}
+.tool-worklog-list .tool-card-header:hover .tool-card-title{opacity:.66;}
+.tool-card-icon{display:none;}
+.tool-card-preview{display:none;}
 
-/* live run status (spinner line at bottom of group) */
-.live-run-status {
-  display:flex; align-items:center; gap:6px;
-  padding:3px 10px;
-  font-size:11px; color:var(--muted); opacity:.7;
-}
-.live-run-status-dot {
-  width:5px; height:5px; border-radius:50%;
-  background:var(--accent);
-  animation:think-pulse 1s ease-in-out infinite;
-  flex-shrink:0;
-}
-.live-run-status-text { font-variant-numeric:tabular-nums; }
-.lf-sep { opacity:.4; }
-.lf-status { opacity:.6; }
+/* Running dot pulse (exact from style.css ~2770) */
+@keyframes wlpulse{0%,100%{box-shadow:0 0 0 0 var(--accent-bg-strong);}50%{box-shadow:0 0 0 5px rgba(212,160,23,0);}}
+.tool-card-running-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);opacity:1;flex-shrink:0;vertical-align:middle;animation:wlpulse 1.3s ease-in-out infinite;}
+.tl-rundot{width:6px;height:6px;border-radius:50%;background:var(--accent);flex-shrink:0;animation:wlpulse 1.3s ease-in-out infinite;}
 
-/* ── Tool card ── */
-.tool-card {
-  background:transparent; border:0;
-  border-radius:0; margin-top:0; margin-bottom:0;
-}
-.tool-card-row { display:flex; flex-direction:column; }
-.tool-card-header {
-  display:flex; align-items:center; gap:7px;
-  padding:3px 8px; margin-left:-8px;
-  border-radius:7px; cursor:pointer; user-select:none;
-  color:var(--muted); font-size:14px; line-height:1.75; min-width:0;
-}
-.tool-card-header:hover { background:var(--hover-bg); color:var(--text); }
-.tool-card-running .tool-card-header { cursor:default; }
-.tool-card-running-dot {
-  width:6px; height:6px; border-radius:50%;
-  background:var(--accent); flex-shrink:0;
-  animation:think-pulse 1s ease-in-out infinite;
-}
-.tool-card-name {
-  font-size:14px; font-weight:400; color:var(--muted);
-  font-family:inherit; flex-shrink:0; opacity:.56;
-}
-.tool-card-running .tool-card-name { color:var(--accent-text); font-weight:600; opacity:1; }
-.tool-card-title {
-  min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-  color:var(--muted); font-family:var(--font-mono); font-size:14px; opacity:.4;
-}
-.tool-card-live-duration {
-  font-size:11px; color:var(--muted); opacity:.52;
-  white-space:nowrap; font-variant-numeric:tabular-nums; flex-shrink:0;
-}
-.tool-done-check { margin-left:auto; font-size:11px; color:var(--success); opacity:.7; flex-shrink:0; }
+/* Live elapsed time badge (new feature from PR) */
+.tool-card-live-duration{font-size:var(--font-size-xs);color:var(--muted);opacity:.52;white-space:nowrap;font-variant-numeric:tabular-nums;flex-shrink:0;}
+.tool-card-live-duration.settled{color:var(--success);opacity:.65;}
 
-/* ── Interim progress note ── */
-.interim-note {
-  margin-left:var(--msg-rail);
-  max-width:var(--msg-max);
-  font-size:12px;
-  color:var(--muted);
-  opacity:.6;
-  padding:3px 0;
-  font-style:italic;
-  line-height:1.5;
-  border-left:2px solid var(--border-subtle);
-  padding-left:10px;
-  margin-bottom:4px;
-}
-.interim-note.collapsed { display:none; }
+/* Done checkmark */
+.tool-done-check{margin-left:auto;font-size:11px;color:var(--success);opacity:.6;flex-shrink:0;}
 
-/* ── Inter-tool hint (new feature) ── */
-.inter-tool-hint {
-  display:flex; align-items:center; gap:5px;
-  padding:5px var(--msg-rail);
-  opacity:0;
-  transition:opacity .25s ease;
-}
-.inter-tool-hint.visible { opacity:.4; }
-.inter-tool-dot {
-  width:4px; height:4px; border-radius:50%;
-  background:var(--muted);
-  animation:inter-tool-pulse 1.2s ease-in-out infinite;
-}
+/* ══ Live run status footer (from style.css ~3148) ══ */
+@keyframes lfspin{to{transform:rotate(360deg);}}
+.live-run-status{display:flex;align-items:center;gap:8px;padding-left:0;margin:2px 0 6px;margin-left:var(--msg-rail);max-width:var(--msg-max);font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums;line-height:1;}
+.live-run-status[hidden]{display:none;}
+.lf-spark{color:var(--accent);font-size:13px;display:inline-block;animation:lfspin 1.7s linear infinite;line-height:1;}
+.live-run-status-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.lf-time{color:var(--text);font-variant-numeric:tabular-nums;}
+.lf-sep{opacity:.4;}
+.lf-tokens{font-variant-numeric:tabular-nums;}
+.lf-status{color:var(--muted);opacity:.85;}
+
+/* ══ Interim note ══ */
+.interim-note{margin-left:var(--msg-rail);max-width:var(--msg-max);font-size:12px;color:var(--muted);opacity:.6;padding:3px 0 3px 10px;font-style:italic;line-height:1.5;border-left:2px solid var(--border-subtle);margin-bottom:4px;}
+
+/* ══ Inter-tool hint (new feature) ══ */
+.inter-tool-hint{display:flex;align-items:center;gap:5px;padding:5px 0;margin-left:var(--msg-rail);opacity:0;transition:opacity .25s ease;}
+.inter-tool-hint.visible{opacity:.4;}
+.inter-tool-dot{width:4px;height:4px;border-radius:50%;background:var(--muted);animation:itpulse 1.2s ease-in-out infinite;}
 .inter-tool-dot:nth-child(2){animation-delay:.2s;}
 .inter-tool-dot:nth-child(3){animation-delay:.4s;}
-@keyframes inter-tool-pulse{0%,80%,100%{opacity:.3;transform:scale(.8);}40%{opacity:1;transform:scale(1);}}
-@media(prefers-reduced-motion:reduce){
-  .inter-tool-dot,.thinking-card-dot,.tool-card-running-dot,.live-run-status-dot{animation:none;opacity:.6;}
-}
+@keyframes itpulse{0%,80%,100%{opacity:.3;transform:scale(.8);}40%{opacity:1;transform:scale(1);}}
+@media(prefers-reduced-motion:reduce){.inter-tool-dot,.tool-card-running-dot,.tl-rundot{animation:none;}.lf-spark{animation:none;}}
+
+/* ══ msg-usage ══ */
+.msg-usage{padding-left:var(--msg-rail);margin-top:8px;font-size:11px;color:var(--muted);opacity:0;transition:opacity .4s ease;display:flex;gap:8px;align-items:center;}
+.msg-usage.visible{opacity:.65;}
 
 /* ── Prose cursor ── */
-.prose-cursor {
-  display:inline-block; width:2px; height:14px;
-  background:var(--accent); animation:cur-blink .9s step-end infinite;
-  vertical-align:middle; margin-left:1px; border-radius:1px;
-}
-@keyframes cur-blink{0%,100%{opacity:1;}50%{opacity:0;}}
+.prose-cursor{display:inline-block;width:2px;height:14px;background:var(--accent);animation:curblink .9s step-end infinite;vertical-align:middle;margin-left:1px;border-radius:1px;}
+@keyframes curblink{0%,100%{opacity:1;}50%{opacity:0;}}
 
-/* ── Usage line ── */
-.msg-usage {
-  padding-left:var(--msg-rail);
-  margin-top:8px;
-  font-size:11px;
-  color:var(--muted);
-  opacity:0;
-  transition:opacity .4s ease;
-  display:flex; gap:8px; align-items:center;
-}
-.msg-usage.visible { opacity:.65; }
-.usage-sep { opacity:.4; }
-.msg-copy-btn {
-  margin-left:auto;
-  background:none; border:none;
-  color:var(--muted); font-size:11px;
-  cursor:pointer; opacity:.4; padding:2px 4px;
-  font-family:var(--font-ui);
-}
-.msg-copy-btn:hover { opacity:.9; }
-
-/* ── Settlement fade ── */
-.assistant-turn.settling .msg-body { animation:settle-in .25s ease forwards; }
+/* ── Settlement ── */
 @keyframes settle-in{from{opacity:.7;}to{opacity:1;}}
+.assistant-turn.settling .msg-body{animation:settle-in .28s ease forwards;}
 
-/* ── Composer bar (decorative) ── */
-.composer-bar {
-  position:fixed; bottom:0; left:0; right:0;
-  background:rgba(24,20,15,.97);
-  border-top:1px solid var(--border);
-  padding:12px 20px;
-  display:flex; justify-content:center;
-  backdrop-filter:blur(10px);
-}
-.composer-inner {
-  width:100%; max-width:800px;
-  display:flex; align-items:center; gap:10px;
-}
-.composer-input {
-  flex:1; background:var(--surface); border:1px solid var(--border);
-  border-radius:10px; padding:9px 14px;
-  color:var(--muted); font-size:13px; font-family:var(--font-ui);
-  outline:none;
-}
-.send-btn {
-  width:34px; height:34px; border-radius:8px;
-  background:var(--accent); border:none;
-  color:#1a1000; font-size:14px;
-  cursor:pointer; display:flex; align-items:center; justify-content:center;
-  transition:opacity .15s;
-}
+/* ── Composer bar ── */
+.composer-bar{position:fixed;bottom:0;left:0;right:0;background:rgba(24,20,15,.97);border-top:1px solid var(--border);padding:12px 40px;display:flex;justify-content:center;backdrop-filter:blur(10px);}
+.composer-inner{width:100%;max-width:860px;display:flex;align-items:center;gap:10px;}
+.composer-input{flex:1;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:9px 14px;color:var(--muted);font-size:13px;font-family:var(--font-ui);outline:none;}
+.send-btn{width:34px;height:34px;border-radius:8px;background:var(--accent);border:none;color:#1a1000;font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:opacity .15s;}
 .send-btn:hover{opacity:.85;}
 .send-btn:disabled{opacity:.35;cursor:not-allowed;}
 
 /* ── Toast ── */
-.toast-wrap {
-  position:fixed; top:60px; right:20px;
-  display:flex; flex-direction:column; gap:8px; z-index:200;
-}
-.toast {
-  background:var(--surface); border:1px solid var(--border);
-  border-radius:10px; padding:9px 13px;
-  font-size:12px; color:var(--text);
-  box-shadow:0 4px 20px rgba(0,0,0,.5);
-  transform:translateX(110%); transition:transform .22s cubic-bezier(.32,.72,.16,1),opacity .2s;
-  opacity:0; max-width:270px; line-height:1.5;
-}
+.toast-wrap{position:fixed;top:56px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:200;}
+.toast{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:9px 13px;font-size:12px;color:var(--text);box-shadow:0 4px 20px rgba(0,0,0,.5);transform:translateX(110%);transition:transform .22s cubic-bezier(.32,.72,.16,1),opacity .2s;opacity:0;max-width:270px;line-height:1.5;}
 .toast.show{transform:translateX(0);opacity:1;}
 .toast.info{border-left:3px solid var(--info);}
 .toast-tag{font-size:10px;color:var(--muted);margin-bottom:2px;text-transform:uppercase;letter-spacing:.5px;}
+
+/* date separator */
+.msg-date-sep{text-align:center;font-size:11px;color:var(--muted);opacity:.45;padding:8px 0 4px;letter-spacing:.5px;}
 </style>
 </head>
 <body>
@@ -414,45 +198,48 @@ body {
   <span class="topbar-badge">Live Stream Demo</span>
   <div class="topbar-spacer"></div>
   <div class="speed-wrap">
-    <span>Speed</span>
-    <input type="range" id="speedRange" min="0.5" max="3" step="0.5" value="1">
+    Speed
+    <input type="range" id="speedRange" min="0.5" max="4" step="0.5" value="1">
     <span id="speedLabel">1×</span>
   </div>
   <button class="ctrl-btn primary" id="btnRun" onclick="runDemo()">▶ Run</button>
-  <button class="ctrl-btn" id="btnReset" onclick="resetDemo()">↺ Reset</button>
+  <button class="ctrl-btn" onclick="resetDemo()">↺ Reset</button>
+  <button class="ctrl-btn" onclick="triggerReconnect()" title="Simulate stream reconnect (or press R)">⚡ Reconnect</button>
 </div>
 
-<!-- Chat pane -->
-<div class="chat-outer" id="chatOuter">
+<!-- Chat -->
+<div class="chat-outer">
+  <div class="msg-list" id="msgList">
+    <div class="msg-date-sep">Today</div>
 
-  <!-- User message -->
-  <div class="msg-row" data-role="user">
-    <div class="msg-body">Analyze the codebase and write a summary of the architecture, then check for any obvious bugs in the streaming module.</div>
+    <!-- User message -->
+    <div class="msg-row" data-role="user">
+      <div class="msg-body">Analyze the codebase and write a summary of the architecture, then check for any obvious bugs in the streaming module.</div>
+    </div>
+
+    <!-- Assistant turn (built by JS) -->
+    <div class="msg-row assistant-turn" data-role="assistant" id="assistantRow" style="display:none">
+      <div class="msg-role assistant">
+        <div class="role-icon assistant">H</div>
+        <span style="font-size:12px">Hermes</span>
+        <span class="msg-tps-inline" id="tpsChip" style="display:none">— t/s</span>
+      </div>
+      <div class="assistant-turn" id="assistantTurn">
+        <div class="assistant-turn-blocks" id="turnBlocks"></div>
+      </div>
+      <div class="msg-usage" id="msgUsage">
+        <span>1 247 tokens</span>
+        <span class="lf-sep">·</span>
+        <span>$0.004</span>
+        <span class="lf-sep">·</span>
+        <span>14.2s</span>
+      </div>
+    </div>
+
   </div>
-
-  <!-- Assistant turn (built by JS) -->
-  <div class="msg-row" data-role="assistant" id="assistantRow" style="display:none">
-    <div class="msg-role">
-      <div class="role-icon">H</div>
-      <span>Hermes</span>
-      <span style="opacity:.4;font-size:10px;margin-left:4px" id="streamStatus"></span>
-    </div>
-    <div class="assistant-turn" id="assistantTurn">
-      <div class="assistant-turn-blocks" id="turnBlocks"></div>
-    </div>
-    <div class="msg-usage" id="msgUsage">
-      <span>1 247 tokens</span>
-      <span class="usage-sep">·</span>
-      <span>$0.004</span>
-      <span class="usage-sep">·</span>
-      <span>14.2s</span>
-      <button class="msg-copy-btn">Copy</button>
-    </div>
-  </div>
-
 </div>
 
-<!-- Composer (decorative) -->
+<!-- Composer -->
 <div class="composer-bar">
   <div class="composer-inner">
     <div class="composer-input">Message Hermes…</div>
@@ -460,156 +247,154 @@ body {
   </div>
 </div>
 
-<!-- Toast container -->
+<!-- Toasts -->
 <div class="toast-wrap" id="toastWrap"></div>
 
 <script>
-/* ─────────────────────────────────────────────────────
+/* ════════════════════════════════════════════════
    Demo controller
-───────────────────────────────────────────────────── */
+════════════════════════════════════════════════ */
 let _running = false;
 let _handles = [];
 let _speed = 1;
+let _tokens = 0;
+let _tpsInterval = null;
 
 document.getElementById('speedRange').addEventListener('input', e => {
   _speed = parseFloat(e.target.value);
   document.getElementById('speedLabel').textContent = _speed + '×';
 });
 
-function ms(base) { return base / _speed; }
+document.addEventListener('keydown', e => {
+  if ((e.key === 'r' || e.key === 'R') && !e.metaKey && !e.ctrlKey) triggerReconnect();
+});
 
+function ms(base) { return Math.round(base / _speed); }
 function wait(base) {
-  return new Promise(res => {
-    const h = setTimeout(res, ms(base));
-    _handles.push(h);
-  });
+  return new Promise(res => { const h = setTimeout(res, ms(base)); _handles.push(h); });
 }
+function cancelAll() { _handles.forEach(h => { clearTimeout(h); clearInterval(h); }); _handles = []; }
 
-function cancelAll() {
-  _handles.forEach(h => { clearTimeout(h); clearInterval(h); });
-  _handles = [];
-}
+const blocks = () => document.getElementById('turnBlocks');
 
-/* ─── DOM helpers ─── */
-const $ = id => document.getElementById(id);
-const blocks = () => $('turnBlocks');
-
-function showRow() {
-  $('assistantRow').style.display = '';
-}
-
-function setStreamStatus(t) {
-  $('streamStatus').textContent = t;
-}
-
-/* ─── Thinking card ─── */
-let _thinkText = '';
-let _thinkOpen = true;
-
+/* ── Thinking card ── */
 function createThinkingCard() {
-  const card = document.createElement('div');
-  card.className = 'thinking-card open';
-  card.id = 'thinkCard';
-  card.innerHTML = `
-    <div class="thinking-card-header" onclick="this.closest('.thinking-card').classList.toggle('open')">
-      <span class="thinking-card-icon">💭</span>
-      <span class="thinking-card-label">Thinking</span>
-      <span class="thinking-card-dots" id="thinkDots">
-        <span class="thinking-card-dot"></span>
-        <span class="thinking-card-dot"></span>
-        <span class="thinking-card-dot"></span>
-      </span>
-      <span class="thinking-card-chevron">›</span>
-    </div>
-    <pre class="thinking-card-body" id="thinkBody"></pre>`;
-  blocks().appendChild(card);
-  return card;
+  const wrap = document.createElement('div');
+  wrap.className = 'live-worklog';
+  wrap.id = 'thinkWorklog';
+  wrap.setAttribute('data-live-worklog-shell','1');
+  const list = document.createElement('div');
+  list.className = 'tool-worklog-list';
+  list.id = 'thinkList';
+  wrap.appendChild(list);
+
+  const actThink = document.createElement('div');
+  actThink.className = 'agent-activity-thinking';
+  actThink.setAttribute('data-live-thinking','1');
+  actThink.setAttribute('data-thinking-active','1');
+
+  actThink.innerHTML = `
+    <div class="thinking-card open" id="thinkCard">
+      <div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')">
+        <span class="thinking-card-icon">💡</span>
+        <span class="thinking-card-label">Thinking</span>
+        <span class="thinking-card-btn-row">
+          <span class="thinking-card-toggle">›</span>
+        </span>
+      </div>
+      <div class="thinking-card-body"><pre id="thinkPre"></pre></div>
+    </div>`;
+
+  list.appendChild(actThink);
+  blocks().appendChild(wrap);
+  return wrap;
 }
 
 async function typeThinking(text) {
-  const body = $('thinkBody');
+  const pre = document.getElementById('thinkPre');
   for (const ch of text) {
-    body.textContent += ch;
-    await wait(12 + Math.random() * 10);
+    pre.textContent += ch;
+    await wait(10 + Math.random() * 8);
   }
 }
 
 function finalizeThinkingCard() {
-  const card = $('thinkCard');
+  const card = document.getElementById('thinkCard');
   if (!card) return;
-  const dots = $('thinkDots');
-  if (dots) dots.remove();
-  // add token count
-  const hdr = card.querySelector('.thinking-card-header');
-  const countEl = document.createElement('span');
-  countEl.style.cssText = 'font-size:10px;opacity:.45;margin-left:4px;font-weight:400;';
-  countEl.textContent = '312 tokens';
-  hdr.insertBefore(countEl, hdr.querySelector('.thinking-card-chevron'));
-  // collapse
+  // remove active marker, collapse
+  card.parentElement.removeAttribute('data-thinking-active');
   card.classList.remove('open');
+  // add token count
+  const label = card.querySelector('.thinking-card-label');
+  if (label) label.textContent = 'Thinking · 312 tokens';
 }
 
-/* ─── Tool worklog group ─── */
-function createWorklogGroup() {
-  const g = document.createElement('div');
-  g.className = 'tool-call-group';
-  g.id = 'toolGroup';
-  g.innerHTML = `
-    <button class="tool-call-group-summary" onclick="this.closest('.tool-call-group').classList.toggle('collapsed')">
-      <span class="as-dot"></span>
-      <span class="as-text">Running</span>
-      <span class="tool-call-group-duration" id="groupDur"></span>
-      <span class="as-caret">›</span>
-    </button>
-    <div class="tool-call-group-body" id="toolGroupBody"></div>`;
-  blocks().appendChild(g);
-  return g;
+/* ── Live worklog for tools ── */
+let _toolWorklog = null;
+let _toolList = null;
+
+function ensureToolWorklog() {
+  if (_toolWorklog) return _toolList;
+  _toolWorklog = document.createElement('div');
+  _toolWorklog.className = 'live-worklog';
+  _toolWorklog.setAttribute('data-live-worklog-shell','1');
+  _toolWorklog.setAttribute('data-live-tool-worklog-group','1');
+  _toolList = document.createElement('div');
+  _toolList.className = 'tool-worklog-list';
+  _toolList.id = 'toolList';
+  _toolWorklog.appendChild(_toolList);
+  blocks().appendChild(_toolWorklog);
+  return _toolList;
 }
 
-/* ─── Live run status line ─── */
-let _liveStatusTimer = null;
-function createLiveStatus() {
-  const div = document.createElement('div');
-  div.className = 'live-run-status';
-  div.id = 'liveStatus';
-  div.innerHTML = `<span class="live-run-status-dot"></span><span class="live-run-status-text" id="liveStatusTime">0:00</span><span class="lf-sep">·</span><span class="lf-status">Running</span>`;
-  const g = $('toolGroup');
-  if (g) g.appendChild(div);
-  const start = Date.now();
-  const h = setInterval(() => {
-    const el = $('liveStatusTime');
-    if (!el) { clearInterval(h); return; }
-    const s = Math.floor((Date.now() - start) / 1000);
-    el.textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+/* ── Live run status ── */
+let _lrsEl = null;
+let _lrsInterval = null;
+let _lrsStart = null;
+
+function createLiveRunStatus() {
+  _lrsEl = document.createElement('div');
+  _lrsEl.className = 'live-run-status';
+  _lrsEl.id = 'liveRunStatus';
+  _lrsEl.innerHTML = `<span class="lf-spark">⟳</span><span class="live-run-status-text lf-time" id="lrsTime">0:00</span><span class="lf-sep">·</span><span class="lf-tokens" id="lrsTokens">0 tokens</span><span class="lf-sep">·</span><span class="lf-status">Running</span>`;
+  blocks().appendChild(_lrsEl);
+  _lrsStart = Date.now();
+  _lrsInterval = setInterval(() => {
+    const s = Math.floor((Date.now() - _lrsStart) / 1000);
+    const t = document.getElementById('lrsTime');
+    const tk = document.getElementById('lrsTokens');
+    if (t) t.textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+    if (tk) { _tokens += Math.floor(Math.random() * 12 + 3); tk.textContent = _tokens + ' tokens'; }
   }, 500);
-  _handles.push(h);
-  return div;
-}
-function removeLiveStatus() {
-  if (_liveStatusTimer) { clearInterval(_liveStatusTimer); _liveStatusTimer = null; }
-  const el = $('liveStatus');
-  if (el) el.remove();
+  _handles.push(_lrsInterval);
 }
 
-/* ─── Tool cards ─── */
+function removeLiveRunStatus() {
+  if (_lrsInterval) { clearInterval(_lrsInterval); _lrsInterval = null; }
+  if (_lrsEl) { _lrsEl.remove(); _lrsEl = null; }
+}
+
+/* ── Tool cards ── */
 const _elapsedTimers = new Map();
 
-function addToolCard(tid, name, preview) {
-  const body = $('toolGroupBody');
-  if (!body) return;
+function addToolCard(tid, name, title) {
+  const list = ensureToolWorklog();
   const row = document.createElement('div');
   row.className = 'tool-card-row';
+  row.setAttribute('data-tool-done','false');
+  row.setAttribute('data-live-tid', tid);
   row.id = 'tc_' + tid;
   row.innerHTML = `
     <div class="tool-card tool-card-running">
-      <div class="tool-card-header">
+      <div class="tool-card-header" onclick="void 0">
         <span class="tool-card-running-dot"></span>
+        <span class="tool-card-icon"></span>
         <span class="tool-card-name">${name}</span>
         <span class="tool-card-live-duration" id="dur_${tid}">0s</span>
-        <span class="tool-card-title">${preview}</span>
+        <span class="tool-card-title">${title}</span>
       </div>
     </div>`;
-  body.appendChild(row);
+  list.appendChild(row);
 
   const startMs = Date.now();
   const h = setInterval(() => {
@@ -622,37 +407,36 @@ function addToolCard(tid, name, preview) {
   _elapsedTimers.set(tid, h);
 }
 
-function settleToolCard(tid, name, preview, finalSec) {
+function settleToolCard(tid, name, title, finalSec) {
   const h = _elapsedTimers.get(tid);
   if (h) { clearInterval(h); _elapsedTimers.delete(tid); }
   const row = document.getElementById('tc_' + tid);
   if (!row) return;
+  row.setAttribute('data-tool-done','true');
   row.innerHTML = `
     <div class="tool-card">
-      <div class="tool-card-header">
+      <div class="tool-card-header" onclick="void 0">
+        <span class="tool-card-icon"></span>
         <span class="tool-card-name">${name}</span>
-        <span class="tool-card-live-duration" style="opacity:.6;color:var(--success)">${finalSec}s</span>
-        <span class="tool-card-title">${preview}</span>
+        <span class="tool-card-live-duration settled">${finalSec}s</span>
+        <span class="tool-card-title">${title}</span>
         <span class="tool-done-check">✓</span>
       </div>
     </div>`;
 }
 
-/* ─── Inter-tool hint ─── */
+/* ── Inter-tool hint ── */
 let _hintTimer = null;
-let _hintEl = null;
 
 function scheduleHint() {
   clearHint();
   _hintTimer = setTimeout(() => {
-    _hintEl = document.createElement('div');
-    _hintEl.id = 'interToolHint';
-    _hintEl.className = 'inter-tool-hint';
-    _hintEl.innerHTML = '<span class="inter-tool-dot"></span><span class="inter-tool-dot"></span><span class="inter-tool-dot"></span>';
-    blocks().appendChild(_hintEl);
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      if (_hintEl) _hintEl.classList.add('visible');
-    }));
+    const h = document.createElement('div');
+    h.id = 'interToolHint';
+    h.className = 'inter-tool-hint';
+    h.innerHTML = '<span class="inter-tool-dot"></span><span class="inter-tool-dot"></span><span class="inter-tool-dot"></span>';
+    blocks().appendChild(h);
+    requestAnimationFrame(() => requestAnimationFrame(() => { h.classList.add('visible'); }));
   }, ms(800));
   _handles.push(_hintTimer);
 }
@@ -660,39 +444,40 @@ function scheduleHint() {
 function clearHint() {
   if (_hintTimer) { clearTimeout(_hintTimer); _hintTimer = null; }
   const h = document.getElementById('interToolHint');
-  if (h) { h.classList.remove('visible'); setTimeout(() => h.remove(), 250); }
+  if (h) { h.classList.remove('visible'); setTimeout(() => h.remove(), 260); }
 }
 
-/* ─── Interim progress note ─── */
+/* ── Interim note ── */
 function addInterimNote(text) {
   clearHint();
   const div = document.createElement('div');
   div.className = 'interim-note';
+  div.setAttribute('data-interim','1');
   div.textContent = text;
   blocks().appendChild(div);
 }
 
-/* ─── Prose segment ─── */
+/* ── Prose ── */
 let _proseEl = null;
 let _cursor = null;
 
-function createProseSegment() {
+function createProse() {
   clearHint();
-  const div = document.createElement('div');
-  div.className = 'msg-body';
-  div.style.paddingTop = '8px';
+  _proseEl = document.createElement('div');
+  _proseEl.className = 'msg-body';
   _cursor = document.createElement('span');
   _cursor.className = 'prose-cursor';
-  div.appendChild(_cursor);
-  blocks().appendChild(div);
-  _proseEl = div;
+  _proseEl.appendChild(_cursor);
+  blocks().appendChild(_proseEl);
 }
 
-async function typeToken(text) {
+async function typeTokens(text) {
   if (!_proseEl || !_cursor) return;
   for (const ch of text) {
     _proseEl.insertBefore(document.createTextNode(ch), _cursor);
-    await wait(13 + Math.random() * 14);
+    await wait(10 + Math.random() * 12);
+    // scroll into view
+    _cursor.scrollIntoView({block:'nearest',behavior:'smooth'});
   }
 }
 
@@ -700,156 +485,143 @@ function finalizeProse() {
   if (_cursor) { _cursor.remove(); _cursor = null; }
 }
 
-/* ─── Settlement ─── */
+/* ── Settlement ── */
 function settle() {
-  const turn = $('assistantTurn');
-  if (turn) turn.classList.add('settling');
-  const usage = $('msgUsage');
-  if (usage) usage.classList.add('visible');
-  const grp = $('toolGroup');
-  if (grp) grp.classList.add('collapsed');
-  // update group summary
-  const dur = $('groupDur');
-  if (dur) dur.textContent = '4.8s';
-  const label = grp && grp.querySelector('.as-text');
-  if (label) label.textContent = 'Used 2 tools';
-  setStreamStatus('');
+  document.getElementById('assistantTurn').classList.add('settling');
+  document.getElementById('msgUsage').classList.add('visible');
+  // show tps
+  const tps = document.getElementById('tpsChip');
+  tps.textContent = '142 t/s';
+  tps.style.display = 'inline-flex';
 }
 
-/* ─── Toast ─── */
+/* ── Toast ── */
 function toast(msg, type = 'info', duration = 3500) {
-  const wrap = $('toastWrap');
+  const wrap = document.getElementById('toastWrap');
   const el = document.createElement('div');
   el.className = `toast ${type}`;
   el.innerHTML = `<div class="toast-tag">${type}</div>${msg}`;
   wrap.appendChild(el);
   requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('show')));
-  setTimeout(() => {
-    el.classList.remove('show');
-    setTimeout(() => el.remove(), 300);
-  }, duration);
+  setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 320); }, duration);
 }
 
-/* ─────────────────────────────────────────────────────
+function triggerReconnect() {
+  toast('Reconnected — restoring response… (23 events)', 'info', 3500);
+}
+
+/* ════════════════════════════════════════════════
    Full demo sequence
-───────────────────────────────────────────────────── */
+════════════════════════════════════════════════ */
 async function runDemo() {
   if (_running) return;
   _running = true;
-  $('btnRun').disabled = true;
+  _tokens = 0;
+  document.getElementById('btnRun').disabled = true;
+  document.getElementById('assistantRow').style.display = '';
 
-  showRow();
-  setStreamStatus('streaming…');
-
-  /* 1 ── Thinking phase ─────────────────────────── */
+  /* 1 ── Thinking (reasoning phase) ── */
   createThinkingCard();
-  await wait(200);
-
-  const thinkText =
+  await wait(300);
+  await typeThinking(
 `The user wants two things:
-1. Analyze codebase → architecture summary
+1. Analyze the codebase → write architecture summary
 2. Check streaming module for bugs
 
-I should start by reading the directory structure,
-then look at streaming.py specifically. Let me plan
-the tool calls I need to make first...`;
+Let me plan my tool calls:
+- First list the project directory to understand structure
+- Then read api/streaming.py for the bug check
+I'll run these sequentially so I have context for each.`
+  );
+  await wait(500);
 
-  await typeThinking(thinkText);
-  await wait(400);
-
-  /* 2 ── First tool: list_dir ───────────────────── */
+  /* 2 ── First tool starts → thinking collapses ── */
   finalizeThinkingCard();
-  await wait(150);
-
-  createWorklogGroup();
-  createLiveStatus();
+  await wait(200);
+  createLiveRunStatus();
   addToolCard('t1', 'list_directory', '~/project/');
-  await wait(2200);
+  await wait(2400);
 
+  /* 3 ── Tool 1 completes → 800ms debounce → hint appears ── */
   settleToolCard('t1', 'list_directory', '~/project/', 2);
-  scheduleHint(); // 800ms debounce starts
+  scheduleHint();
+  await wait(1100); // hint visible at ~800ms mark
 
-  /* 3 ── Inter-tool hint visible ────────────────── */
-  await wait(1100); // hint becomes visible at ~800ms
-
-  /* 4 ── Second tool: read_file ─────────────────── */
+  /* 4 ── Second tool arrives → hint clears ── */
   clearHint();
   addToolCard('t2', 'read_file', 'api/streaming.py');
-  await wait(2800);
+  await wait(2900);
 
+  /* 5 ── Tool 2 completes ── */
   settleToolCard('t2', 'read_file', 'api/streaming.py', 3);
+  await wait(350);
 
-  /* 5 ── Interim progress note ──────────────────── */
-  await wait(400);
-  addInterimNote('Read 842 lines of api/streaming.py — scanning for race conditions and error handling gaps…');
-  await wait(1200);
+  /* 6 ── Interim progress note ── */
+  addInterimNote('Read 842 lines — scanning for race conditions and error handling gaps…');
+  await wait(900);
 
-  /* 6 ── Prose streaming ────────────────────────── */
-  removeLiveStatus();
-  createProseSegment();
+  /* 7 ── Prose streaming ── */
+  removeLiveRunStatus();
+  createProse();
 
   const prose = [
     '## Architecture Overview\n\n',
     'The project follows a **three-layer pattern**: a thin stdlib HTTP server (`server.py`), ',
-    'a set of pure-Python API modules (`api/`), and a vanilla-JS frontend (`static/`). ',
-    'There is no build step — the server is launched directly with `python bootstrap.py`.\n\n',
+    'a set of pure-Python API modules under `api/`, and a vanilla-JS frontend in `static/`. ',
+    'There is no build step — just run `python bootstrap.py` to start.\n\n',
+    'Key design decisions:\n',
+    '- **No framework**: stdlib `ThreadingHTTPServer`, no Flask/FastAPI overhead\n',
+    '- **SSE streaming**: responses stream token-by-token via `api/streaming.py`\n',
+    '- **Thread-safe globals**: `LOCK` (RLock) serializes session state mutations\n\n',
     '## Streaming Module — Findings\n\n',
-    'One potential issue in `api/streaming.py`: the `os.environ` mutation at line 312 ',
-    'is protected by `_ENV_LOCK`, but concurrent sessions can still observe each other\'s ',
-    'environment writes during the window between lock release and the subprocess inheriting ',
-    'the environment. This is a **known architectural limitation** tracked as Phase B cleanup.\n\n',
-    'No other critical bugs found in the module.',
+    'One issue found: `os.environ` mutations at line 312 are protected by `_ENV_LOCK`, ',
+    'but concurrent sessions can briefly observe each other\'s env writes between lock release ',
+    'and subprocess fork. This is a **known limitation** (Phase B cleanup) — not a critical bug ',
+    'but worth documenting in `ARCHITECTURE.md`.\n\n',
+    'No other critical issues found.',
   ];
 
   for (const chunk of prose) {
+    if (!_cursor) break;
     for (const ch of chunk) {
       if (!_cursor) break;
       _proseEl.insertBefore(document.createTextNode(ch), _cursor);
-      await wait(11 + Math.random() * 12);
+      await wait(10 + Math.random() * 11);
     }
   }
 
-  /* 7 ── Done / settlement ──────────────────────── */
+  /* 8 ── done event → settle ── */
   finalizeProse();
-  await wait(100);
+  clearHint();
+  await wait(120);
   settle();
-  setStreamStatus('');
-
-  // Simulate reconnect toast for demo (shows separately)
-  // toast('Reconnected — restoring response… (23 events)', 'info');
 
   _running = false;
-  $('btnRun').textContent = '▶ Run again';
-  $('btnRun').disabled = false;
+  document.getElementById('btnRun').textContent = '▶ Run again';
+  document.getElementById('btnRun').disabled = false;
 }
 
-/* ─── Reset ─── */
+/* ── Reset ── */
 function resetDemo() {
   cancelAll();
   _running = false;
   _elapsedTimers.forEach(h => clearInterval(h));
   _elapsedTimers.clear();
+  _toolWorklog = null;
+  _toolList = null;
+  _lrsEl = null;
+  _lrsInterval = null;
+  _hintTimer = null;
   _proseEl = null;
   _cursor = null;
-  _hintEl = null;
-  _hintTimer = null;
-  $('turnBlocks').innerHTML = '';
-  $('assistantRow').style.display = 'none';
-  $('msgUsage').classList.remove('visible');
-  $('assistantTurn').classList.remove('settling');
-  $('streamStatus').textContent = '';
-  $('btnRun').textContent = '▶ Run';
-  $('btnRun').disabled = false;
+  document.getElementById('turnBlocks').innerHTML = '';
+  document.getElementById('assistantRow').style.display = 'none';
+  document.getElementById('msgUsage').classList.remove('visible');
+  document.getElementById('assistantTurn').classList.remove('settling');
+  document.getElementById('tpsChip').style.display = 'none';
+  document.getElementById('btnRun').textContent = '▶ Run';
+  document.getElementById('btnRun').disabled = false;
 }
-
-/* ─── Reconnect toast button ─── */
-document.addEventListener('keydown', e => {
-  if (e.key === 'r' && !e.metaKey && !e.ctrlKey) {
-    toast('Reconnected — restoring response… (23 events)', 'info');
-  }
-});
 </script>
-
-<!-- Hint: press R to trigger the reconnect toast -->
 </body>
 </html>
