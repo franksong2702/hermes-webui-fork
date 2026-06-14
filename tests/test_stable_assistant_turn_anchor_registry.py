@@ -1284,28 +1284,33 @@ def test_compact_worklog_anchor_scene_handoff_is_guarded_and_fallback_preserving
     render_fn = src.split("function renderMessages(options){", 1)[1].split(
         "function _toolDisplayName", 1
     )[0]
-    cache_body = src.split("const hasAnchorSceneWorklogCandidate=", 1)[1].split(
+    cache_body = src.split("const hasRetainedAnchorSceneWorklogCandidate=", 1)[1].split(
         "const worklogDetailDisclosureState=", 1
     )[0]
     cache_store_body = src.split("// Populate session cache so switching back here skips a full rebuild.", 1)[1].split(
         "function _toolDisplayName", 1
     )[0]
+    live_lookup_helper = helper.split(
+        "return _assistantTurnAnchorDurableActivitySceneForMessage", 1
+    )[0]
 
     assert "window._liveAnchorRegistries" in helper
     assert "message._anchor_stream_id" in helper
-    assert "message.stream_id" not in helper
-    assert "message._stream_id" not in helper
-    assert "registries.get(streamId)" in helper
-    assert "expectedSession&&(!actualSession||actualSession!==expectedSession)" in helper
-    assert "return _assistantTurnAnchorCompactWorklogItems(scene).length?scene:null" in helper
+    assert "message.stream_id" not in live_lookup_helper
+    assert "message._stream_id" not in live_lookup_helper
+    assert "registries.get(streamId)" in live_lookup_helper
+    assert "expectedSession&&(!actualSession||actualSession!==expectedSession)" in live_lookup_helper
+    assert "return _assistantTurnAnchorDurableActivitySceneForMessage(message, context)" in helper
 
-    assert "m&&m.role==='assistant'&&!m._live&&m._anchor_stream_id" in render_body
-    assert "!hasAnchorSceneWorklogCandidate" in cache_body
-    assert "!hasAnchorSceneWorklogCandidate" in cache_store_body
+    assert "_assistantTurnAnchorHasActivitySceneCandidate(m)" in render_body
+    assert "!hasRetainedAnchorSceneWorklogCandidate" in cache_body
+    assert "!hasRetainedAnchorSceneWorklogCandidate" in cache_store_body
     assert render_fn.index("const hasAnchorSceneWorklogCandidate=") < render_fn.index("if(sid&&sid!==_sessionHtmlCacheSid")
     assert "if(!S.busy || (S.toolCalls&&S.toolCalls.length) || hasAnchorSceneWorklogCandidate){" in render_body
     assert "if(isCompactWorklogMode()){" in render_body
     assert "_assistantTurnAnchorActivitySceneForMessage(msg,{" in render_body
+    assert "tool_calls:S.toolCalls" in render_body
+    assert "hasContextToolCandidate" in render_body
     assert "_renderAssistantTurnAnchorCompactWorklogScene(anchorRow, scene" in render_body
     assert "_legacyToolCountForTurn(anchorTurn)" in render_body
     assert "_assistantTurnAnchorSceneOwnsCompactWorklogTurn(items,_legacyToolCountForTurn(anchorTurn))" in render_body
@@ -1360,6 +1365,111 @@ registry.anchor.identity.session_id = 'sid-current';
 const scene = _assistantTurnAnchorActivitySceneForMessage(message, {{session_id: 'sid-current'}});
 assert.strictEqual(scene && scene.version, 'activity_scene_v1');
 assert.strictEqual(projectCalls.length, 1);
+"""
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_compact_worklog_anchor_scene_rebuilds_from_settled_tool_metadata_without_live_registry():
+    assert NODE, "node is required for ui.js helper tests"
+    src = _read(UI_JS)
+    helpers = "\n".join(
+        _function_source(src, name)
+        for name in [
+            "_assistantTurnAnchorWarnActivitySceneFailure",
+            "_assistantTurnAnchorActivitySceneForMessage",
+            "_assistantTurnAnchorMessageHasToolMetadata",
+            "_assistantTurnAnchorHasActivitySceneCandidate",
+            "_assistantTurnAnchorMessageRef",
+            "_assistantTurnAnchorIdentityFromMessage",
+            "_assistantTurnAnchorDurableToolId",
+            "_assistantTurnAnchorMessageToolIds",
+            "_assistantTurnAnchorToolCallSignature",
+            "_assistantTurnAnchorSameTurnToolCalls",
+            "_assistantTurnAnchorToolPayload",
+            "_assistantTurnAnchorDurableActivitySceneForMessage",
+            "_assistantTurnAnchorSceneTextValue",
+            "_assistantTurnAnchorToolKey",
+            "_assistantTurnAnchorToolCallFromSceneRow",
+            "_assistantTurnAnchorThinkingDedupeKey",
+            "_assistantTurnAnchorCompactWorklogItems",
+            "_assistantTurnAnchorSceneOwnsCompactWorklogTurn",
+        ]
+    )
+    script = f"""
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+global.window = {{_liveAnchorRegistries: new Map()}};
+var window = global.window;
+vm.runInThisContext(fs.readFileSync({json.dumps(str(ANCHORS_JS))}, 'utf8'), {{filename:'assistant_turn_anchors.js'}});
+let warned = false;
+const console = {{warn() {{ warned = true; }}}};
+let _assistantTurnAnchorActivitySceneWarned = false;
+function _toolArgsSnapshot(args) {{ return Object.assign({{}}, args || {{}}); }}
+function _assistantReasoningPayloadText(message) {{ return String(message && message.reasoning || ''); }}
+function _normalizeThinkingEchoCompare(text) {{
+  return String(text || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+}}
+{helpers}
+
+const message = {{
+  role: 'assistant',
+  content: 'Final answer',
+  reasoning: 'I need to inspect the source first.',
+  tool_calls: [
+    {{id: 'call-1', function: {{name: 'terminal', arguments: '{{"command":"rg anchor"}}'}}}},
+  ],
+}};
+const scene = _assistantTurnAnchorActivitySceneForMessage(message, {{
+  session_id: 'sid-durable',
+  raw_idx: 4,
+  tool_calls: [
+    {{
+      name: 'terminal',
+      tid: 'call-1',
+      args: {{command: 'rg anchor'}},
+      snippet: '2 matches',
+      done: true,
+      assistant_msg_idx: 4,
+      activityBurstId: 3,
+      activitySegmentSeq: 3,
+    }},
+  ],
+}});
+
+assert.strictEqual(warned, false);
+assert.strictEqual(scene && scene.version, 'activity_scene_v1');
+assert.strictEqual(scene.mode, 'compact_worklog');
+assert.deepStrictEqual(scene.activity_rows.map((row) => row.kind), [
+  'reasoning',
+  'tool_completed',
+  'terminal_status',
+]);
+const items = _assistantTurnAnchorCompactWorklogItems(scene, 4);
+assert.deepStrictEqual(items.map((item) => item.kind), ['reasoning', 'tool']);
+assert.strictEqual(items[0].text, 'I need to inspect the source first.');
+assert.strictEqual(items[1].toolCall.name, 'terminal');
+assert.strictEqual(items[1].toolCall.snippet, '2 matches');
+assert.strictEqual(items[1].toolCall.done, true);
+assert.strictEqual(items[1].toolCall.activitySegmentSeq, 3);
+assert.strictEqual(_assistantTurnAnchorSceneOwnsCompactWorklogTurn(items, 1), true);
+
+const directOnlyScene = _assistantTurnAnchorActivitySceneForMessage(message, {{
+  session_id: 'sid-durable',
+  raw_idx: 4,
+  tool_calls: [],
+}});
+const directOnlyItems = _assistantTurnAnchorCompactWorklogItems(directOnlyScene, 4);
+assert.deepStrictEqual(directOnlyItems.map((item) => item.kind), ['reasoning', 'tool']);
+assert.strictEqual(directOnlyItems[1].toolCall.name, 'terminal');
+assert.strictEqual(directOnlyItems[1].toolCall.done, true);
+
+const reasoningOnly = _assistantTurnAnchorActivitySceneForMessage(
+  {{role: 'assistant', content: 'Final answer', reasoning: 'thinking only'}},
+  {{session_id: 'sid-durable', raw_idx: 5, tool_calls: []}}
+);
+assert.strictEqual(reasoningOnly, null);
 """
     result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr

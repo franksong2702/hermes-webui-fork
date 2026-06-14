@@ -8871,22 +8871,220 @@ function _assistantTurnAnchorActivitySceneForMessage(message, context){
     const api=(typeof window!=='undefined')?window.HermesAssistantTurnAnchors:null;
     if(!api||typeof api.projectAssistantTurnAnchorActivityScene!=='function') return null;
     const streamId=String((message&&message._anchor_stream_id)||'').trim();
-    if(!streamId) return null;
-    const registries=(typeof window!=='undefined')?window._liveAnchorRegistries:null;
-    if(!registries||typeof registries.get!=='function') return null;
-    const registry=registries.get(streamId);
-    const anchor=registry&&registry.anchor;
-    if(!anchor) return null;
-    const expectedSession=String((context&&context.session_id)||'').trim();
-    const actualSession=String((anchor.identity&&anchor.identity.session_id)||anchor.session_id||'').trim();
-    if(expectedSession&&(!actualSession||actualSession!==expectedSession)) return null;
-    const scene=api.projectAssistantTurnAnchorActivityScene(registry,{mode:'compact_worklog'});
-    if(!scene||scene.version!=='activity_scene_v1'||scene.mode!=='compact_worklog') return null;
-    return _assistantTurnAnchorCompactWorklogItems(scene).length?scene:null;
+    if(streamId){
+      const registries=(typeof window!=='undefined')?window._liveAnchorRegistries:null;
+      const registry=registries&&typeof registries.get==='function'?registries.get(streamId):null;
+      const anchor=registry&&registry.anchor;
+      if(anchor){
+        const expectedSession=String((context&&context.session_id)||'').trim();
+        const actualSession=String((anchor.identity&&anchor.identity.session_id)||anchor.session_id||'').trim();
+        if(expectedSession&&(!actualSession||actualSession!==expectedSession)) return null;
+        const scene=api.projectAssistantTurnAnchorActivityScene(registry,{mode:'compact_worklog'});
+        if(scene&&scene.version==='activity_scene_v1'&&scene.mode==='compact_worklog'&&_assistantTurnAnchorCompactWorklogItems(scene).length) return scene;
+      }
+    }
+    return _assistantTurnAnchorDurableActivitySceneForMessage(message, context);
   }catch(err){
     _assistantTurnAnchorWarnActivitySceneFailure(err);
     return null;
   }
+}
+function _assistantTurnAnchorMessageHasToolMetadata(message){
+  if(!message||typeof message!=='object') return false;
+  if(Array.isArray(message.tool_calls)&&message.tool_calls.length>0) return true;
+  if(Array.isArray(message._partial_tool_calls)&&message._partial_tool_calls.length>0) return true;
+  return Array.isArray(message.content)&&message.content.some(p=>p&&typeof p==='object'&&p.type==='tool_use');
+}
+function _assistantTurnAnchorHasActivitySceneCandidate(message){
+  return !!(message&&message.role==='assistant'&&!message._live&&(
+    message._anchor_stream_id||
+    _assistantTurnAnchorMessageHasToolMetadata(message)
+  ));
+}
+function _assistantTurnAnchorMessageRef(message, context){
+  const rawIdx=context&&context.raw_idx;
+  const explicit=(message&&(message.message_id||message.id||message.local_id))||
+    (context&&(context.message_id||context.local_id));
+  if(explicit!==undefined&&explicit!==null&&String(explicit).trim()) return String(explicit).trim();
+  if(rawIdx!==undefined&&rawIdx!==null&&rawIdx!=='') return `raw_idx:${String(rawIdx)}`;
+  return 'settled-assistant';
+}
+function _assistantTurnAnchorIdentityFromMessage(message, context){
+  const sessionId=String((context&&context.session_id)||(message&&message.session_id)||'').trim();
+  const messageRef=_assistantTurnAnchorMessageRef(message, context);
+  const runId=String((context&&(context.run_id||context.runId))||(message&&(message.run_id||message.runId||message._run_id||message.runtime_run_id))||'').trim();
+  const streamId=String((context&&(context.stream_id||context.streamId))||(message&&(message._anchor_stream_id||message.stream_id||message.streamId||message._stream_id))||'').trim();
+  return {
+    session_id:sessionId,
+    turn_id:`settled:${sessionId||'session'}:${runId||streamId||messageRef}`,
+    run_id:runId||null,
+    stream_id:streamId||null,
+    local_id:messageRef,
+    source_message_refs:[messageRef],
+  };
+}
+function _assistantTurnAnchorDurableToolId(toolCall){
+  if(!toolCall||typeof toolCall!=='object') return '';
+  return String(toolCall.tid||toolCall.id||toolCall.tool_call_id||toolCall.tool_use_id||toolCall.call_id||'').trim();
+}
+function _assistantTurnAnchorMessageToolIds(message){
+  const ids=new Set();
+  if(!message||typeof message!=='object') return ids;
+  (Array.isArray(message.tool_calls)?message.tool_calls:[]).forEach(tc=>{
+    const id=_assistantTurnAnchorDurableToolId(tc);
+    if(id) ids.add(id);
+  });
+  (Array.isArray(message._partial_tool_calls)?message._partial_tool_calls:[]).forEach(tc=>{
+    const id=_assistantTurnAnchorDurableToolId(tc);
+    if(id) ids.add(id);
+  });
+  if(Array.isArray(message.content)){
+    message.content.forEach(part=>{
+      if(!part||typeof part!=='object'||part.type!=='tool_use') return;
+      const id=String(part.id||part.tool_call_id||part.tool_use_id||part.call_id||'').trim();
+      if(id) ids.add(id);
+    });
+  }
+  return ids;
+}
+function _assistantTurnAnchorToolCallSignature(toolCall){
+  if(!toolCall||typeof toolCall!=='object') return '';
+  const id=_assistantTurnAnchorDurableToolId(toolCall);
+  if(id) return `id:${id}`;
+  const name=String(toolCall.name||((toolCall.function||{}).name)||'tool').trim();
+  let args=toolCall.args||toolCall.input||{};
+  if((!args||typeof args!=='object')&&toolCall.function&&toolCall.function.arguments){
+    try{args=JSON.parse(toolCall.function.arguments||'{}');}catch(_){args={};}
+  }
+  try{return `sig:${name}:${JSON.stringify(args||{})}`;}catch(_){return `sig:${name}`;}
+}
+function _assistantTurnAnchorSameTurnToolCalls(message, context){
+  const rawIdx=Number(context&&context.raw_idx);
+  const hasRawIdx=Number.isFinite(rawIdx);
+  const messageToolIds=_assistantTurnAnchorMessageToolIds(message);
+  const direct=[];
+  if(message&&typeof message==='object'){
+    (Array.isArray(message.tool_calls)?message.tool_calls:[]).forEach(tc=>direct.push(tc));
+    (Array.isArray(message._partial_tool_calls)?message._partial_tool_calls:[]).forEach(tc=>direct.push(tc));
+    if(Array.isArray(message.content)){
+      message.content.forEach(part=>{
+        if(part&&typeof part==='object'&&part.type==='tool_use') direct.push(part);
+      });
+    }
+  }
+  const source=[
+    ...(Array.isArray(context&&context.tool_calls)?context.tool_calls:[]),
+    ...direct,
+  ];
+  const out=[];
+  const seen=new Set();
+  source.forEach(tc=>{
+    if(!tc||typeof tc!=='object') return;
+    const tcIdx=Number(tc.assistant_msg_idx);
+    const id=_assistantTurnAnchorDurableToolId(tc);
+    const sameRawIdx=hasRawIdx&&Number.isFinite(tcIdx)&&tcIdx===rawIdx;
+    const sameToolId=!!(id&&messageToolIds.has(id));
+    const fromMessage=direct.indexOf(tc)!==-1;
+    if(!sameRawIdx&&!sameToolId&&!fromMessage) return;
+    const key=_assistantTurnAnchorToolCallSignature(tc)||`tool:${out.length}`;
+    if(seen.has(key)) return;
+    seen.add(key);
+    out.push(tc);
+  });
+  return out;
+}
+function _assistantTurnAnchorToolPayload(toolCall, rawIdx){
+  const tc=(toolCall&&typeof toolCall==='object')?toolCall:{};
+  const fn=tc.function&&typeof tc.function==='object'?tc.function:{};
+  const name=String(tc.name||fn.name||'tool').trim()||'tool';
+  let args=tc.args||tc.input||{};
+  if((!args||typeof args!=='object')&&fn.arguments){
+    try{args=JSON.parse(fn.arguments||'{}');}catch(_){args={};}
+  }
+  const id=_assistantTurnAnchorDurableToolId(tc);
+  const payload={
+    name,
+    args:(args&&typeof args==='object')?args:{},
+    preview:tc.preview||tc.summary||'',
+    snippet:tc.snippet||tc.result||tc.output||tc.preview||'',
+    result:tc.result,
+    output:tc.output,
+    done:tc.done!==false,
+    is_error:!!(tc.is_error||tc.error),
+    assistant_msg_idx:rawIdx,
+  };
+  if(id){
+    payload.id=id;
+    payload.tid=id;
+    payload.tool_call_id=id;
+  }
+  ['duration','duration_seconds','started_at','startedAt','activityBurstId','activity_burst_id','activitySegmentSeq','activity_segment_seq'].forEach(key=>{
+    if(tc[key]!==undefined&&tc[key]!==null) payload[key]=tc[key];
+  });
+  return payload;
+}
+function _assistantTurnAnchorDurableActivitySceneForMessage(message, context){
+  const api=(typeof window!=='undefined')?window.HermesAssistantTurnAnchors:null;
+  if(!api||
+     typeof api.createAssistantTurnAnchorRegistry!=='function'||
+     typeof api.applyAssistantTurnAnchorSourceEvent!=='function'||
+     typeof api.projectAssistantTurnAnchorActivityScene!=='function') return null;
+  if(!message||message.role!=='assistant'||message._live) return null;
+  const identity=_assistantTurnAnchorIdentityFromMessage(message, context);
+  if(!identity.session_id) return null;
+  const rawIdx=context&&context.raw_idx;
+  const toolCalls=_assistantTurnAnchorSameTurnToolCalls(message, context);
+  // The durable handoff only owns a Compact Worklog turn when the settled
+  // transcript/tool metadata can rebuild completed tool rows. Reasoning-only
+  // turns stay on the legacy path so we do not regress to a Thinking-only card.
+  if(!toolCalls.length) return null;
+  const registry=api.createAssistantTurnAnchorRegistry(identity);
+  const messageRef=identity.local_id||'settled-assistant';
+  api.applyAssistantTurnAnchorSourceEvent(registry,{
+    source_event_type:'settled_message',
+    local_id:messageRef,
+    seq:0,
+    payload:{
+      role:'assistant',
+      id:messageRef,
+      content:message.content,
+      _turnUsage:message._turnUsage||undefined,
+      usage:message.usage||undefined,
+    },
+  },identity);
+  const reasoningText=(typeof _assistantReasoningPayloadText==='function'
+    ? _assistantReasoningPayloadText(message)
+    : String((message&&message.reasoning)||'')).trim();
+  if(reasoningText){
+    api.applyAssistantTurnAnchorSourceEvent(registry,{
+      source_event_type:'reasoning',
+      local_id:`${messageRef}:reasoning`,
+      seq:1,
+      text:reasoningText,
+      assistant_msg_idx:rawIdx,
+    },identity);
+  }
+  toolCalls.forEach((tc,index)=>{
+    const payload=_assistantTurnAnchorToolPayload(tc, rawIdx);
+    const localId=`${messageRef}:tool:${payload.tid||payload.name||index}`;
+    const event={
+      source_event_type:'tool_complete',
+      local_id:localId,
+      seq:index+2,
+      ...payload,
+    };
+    if(tc.event_id) event.event_id=tc.event_id;
+    api.applyAssistantTurnAnchorSourceEvent(registry,event,identity);
+  });
+  api.applyAssistantTurnAnchorSourceEvent(registry,{
+    source_event_type:'done',
+    local_id:`${messageRef}:done`,
+    seq:toolCalls.length+2,
+    status:'completed',
+  },identity);
+  const scene=api.projectAssistantTurnAnchorActivityScene(registry,{mode:'compact_worklog'});
+  if(!scene||scene.version!=='activity_scene_v1'||scene.mode!=='compact_worklog') return null;
+  return _assistantTurnAnchorCompactWorklogItems(scene, rawIdx).length?scene:null;
 }
 function _assistantTurnAnchorSceneTextValue(value){
   if(value===undefined||value===null) return '';
@@ -9111,7 +9309,8 @@ function renderMessages(options){
   if(sid!==_messageRenderWindowSid) _resetMessageRenderWindow(sid);
   const renderWindowSize=_currentMessageRenderWindowSize();
   let cachedRenderSignature=null;
-  const hasAnchorSceneWorklogCandidate=isCompactWorklogMode()&&Array.isArray(S.messages)&&S.messages.some(m=>m&&m.role==='assistant'&&!m._live&&m._anchor_stream_id);
+  const hasRetainedAnchorSceneWorklogCandidate=isCompactWorklogMode()&&Array.isArray(S.messages)&&S.messages.some(m=>m&&m.role==='assistant'&&!m._live&&m._anchor_stream_id);
+  const hasAnchorSceneWorklogCandidate=isCompactWorklogMode()&&Array.isArray(S.messages)&&S.messages.some(m=>_assistantTurnAnchorHasActivitySceneCandidate(m));
   const hasTransientTranscriptUi=!!(
     (window._compressionUi&&(!window._compressionUi.sessionId||window._compressionUi.sessionId===sid)) ||
     (window._handoffUi&&(!window._handoffUi.sessionId||window._handoffUi.sessionId===sid))
@@ -9125,10 +9324,12 @@ function renderMessages(options){
   // Also skip cache for transient transcript cards such as /compress and
   // cross-channel handoff summaries; otherwise the cached transcript returns
   // before those cards can be inserted.
-  // Anchor-scene Worklog handoff is also a render-time reconciliation: restoring
-  // cached HTML here would skip the scene projection and make session switching
-  // depend on whether the old DOM happened to be cached before settlement.
-  if(sid&&sid!==_sessionHtmlCacheSid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!hasAnchorSceneWorklogCandidate){
+  // Retained-live-registry Worklog handoff is render-time reconciliation:
+  // restoring cached HTML here would skip the live registry projection and make
+  // session switching depend on whether an old DOM snapshot existed before the
+  // retained registry expired. Durable settled rebuilds can still use this
+  // cache because their source is stable transcript/tool metadata.
+  if(sid&&sid!==_sessionHtmlCacheSid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!hasRetainedAnchorSceneWorklogCandidate){
     const renderSignature=_messageRenderCacheSignature();
     cachedRenderSignature=renderSignature;
     const cached=_sessionHtmlCache.get(sid);
@@ -9947,7 +10148,9 @@ function renderMessages(options){
         };
         for(const aIdx of assistantIdxs){
           const msg=S.messages[aIdx]||{};
-          if(!msg||msg.role!=='assistant'||msg._live||!msg._anchor_stream_id) continue;
+          if(!msg||msg.role!=='assistant'||msg._live) continue;
+          const hasContextToolCandidate=Array.isArray(S.toolCalls)&&S.toolCalls.some(tc=>tc&&Number(tc.assistant_msg_idx)===aIdx);
+          if(!_assistantTurnAnchorHasActivitySceneCandidate(msg)&&!hasContextToolCandidate) continue;
           const anchorRow=assistantSegments.get(aIdx);
           if(!anchorRow) continue;
           const anchorTurn=anchorRow.closest('.assistant-turn');
@@ -9955,6 +10158,7 @@ function renderMessages(options){
           const scene=_assistantTurnAnchorActivitySceneForMessage(msg,{
             session_id:sid,
             raw_idx:aIdx,
+            tool_calls:S.toolCalls,
           });
           if(!scene) continue;
           const fallbackThinkingEntries=_assistantThinkingEntriesForTurn(anchorTurn);
@@ -10390,7 +10594,7 @@ function renderMessages(options){
   if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(inner);
   // Populate session cache so switching back here skips a full rebuild.
   _sessionHtmlCacheSid=sid;
-  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!hasAnchorSceneWorklogCandidate){
+  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!hasRetainedAnchorSceneWorklogCandidate){
     const _html=inner.innerHTML;
     // Only cache sessions with <300KB rendered HTML; evict oldest beyond 8 sessions.
     if(_html.length<300_000){

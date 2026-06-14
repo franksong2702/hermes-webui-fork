@@ -48,6 +48,13 @@ the existing renderer.
   Worklog DOM helpers, and skip the legacy rebuild for that turn. Transparent
   Stream, reload-after-registry-expiry, and any missing/mismatched registry still
   use the existing renderer.
+- Slice 10 extends that Compact Worklog handoff to durable settled-session
+  rebuilds. When a retained live registry is unavailable, `renderMessages()` can
+  construct a local anchor registry from the settled assistant message plus the
+  existing settled tool metadata, project the same `activity_scene_v1`, and
+  render through the same Worklog handoff. Reasoning-only turns still fall back
+  to the legacy renderer so a final settled turn cannot collapse to a
+  Thinking-only Worklog.
 
 ## State Layers
 
@@ -305,6 +312,30 @@ at least as many tool rows as that fallback set. Reasoning-only scenes,
 incomplete/running tool scenes, and scenes missing message-level tools all fall
 back to the existing renderer so a restored final turn cannot collapse to
 Thinking-only Worklog detail.
+
+## Slice 10 Durable Compact Worklog Rebuild
+
+`renderMessages()` now keeps the Slice 9 retained-live-registry lookup as the
+preferred source for anchor-owned Compact Worklog rows, then falls back to a
+durable settled-session rebuild when that registry is unavailable. The durable
+path constructs a local anchor registry from the settled assistant transcript
+message and the current settled tool metadata (`S.toolCalls`, including the
+message-derived reload path), applies those observations through
+`applyAssistantTurnAnchorSourceEvent()`, projects `activity_scene_v1` in
+`compact_worklog` mode, and renders the scene through the same Worklog DOM
+handoff.
+
+This is still a render-time projection, not a new persisted store. The settled
+transcript and its tool metadata remain the durable input; the temporary
+registry exists only to reuse the anchor normalizer, activity-scene projection,
+and ownership guard. The existing legacy `S.toolCalls` / `assistantThinking`
+rebuild remains the fallback whenever the helper is unavailable, the turn has no
+completed tool rows, the scene has fewer tool rows than the message-derived
+fallback, or projection/rendering throws.
+
+The durable path is deliberately scoped to Compact Worklog. Transparent Stream,
+in-place settlement optimization, reconnect replay dedupe, and `INFLIGHT` field
+retirement remain separate follow-up slices.
 
 ## Source Event Classification
 

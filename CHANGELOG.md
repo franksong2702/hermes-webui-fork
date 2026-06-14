@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Stable Assistant Turn Anchors durable Compact Worklog rebuild (#3926).** Settled assistant turns can now rebuild Compact Worklog rows through the anchor `activity_scene_v1` projection even after the retained live registry is unavailable, using the settled assistant message plus existing settled tool metadata as the durable input. The retained live registry remains preferred, reasoning-only turns still fall back to the legacy renderer, and Transparent Stream / in-place settlement / reconnect replay dedupe remain follow-up slices.
+
 ## [v0.51.410] — 2026-06-14 — Release NW (chat Mermaid lightbox + workspace CSV table preview, #4075/#4025)
 
 ### Added

@@ -90,8 +90,12 @@ def test_phase0_scaffold_is_loaded_before_current_rendering_modules():
     ui_src = _read(UI_JS)
     assert "'./static/assistant_turn_anchors.js' + VQ" in _read(SW_JS)
     assert "projectAssistantTurnAnchorSettledMessageFinalAnswer" in ui_src
-    assert "createAssistantTurnAnchorRegistry" not in ui_src
-    assert "applyAssistantTurnAnchorSourceEvent" not in ui_src
+    assert "_assistantTurnAnchorDurableActivitySceneForMessage" in ui_src
+    durable_helper = ui_src.split(
+        "function _assistantTurnAnchorDurableActivitySceneForMessage", 1
+    )[1].split("function _assistantTurnAnchorSceneTextValue", 1)[0]
+    assert "createAssistantTurnAnchorRegistry" in durable_helper
+    assert "applyAssistantTurnAnchorSourceEvent" in durable_helper
     assert "HermesAssistantTurnAnchors" not in _read(SESSIONS_JS)
     messages_src = _read(MESSAGES_JS)
     assert "window._liveAnchorRegistries" in messages_src
