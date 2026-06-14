@@ -3,8 +3,9 @@
 This inventory implements the first non-visual slice of
 [`stable-assistant-turn-anchors.md`](../rfcs/stable-assistant-turn-anchors.md).
 It documents the current per-turn state layers and the event-shape contract that
-future anchor phases must consume. It does not claim that anchors are wired into
-streaming or rendering yet.
+later anchor phases must consume. Early slices were inert; this file now tracks
+which narrow rendering handoffs have started and which paths still fall back to
+the existing renderer.
 
 ## RFC Phase Progress
 
@@ -41,6 +42,12 @@ streaming or rendering yet.
   Transparent Stream row hooks and feed them through the reconciler to produce a
   concrete matched / mismatched answer. The adapter remains opt-in and is not
   invoked by `renderMessages()` or the live SSE hot path.
+- Slice 9 starts the Compact Worklog renderer handoff: settled assistant
+  messages stamped with `_anchor_stream_id` can read the retained live anchor
+  registry's `activity_scene_v1`, render reasoning/tool rows through the current
+  Worklog DOM helpers, and skip the legacy rebuild for that turn. Transparent
+  Stream, reload-after-registry-expiry, and any missing/mismatched registry still
+  use the existing renderer.
 
 ## State Layers
 
@@ -163,8 +170,10 @@ Transparent Stream receives the same row IDs, order, kinds, roles, text, tool
 IDs, and sanitized payloads with a chronological display hint. This pins the
 shared input shape before either renderer is rewired.
 
-This slice is still inert. No current UI module consumes the activity scene.
-`renderMessages()` and the live streaming hot path were unchanged by Slice 5.
+Slice 5 landed inert: no UI module consumed the activity scene at that point,
+and `renderMessages()` plus the live streaming hot path were unchanged by that
+slice. Later handoffs must be documented separately below when they start
+consuming this projection.
 
 ## Slice 6 Live Shadow Feed
 
@@ -249,6 +258,53 @@ bounded way to ask whether the current renderer output is equivalent to the
 anchor-owned activity scene. A `matched: false` result is expected while current
 renderers intentionally collapse or omit events, such as representing a tool
 start + tool completion as one visible row or omitting terminal status rows.
+
+## Slice 9 Compact Worklog Handoff
+
+`renderMessages()` now has a guarded Compact Worklog handoff for settled
+assistant messages that carry `_anchor_stream_id` from the live stream done
+path. When `window._liveAnchorRegistries` still contains the matching registry
+and the registry belongs to the current session, the renderer projects
+`activity_scene_v1` in `compact_worklog` mode and renders the scene's reasoning
+and tool rows through the existing Worklog helpers (`ensureActivityGroup()`,
+`_appendWorklogStep()`, and `buildToolCard()`).
+
+The handoff preserves the current visual surface. It does not redesign Worklog
+rows, does not fold the final answer into Worklog, and does not touch
+Transparent Stream. Tool start/update/complete activity rows are coalesced by
+tool identity so Compact Worklog continues to show one tool card with the latest
+known state rather than duplicate start and completion cards.
+
+The scene remains the owner for tool rows in this slice. Same-turn
+`assistantThinking` is only used as a de-duped reasoning backfill when the
+retained live scene does not include reasoning text that already exists in the
+settled transcript extraction path, such as reasoning split from a final
+assistant message after `done`. Those fallback reasoning rows are inserted
+before the first tool row so the expanded Compact Worklog still reads as
+reasoning first, then tool activity, instead of moving settled Thinking to the
+bottom.
+
+Anchor-stamped settled turns also bypass the session HTML cache. The cache is a
+DOM snapshot optimization for ordinary session switches; restoring it before the
+worklog rebuild would skip the scene projection and make settled Worklog
+continuity depend on whether a stale DOM snapshot happened to exist. This slice
+therefore re-runs render-time scene reconciliation whenever `_anchor_stream_id`
+is present, while still allowing normal sessions to use the cache.
+
+If the anchor helper is unavailable, the retained live registry has expired, the
+session identity is missing or does not match, the scene has no Compact Worklog
+rows, or the projection/render adapter throws, the current `S.toolCalls` /
+`assistantThinking` settled rebuild path remains the fallback. This keeps Slice
+9 as a renderer handoff, not a second semantic store and not the final
+replay/reload rebuild solution.
+
+The handoff also has a negative ownership guard: an anchor scene may suppress the
+legacy settled rebuild only when it has at least one completed tool row and, when
+message-derived fallback tools exist for the same assistant turn, the scene has
+at least as many tool rows as that fallback set. Reasoning-only scenes,
+incomplete/running tool scenes, and scenes missing message-level tools all fall
+back to the existing renderer so a restored final turn cannot collapse to
+Thinking-only Worklog detail.
 
 ## Source Event Classification
 

@@ -239,7 +239,7 @@ class TestToolCallGroupingStatic:
         restore_fn = _function_body(UI_JS, "_restoreWorklogDetailDisclosureState")
         apply_fn = _function_body(UI_JS, "_setWorklogDetailDisclosureOpen")
         capture_pos = render_fn.index("const worklogDetailDisclosureState=_captureWorklogDetailDisclosureState(inner);")
-        cache_pos = render_fn.index("if(sid&&sid!==_sessionHtmlCacheSid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi)")
+        cache_pos = render_fn.index("if(sid&&sid!==_sessionHtmlCacheSid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!hasAnchorSceneWorklogCandidate)")
         cache_return_pos = render_fn.index("return;", cache_pos)
         wipe_pos = render_fn.index("inner.innerHTML='';")
         restore_pos = render_fn.index("_restoreWorklogDetailDisclosureState(inner, worklogDetailDisclosureState);")

@@ -8860,6 +8860,199 @@ function _assistantTurnAnchorSettledFinalAnswer(message, content, context){
     return null;
   }
 }
+let _assistantTurnAnchorActivitySceneWarned=false;
+function _assistantTurnAnchorWarnActivitySceneFailure(err){
+  if(_assistantTurnAnchorActivitySceneWarned||typeof console==='undefined'||!console.warn) return;
+  _assistantTurnAnchorActivitySceneWarned=true;
+  console.warn('assistant turn anchor activity-scene projection failed',err);
+}
+function _assistantTurnAnchorActivitySceneForMessage(message, context){
+  try{
+    const api=(typeof window!=='undefined')?window.HermesAssistantTurnAnchors:null;
+    if(!api||typeof api.projectAssistantTurnAnchorActivityScene!=='function') return null;
+    const streamId=String((message&&message._anchor_stream_id)||'').trim();
+    if(!streamId) return null;
+    const registries=(typeof window!=='undefined')?window._liveAnchorRegistries:null;
+    if(!registries||typeof registries.get!=='function') return null;
+    const registry=registries.get(streamId);
+    const anchor=registry&&registry.anchor;
+    if(!anchor) return null;
+    const expectedSession=String((context&&context.session_id)||'').trim();
+    const actualSession=String((anchor.identity&&anchor.identity.session_id)||anchor.session_id||'').trim();
+    if(expectedSession&&(!actualSession||actualSession!==expectedSession)) return null;
+    const scene=api.projectAssistantTurnAnchorActivityScene(registry,{mode:'compact_worklog'});
+    if(!scene||scene.version!=='activity_scene_v1'||scene.mode!=='compact_worklog') return null;
+    return _assistantTurnAnchorCompactWorklogItems(scene).length?scene:null;
+  }catch(err){
+    _assistantTurnAnchorWarnActivitySceneFailure(err);
+    return null;
+  }
+}
+function _assistantTurnAnchorSceneTextValue(value){
+  if(value===undefined||value===null) return '';
+  if(typeof value==='string') return value;
+  try{return JSON.stringify(value,null,2);}catch(_){return String(value);}
+}
+function _assistantTurnAnchorToolKey(row){
+  if(!row) return '';
+  const tool=row.tool&&typeof row.tool==='object'?row.tool:null;
+  return String(
+    row.tool_call_id||
+    (tool&&(tool.id||tool.signature))||
+    row.event_id||
+    row.local_id||
+    row.row_id||
+    ''
+  );
+}
+function _assistantTurnAnchorToolCallFromSceneRow(row, rawIdx){
+  const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:null;
+  if(!tool) return null;
+  const payload=row.payload&&typeof row.payload==='object'?row.payload:{};
+  const tid=String(row.tool_call_id||tool.id||payload.tool_call_id||payload.tool_use_id||payload.call_id||payload.tid||row.row_id||'');
+  const snippet=_assistantTurnAnchorSceneTextValue(tool.snippet||tool.output||payload.output||payload.result||payload.snippet||'');
+  const preview=_assistantTurnAnchorSceneTextValue(tool.preview||payload.preview||payload.summary||row.text||'');
+  const done=tool.done!==undefined&&tool.done!==null
+    ? !!tool.done
+    : (row.kind==='tool_completed'||row.status==='completed'||row.status==='error'||row.status==='failed');
+  const args=tool.args&&typeof tool.args==='object'?tool.args:{};
+  const tc={
+    name:tool.name||payload.name||payload.tool_name||payload.function_name||'tool',
+    tid,
+    id:tid,
+    tool_call_id:tid,
+    args:typeof _toolArgsSnapshot==='function'?_toolArgsSnapshot(args):args,
+    preview,
+    snippet:snippet||preview,
+    done,
+    is_error:!!tool.is_error,
+    assistant_msg_idx:rawIdx,
+  };
+  if(tool.duration!==undefined&&tool.duration!==null) tc.duration=tool.duration;
+  if(tool.started_at!==undefined&&tool.started_at!==null) tc.started_at=tool.started_at;
+  if(row.group&&row.group.activity_burst_id!==undefined&&row.group.activity_burst_id!==null) tc.activityBurstId=row.group.activity_burst_id;
+  if(row.group&&row.group.activity_segment_seq!==undefined&&row.group.activity_segment_seq!==null) tc.activitySegmentSeq=row.group.activity_segment_seq;
+  return tc;
+}
+function _assistantTurnAnchorThinkingDedupeKey(text){
+  const raw=String(text||'').trim();
+  if(!raw) return '';
+  if(typeof _normalizeThinkingEchoCompare==='function') return _normalizeThinkingEchoCompare(raw);
+  return raw.replace(/\s+/g,' ').trim().toLowerCase();
+}
+function _assistantTurnAnchorCompactWorklogItems(scene, rawIdx, opts){
+  const rows=scene&&Array.isArray(scene.activity_rows)?scene.activity_rows:[];
+  const fallbackThinkingEntries=Array.isArray(opts&&opts.fallbackThinkingEntries)?opts.fallbackThinkingEntries:[];
+  const items=[];
+  const toolIndexes=new Map();
+  const thinkingKeys=new Set();
+  const fallbackItems=[];
+  rows.forEach(row=>{
+    if(!row||typeof row!=='object') return;
+    if(row.kind==='reasoning'){
+      const text=row.thinking&&row.thinking.text?row.thinking.text:row.text;
+      const key=_assistantTurnAnchorThinkingDedupeKey(text);
+      if(key){
+        thinkingKeys.add(key);
+        items.push({kind:'reasoning',row,text:String(text)});
+      }
+      return;
+    }
+    if(row.kind==='tool_started'||row.kind==='tool_updated'||row.kind==='tool_completed'){
+      const toolCall=_assistantTurnAnchorToolCallFromSceneRow(row, rawIdx);
+      if(!toolCall) return;
+      const key=_assistantTurnAnchorToolKey(row)||`row:${items.length}`;
+      const item={kind:'tool',row,toolCall};
+      if(toolIndexes.has(key)) items[toolIndexes.get(key)]=item;
+      else{
+        toolIndexes.set(key,items.length);
+        items.push(item);
+      }
+    }
+  });
+  fallbackThinkingEntries.forEach((entry,index)=>{
+    const text=String((entry&&entry.text)||entry||'').trim();
+    const key=_assistantTurnAnchorThinkingDedupeKey(text);
+    if(!key||thinkingKeys.has(key)) return;
+    thinkingKeys.add(key);
+    fallbackItems.push({
+      kind:'reasoning',
+      row:{row_id:(entry&&entry.key)||`fallback-thinking:${index}`},
+      text,
+    });
+  });
+  if(fallbackItems.length){
+    const firstToolIndex=items.findIndex(item=>item&&item.kind==='tool');
+    if(firstToolIndex>=0) items.splice(firstToolIndex,0,...fallbackItems);
+    else items.push(...fallbackItems);
+  }
+  return items;
+}
+function _assistantTurnAnchorSceneOwnsCompactWorklogTurn(items, fallbackToolCount){
+  const toolItems=Array.from(items||[]).filter(item=>item&&item.kind==='tool'&&item.toolCall);
+  if(!toolItems.length) return false;
+  if(toolItems.some(item=>item.toolCall&&item.toolCall.done===false)) return false;
+  const fallbackCount=Math.max(0,Number(fallbackToolCount)||0);
+  if(fallbackCount&&toolItems.length<fallbackCount) return false;
+  return true;
+}
+function _assistantTurnAnchorCompactWorklogPlacementAnchor(anchorTurn, fallbackAnchor){
+  const blocks=_assistantTurnBlocks(anchorTurn);
+  if(!blocks) return fallbackAnchor;
+  return blocks.querySelector('.assistant-segment')||fallbackAnchor;
+}
+function _renderAssistantTurnAnchorCompactWorklogScene(anchorRow, scene, opts){
+  if(!anchorRow||!scene) return false;
+  const anchorTurn=anchorRow.closest('.assistant-turn');
+  if(!anchorTurn) return false;
+  const placementAnchor=_assistantTurnAnchorCompactWorklogPlacementAnchor(anchorTurn, anchorRow);
+  const anchorParent=placementAnchor&&placementAnchor.parentElement;
+  if(!anchorParent) return false;
+  const rawIdx=opts&&opts.raw_idx;
+  const items=Array.isArray(opts&&opts.items)
+    ? opts.items
+    : _assistantTurnAnchorCompactWorklogItems(scene, rawIdx, opts);
+  if(!items.length) return false;
+  const identity=scene.identity||{};
+  const activityKey=`anchor-scene:${identity.session_id||''}:${identity.stream_id||identity.run_id||rawIdx||''}`;
+  const firstGroup=(items.find(item=>item.row&&item.row.group)||{}).row?.group||{};
+  const group=ensureActivityGroup(anchorParent,{
+    collapsed:true,
+    anchor:placementAnchor,
+    beforeAnchor:true,
+    syncAnchorReason:false,
+    activityKey,
+    burstId:firstGroup.activity_burst_id||'',
+    segmentSeq:firstGroup.activity_segment_seq||'',
+    turnDuration:opts&&opts.turnDuration,
+  });
+  const list=_toolWorklogListEl(group);
+  if(!list) return false;
+  list.innerHTML='';
+  const state={seenReasons:new Set(),seenTools:new Set()};
+  for(const item of items){
+    if(item.kind==='reasoning'){
+      const rowId=item.row&&item.row.row_id?item.row.row_id:String(item.text||'').trim();
+      _appendWorklogStep(group, anchorRow, [], item.text, {
+        live:false,
+        includeAnchorReason:false,
+        thinkingKey:`anchor-scene:${rowId}`,
+        thinkingDisclosureKey:`anchor-scene:${rowId}`,
+        seenReasons:state.seenReasons,
+        seenTools:state.seenTools,
+      });
+    }else if(item.kind==='tool'){
+      _appendWorklogStep(group, anchorRow, [item.toolCall], '', {
+        live:false,
+        includeAnchorReason:false,
+        seenReasons:state.seenReasons,
+        seenTools:state.seenTools,
+      });
+    }
+  }
+  _syncToolCallGroupSummary(group);
+  return true;
+}
 function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
   // Terminal stream renders can happen after S.activeStreamId is cleared.
   // In that case, preserveScroll asks the normal pin-state helper to decide:
@@ -8918,6 +9111,7 @@ function renderMessages(options){
   if(sid!==_messageRenderWindowSid) _resetMessageRenderWindow(sid);
   const renderWindowSize=_currentMessageRenderWindowSize();
   let cachedRenderSignature=null;
+  const hasAnchorSceneWorklogCandidate=isCompactWorklogMode()&&Array.isArray(S.messages)&&S.messages.some(m=>m&&m.role==='assistant'&&!m._live&&m._anchor_stream_id);
   const hasTransientTranscriptUi=!!(
     (window._compressionUi&&(!window._compressionUi.sessionId||window._compressionUi.sessionId===sid)) ||
     (window._handoffUi&&(!window._handoffUi.sessionId||window._handoffUi.sessionId===sid))
@@ -8931,7 +9125,10 @@ function renderMessages(options){
   // Also skip cache for transient transcript cards such as /compress and
   // cross-channel handoff summaries; otherwise the cached transcript returns
   // before those cards can be inserted.
-  if(sid&&sid!==_sessionHtmlCacheSid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi){
+  // Anchor-scene Worklog handoff is also a render-time reconciliation: restoring
+  // cached HTML here would skip the scene projection and make session switching
+  // depend on whether the old DOM happened to be cached before settlement.
+  if(sid&&sid!==_sessionHtmlCacheSid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!hasAnchorSceneWorklogCandidate){
     const renderSignature=_messageRenderCacheSignature();
     cachedRenderSignature=renderSignature;
     const cached=_sessionHtmlCache.get(sid);
@@ -9622,7 +9819,8 @@ function renderMessages(options){
     if(derived.length) S.toolCalls=derived;
     if(S._settledLiveToolMetadata) S._settledLiveToolMetadata=null;
   }
-  if(!S.busy || (S.toolCalls&&S.toolCalls.length)){
+  const anchorSceneWorklogAssistantIdxs=new Set();
+  if(!S.busy || (S.toolCalls&&S.toolCalls.length) || hasAnchorSceneWorklogCandidate){
     // Rebuild settled tool/worklog/thinking nodes. The `|| (S.toolCalls.length)`
     // arm is REQUIRED, not just `!S.busy`: when renderMessages re-runs during an
     // active stream (e.g. switching back to an in-progress session, busy=true),
@@ -9668,8 +9866,20 @@ function renderMessages(options){
       }
       return duration;
     };
+    const _assistantThinkingEntriesForTurn=(anchorTurn)=>{
+      const entries=[];
+      if(!anchorTurn) return entries;
+      for(const [thinkingIdx,text] of assistantThinking){
+        const thinkingSeg=assistantSegments.get(thinkingIdx);
+        if(thinkingSeg&&thinkingSeg.closest('.assistant-turn')===anchorTurn&&String(text||'').trim()){
+          entries.push({key:`legacy-thinking:${thinkingIdx}`,text});
+        }
+      }
+      return entries;
+    };
     const durationAssignedTurns = new Set();
     const activityByTurn = new Map();
+    const anchorSceneWorklogTurns = new Set();
     const activityOrder = [];
     const ensureActivityBucket=(key,aIdx,segmentSeq,burstId)=>{
       if(!byActivity.has(key)){
@@ -9725,6 +9935,49 @@ function renderMessages(options){
       return a.aIdx-b.aIdx;
     });
     if(!isTransparentStream()){
+      if(isCompactWorklogMode()){
+        const _legacyToolCountForTurn=(anchorTurn)=>{
+          let count=0;
+          for(const entry of activityOrder){
+            if(!entry||!Array.isArray(entry.cards)||!entry.cards.length) continue;
+            const row=_assistantAnchorForActivity(entry.aIdx,entry.segmentSeq,entry.burstId);
+            if(row&&row.closest('.assistant-turn')===anchorTurn) count+=entry.cards.length;
+          }
+          return count;
+        };
+        for(const aIdx of assistantIdxs){
+          const msg=S.messages[aIdx]||{};
+          if(!msg||msg.role!=='assistant'||msg._live||!msg._anchor_stream_id) continue;
+          const anchorRow=assistantSegments.get(aIdx);
+          if(!anchorRow) continue;
+          const anchorTurn=anchorRow.closest('.assistant-turn');
+          if(!anchorTurn||anchorSceneWorklogTurns.has(anchorTurn)) continue;
+          const scene=_assistantTurnAnchorActivitySceneForMessage(msg,{
+            session_id:sid,
+            raw_idx:aIdx,
+          });
+          if(!scene) continue;
+          const fallbackThinkingEntries=_assistantThinkingEntriesForTurn(anchorTurn);
+          const items=_assistantTurnAnchorCompactWorklogItems(scene, aIdx, {
+            fallbackThinkingEntries,
+          });
+          if(!_assistantTurnAnchorSceneOwnsCompactWorklogTurn(items,_legacyToolCountForTurn(anchorTurn))) continue;
+          const includeTurnDuration=!durationAssignedTurns.has(anchorTurn);
+          const rendered=_renderAssistantTurnAnchorCompactWorklogScene(anchorRow, scene, {
+            raw_idx:aIdx,
+            turnDuration:includeTurnDuration?_turnDurationForAnchor(anchorRow):undefined,
+            fallbackThinkingEntries,
+            items,
+          });
+          if(rendered){
+            anchorSceneWorklogTurns.add(anchorTurn);
+            for(const [turnIdx,turnSeg] of assistantSegments){
+              if(turnSeg&&turnSeg.closest('.assistant-turn')===anchorTurn) anchorSceneWorklogAssistantIdxs.add(turnIdx);
+            }
+            if(includeTurnDuration) durationAssignedTurns.add(anchorTurn);
+          }
+        }
+      }
       for(const entry of activityOrder){
         const {aIdx,segmentSeq,burstId,cards,thinkingIdx,includeAnchorReason}=entry;
         if(aIdx<assistantIdxs[0]) continue;
@@ -9736,6 +9989,7 @@ function renderMessages(options){
         if(!cards.length&&!anchorReasonHtml&&!thinkingText) continue;
         const anchorTurn=anchorRow.closest('.assistant-turn');
         if(!anchorTurn) continue;
+        if(anchorSceneWorklogTurns.has(anchorTurn)) continue;
         let state=activityByTurn.get(anchorTurn);
         if(!state){
           const includeTurnDuration=!durationAssignedTurns.has(anchorTurn);
@@ -9860,7 +10114,7 @@ function renderMessages(options){
       // The Worklog summary owns the "Done in …" duration whenever this
       // assistant message contributes tool or thinking detail to a folded
       // Worklog above the final answer.
-      const compactWorklogForMessage=isCompactWorklogMode()&&(toolCallAssistantIdxs.has(mi)||assistantThinking.has(mi));
+      const compactWorklogForMessage=isCompactWorklogMode()&&(toolCallAssistantIdxs.has(mi)||assistantThinking.has(mi)||anchorSceneWorklogAssistantIdxs.has(mi));
       const durationText=compactWorklogForMessage?'':_formatTurnDuration(msg._turnDuration);
       if(!hasTurnUsage&&!durationText&&!gatewayText&&!failoverText&&!modelWarningText) continue;
       const seg=assistantSegments.get(mi);
@@ -10136,7 +10390,7 @@ function renderMessages(options){
   if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(inner);
   // Populate session cache so switching back here skips a full rebuild.
   _sessionHtmlCacheSid=sid;
-  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi){
+  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!hasAnchorSceneWorklogCandidate){
     const _html=inner.innerHTML;
     // Only cache sessions with <300KB rendered HTML; evict oldest beyond 8 sessions.
     if(_html.length<300_000){

@@ -3931,6 +3931,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(typeof _messageRenderableMessageCount==='function'&&typeof _messageRenderWindowSize!=='undefined'){
           _messageRenderWindowSize=Math.max(typeof _currentMessageRenderWindowSize==='function'?_currentMessageRenderWindowSize():50, _messageRenderableMessageCount());
         }
+        // Restore-path settlement must render as idle. The settled renderer's
+        // message-level tool fallback is gated on !S.busy, so leaving the pane
+        // busy here can rebuild the final turn with Thinking only and no tools.
+        S.busy=false;
         syncTopbar();renderMessages({preserveScroll:true});
       }
       if(_isActiveSession()) _queueDrainSid=activeSid;

@@ -134,13 +134,18 @@ def test_settled_worklog_rebuild_not_gated_on_idle_only():
     when renderMessages re-ran during an active stream (switch-back to in-progress
     session) — the same content-loss-on-switch class as #3668. (#3401 regression)"""
     body = UI_JS
-    # The rebuild guard must include the `|| (S.toolCalls && S.toolCalls.length)` arm.
-    assert re.search(
-        r"if\(!S\.busy\s*\|\|\s*\(S\.toolCalls\s*&&\s*S\.toolCalls\.length\)\)\{",
+    guard_match = re.search(
+        r"if\((?P<guard>[^\n]+)\)\{\n    // Rebuild settled tool/worklog/thinking nodes",
         body,
-    ), (
+    )
+    assert guard_match, "the settled worklog rebuild guard was not found"
+    guard = re.sub(r"\s+", "", guard_match.group("guard"))
+    # The rebuild guard may gain additional ownership arms, but it must keep the
+    # busy-path `S.toolCalls` arm that fixes the original switch-back regression.
+    assert "!S.busy" in guard, "the settled worklog rebuild must still run while idle"
+    assert re.search(r"(^|\|\|)\(?S\.toolCalls&&S\.toolCalls\.length\)?($|\|\|)", guard), (
         "the settled worklog rebuild must run while busy when tool calls exist "
-        "(if(!S.busy || (S.toolCalls && S.toolCalls.length))), not gate purely on !S.busy"
+        "(the guard must include an OR arm for S.toolCalls&&S.toolCalls.length)"
     )
     # And the bare `if(!S.busy){` immediately before that rebuild's worklog-wipe must be gone.
     assert "if(!S.busy){\n    inner.querySelectorAll('.tool-worklog-group" not in body, (

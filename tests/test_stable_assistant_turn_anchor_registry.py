@@ -31,6 +31,23 @@ def _event_listener_body(src: str, event_name: str) -> str:
     return src[start:end]
 
 
+def _function_source(src: str, name: str) -> str:
+    marker = f"function {name}("
+    start = src.find(marker)
+    assert start != -1
+    brace = src.find("{", start)
+    depth = 0
+    for idx in range(brace, len(src)):
+        ch = src[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:idx + 1]
+    raise AssertionError(f"function {name} did not close")
+
+
 def _registry_snapshot() -> dict:
     assert NODE, "node is required for assistant_turn_anchors.js registry tests"
     script = f"""
@@ -1236,22 +1253,246 @@ def test_registry_instances_do_not_share_owner_state():
     assert isolated["stats"]["applied"] == 0
     assert isolated["anchor"]["activity_events"] == []
 
-def test_slice5_scene_projection_does_not_wire_activity_scene_into_rendering_hot_paths():
+def test_activity_scene_projection_only_reaches_compact_worklog_handoff():
     scene_helper = "projectAssistantTurnAnchorActivityScene"
+    ui_src = _read(UI_JS)
     for helper in [
         "applyAssistantTurnAnchorNormalizedEvent",
         "applyAssistantTurnAnchorSourceEvents",
         "createAssistantTurnAnchorShadowSnapshot",
-        scene_helper,
         "reconcileAssistantTurnAnchorActivityScene",
     ]:
         assert helper not in _read(UI_JS)
         assert helper not in _read(SESSIONS_JS)
         assert helper not in _read(MESSAGES_JS)
     assert "projectAssistantTurnAnchorSettledMessageFinalAnswer" in _read(UI_JS)
-    assert scene_helper not in _read(UI_JS)
+    assert scene_helper in ui_src
+    assert "_assistantTurnAnchorActivitySceneForMessage" in ui_src
+    assert "projectAssistantTurnAnchorActivityScene(registry,{mode:'compact_worklog'})" in ui_src
     assert scene_helper not in _read(SESSIONS_JS)
     assert scene_helper not in _read(MESSAGES_JS)
+
+
+def test_compact_worklog_anchor_scene_handoff_is_guarded_and_fallback_preserving():
+    src = _read(UI_JS)
+    helper = src.split("function _assistantTurnAnchorActivitySceneForMessage", 1)[1].split(
+        "function _assistantTurnAnchorSceneTextValue", 1
+    )[0]
+    render_body = src.split("const hasAnchorSceneWorklogCandidate=", 1)[1].split(
+        "// ── transparent_stream path: individual expandable event rows ──", 1
+    )[0]
+    render_fn = src.split("function renderMessages(options){", 1)[1].split(
+        "function _toolDisplayName", 1
+    )[0]
+    cache_body = src.split("const hasAnchorSceneWorklogCandidate=", 1)[1].split(
+        "const worklogDetailDisclosureState=", 1
+    )[0]
+    cache_store_body = src.split("// Populate session cache so switching back here skips a full rebuild.", 1)[1].split(
+        "function _toolDisplayName", 1
+    )[0]
+
+    assert "window._liveAnchorRegistries" in helper
+    assert "message._anchor_stream_id" in helper
+    assert "message.stream_id" not in helper
+    assert "message._stream_id" not in helper
+    assert "registries.get(streamId)" in helper
+    assert "expectedSession&&(!actualSession||actualSession!==expectedSession)" in helper
+    assert "return _assistantTurnAnchorCompactWorklogItems(scene).length?scene:null" in helper
+
+    assert "m&&m.role==='assistant'&&!m._live&&m._anchor_stream_id" in render_body
+    assert "!hasAnchorSceneWorklogCandidate" in cache_body
+    assert "!hasAnchorSceneWorklogCandidate" in cache_store_body
+    assert render_fn.index("const hasAnchorSceneWorklogCandidate=") < render_fn.index("if(sid&&sid!==_sessionHtmlCacheSid")
+    assert "if(!S.busy || (S.toolCalls&&S.toolCalls.length) || hasAnchorSceneWorklogCandidate){" in render_body
+    assert "if(isCompactWorklogMode()){" in render_body
+    assert "_assistantTurnAnchorActivitySceneForMessage(msg,{" in render_body
+    assert "_renderAssistantTurnAnchorCompactWorklogScene(anchorRow, scene" in render_body
+    assert "_legacyToolCountForTurn(anchorTurn)" in render_body
+    assert "_assistantTurnAnchorSceneOwnsCompactWorklogTurn(items,_legacyToolCountForTurn(anchorTurn))" in render_body
+    assert "anchorSceneWorklogTurns.add(anchorTurn)" in render_body
+    assert "anchorSceneWorklogAssistantIdxs.add(turnIdx)" in render_body
+    assert "if(anchorSceneWorklogTurns.has(anchorTurn)) continue;" in render_body
+
+
+def test_compact_worklog_anchor_scene_session_guard_fails_closed_for_missing_anchor_session():
+    assert NODE, "node is required for ui.js helper tests"
+    src = _read(UI_JS)
+    helper = _function_source(src, "_assistantTurnAnchorActivitySceneForMessage")
+    script = f"""
+const assert = require('assert');
+const projectCalls = [];
+function _assistantTurnAnchorCompactWorklogItems(scene) {{
+  return Array.isArray(scene && scene.activity_rows) ? scene.activity_rows : [];
+}}
+global.window = {{
+  HermesAssistantTurnAnchors: {{
+    projectAssistantTurnAnchorActivityScene(registry, opts) {{
+      projectCalls.push({{registry, opts}});
+      return {{
+        version: 'activity_scene_v1',
+        mode: 'compact_worklog',
+        activity_rows: [{{kind: 'tool_completed', row_id: 'row-1'}}],
+      }};
+    }},
+  }},
+  _liveAnchorRegistries: new Map(),
+}};
+var window = global.window;
+{helper}
+
+const registry = {{anchor: {{identity: {{stream_id: 'stream-1'}}}}}};
+window._liveAnchorRegistries.set('stream-1', registry);
+const message = {{_anchor_stream_id: 'stream-1'}};
+assert.strictEqual(
+  _assistantTurnAnchorActivitySceneForMessage(message, {{session_id: 'sid-current'}}),
+  null
+);
+assert.strictEqual(projectCalls.length, 0);
+
+registry.anchor.identity.session_id = 'sid-other';
+assert.strictEqual(
+  _assistantTurnAnchorActivitySceneForMessage(message, {{session_id: 'sid-current'}}),
+  null
+);
+assert.strictEqual(projectCalls.length, 0);
+
+registry.anchor.identity.session_id = 'sid-current';
+const scene = _assistantTurnAnchorActivitySceneForMessage(message, {{session_id: 'sid-current'}});
+assert.strictEqual(scene && scene.version, 'activity_scene_v1');
+assert.strictEqual(projectCalls.length, 1);
+"""
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_compact_worklog_scene_coalesces_tools_and_keeps_final_anchor_visible():
+    src = _read(UI_JS)
+    item_helper = src.split("function _assistantTurnAnchorCompactWorklogItems", 1)[1].split(
+        "function _renderAssistantTurnAnchorCompactWorklogScene", 1
+    )[0]
+    render_helper = src.split("function _renderAssistantTurnAnchorCompactWorklogScene", 1)[1].split(
+        "function _scrollAfterMessageRender", 1
+    )[0]
+    footer_body = src.split("// Render per-turn duration", 1)[1].split(
+        "// Transparent mode per-turn wiring", 1
+    )[0]
+
+    assert "const toolIndexes=new Map()" in item_helper
+    assert "items[toolIndexes.get(key)]=item" in item_helper
+    assert "row.kind==='tool_started'||row.kind==='tool_updated'||row.kind==='tool_completed'" in item_helper
+    assert "row.kind==='reasoning'" in item_helper
+    assert "fallbackThinkingEntries.forEach" in item_helper
+    assert "thinkingKeys.has(key)" in item_helper
+    assert "const fallbackItems=[]" in item_helper
+    assert "const firstToolIndex=items.findIndex(item=>item&&item.kind==='tool')" in item_helper
+    assert "items.splice(firstToolIndex,0,...fallbackItems)" in item_helper
+    assert "function _assistantTurnAnchorSceneOwnsCompactWorklogTurn(items, fallbackToolCount)" in src
+    assert "if(!toolItems.length) return false;" in src
+    assert "toolItems.some(item=>item.toolCall&&item.toolCall.done===false)" in src
+    assert "toolItems.length<fallbackCount" in src
+
+    assert "_assistantTurnAnchorCompactWorklogPlacementAnchor(anchorTurn, anchorRow)" in render_helper
+    assert "beforeAnchor:true" in render_helper
+    assert "syncAnchorReason:false" in render_helper
+    assert "includeAnchorReason:false" in render_helper
+    assert "_appendWorklogStep(group, anchorRow, [item.toolCall], ''" in render_helper
+    assert "Array.isArray(opts&&opts.items)" in render_helper
+    assert "anchorSceneWorklogAssistantIdxs.has(mi)" in footer_body
+    assert "const fallbackThinkingEntries=_assistantThinkingEntriesForTurn(anchorTurn);" in src
+    assert "fallbackThinkingEntries," in src
+    assert "items," in src
+
+
+def test_compact_worklog_scene_item_projection_orders_fallback_reasoning_before_tools_and_guards_ownership():
+    assert NODE, "node is required for ui.js helper tests"
+    src = _read(UI_JS)
+    helpers = "\n".join(
+        _function_source(src, name)
+        for name in [
+            "_assistantTurnAnchorSceneTextValue",
+            "_assistantTurnAnchorToolKey",
+            "_assistantTurnAnchorToolCallFromSceneRow",
+            "_assistantTurnAnchorThinkingDedupeKey",
+            "_assistantTurnAnchorCompactWorklogItems",
+            "_assistantTurnAnchorSceneOwnsCompactWorklogTurn",
+        ]
+    )
+    script = f"""
+const assert = require('assert');
+function _normalizeThinkingEchoCompare(text) {{
+  return String(text || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+}}
+function _toolArgsSnapshot(args) {{ return Object.assign({{}}, args || {{}}); }}
+{helpers}
+
+const scene = {{
+  activity_rows: [
+    {{
+      kind: 'tool_started',
+      row_id: 'run-item:2',
+      tool_call_id: 'tool-1',
+      group: {{activity_burst_id: 2, activity_segment_seq: 4}},
+      tool: {{
+        id: 'tool-1',
+        name: 'terminal',
+        args: {{command: 'rg anchor'}},
+        preview: 'rg anchor',
+        done: false,
+        is_error: false,
+      }},
+    }},
+    {{
+      kind: 'tool_completed',
+      row_id: 'run-item:3',
+      tool_call_id: 'tool-1',
+      group: {{activity_burst_id: 2, activity_segment_seq: 4}},
+      tool: {{
+        id: 'tool-1',
+        name: 'terminal',
+        args: {{command: 'rg anchor'}},
+        snippet: 'done',
+        done: true,
+        is_error: false,
+      }},
+    }},
+  ],
+}};
+
+const items = _assistantTurnAnchorCompactWorklogItems(scene, 7, {{
+  fallbackThinkingEntries: [{{key: 'legacy-thinking:7', text: 'I should inspect the files first.'}}],
+}});
+
+assert.deepStrictEqual(items.map((item) => item.kind), ['reasoning', 'tool']);
+assert.strictEqual(items[0].text, 'I should inspect the files first.');
+assert.strictEqual(items[1].toolCall.done, true);
+assert.strictEqual(items[1].toolCall.snippet, 'done');
+assert.strictEqual(items[1].toolCall.assistant_msg_idx, 7);
+assert.strictEqual(items[1].toolCall.activityBurstId, 2);
+assert.strictEqual(items[1].toolCall.activitySegmentSeq, 4);
+assert.strictEqual(_assistantTurnAnchorSceneOwnsCompactWorklogTurn(items, 1), true);
+assert.strictEqual(_assistantTurnAnchorSceneOwnsCompactWorklogTurn(items, 2), false);
+
+const deduped = _assistantTurnAnchorCompactWorklogItems({{
+  activity_rows: [{{kind: 'reasoning', row_id: 'run-item:1', text: 'Same thought'}}],
+}}, 8, {{
+  fallbackThinkingEntries: [{{key: 'legacy-thinking:8', text: 'Same thought'}}],
+}});
+assert.deepStrictEqual(deduped.map((item) => item.kind), ['reasoning']);
+assert.strictEqual(_assistantTurnAnchorSceneOwnsCompactWorklogTurn(deduped, 0), false);
+
+const runningOnly = _assistantTurnAnchorCompactWorklogItems({{
+  activity_rows: [{{
+    kind: 'tool_started',
+    row_id: 'run-item:4',
+    tool_call_id: 'tool-running',
+    tool: {{id: 'tool-running', name: 'terminal', done: false}},
+  }}],
+}}, 9, {{}});
+assert.strictEqual(runningOnly.length, 1);
+assert.strictEqual(_assistantTurnAnchorSceneOwnsCompactWorklogTurn(runningOnly, 1), false);
+"""
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
 
 
 def test_slice6_live_shadow_feed_wires_non_token_events_without_renderer_scene_consumption():

@@ -114,6 +114,18 @@ def test_restore_settled_session_can_report_active_pending_status():
     assert "return returnStatus?'restored':true;" in fn
 
 
+def test_restore_settled_session_renders_after_clearing_busy_state():
+    fn = _function_body("_restoreSettledSession")
+    clear_idx = fn.find("S.busy=false;")
+    render_idx = fn.find("renderMessages({preserveScroll:true});")
+    assert clear_idx != -1, (
+        "restored settled sessions must clear busy before render so message-level "
+        "tool metadata can rebuild Worklog tool rows"
+    )
+    assert render_idx != -1
+    assert clear_idx < render_idx
+
+
 def test_stream_end_recovery_state_is_cleared_on_done_and_terminal_events():
     assert "_clearStreamEndRecovery();" in _event_block("done")
     assert "_clearStreamEndRecovery();" in _event_block("stream_end")

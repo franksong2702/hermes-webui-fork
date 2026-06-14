@@ -118,6 +118,14 @@
 
 - **Long final answers no longer snap back to the bottom while you are reading them in PWA/mobile mode (#4123).** Same-session background refreshes now treat a preserved scroll snapshot whose viewport is clearly away from the bottom (>250px) as an active reading position and restore it before any follow-to-bottom path runs, re-mark restored mid-answer positions as unpinned so later refreshes keep respecting the reader, and no longer reset the scroll-direction tracker on same-session force refreshes (that reset stays scoped to real session switches). (#4123)
 
+### Changed
+
+- **Stable Assistant Turn Anchors Compact Worklog handoff (#3926).** Settled Compact Worklog rendering can now consume the live anchor registry's `activity_scene_v1` for assistant messages stamped with `_anchor_stream_id`, coalescing tool start/complete events into the existing Worklog tool-card UI and skipping the legacy `S.toolCalls` / `assistantThinking` rebuild only when the scene proves it owns a complete settled tool set for that turn. The handoff still backfills same-turn settled reasoning ahead of tool rows when the live scene lacks it, bypasses the session HTML cache for anchor-stamped turns so session switching re-runs scene reconciliation, and missing registries, mismatched sessions, reasoning-only scenes, incomplete/running tool scenes, non-Compact modes, Transparent Stream, and projection errors all fall back to the existing renderer.
+
+### Fixed
+
+- **Restored settled streams rebuild Worklog tool rows before final render (#3926).** The stream-end/reconnect restore path now clears the active pane busy state before calling `renderMessages()`, so the settled message-level tool metadata fallback can rebuild Compact Worklog tool cards instead of rendering a restored final turn with only Thinking detail.
+
 ## [v0.51.389] — 2026-06-13 — Release NB (surface dirty-install state in update check, #4085)
 
 ### Fixed
