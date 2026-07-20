@@ -1958,6 +1958,14 @@ def _stamp_anchor_stream_owner(message, stream_id: str | None, terminal_state: s
     return True
 
 
+def _stamp_anchor_run_owner(message, run_id: str | None) -> None:
+    if not isinstance(message, dict):
+        return
+    run_id = str(run_id or '').strip()
+    if run_id:
+        message['_anchor_run_id'] = run_id
+
+
 def _stamp_latest_cancel_marker_for_stream(session, stream_id: str | None) -> bool:
     messages = getattr(session, 'messages', None)
     if not isinstance(messages, list):
@@ -2042,17 +2050,19 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
     *,
     terminal_state: str,
     message_index: int | None = None,
+    run_id: str | None = None,
 ) -> bool:
     """Persist run-owned artifact outcomes on the terminal assistant message."""
     stream_id = str(stream_id or '').strip()
     if not stream_id:
         return False
+    run_id = str(run_id or stream_id or '').strip()
     try:
         artifacts = bound_anchor_artifact_events(
             list(artifact_events or []),
             session_id=getattr(session, 'session_id', None),
             stream_id=stream_id,
-            run_id=stream_id,
+            run_id=run_id,
             reject_owner_mismatch=True,
         )
     except ValueError:
@@ -2089,6 +2099,7 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
     message = messages[idx]
     if not _stamp_anchor_stream_owner(message, stream_id, terminal_state):
         return False
+    _stamp_anchor_run_owner(message, run_id)
     ref = _message_ref_for_anchor_scene(message)
     key = ref or f"index:{idx}"
     records = dict(getattr(session, 'anchor_activity_scenes', None) or {})
@@ -2103,7 +2114,7 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
         'mode': 'compact_worklog',
         'identity': {
             'session_id': getattr(session, 'session_id', None),
-            'run_id': stream_id,
+            'run_id': run_id,
             'stream_id': stream_id,
             'source_message_refs': [ref] if ref else [],
         },
@@ -2121,8 +2132,10 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
             existing_scene,
             incoming_scene,
             session_id=getattr(session, 'session_id', None),
-            run_id=stream_id,
+            run_id=run_id,
             stream_id=stream_id,
+            owner_run_id=run_id,
+            owner_stream_id=stream_id,
             terminal_state=terminal_state,
             final_answer=final_answer,
             final_message_ref=ref,
@@ -2136,6 +2149,7 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
         'version': 'anchor_activity_scene_record_v1',
         'message_index': idx,
         'message_ref': ref,
+        'run_id': run_id,
         'stream_id': stream_id,
         'scene': scene,
         'updated_at': time.time(),
@@ -2156,6 +2170,7 @@ def _finalize_cancelled_turn(
     ephemeral: bool = False,
     message: str = 'Task cancelled.',
     stream_id: str | None = None,
+    run_id: str | None = None,
     artifact_events=None,
 ) -> None:
     """Finalize a cancelled turn for persistent or ephemeral sessions."""
@@ -2168,6 +2183,7 @@ def _finalize_cancelled_turn(
         stream_id,
         artifact_events or [],
         terminal_state='cancelled',
+        run_id=run_id,
     )
     try:
         session.save()
@@ -8177,15 +8193,19 @@ def _run_agent_streaming(
 
     _success_writeback_committed = False
     _anchor_artifact_events: list[dict] = []
+    _anchor_run_id = [stream_id]
 
     def _record_anchor_artifact_reference(artifact_reference, event_id=None):
         event_run_id, event_seq = _parse_run_journal_event_id(event_id)
+        if event_run_id:
+            _anchor_run_id[0] = event_run_id
         if event_seq is None:
             event_seq = len(_anchor_artifact_events) + 1
+        active_run_id = event_run_id or _anchor_run_id[0] or stream_id
         event = anchor_artifact_event_from_payload(
             artifact_reference,
             session_id=session_id,
-            run_id=event_run_id or stream_id,
+            run_id=active_run_id,
             stream_id=stream_id,
             event_id=event_id,
             seq=event_seq,
@@ -8196,7 +8216,7 @@ def _run_agent_streaming(
         _anchor_artifact_events[:] = bound_anchor_artifact_events(
             [*_anchor_artifact_events, event],
             session_id=session_id,
-            run_id=event_run_id or stream_id,
+            run_id=active_run_id,
             stream_id=stream_id,
         )
 
@@ -8353,6 +8373,7 @@ def _run_agent_streaming(
                     ephemeral=ephemeral,
                     message='Task cancelled before start.',
                     stream_id=stream_id,
+                    run_id=_anchor_run_id[0],
                     artifact_events=_anchor_artifact_events,
                 )
             put('cancel', _cancel_event_payload('Cancelled before start'))
@@ -9671,6 +9692,7 @@ def _run_agent_streaming(
                             ephemeral=ephemeral,
                             message='Task cancelled before start.',
                             stream_id=stream_id,
+                            run_id=_anchor_run_id[0],
                             artifact_events=_anchor_artifact_events,
                         )
                     put('cancel', _cancel_event_payload('Cancelled by user'))
@@ -9879,6 +9901,7 @@ def _run_agent_streaming(
                             s,
                             ephemeral=False,
                             stream_id=stream_id,
+                            run_id=_anchor_run_id[0],
                             artifact_events=_anchor_artifact_events,
                         )
                         try:
@@ -9926,6 +9949,7 @@ def _run_agent_streaming(
                         s,
                         ephemeral=False,
                         stream_id=stream_id,
+                        run_id=_anchor_run_id[0],
                         artifact_events=_anchor_artifact_events,
                     )
                     try:
@@ -9992,6 +10016,7 @@ def _run_agent_streaming(
                             s,
                             ephemeral=False,
                             stream_id=stream_id,
+                            run_id=_anchor_run_id[0],
                             artifact_events=_anchor_artifact_events,
                         )
                         try:
@@ -10249,6 +10274,7 @@ def _run_agent_streaming(
                             s,
                             ephemeral=ephemeral,
                             stream_id=stream_id,
+                            run_id=_anchor_run_id[0],
                             artifact_events=_anchor_artifact_events,
                         )
                         if not ephemeral:
@@ -10484,6 +10510,7 @@ def _run_agent_streaming(
                             _anchor_artifact_events,
                             terminal_state=_err_type or 'error',
                             message_index=len(s.messages) - 1,
+                            run_id=_anchor_run_id[0],
                         )
                         try:
                             s.save()
@@ -10912,6 +10939,7 @@ def _run_agent_streaming(
                                 _anchor_artifact_events,
                                 terminal_state='completed',
                                 message_index=_latest_assistant_idx,
+                                run_id=_anchor_run_id[0],
                             )
                         try:
                             append_turn_journal_event_for_stream(
@@ -10930,6 +10958,7 @@ def _run_agent_streaming(
                         s,
                         ephemeral=False,
                         stream_id=stream_id,
+                        run_id=_anchor_run_id[0],
                         artifact_events=_anchor_artifact_events,
                     )
                     try:
@@ -10953,6 +10982,7 @@ def _run_agent_streaming(
                         s,
                         ephemeral=False,
                         stream_id=stream_id,
+                        run_id=_anchor_run_id[0],
                         artifact_events=_anchor_artifact_events,
                     )
                     try:
@@ -11062,6 +11092,7 @@ def _run_agent_streaming(
                         s,
                         ephemeral=False,
                         stream_id=stream_id,
+                        run_id=_anchor_run_id[0],
                         artifact_events=_anchor_artifact_events,
                     )
                     try:
@@ -11099,6 +11130,7 @@ def _run_agent_streaming(
                             s,
                             ephemeral=False,
                             stream_id=stream_id,
+                            run_id=_anchor_run_id[0],
                             artifact_events=_anchor_artifact_events,
                         )
                         try:
@@ -11127,6 +11159,7 @@ def _run_agent_streaming(
                             s,
                             ephemeral=False,
                             stream_id=stream_id,
+                            run_id=_anchor_run_id[0],
                             artifact_events=_anchor_artifact_events,
                         )
                         try:
@@ -11501,6 +11534,7 @@ def _run_agent_streaming(
                         s,
                         ephemeral=ephemeral,
                         stream_id=stream_id,
+                        run_id=_anchor_run_id[0],
                         artifact_events=_anchor_artifact_events,
                     )
                     if not ephemeral:
@@ -11752,6 +11786,7 @@ def _run_agent_streaming(
                     _anchor_artifact_events,
                     terminal_state=_exc_type or 'error',
                     message_index=len(s.messages) - 1,
+                    run_id=_anchor_run_id[0],
                 )
                 try:
                     s.save()
