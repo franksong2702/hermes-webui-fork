@@ -13647,6 +13647,7 @@ function _turnArtifactEntriesFromScene(scene){
   const entries=[];
   const currentSessionId = S&&S.session&&typeof S.session.session_id==='string' ? S.session.session_id : '';
   for(const artifact of artifacts){
+    if(artifact && artifact.type !== 'artifact_reference') continue;
     const payload=artifact&&artifact.payload&&typeof artifact.payload==='object'?artifact.payload:{};
     if(
       typeof payload.path!=='string'
@@ -13669,6 +13670,7 @@ function _turnArtifactEntriesFromScene(scene){
       session_id: sessionId,
       tool_name: toolName,
       tool_call_id: toolCallId,
+      type: artifact.type,
       owner: {
         session_id: sessionId,
         workspace_root: payload.workspace_root.replace(/\/+$/,''),
