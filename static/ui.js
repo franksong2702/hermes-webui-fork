@@ -17052,7 +17052,9 @@ function renderMessages(options){
       if(msg._anchor_activity_scene){
         _renderSettledAnchorSceneForMessage(msg, seg, rawIdx);
       }
-      _renderTurnArtifactListForMessage(msg, seg, rawIdx);
+      if(typeof _renderTurnArtifactListForMessage==='function'){
+        _renderTurnArtifactListForMessage(msg, seg, rawIdx);
+      }
     }
   }
   _restoreWorklogDetailDisclosureState(inner, worklogDetailDisclosureState);
