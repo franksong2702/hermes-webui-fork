@@ -60,6 +60,7 @@ from api.session_events import (
     unsubscribe_session_events,
 )
 from api.gateway_restart import restart_active_profile_gateway
+from api.process_event_utils import stamp_message_source
 from api.shares import create_or_refresh_share, load_share, revoke_share
 from api.turn_artifacts import landed_artifact_descriptors, normalize_tool_name, tool_result_is_error
 
