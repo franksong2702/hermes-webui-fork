@@ -768,9 +768,16 @@ function _selectedTextReplyRoot(){
   return document.getElementById('messages')||document.getElementById('msgInner');
 }
 
-function _selectedTextReplyWorkspaceRoot(){
-  if(typeof $==='function') return $('previewMd');
-  return document.getElementById('previewMd');
+function _selectedTextReplyWorkspaceRoots(){
+  const roots=[];
+  const markdownRoot=typeof $==='function' ? $('previewMd') : document.getElementById('previewMd');
+  if(markdownRoot)roots.push(markdownRoot);
+  const path=typeof _previewCurrentPath!=='undefined' ? String(_previewCurrentPath||'') : '';
+  if(/\.(?:md|markdown|mdown)$/i.test(path)){
+    const plainRoot=typeof $==='function' ? $('previewCode') : document.getElementById('previewCode');
+    if(plainRoot)roots.push(plainRoot);
+  }
+  return roots;
 }
 
 function _selectedTextReplyNodeInChat(node, root){
@@ -784,11 +791,11 @@ function _selectedTextReplySelection(){
   const selection=window.getSelection();
   if(!selection||selection.isCollapsed||!selection.rangeCount)return null;
   const root=_selectedTextReplyRoot();
-  const wsRoot=_selectedTextReplyWorkspaceRoot();
-  if(!root&&!wsRoot)return null;
+  const wsRoots=_selectedTextReplyWorkspaceRoots();
+  if(!root&&!wsRoots.length)return null;
   const range=selection.getRangeAt(0);
   const inChat=root && _selectedTextReplyNodeInChat(range.startContainer, root) && _selectedTextReplyNodeInChat(range.endContainer, root);
-  const inWs=wsRoot && _selectedTextReplyNodeInChat(range.startContainer, wsRoot) && _selectedTextReplyNodeInChat(range.endContainer, wsRoot);
+  const inWs=wsRoots.some(wsRoot=>_selectedTextReplyNodeInChat(range.startContainer, wsRoot) && _selectedTextReplyNodeInChat(range.endContainer, wsRoot));
   if(!inChat&&!inWs)return null;
   const text=selection.toString().replace(/\u00a0/g,' ').trim();
   if(!text)return null;

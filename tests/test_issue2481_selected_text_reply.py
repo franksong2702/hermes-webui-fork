@@ -32,8 +32,10 @@ def test_selected_text_reply_button_is_selection_scoped_and_frontend_only():
     assert "range.getBoundingClientRect" in js
     assert "_selectedTextReplyRoot" in js
     assert "$('messages')||$('msgInner')" in js
-    assert "_selectedTextReplyWorkspaceRoot" in js
+    assert "_selectedTextReplyWorkspaceRoots" in js
     assert "$('previewMd')" in js
+    assert "$('previewCode')" in js
+    assert "previewMd') : document.getElementById('previewMd')" in js
     assert "root.contains(el)" in js
     assert "document.addEventListener('selectionchange', _updateSelectedTextReplyButton)" in js
 
