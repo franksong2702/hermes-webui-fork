@@ -13630,9 +13630,11 @@ function _turnArtifactEntriesFromScene(scene){
   const entries=[];
   const currentSessionId = S&&S.session&&typeof S.session.session_id==='string' ? S.session.session_id : '';
   for(const artifact of artifacts){
+    const isReference = artifact && (artifact.type === 'artifact_reference' || artifact.source_event_type === 'artifact_reference');
     const payload=artifact&&artifact.payload&&typeof artifact.payload==='object'?artifact.payload:{};
     if(
-      typeof payload.path!=='string'
+      !isReference
+      || typeof payload.path!=='string'
       || typeof payload.workspace_root!=='string'
       || typeof payload.tool_name!=='string'
       || typeof payload.tool_call_id!=='string'
