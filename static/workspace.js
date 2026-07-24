@@ -1364,9 +1364,7 @@ async function openFile(path, opts={}){
       _previewRawContentPath = path;
       if(!ownerStillActive()) return;
       if(!forceRichMarkdown && shouldRenderMarkdownPreviewAsPlainText(data.content)){
-        if(!ownerStillActive()) return;
         showPreview('code');
-        if(!ownerStillActive()) return;
         $('previewCode').textContent=data.content;
         setLargeMarkdownForceRenderVisible(true);
         setStatus(largeMarkdownPlainTextStatus(data.content));
