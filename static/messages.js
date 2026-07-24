@@ -167,6 +167,7 @@ if(_msgEl) _msgEl.addEventListener('blur', ()=>{ if('speechSynthesis' in window 
 
 let _selectedTextReplyBtn=null;
 let _selectedTextReplyText='';
+let _selectedTextReplySource='';  // 'chat' | 'workspace'
 let _pendingSelections=[];  // [{id, name, text}] — named context blocks
 let _selectionIdCounter=0;
 // #4380: expose a pending-selection predicate so the composer's primary-action
@@ -767,6 +768,11 @@ function _selectedTextReplyRoot(){
   return document.getElementById('messages')||document.getElementById('msgInner');
 }
 
+function _selectedTextReplyWorkspaceRoot(){
+  if(typeof $==='function') return $('previewMd');
+  return document.getElementById('previewMd');
+}
+
 function _selectedTextReplyNodeInChat(node, root){
   if(!node||!root)return false;
   const el=node.nodeType===Node.ELEMENT_NODE?node:node.parentElement;
@@ -778,20 +784,29 @@ function _selectedTextReplySelection(){
   const selection=window.getSelection();
   if(!selection||selection.isCollapsed||!selection.rangeCount)return null;
   const root=_selectedTextReplyRoot();
-  if(!root)return null;
+  const wsRoot=_selectedTextReplyWorkspaceRoot();
+  if(!root&&!wsRoot)return null;
   const range=selection.getRangeAt(0);
-  if(!_selectedTextReplyNodeInChat(range.startContainer, root)||!_selectedTextReplyNodeInChat(range.endContainer, root))return null;
+  const inChat=root && _selectedTextReplyNodeInChat(range.startContainer, root) && _selectedTextReplyNodeInChat(range.endContainer, root);
+  const inWs=wsRoot && _selectedTextReplyNodeInChat(range.startContainer, wsRoot) && _selectedTextReplyNodeInChat(range.endContainer, wsRoot);
+  if(!inChat&&!inWs)return null;
   const text=selection.toString().replace(/\u00a0/g,' ').trim();
   if(!text)return null;
   const rect=range.getBoundingClientRect();
   if(!rect||(!rect.width&&!rect.height))return null;
-  return {text, rect};
+  return {text, rect, source: inWs ? 'workspace' : 'chat'};
 }
 
 function _formatSelectedTextReplyQuote(text){
   const normalized=String(text||'').replace(/\r\n?/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
   if(!normalized)return '';
   return `<!-- hermes-selected-context -->\n${normalized.split('\n').map(line=>`> ${line}`).join('\n')}`;
+}
+
+function _formatWorkspaceSelectedText(text){
+  const path = typeof _previewCurrentPath !== 'undefined' ? _previewCurrentPath : '';
+  if(!path) return text;
+  return `From: \`${path}\`\n\n${text}`;
 }
 
 function insertSavedPromptIntoComposer(text){
@@ -1067,7 +1082,10 @@ function _selectedTextReplyButton(){
   btn.addEventListener('click', e=>{
     e.preventDefault();
     if(_selectedTextReplyText){
-      _addNamedContextBlock(_selectedTextReplyText);
+      const text = _selectedTextReplySource === 'workspace'
+        ? _formatWorkspaceSelectedText(_selectedTextReplyText)
+        : _selectedTextReplyText;
+      _addNamedContextBlock(text);
       _hideSelectedTextReplyButton();
       const selection=window.getSelection&&window.getSelection();
       if(selection&&selection.removeAllRanges)selection.removeAllRanges();
@@ -1081,12 +1099,14 @@ function _selectedTextReplyButton(){
 
 function _hideSelectedTextReplyButton(){
   _selectedTextReplyText='';
+  _selectedTextReplySource='';
   if(_selectedTextReplyBtn)_selectedTextReplyBtn.classList.remove('visible');
 }
 
 function _positionSelectedTextReplyButton(info){
   const btn=_selectedTextReplyButton();
   _selectedTextReplyText=info.text;
+  _selectedTextReplySource=info.source||'chat';
   btn.classList.add('visible');
   const gap=8;
   const btnRect=btn.getBoundingClientRect();

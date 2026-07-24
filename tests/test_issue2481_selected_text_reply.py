@@ -32,6 +32,8 @@ def test_selected_text_reply_button_is_selection_scoped_and_frontend_only():
     assert "range.getBoundingClientRect" in js
     assert "_selectedTextReplyRoot" in js
     assert "$('messages')||$('msgInner')" in js
+    assert "_selectedTextReplyWorkspaceRoot" in js
+    assert "$('previewMd')" in js
     assert "root.contains(el)" in js
     assert "document.addEventListener('selectionchange', _updateSelectedTextReplyButton)" in js
 
@@ -51,6 +53,7 @@ def test_selected_text_reply_collects_named_context_blocks_without_dumping_into_
     js = read("static/messages.js")
 
     assert "function _formatSelectedTextReplyQuote" in js
+    assert "function _formatWorkspaceSelectedText" in js
     assert "replace(/\\r\\n?/g,'\\n')" in js
     assert "replace(/\\n{3,}/g,'\\n\\n')" in js
     assert "map(line=>`> ${line}`).join('\\n')" in js
@@ -59,7 +62,7 @@ def test_selected_text_reply_collects_named_context_blocks_without_dumping_into_
     assert "function _renderSelectionChips()" in js
     assert "function _flushSelectionBlocksToComposer()" in js
     assert "_pendingSelections.push({id, name, text})" in js
-    assert "_addNamedContextBlock(_selectedTextReplyText)" in js
+    assert "_addNamedContextBlock(text)" in js
     assert "**${s.name}:**\\n${_formatSelectedTextReplyQuote(s.text)}" in js
     assert "composer.dispatchEvent(new Event('input',{bubbles:true}))" in js
     assert "if(typeof autoResize==='function') autoResize()" in js
