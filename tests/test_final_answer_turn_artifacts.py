@@ -124,6 +124,68 @@ def test_artifact_owner_match_requires_root_when_captured():
     assert output == [False, True, True, False]
 
 
+def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    helpers = workspace[workspace.index("const ARTIFACT_IGNORE_RE") : workspace.index("async function _workspacePathExists")]
+    exists = workspace[workspace.index("async function _workspacePathExists") : workspace.index("// ── Workspace file-tree")]
+    open_file = workspace[workspace.index("async function openFile") : workspace.index("function downloadFile")]
+    output = _run_node(
+        "const pending = [];\n"
+        "const status = [];\n"
+        "let previewMutations = 0;\n"
+        "let openMutations = 0;\n"
+        "let downloadMutations = 0;\n"
+        "const nodes = new Proxy({}, {get: (_target, key) => {\n"
+        "  if(!(key in _target)) _target[key] = {textContent:'',style:{},classList:{add(){},remove(){}},\n"
+        "    appendChild(){},setAttribute(){},innerHTML:'',src:'',onerror:null};\n"
+        "  return _target[key];\n"
+        "}});\n"
+        "const $ = (id) => nodes[id];\n"
+        "const document = {createElement: () => ({style:{},classList:{add(){},remove(){}},appendChild(){},click(){},setAttribute(){}}), body:{appendChild(){},removeChild(){}}};\n"
+        "const window = {};\n"
+        "const S = {session:{session_id:'sid-1',workspace:'/old'}};\n"
+        "const IMAGE_EXTS = new Set(['.png']); const AUDIO_EXTS = new Set(); const VIDEO_EXTS = new Set();\n"
+        "const PDF_EXTS = new Set(); const MD_EXTS = new Set(); const HTML_EXTS = new Set(); const DOWNLOAD_EXTS = new Set();\n"
+        "const api = () => new Promise((resolve, reject) => pending.push({resolve, reject}));\n"
+        "const ensureWorkspacePreviewVisible = () => { openMutations++; };\n"
+        "const switchWorkspacePanelTab = () => { openMutations++; };\n"
+        "const setStatus = (value) => status.push(value); const t = (value) => value;\n"
+        "const fileExt = (path) => path.slice(path.lastIndexOf('.')).toLowerCase();\n"
+        "const showPreview = () => { previewMutations++; }; const renderFileBreadcrumb = () => {};\n"
+        "const _workspaceRouteForPath = () => '/raw'; const _workspaceRouteForPathRel = () => '/list';\n"
+        "const _workspaceEscapeGrantForPath = () => null; const _clearWorkspaceEscapeGrant = () => {};\n"
+        "const showToast = () => {}; const _mediaPlayerHtml = () => '';\n"
+        "const renderMarkdownPreviewContent = () => {}; const renderCodePreviewContent = () => {};\n"
+        "const shouldRenderMarkdownPreviewAsPlainText = () => false; const setLargeMarkdownForceRenderVisible = () => {};\n"
+        "const largeMarkdownPlainTextStatus = () => ''; let _previewServerEditable = null;\n"
+        "let _previewSaveRoute = ''; let _previewOfficeFormat = ''; let _previewPreviewKind = '';\n"
+        "let _previewCurrentPath = ''; let _previewRawContent = ''; let _previewRawContentPath = '';\n"
+        "const _turnArtifactEntriesFromScene = () => [];\n"
+        + helpers
+        + exists
+        + open_file
+        + "async function run(){\n"
+        + "  const stale = openArtifactPath('output/report.md');\n"
+        + "  S.session = {session_id:'sid-1',workspace:''};\n"
+        + "  pending[0].reject(new Error('switched')); await stale;\n"
+        + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
+        + "  const positive = openArtifactPath('output/image.png');\n"
+        + "  pending[1].resolve({entries:[{path:'output/image.png'}]}); await positive;\n"
+        + "  const image = nodes.previewImg;\n"
+        + "  S.session = {session_id:'sid-1',workspace:''};\n"
+        + "  image.onerror();\n"
+        + "  console.log(JSON.stringify({status,previewMutations,openMutations,downloadMutations,imageErrorInstalled:typeof image.onerror==='function'}));\n"
+        + "}\nrun().catch((error)=>{console.error(error);process.exit(1)});"
+    )
+    assert output == {
+        "status": [],
+        "previewMutations": 1,
+        "openMutations": 4,
+        "downloadMutations": 0,
+        "imageErrorInstalled": True,
+    }
+
+
 def test_final_answer_artifact_entries_are_turn_owned_and_workspace_scoped():
     ui = (ROOT / "static/ui.js").read_text(encoding="utf-8")
     messages = (ROOT / "static/messages.js").read_text(encoding="utf-8")
@@ -262,12 +324,19 @@ def test_replay_merges_missing_artifact_into_existing_anchor_scene():
         messages,
         {
             0: [
-                {"path": "output/report.md", "workspace_root": "/workspace"},
+                {
+                    "path": "output/report.md",
+                    "workspace_root": "/workspace",
+                    "tool_call_id": "call-1",
+                    "tool_name": "write_file",
+                    "session_id": "sid-replay",
+                },
                 {
                     "path": "output/large-worklog.md",
                     "workspace_root": "/workspace",
                     "tool_call_id": "call-2",
                     "tool_name": "patch",
+                    "session_id": "sid-replay",
                 },
             ]
         },
@@ -281,6 +350,9 @@ def test_replay_merges_missing_artifact_into_existing_anchor_scene():
             "payload": {
                 "path": "output/report.md",
                 "workspace_root": "/workspace",
+                "session_id": "sid-replay",
+                "tool_call_id": "call-1",
+                "tool_name": "write_file",
                 "source": "transcript_replay",
             },
         },
@@ -291,6 +363,7 @@ def test_replay_merges_missing_artifact_into_existing_anchor_scene():
                 "workspace_root": "/workspace",
                 "tool_call_id": "call-2",
                 "tool_name": "patch",
+                "session_id": "sid-replay",
                 "source": "transcript_replay",
             },
         },
@@ -427,6 +500,65 @@ def test_replay_replaces_wrong_session_existing_anchor_artifacts_with_transcript
             },
         }
     ]
+
+
+def test_replay_collision_controls_feed_real_renderer_and_click_current_owner():
+    from api import routes
+
+    descriptor = {
+        "path": "output/report.md",
+        "workspace_root": "/workspace",
+        "tool_call_id": "call-replay",
+        "tool_name": "patch",
+        "session_id": "sid-replay",
+    }
+    incumbents = [
+        {"type": "artifact_reference", "payload": {"path": descriptor["path"], "workspace_root": descriptor["workspace_root"]}},
+        {"type": "wrong_type", "payload": {**descriptor}},
+        {"type": "artifact_reference", "payload": {**descriptor, "session_id": "sid-old"}},
+        {"source_event_type": "artifact_reference", "session_id": "sid-replay", "payload": {**descriptor}},
+        {"type": "artifact_reference", "payload": {**descriptor}},
+    ]
+    for incumbent in incumbents:
+        hydrated = routes._attach_replayed_turn_artifacts_to_anchor_scenes(
+            [{
+                "role": "assistant",
+                "content": "final answer",
+                "_anchor_activity_scene": {
+                    "version": "activity_scene_v1",
+                    "activity_rows": [],
+                    "artifacts": [incumbent],
+                },
+            }],
+            {0: [descriptor]},
+        )
+        scene = hydrated[0]["_anchor_activity_scene"]
+        helpers = _function_source(
+            "static/ui.js", "function _turnArtifactWorkspacePath", "function _syncLiveWorklogReasonsForAnchor"
+        )
+        output = _run_node(
+            "const S={session:{workspace:'/workspace',session_id:'sid-replay'}};\n"
+            "const clicked=[]; const openArtifactPath=(entry)=>clicked.push(entry);\n"
+            "const document={createElement:()=>({className:'',title:'',type:'',innerHTML:'',children:[],append(...x){this.children.push(...x)},appendChild(x){this.children.push(x)},setAttribute(){},addEventListener(_name,fn){this.onclick=fn}})};\n"
+            + helpers
+            + "const segment={children:[],querySelectorAll:()=>[],appendChild(node){this.children.push(node)}};\n"
+            + "const message={_anchor_activity_scene:"
+            + json.dumps(scene)
+            + "};\n"
+            + "_renderTurnArtifactListForMessage(message,segment,0);\n"
+            + "segment.children[0].children[0].onclick();\n"
+            + "console.log(JSON.stringify({entries:_turnArtifactEntriesFromScene(message._anchor_activity_scene),clicked}));"
+        )
+        expected = {
+            "path": "output/report.md",
+            "workspace_root": "/workspace",
+            "session_id": "sid-replay",
+            "tool_name": "patch",
+            "tool_call_id": "call-replay",
+            "type": "artifact_reference",
+            "owner": {"session_id": "sid-replay", "workspace_root": "/workspace"},
+        }
+        assert output == {"entries": [expected], "clicked": [expected]}
 
 
 def test_paginated_session_response_keeps_paired_landed_turn_artifacts():
