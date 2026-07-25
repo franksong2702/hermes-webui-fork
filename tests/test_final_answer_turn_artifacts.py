@@ -230,7 +230,7 @@ def test_anchor_projector_normalizes_real_artifact_event_for_renderer():
         + "const document={createElement:()=>({className:'',title:'',type:'',innerHTML:'',children:[],append(...x){this.children.push(...x)},appendChild(x){this.children.push(x)},replaceChildren(...x){this.children=[...x]},setAttribute(){},addEventListener(_name,fn){this.onclick=fn}})};\n"
         + ui_helpers
         + "const segment={children:[],querySelectorAll:()=>[],appendChild(node){this.children.push(node)}}; const message={_anchor_activity_scene:scene};\n"
-        + "_renderTurnArtifactListForMessage(message,segment,0); segment.children[0].children[0].onclick();\n"
+        + "_renderTurnArtifactListForMessage(message,segment,0); segment.children[0].children[0].children[0].onclick();\n"
         + "console.log(JSON.stringify({scene,entries:_turnArtifactEntriesFromScene(scene),clicked}));"
     )
     artifact = output["entries"][0]
@@ -295,22 +295,27 @@ def test_turn_artifact_renderer_collapses_large_lists_with_accessible_toggle():
         }
         for index in range(12)
     ]
+    styles = (ROOT / "static/style.css").read_text(encoding="utf-8")
     output = _run_node(
         "const S={session:{workspace:'/workspace',session_id:'sid-owner'}};\n"
-        "class Node{constructor(){this.children=[];this.attributes={};this.onclick=null;} append(...x){this.children.push(...x)} appendChild(x){this.children.push(x)} replaceChildren(...x){this.children=[...x]} setAttribute(k,v){this.attributes[k]=v} addEventListener(_n,fn){this.onclick=fn} }\n"
-        "const document={createElement:()=>new Node()};\n"
+        "class Node{constructor(){this.children=[];this.attributes={};this.onclick=null;this.id='';this.focused=false;} append(...x){this.children.push(...x)} appendChild(x){this.children.push(x)} replaceChildren(...x){this.children=[...x]} setAttribute(k,v){this.attributes[k]=v} addEventListener(_n,fn){this.onclick=fn} focus(){document.activeElement=this;this.focused=true;} }\n"
+        "const document={activeElement:null,createElement:()=>new Node()};\n"
         + helpers
         + "const segment=new Node(); segment.querySelectorAll=()=>[];\n"
         + "const message={_anchor_activity_scene:{artifacts:"
         + json.dumps(artifacts)
         + "}}; _renderTurnArtifactListForMessage(message,segment,0);\n"
-        + "const list=segment.children[0]; let toggle=list.children[5]; const collapsed={items:list.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded']}; toggle.onclick(); const expanded={items:list.children.length,toggle:list.children[12].textContent,expanded:list.children[12].attributes['aria-expanded']}; toggle=list.children[12]; toggle.onclick(); console.log(JSON.stringify({collapsed,expanded,collapsedAgain:{items:list.children.length,toggle:list.children[5].textContent,expanded:list.children[5].attributes['aria-expanded']}}));"
+        + "const list=segment.children[0]; const items=list.children[0]; const toggle=list.children[1]; const stableToggle=toggle; toggle.focus(); const collapsed={items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],type:toggle.type,controls:toggle.attributes['aria-controls'],target:items.id,focused:document.activeElement===toggle}; toggle.onclick(); const expanded={items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],stable:toggle===stableToggle,focused:document.activeElement===toggle}; toggle.onclick(); console.log(JSON.stringify({collapsed,expanded,collapsedAgain:{items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],stable:toggle===stableToggle,focused:document.activeElement===toggle}}));"
     )
     assert output == {
-        "collapsed": {"items": 6, "toggle": "+7 more", "expanded": "false"},
-        "expanded": {"items": 13, "toggle": "Show fewer artifacts", "expanded": "true"},
-        "collapsedAgain": {"items": 6, "toggle": "+7 more", "expanded": "false"},
+        "collapsed": {"items": 5, "toggle": "+7 more", "expanded": "false", "type": "button", "controls": output["collapsed"]["target"], "target": output["collapsed"]["target"], "focused": True},
+        "expanded": {"items": 12, "toggle": "Show fewer artifacts", "expanded": "true", "stable": True, "focused": True},
+        "collapsedAgain": {"items": 5, "toggle": "+7 more", "expanded": "false", "stable": True, "focused": True},
     }
+    assert ".turn-artifact-toggle" in styles
+    assert "min-height:44px" in styles
+    assert "touch-action:manipulation" in styles
+    assert "overflow-wrap:anywhere" in styles
 
 
 def test_final_answer_artifact_entries_are_turn_owned_and_workspace_scoped():
@@ -673,7 +678,7 @@ def test_replay_collision_controls_feed_real_renderer_and_click_current_owner():
             + json.dumps(scene)
             + "};\n"
             + "_renderTurnArtifactListForMessage(message,segment,0);\n"
-            + "segment.children[0].children[0].onclick();\n"
+            + "segment.children[0].children[0].children[0].onclick();\n"
             + "console.log(JSON.stringify({entries:_turnArtifactEntriesFromScene(message._anchor_activity_scene),clicked}));"
         )
         expected = {

@@ -629,10 +629,14 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
         function _isMarkerOnlyAssistantCompressionMessage() {{ return false; }}
         function _isAssistantEmptyPlaceholderContent() {{ return false; }}
         function _assistantTurnAnchorSettledFinalAnswer() {{ return null; }}
-        function _worklogReasoningTextFromMessage() {{ return ''; }}
+        function _worklogReasoningTextFromMessage(m) {{ return String((m && m.reasoning) || ''); }}
         function _assistantMessageBelongsInWorklog() {{ return false; }}
-        function _assistantThinkingBelongsInWorklog() {{ return false; }}
-        function _assistantReasoningPayloadText() {{ return ''; }}
+        let legacyThinkingCalls = 0;
+        function _assistantThinkingBelongsInWorklog(m) {{
+          if (m && m.reasoning) legacyThinkingCalls += 1;
+          return !!(m && m.reasoning);
+        }}
+        function _assistantReasoningPayloadText(m) {{ return String((m && m.reasoning) || ''); }}
         function _statusCardHtml() {{ return ''; }}
         function _collectHandoffSummaryStates() {{ return []; }}
         function _insertCompressionLikeNode() {{}}
@@ -767,6 +771,7 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
         const artifactOnly = {{
           role: 'assistant',
           content: 'Artifact-only replay answer',
+          reasoning: 'Legacy thinking must remain visible',
           tool_calls: [legacyToolCall],
           _anchor_activity_scene: {{
             version: 'activity_scene_v1',
@@ -791,6 +796,7 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
           legacyGroups: elements.msgInner.querySelectorAll('[data-legacy-fallback-owner]').length,
           legacyRows: elements.msgInner.querySelectorAll('.tool-card-row').length,
           legacyCards,
+          legacyThinkingCalls,
         }};
 
         elements.msgInner = new FakeElement('div');
@@ -900,6 +906,7 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
     assert result["artifactOnlySummary"]["anchorGroups"] == 0
     assert result["artifactOnlySummary"]["legacyGroups"] == 1
     assert result["artifactOnlySummary"]["legacyRows"] >= 1
+    assert result["artifactOnlySummary"]["legacyThinkingCalls"] >= 1
     assert [card["tid"] for card in result["artifactOnlySummary"]["legacyCards"]] == [
         "toolu_1"
     ]

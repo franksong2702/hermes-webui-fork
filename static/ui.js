@@ -13700,10 +13700,21 @@ function _renderTurnArtifactListForMessage(message, segment, rawIdx){
   const list=document.createElement('div');
   list.className='turn-artifact-list';
   list.setAttribute('data-turn-artifact-list','1');
+  const items=document.createElement('div');
+  items.className='turn-artifact-items';
+  const itemsId=`turn-artifact-items-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  items.id=itemsId;
+  items.setAttribute('data-turn-artifact-items','1');
   const collapsedLimit=5;
   let expanded=false;
+  const toggle=entries.length>collapsedLimit?document.createElement('button'):null;
+  if(toggle){
+    toggle.type='button';
+    toggle.className='turn-artifact-toggle';
+    toggle.setAttribute('aria-controls',itemsId);
+  }
   const renderItems=()=>{
-    list.replaceChildren();
+    items.replaceChildren();
     const visibleEntries=expanded?entries:entries.slice(0,collapsedLimit);
     for(const entry of visibleEntries){
       const item=document.createElement('button');
@@ -13721,19 +13732,17 @@ function _renderTurnArtifactListForMessage(message, segment, rawIdx){
       item.addEventListener('click',()=>{
         if(typeof openArtifactPath==='function') openArtifactPath(entry);
       });
-      list.appendChild(item);
+      items.appendChild(item);
     }
-    if(entries.length>collapsedLimit){
-      const toggle=document.createElement('button');
-      toggle.type='button';
-      toggle.className='turn-artifact-toggle';
+    if(toggle){
       toggle.setAttribute('aria-expanded',expanded?'true':'false');
       toggle.textContent=expanded?'Show fewer artifacts':`+${entries.length-collapsedLimit} more`;
-      toggle.addEventListener('click',()=>{ expanded=!expanded; renderItems(); });
-      list.appendChild(toggle);
     }
   };
+  if(toggle) toggle.addEventListener('click',()=>{ expanded=!expanded; renderItems(); });
   renderItems();
+  list.appendChild(items);
+  if(toggle) list.appendChild(toggle);
   segment.appendChild(list);
   return true;
 }
