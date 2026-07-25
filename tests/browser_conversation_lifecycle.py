@@ -67,10 +67,27 @@ FORCED_WORKLOG_EXPANSION_FAILURE = (
 UNRELATED_WORKLOG_EXPANSION_FAILURE = (
     "hermes lifecycle negative canary: unrelated Worklog expansion timeout"
 )
+DISCRIMINATOR_FAILURE_MARKERS = {
+    "close-reload-final-text": (
+        "NEGATIVE CANARY DISCRIMINATOR: page closed before hard-reload final-text prerequisite"
+    ),
+    "server-death-reload-final-text": (
+        "NEGATIVE CANARY DISCRIMINATOR: server died before hard-reload final-text prerequisite"
+    ),
+    "close-reloaded-anchor-group": (
+        "NEGATIVE CANARY DISCRIMINATOR: page closed before reloaded Anchor-group classification"
+    ),
+    "server-death-reloaded-anchor-group": (
+        "NEGATIVE CANARY DISCRIMINATOR: server died before reloaded Anchor-group classification"
+    ),
+}
 
 
 class _InjectedWorklogFailure(RuntimeError):
     """Failure injected after the reloaded Worklog group is proven present."""
+
+
+PLAYWRIGHT_TIMEOUT_ERROR = None
 
 
 def _latest_anchor_scene_from_disk(state_root: Path, session_id: str) -> dict | None:
@@ -747,6 +764,28 @@ def _raise_expected_mutation_failure(
     raise AssertionError(marker) from cause
 
 
+def _is_playwright_timeout(error: Exception) -> bool:
+    return PLAYWRIGHT_TIMEOUT_ERROR is not None and isinstance(
+        error,
+        PLAYWRIGHT_TIMEOUT_ERROR,
+    )
+
+
+def _assert_canary_health(page, errors: list, proc, *, cause: Exception, boundary: str) -> None:
+    if page is not None and page.is_closed():
+        raise AssertionError(
+            f"page closed before expected {boundary} failure"
+        ) from cause
+    if errors:
+        raise AssertionError(
+            f"unexpected browser errors before expected {boundary} failure: {errors!r}"
+        ) from cause
+    if proc is not None and proc.poll() is not None:
+        raise AssertionError(
+            f"WebUI server exited before expected {boundary} failure: {proc.returncode}"
+        ) from cause
+
+
 def _semantic_activity(snapshot: dict) -> list[dict]:
     """Canonical user-visible activity, independent of renderer row ordering."""
     semantic = []
@@ -763,10 +802,13 @@ def _semantic_activity(snapshot: dict) -> list[dict]:
 
 def main() -> int:
     try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
     except ImportError:
         print("SETUP FAIL: playwright is not installed", file=sys.stderr)
         return 2
+    global PLAYWRIGHT_TIMEOUT_ERROR
+    PLAYWRIGHT_TIMEOUT_ERROR = PlaywrightTimeoutError
 
     repo_root = Path(__file__).resolve().parent.parent
     state_tmp = tempfile.TemporaryDirectory(prefix="hermes-lifecycle-gate-")
@@ -793,11 +835,17 @@ def main() -> int:
         "fail-reload-final-text",
         "throw-reloaded-worklog-expand",
         "timeout-reloaded-worklog-expand",
+        "close-reload-final-text",
+        "server-death-reload-final-text",
+        "close-reloaded-anchor-group",
+        "server-death-reloaded-anchor-group",
     }:
         raise ValueError(
             f"Unsupported LIFECYCLE_NEGATIVE_BITE {NEGATIVE_BITE!r}; "
             "expected one of '', 'fail-reload-final-text', "
-            "'throw-reloaded-worklog-expand', 'timeout-reloaded-worklog-expand'"
+            "'throw-reloaded-worklog-expand', 'timeout-reloaded-worklog-expand', "
+            "'close-reload-final-text', 'server-death-reload-final-text', "
+            "'close-reloaded-anchor-group', 'server-death-reloaded-anchor-group'"
         )
     if NEGATIVE_BITE and TEST_BITE != "drop-anchor-persistence":
         raise ValueError(
@@ -876,16 +924,16 @@ def main() -> int:
                         "timeout-reloaded-worklog-expand",
                     }
                 ):
-                    anchor_scene_requests.append({
-                        "type": "mutation",
-                        "bite": "drop-anchor-persistence",
-                        "action": "dropped-anchor-scene-persistence",
-                    })
                     route.fulfill(
                         status=200,
                         content_type="application/json",
                         body='{"ok":true}',
                     )
+                    anchor_scene_requests.append({
+                        "type": "mutation",
+                        "bite": "drop-anchor-persistence",
+                        "action": "dropped-anchor-scene-persistence",
+                    })
                     return
                 if TEST_BITE == "drop-terminal-anchor-row":
                     raw_payload = _safe_request_post_data(route.request)
@@ -900,17 +948,17 @@ def main() -> int:
                                     if not (isinstance(row, dict) and row.get("role") == "terminal")
                                 ]
                                 if len(kept) != len(rows):
-                                    anchor_scene_requests.append({
-                                        "type": "mutation",
-                                        "bite": "drop-terminal-anchor-row",
-                                        "action": "removed-terminal-row",
-                                    })
                                     mutated = dict(payload)
                                     updated_scene = dict(scene)
                                     updated_scene["activity_rows"] = kept
                                     mutated["scene"] = updated_scene
                                     response = route.fetch(post_data=json.dumps(mutated))
                                     route.fulfill(response=response)
+                                    anchor_scene_requests.append({
+                                        "type": "mutation",
+                                        "bite": "drop-terminal-anchor-row",
+                                        "action": "removed-terminal-row",
+                                    })
                                     return
                     response = route.fetch()
                     route.fulfill(response=response)
@@ -1089,8 +1137,15 @@ def main() -> int:
 
         page.reload(wait_until="domcontentloaded")
         reload_text = TERMINAL_ERROR_TEXT if scenario == "terminal-error" else FINAL_TEXT
-        if NEGATIVE_BITE == "fail-reload-final-text":
+        if NEGATIVE_BITE in {
+            "fail-reload-final-text",
+            "server-death-reload-final-text",
+        }:
             reload_text = "missing lifecycle final-text negative canary"
+        if NEGATIVE_BITE == "close-reload-final-text":
+            page.close()
+        elif NEGATIVE_BITE == "server-death-reload-final-text":
+            _terminate_process(proc)
         try:
             page.wait_for_function(
                 "text => (document.querySelector('#msgInner') || {}).innerText?.includes(text)",
@@ -1098,7 +1153,21 @@ def main() -> int:
                 timeout=15000,
             )
         except Exception as exc:
+            if NEGATIVE_BITE in {
+                "close-reload-final-text",
+                "server-death-reload-final-text",
+            }:
+                raise AssertionError(DISCRIMINATOR_FAILURE_MARKERS[NEGATIVE_BITE]) from exc
             if NEGATIVE_BITE == "fail-reload-final-text":
+                if not _is_playwright_timeout(exc):
+                    raise
+                _assert_canary_health(
+                    page,
+                    errors,
+                    proc,
+                    cause=exc,
+                    boundary="hard-reload final-text prerequisite",
+                )
                 raise AssertionError(
                     NEGATIVE_MUTATION_FAILURE_MARKERS["fail-reload-final-text"]
                 ) from exc
@@ -1111,9 +1180,24 @@ def main() -> int:
             '[data-anchor-scene-row="1"]'
         )
         if TEST_BITE == "drop-anchor-persistence":
+            if NEGATIVE_BITE == "close-reloaded-anchor-group":
+                page.close()
+            elif NEGATIVE_BITE == "server-death-reloaded-anchor-group":
+                _terminate_process(proc)
+                page.evaluate(
+                    "selector => document.querySelector(selector)?.remove()",
+                    settled_anchor_group_selector,
+                )
             try:
                 page.wait_for_selector(settled_anchor_group_selector, timeout=2000)
             except Exception as exc:
+                if NEGATIVE_BITE in {
+                    "close-reloaded-anchor-group",
+                    "server-death-reloaded-anchor-group",
+                }:
+                    raise AssertionError(DISCRIMINATOR_FAILURE_MARKERS[NEGATIVE_BITE]) from exc
+                if not _is_playwright_timeout(exc):
+                    raise
                 if not _mutation_event_observed(
                     anchor_scene_requests,
                     "drop-anchor-persistence",
@@ -1122,6 +1206,13 @@ def main() -> int:
                         "drop-anchor-persistence mutation was not observed before "
                         "the reloaded Anchor group went missing"
                     ) from exc
+                _assert_canary_health(
+                    page,
+                    errors,
+                    proc,
+                    cause=exc,
+                    boundary="drop-anchor-persistence",
+                )
                 _raise_expected_mutation_failure(
                     EXPECTED_MUTATION_FAILURE_MARKERS["drop-anchor-persistence"],
                     errors=errors,
@@ -1143,29 +1234,27 @@ def main() -> int:
                     ),
                 )
             except Exception as exc:
-                if NEGATIVE_BITE == "throw-reloaded-worklog-expand":
+                if NEGATIVE_BITE in {
+                    "throw-reloaded-worklog-expand",
+                    "timeout-reloaded-worklog-expand",
+                }:
                     if not (
                         isinstance(exc, _InjectedWorklogFailure)
                         and str(exc) == FORCED_WORKLOG_EXPANSION_FAILURE
                     ):
                         raise
-                    if errors:
-                        raise AssertionError(
-                            "unexpected browser errors before expected unmarked "
-                            f"Worklog failure: {errors!r}"
-                        ) from exc
-                    if proc is not None and proc.poll() is not None:
-                        raise AssertionError(
-                            "WebUI server exited before expected unmarked "
-                            f"Worklog failure: {proc.returncode}"
-                    ) from exc
+                    _assert_canary_health(
+                        page,
+                        errors,
+                        proc,
+                        cause=exc,
+                        boundary="unmarked Worklog expansion",
+                    )
                     raise AssertionError(
                         NEGATIVE_MUTATION_FAILURE_MARKERS[
                             "throw-reloaded-worklog-expand"
                         ]
                     ) from exc
-                if NEGATIVE_BITE == "timeout-reloaded-worklog-expand":
-                    raise
                 raise
             raise AssertionError(
                 "Mutation survived: drop-anchor-persistence still rendered a "

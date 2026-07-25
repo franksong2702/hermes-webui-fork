@@ -144,12 +144,24 @@ LIFECYCLE_NEGATIVE_BITE=throw-reloaded-worklog-expand \
 LIFECYCLE_TEST_BITE=drop-anchor-persistence \
 LIFECYCLE_NEGATIVE_BITE=timeout-reloaded-worklog-expand \
   python tests/browser_conversation_lifecycle.py
+
+# Negative discriminator checks: page closure and server death at the final-text
+# and missing-Anchor-group boundaries must emit neither classification marker.
+for bite in \
+  close-reload-final-text \
+  server-death-reload-final-text \
+  close-reloaded-anchor-group \
+  server-death-reloaded-anchor-group; do
+  LIFECYCLE_TEST_BITE=drop-anchor-persistence \
+  LIFECYCLE_NEGATIVE_BITE="$bite" \
+    python tests/browser_conversation_lifecycle.py
+done
 ```
 
 The dedicated `Conversation lifecycle (informational)` workflow runs both current
 proof rows (`normal` and `terminal-error`) and automatically verifies the two
 mutation commands above still fail with their scenario-specific expected-failure
-marker. It also runs the three negative classification checks above and rejects them
+marker. It also runs the seven negative classification and discriminator checks above and rejects them
 if they emit either classification marker. Its `Lifecycle proof summary` result
 aggregates those checks, so a broken proof row, a mutation that unexpectedly
 survives, or an unrelated browser/server failure is visible as a failed workflow

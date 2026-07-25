@@ -104,6 +104,10 @@ jobs:
             local expected_marker="$2"
             shift 2
             local artifact_dir="$LIFECYCLE_ARTIFACT_DIR/$name"
+            if [ -e "$artifact_dir" ]; then
+              echo "::error title=Dirty mutation artifacts::$name artifact directory already exists"
+              return 1
+            fi
             mkdir "$artifact_dir"
             local log="$artifact_dir/run.log"
 
@@ -137,6 +141,10 @@ jobs:
             local forbidden_marker="$3"
             shift 3
             local artifact_dir="$LIFECYCLE_ARTIFACT_DIR/$name"
+            if [ -e "$artifact_dir" ]; then
+              echo "::error title=Dirty mutation artifacts::$name artifact directory already exists"
+              return 1
+            fi
             mkdir "$artifact_dir"
             local log="$artifact_dir/run.log"
 
@@ -176,6 +184,10 @@ jobs:
             local rejected_marker="$4"
             shift 4
             local artifact_dir="$LIFECYCLE_ARTIFACT_DIR/$name"
+            if [ -e "$artifact_dir" ]; then
+              echo "::error title=Dirty mutation artifacts::$name artifact directory already exists"
+              return 1
+            fi
             mkdir "$artifact_dir"
             local log="$artifact_dir/run.log"
 
@@ -235,6 +247,34 @@ jobs:
             'NEGATIVE CANARY EXPECTED UNMARKED FAILURE: Worklog expansion failed after the reloaded Anchor group was present' \
             env LIFECYCLE_TEST_BITE=drop-anchor-persistence \
             LIFECYCLE_NEGATIVE_BITE=timeout-reloaded-worklog-expand \
+            python tests/browser_conversation_lifecycle.py
+          run_unexpected_failure_rejects_marker final-text-page-close \
+            'NEGATIVE CANARY DISCRIMINATOR: page closed before hard-reload final-text prerequisite' \
+            'MUTATION CANARY EXPECTED FAILURE: drop-anchor-persistence removed the transcript-backed Anchor scene before hard reload' \
+            'NEGATIVE CANARY EXPECTED UNMARKED FAILURE: hard-reload final-text prerequisite failed before Anchor-scene classification' \
+            env LIFECYCLE_TEST_BITE=drop-anchor-persistence \
+            LIFECYCLE_NEGATIVE_BITE=close-reload-final-text \
+            python tests/browser_conversation_lifecycle.py
+          run_unexpected_failure_rejects_marker final-text-server-death \
+            'NEGATIVE CANARY DISCRIMINATOR: server died before hard-reload final-text prerequisite' \
+            'MUTATION CANARY EXPECTED FAILURE: drop-anchor-persistence removed the transcript-backed Anchor scene before hard reload' \
+            'NEGATIVE CANARY EXPECTED UNMARKED FAILURE: hard-reload final-text prerequisite failed before Anchor-scene classification' \
+            env LIFECYCLE_TEST_BITE=drop-anchor-persistence \
+            LIFECYCLE_NEGATIVE_BITE=server-death-reload-final-text \
+            python tests/browser_conversation_lifecycle.py
+          run_unexpected_failure_rejects_marker anchor-group-page-close \
+            'NEGATIVE CANARY DISCRIMINATOR: page closed before reloaded Anchor-group classification' \
+            'MUTATION CANARY EXPECTED FAILURE: drop-anchor-persistence removed the transcript-backed Anchor scene before hard reload' \
+            'NEGATIVE CANARY EXPECTED UNMARKED FAILURE: Worklog expansion failed after the reloaded Anchor group was present' \
+            env LIFECYCLE_TEST_BITE=drop-anchor-persistence \
+            LIFECYCLE_NEGATIVE_BITE=close-reloaded-anchor-group \
+            python tests/browser_conversation_lifecycle.py
+          run_unexpected_failure_rejects_marker anchor-group-server-death \
+            'NEGATIVE CANARY DISCRIMINATOR: server died before reloaded Anchor-group classification' \
+            'MUTATION CANARY EXPECTED FAILURE: drop-anchor-persistence removed the transcript-backed Anchor scene before hard reload' \
+            'NEGATIVE CANARY EXPECTED UNMARKED FAILURE: Worklog expansion failed after the reloaded Anchor group was present' \
+            env LIFECYCLE_TEST_BITE=drop-anchor-persistence \
+            LIFECYCLE_NEGATIVE_BITE=server-death-reloaded-anchor-group \
             python tests/browser_conversation_lifecycle.py
 
       - name: Upload mutation artifacts
