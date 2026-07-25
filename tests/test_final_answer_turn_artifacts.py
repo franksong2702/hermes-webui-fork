@@ -2,6 +2,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -577,6 +579,31 @@ def test_turn_artifact_renderer_collapses_large_lists_with_accessible_toggle():
     assert "min-height:44px" in styles
     assert "touch-action:manipulation" in styles
     assert "overflow-wrap:anywhere" in styles
+
+
+def test_mobile_turn_artifact_items_meet_computed_touch_target_floor():
+    """Exercise the shipped CSS in Chromium at the narrow mobile viewport."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        pytest.skip("playwright is unavailable; run the browser-smoke environment")
+    styles = (ROOT / "static/style.css").read_text(encoding="utf-8")
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is unavailable: {exc}")
+        with browser:
+            page = browser.new_page(viewport={"width": 390, "height": 844})
+            page.set_content(
+                f"<style>{styles}</style>"
+                '<div class="turn-artifact-list"><div class="turn-artifact-items">'
+                '<div role="listitem"><button class="turn-artifact-item">output/report.md</button></div>'
+                "</div></div>"
+            )
+            box = page.locator(".turn-artifact-item").bounding_box()
+            assert box is not None
+            assert box["height"] >= 44
 
 
 def test_final_answer_artifact_entries_are_turn_owned_and_workspace_scoped():
