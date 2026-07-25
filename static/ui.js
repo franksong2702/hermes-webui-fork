@@ -13700,24 +13700,40 @@ function _renderTurnArtifactListForMessage(message, segment, rawIdx){
   const list=document.createElement('div');
   list.className='turn-artifact-list';
   list.setAttribute('data-turn-artifact-list','1');
-  for(const entry of entries){
-    const item=document.createElement('button');
-    item.type='button';
-    item.className='turn-artifact-item';
-    item.title=entry.path;
-    const icon=document.createElement('span');
-    icon.className='turn-artifact-icon';
-    icon.setAttribute('aria-hidden','true');
-    icon.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path><path d="M8 13h8"></path><path d="M8 17h8"></path></svg>';
-    const label=document.createElement('span');
-    label.className='turn-artifact-path';
-    label.textContent=entry.path;
-    item.append(icon,label);
-    item.addEventListener('click',()=>{
-      if(typeof openArtifactPath==='function') openArtifactPath(entry);
-    });
-    list.appendChild(item);
-  }
+  const collapsedLimit=5;
+  let expanded=false;
+  const renderItems=()=>{
+    list.replaceChildren();
+    const visibleEntries=expanded?entries:entries.slice(0,collapsedLimit);
+    for(const entry of visibleEntries){
+      const item=document.createElement('button');
+      item.type='button';
+      item.className='turn-artifact-item';
+      item.title=entry.path;
+      const icon=document.createElement('span');
+      icon.className='turn-artifact-icon';
+      icon.setAttribute('aria-hidden','true');
+      icon.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path><path d="M8 13h8"></path><path d="M8 17h8"></path></svg>';
+      const label=document.createElement('span');
+      label.className='turn-artifact-path';
+      label.textContent=entry.path;
+      item.append(icon,label);
+      item.addEventListener('click',()=>{
+        if(typeof openArtifactPath==='function') openArtifactPath(entry);
+      });
+      list.appendChild(item);
+    }
+    if(entries.length>collapsedLimit){
+      const toggle=document.createElement('button');
+      toggle.type='button';
+      toggle.className='turn-artifact-toggle';
+      toggle.setAttribute('aria-expanded',expanded?'true':'false');
+      toggle.textContent=expanded?'Show fewer artifacts':`+${entries.length-collapsedLimit} more`;
+      toggle.addEventListener('click',()=>{ expanded=!expanded; renderItems(); });
+      list.appendChild(toggle);
+    }
+  };
+  renderItems();
   segment.appendChild(list);
   return true;
 }
@@ -16657,6 +16673,10 @@ function renderMessages(options){
   for(const [rawIdx,seg] of assistantSegments){
     const msg=S.messages[rawIdx];
     if(!msg||!msg._anchor_activity_scene||!seg) continue;
+    const scene=msg._anchor_activity_scene;
+    const sceneOwnsActivity=_anchorSceneSceneHasWorklogWorthyRows(scene)
+      || String(scene.mode||'').trim()==='hide_all_activity';
+    if(!sceneOwnsActivity) continue;
     const turn=seg.closest('.assistant-turn');
     if(!turn) continue;
     turn.querySelectorAll('.assistant-segment[data-msg-idx]').forEach(node=>{

@@ -8727,7 +8727,10 @@ def _declared_turn_tool_calls(messages) -> dict[str, str]:
     for message in messages:
         if not isinstance(message, dict) or str(message.get("role") or "").lower() != "assistant":
             continue
-        for call in list(message.get("tool_calls") or []):
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for call in tool_calls:
             if not isinstance(call, dict):
                 continue
             raw_call_id = call.get("id") or call.get("tool_call_id")
@@ -8804,7 +8807,10 @@ def _final_turn_artifact_paths(
             if not isinstance(message, dict):
                 continue
             if str(message.get("role") or "").lower() == "assistant":
-                for call in list(message.get("tool_calls") or []):
+                tool_calls = message.get("tool_calls")
+                if not isinstance(tool_calls, list):
+                    continue
+                for call in tool_calls:
                     if not isinstance(call, dict):
                         continue
                     raw_call_id = call.get("id") or call.get("tool_call_id")
@@ -8969,7 +8975,8 @@ def _attach_replayed_turn_artifacts_to_anchor_scenes(messages, paths_by_final_in
             continue
         scene = message.get("_anchor_activity_scene")
         next_scene = dict(scene) if isinstance(scene, dict) and scene.get("version") == "activity_scene_v1" else _artifact_only_anchor_scene(message)
-        artifacts = list(next_scene.get("artifacts") or [])
+        raw_artifacts = next_scene.get("artifacts")
+        artifacts = list(raw_artifacts) if isinstance(raw_artifacts, list) else []
         seen = set()
         seen_to_first_index = {}
         for idx, artifact in enumerate(artifacts):

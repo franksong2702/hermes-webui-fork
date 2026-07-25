@@ -227,7 +227,7 @@ def test_anchor_projector_normalizes_real_artifact_event_for_renderer():
         + "api.applyAssistantTurnAnchorSourceEvent(registry,{event:'artifact_reference',source_event_type:'artifact_reference',session_id:'sid-replay',payload:{path:'output/report.md',workspace_root:'/workspace',tool_name:'patch',tool_call_id:'call-replay'},event_id:'run-1:3',seq:3},{session_id:'sid-replay',stream_id:'stream-1'});\n"
         + "const scene=api.projectAssistantTurnAnchorActivityScene(registry,{mode:'compact_worklog'});\n"
         + "const S={session:{workspace:'/workspace',session_id:'sid-replay'}}; const clicked=[]; const openArtifactPath=(entry)=>clicked.push(entry);\n"
-        + "const document={createElement:()=>({className:'',title:'',type:'',innerHTML:'',children:[],append(...x){this.children.push(...x)},appendChild(x){this.children.push(x)},setAttribute(){},addEventListener(_name,fn){this.onclick=fn}})};\n"
+        + "const document={createElement:()=>({className:'',title:'',type:'',innerHTML:'',children:[],append(...x){this.children.push(...x)},appendChild(x){this.children.push(x)},replaceChildren(...x){this.children=[...x]},setAttribute(){},addEventListener(_name,fn){this.onclick=fn}})};\n"
         + ui_helpers
         + "const segment={children:[],querySelectorAll:()=>[],appendChild(node){this.children.push(node)}}; const message={_anchor_activity_scene:scene};\n"
         + "_renderTurnArtifactListForMessage(message,segment,0); segment.children[0].children[0].onclick();\n"
@@ -238,6 +238,79 @@ def test_anchor_projector_normalizes_real_artifact_event_for_renderer():
     assert artifact["type"] == "artifact_reference"
     assert artifact["session_id"] == "sid-replay"
     assert output["clicked"] == [artifact]
+
+
+def test_replay_restore_ignores_scalar_tool_calls_and_artifacts():
+    from api import routes
+
+    descriptor = {
+        "path": "output/report.md",
+        "workspace_root": "/workspace",
+        "tool_call_id": "call-replay",
+        "tool_name": "patch",
+        "session_id": "sid-replay",
+    }
+    for malformed_tool_calls in (None, 1, {"id": "call-replay"}):
+        messages = [
+            {"role": "user", "content": "write"},
+            {
+                "role": "assistant",
+                "content": "final answer",
+                "tool_calls": malformed_tool_calls,
+                "_anchor_activity_scene": {
+                    "version": "activity_scene_v1",
+                    "activity_rows": [],
+                    "artifacts": 1,
+                },
+            },
+        ]
+        assert routes._final_turn_artifact_paths(
+            messages, workspace_root="/workspace", session_id="sid-replay"
+        ) == {}
+        hydrated = routes._attach_replayed_turn_artifacts_to_anchor_scenes(
+            messages, {1: [descriptor]}
+        )
+        assert hydrated[1]["_anchor_activity_scene"]["artifacts"] == [
+            {
+                "type": "artifact_reference",
+                "payload": {**descriptor, "source": "transcript_replay"},
+            }
+        ]
+
+
+def test_turn_artifact_renderer_collapses_large_lists_with_accessible_toggle():
+    helpers = _function_source(
+        "static/ui.js", "function _turnArtifactWorkspacePath", "function _syncLiveWorklogReasonsForAnchor"
+    )
+    artifacts = [
+        {
+            "type": "artifact_reference",
+            "payload": {
+                "path": f"output/report-{index}.md",
+                "workspace_root": "/workspace",
+                "session_id": "sid-owner",
+                "tool_name": "patch",
+                "tool_call_id": f"call-{index}",
+            },
+        }
+        for index in range(12)
+    ]
+    output = _run_node(
+        "const S={session:{workspace:'/workspace',session_id:'sid-owner'}};\n"
+        "class Node{constructor(){this.children=[];this.attributes={};this.onclick=null;} append(...x){this.children.push(...x)} appendChild(x){this.children.push(x)} replaceChildren(...x){this.children=[...x]} setAttribute(k,v){this.attributes[k]=v} addEventListener(_n,fn){this.onclick=fn} }\n"
+        "const document={createElement:()=>new Node()};\n"
+        + helpers
+        + "const segment=new Node(); segment.querySelectorAll=()=>[];\n"
+        + "const message={_anchor_activity_scene:{artifacts:"
+        + json.dumps(artifacts)
+        + "}}; _renderTurnArtifactListForMessage(message,segment,0);\n"
+        + "const list=segment.children[0]; let toggle=list.children[5]; const collapsed={items:list.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded']}; toggle.onclick(); const expanded={items:list.children.length,toggle:list.children[12].textContent,expanded:list.children[12].attributes['aria-expanded']}; toggle=list.children[12]; toggle.onclick(); console.log(JSON.stringify({collapsed,expanded,collapsedAgain:{items:list.children.length,toggle:list.children[5].textContent,expanded:list.children[5].attributes['aria-expanded']}}));"
+    )
+    assert output == {
+        "collapsed": {"items": 6, "toggle": "+7 more", "expanded": "false"},
+        "expanded": {"items": 13, "toggle": "Show fewer artifacts", "expanded": "true"},
+        "collapsedAgain": {"items": 6, "toggle": "+7 more", "expanded": "false"},
+    }
 
 
 def test_final_answer_artifact_entries_are_turn_owned_and_workspace_scoped():
@@ -593,7 +666,7 @@ def test_replay_collision_controls_feed_real_renderer_and_click_current_owner():
         output = _run_node(
             "const S={session:{workspace:'/workspace',session_id:'sid-replay'}};\n"
             "const clicked=[]; const openArtifactPath=(entry)=>clicked.push(entry);\n"
-            "const document={createElement:()=>({className:'',title:'',type:'',innerHTML:'',children:[],append(...x){this.children.push(...x)},appendChild(x){this.children.push(x)},setAttribute(){},addEventListener(_name,fn){this.onclick=fn}})};\n"
+            "const document={createElement:()=>({className:'',title:'',type:'',innerHTML:'',children:[],append(...x){this.children.push(...x)},appendChild(x){this.children.push(x)},replaceChildren(...x){this.children=[...x]},setAttribute(){},addEventListener(_name,fn){this.onclick=fn}})};\n"
             + helpers
             + "const segment={children:[],querySelectorAll:()=>[],appendChild(node){this.children.push(node)}};\n"
             + "const message={_anchor_activity_scene:"

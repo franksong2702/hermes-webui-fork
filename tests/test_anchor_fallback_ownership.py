@@ -682,7 +682,12 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
         function _gatewayModelWarningText() {{ return ''; }}
         function _usedModelTurnChipLabel() {{ return ''; }}
         function _formatTurnDuration() {{ return ''; }}
+        function _anchorSceneSceneHasWorklogWorthyRows(scene) {{
+          return Array.isArray(scene && scene.activity_rows)
+            && scene.activity_rows.some((row) => row && (row.role === 'tool' || row.role === 'thinking' || row.kind === 'tool' || row.kind === 'thinking'));
+        }}
         function _renderSettledAnchorSceneForMessage(message, segment, rawIdx) {{
+          if (!_anchorSceneSceneHasWorklogWorthyRows(message && message._anchor_activity_scene)) return false;
           const group = new FakeElement('div');
           group.className = 'tool-worklog-group agent-activity-group';
           group.setAttribute('data-anchor-settled-scene-owner', '1');
@@ -755,6 +760,37 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
           legacyRows: elements.msgInner.querySelectorAll('.tool-card-row').length,
           legacyCards,
           sToolCalls: S.toolCalls.length,
+        }};
+
+        elements.msgInner = new FakeElement('div');
+        legacyCards = [];
+        const artifactOnly = {{
+          role: 'assistant',
+          content: 'Artifact-only replay answer',
+          tool_calls: [legacyToolCall],
+          _anchor_activity_scene: {{
+            version: 'activity_scene_v1',
+            mode: 'compact_worklog',
+            activity_rows: [],
+            artifacts: [{{
+              type: 'artifact_reference',
+              payload: {{path: 'output/report.md', workspace_root: '/workspace', session_id: 's-artifact', tool_name: 'patch', tool_call_id: 'toolu_1'}},
+            }}],
+            final_answer: 'Artifact-only replay answer',
+          }},
+        }};
+        S = {{
+          session: {{ session_id: 's-artifact', tool_calls: [{{ tid: 'toolu_1', snippet: 'persisted result' }}] }},
+          messages: [{{ role: 'user', content: 'run' }}, artifactOnly, toolResult],
+          toolCalls: [{{ tid: 'toolu_1', assistant_msg_idx: 1, name: 'terminal', snippet: 'session fallback' }}],
+          busy: false,
+        }};
+        renderMessages();
+        const artifactOnlySummary = {{
+          anchorGroups: elements.msgInner.querySelectorAll('[data-anchor-settled-scene-owner]').length,
+          legacyGroups: elements.msgInner.querySelectorAll('[data-legacy-fallback-owner]').length,
+          legacyRows: elements.msgInner.querySelectorAll('.tool-card-row').length,
+          legacyCards,
         }};
 
         elements.msgInner = new FakeElement('div');
@@ -833,6 +869,7 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
           selectorSanity,
           anchorSummary,
           historicalSummary,
+          artifactOnlySummary,
           rawHistoricalSummary,
           duplicateReferenceSummary,
         }}));
@@ -858,6 +895,12 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
     assert result["historicalSummary"]["legacyRows"] >= 1
     assert result["historicalSummary"]["sToolCalls"] >= 1
     assert [card["tid"] for card in result["historicalSummary"]["legacyCards"]] == [
+        "toolu_1"
+    ]
+    assert result["artifactOnlySummary"]["anchorGroups"] == 0
+    assert result["artifactOnlySummary"]["legacyGroups"] == 1
+    assert result["artifactOnlySummary"]["legacyRows"] >= 1
+    assert [card["tid"] for card in result["artifactOnlySummary"]["legacyCards"]] == [
         "toolu_1"
     ]
 
