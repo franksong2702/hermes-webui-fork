@@ -793,11 +793,6 @@ def _assert_canary_health(page, errors: list, proc, *, cause: Exception, boundar
             "page-closed",
             f"page closed before expected {boundary} failure",
         ) from cause
-    if errors:
-        raise _CanaryHealthRejection(
-            "browser-errors",
-            f"unexpected browser errors before expected {boundary} failure: {errors!r}",
-        ) from cause
     if (
         proc is not None
         and proc.poll() is not None
@@ -806,6 +801,11 @@ def _assert_canary_health(page, errors: list, proc, *, cause: Exception, boundar
         raise _CanaryHealthRejection(
             "server-exited",
             f"WebUI server exited before expected {boundary} failure: {proc.returncode}",
+        ) from cause
+    if errors:
+        raise _CanaryHealthRejection(
+            "browser-errors",
+            f"unexpected browser errors before expected {boundary} failure: {errors!r}",
         ) from cause
 
 
