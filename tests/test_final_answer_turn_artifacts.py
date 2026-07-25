@@ -216,7 +216,6 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
 
 
 def test_anchor_projector_normalizes_real_artifact_event_for_renderer():
-    anchors = (ROOT / "static/assistant_turn_anchors.js").read_text(encoding="utf-8")
     ui_helpers = _function_source(
         "static/ui.js", "function _turnArtifactWorkspacePath", "function _syncLiveWorklogReasonsForAnchor"
     )
