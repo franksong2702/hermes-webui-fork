@@ -700,7 +700,11 @@ async function refreshOpenPreviewIfMutated(){
   if(typeof _previewDirty!=='undefined'&&_previewDirty) return;
   if(!_isOpenPreviewPathMutated()) return;
   if(!_previewCurrentPath||!S.session) return;
-  await openFile(_previewCurrentPath, { bustCache: true });
+  await openFile(_previewCurrentPath, {
+    bustCache: true,
+    owner: _previewOwner,
+    _preserveArtifactPath: _previewPreserveArtifactPath,
+  });
 }
 
 function collectSessionArtifacts(){
@@ -802,7 +806,10 @@ async function _workspacePathExists(path, opts={}){
   const name=parts.pop();
   if(!name) return false;
   const dir=parts.length?parts.join('/'):'.';
-  const route = _workspaceRouteForPathRel(dir,'list',{owner});
+  const route = _workspaceRouteForPathRel(dir,'list',{
+    owner,
+    _preserveArtifactPath: !!opts._preserveArtifactPath,
+  });
   if(!route) return false;
   const data=await api(route);
   return (data.entries||[]).some(entry=>entry&&((entry.path===path)||entry.name===name));
@@ -1151,11 +1158,17 @@ function forceRenderMarkdownPreview(){
   // non-dirty state and cached content that belongs to the current file.
   if(_previewDirty || $('previewEditArea').style.display!=='none') return;
   if(!_previewRawContent || _previewRawContentPath!==_previewCurrentPath) return;
-  openFile(_previewCurrentPath,{forceRichMarkdown:true});
+  openFile(_previewCurrentPath,{
+    forceRichMarkdown:true,
+    owner:_previewOwner,
+    _preserveArtifactPath:_previewPreserveArtifactPath,
+  });
   setStatus('Markdown rendered for this file.');
 }
 
 let _previewCurrentPath = '';  // relative path of currently previewed file
+let _previewOwner = null;  // immutable session/workspace owner captured at open time
+let _previewPreserveArtifactPath = false;  // retain typed descriptor path semantics
 let _previewCurrentMode = '';  // 'code' | 'csv' | 'md' | 'image' | 'html' | 'pdf' | 'audio' | 'video'
 let _previewDirty = false;     // true when edits are unsaved
 let _previewServerEditable = null;  // backend editability metadata when available
@@ -1327,14 +1340,21 @@ async function openFile(path, opts={}){
     };
   const owner = resolveOwner(opts);
   if(!path || typeof path !== 'string' || !owner) return;
-  const exactParts=path.split('/');
-  if(
-    !path
-    || path.startsWith('/')
-    || path.startsWith('~/')
-    || path.includes('\\')
-    || exactParts.some(part=>!part||part==='.'||part==='..')
-  ) return;
+  const typedPath = typeof _normalizeTypedArtifactPath === 'function'
+    ? _normalizeTypedArtifactPath(path)
+    : (
+      path.length<=512
+      && !path.includes('://')
+      && !/[\\\0]/.test(path)
+      && !path.startsWith('/')
+      && !path.startsWith('~/')
+      && !/^[A-Za-z]:/.test(path)
+      && !path.split('/').some(part=>!part||part==='.'||part==='..')
+        ? path
+        : ''
+    );
+  if(!typedPath) return;
+  path = typedPath;
   if(typeof _artifactOwnerMatchesSession === 'function' && !_artifactOwnerMatchesSession(owner)) return;
   const nextGeneration = typeof _nextWorkspaceOpenGeneration === 'function'
     ? _nextWorkspaceOpenGeneration
@@ -1376,6 +1396,11 @@ async function openFile(path, opts={}){
   $('fileTree').style.display='none';
 
   _previewCurrentPath = path;
+  _previewOwner = {
+    session_id: openFileOwner.session_id,
+    workspace_root: openFileOwner.workspace_root || '',
+  };
+  _previewPreserveArtifactPath = !!(opts && opts._preserveArtifactPath);
   if(!ownerStillActive()) return;
   renderFileBreadcrumb(path);
   if(IMAGE_EXTS.has(ext)){
@@ -1582,8 +1607,14 @@ function renderFileBreadcrumb(filePath) {
 }
 
 function openInBrowser(){
-  if(!_previewCurrentPath||!S.session) return;
-  const url=_workspaceRouteForPath(_previewCurrentPath, 'raw', {inline:true});
+  if(!_previewCurrentPath||!S.session||!_previewOwner) return;
+  if(!_artifactOwnerMatchesSession(_previewOwner)) return;
+  const url=_workspaceRouteForPath(_previewCurrentPath, 'raw', {
+    inline:true,
+    owner:_previewOwner,
+    _preserveArtifactPath:_previewPreserveArtifactPath,
+  });
+  if(!url) return;
   window.open(url,'_blank','noopener');
 }
 // openInBrowser keeps the helper-based raw path, which expands to an explicit &inline=1 URL.

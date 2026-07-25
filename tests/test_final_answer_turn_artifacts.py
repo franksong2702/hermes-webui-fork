@@ -136,6 +136,25 @@ def test_typed_artifact_path_reaches_real_route_without_rebinding():
     assert output == {"spaced": " report.md ", "sibling": "report.md"}
 
 
+def test_direct_open_file_rejects_malformed_typed_paths_before_generation():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    open_file = workspace[workspace.index("async function openFile") : workspace.index("function downloadFile")]
+    output = _run_node(
+        "const S={session:{session_id:'sid-1',workspace:'/workspace'}};\n"
+        "let generations=0; let _workspaceOpenGeneration=0;\n"
+        "const _nextWorkspaceOpenGeneration=()=>{generations+=1; return ++_workspaceOpenGeneration;};\n"
+        "const _artifactOwnerFromOptions=(opts)=>opts.owner;\n"
+        "const _artifactOwnerMatchesSession=()=>true;\n"
+        + open_file
+        + "Promise.all(["
+        + "openFile('bad\\0.md',{owner:{session_id:'sid-1',workspace_root:'/workspace'}}),"
+        + "openFile('C:/bad.md',{owner:{session_id:'sid-1',workspace_root:'/workspace'}}),"
+        + "openFile('a'.repeat(513)+'.md',{owner:{session_id:'sid-1',workspace_root:'/workspace'}})"
+        + "]).then(()=>console.log(JSON.stringify({generations,_workspaceOpenGeneration})));"
+    )
+    assert output == {"generations": 0, "_workspaceOpenGeneration": 0}
+
+
 def test_artifact_owner_match_requires_root_when_captured():
     workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
     start = workspace.index("function _artifactScalarString(value){")

@@ -2174,7 +2174,10 @@ function clearPreview(opts={}){
   const pc=$('previewCode');if(pc)pc.textContent='';
   const pp=$('previewPathText');if(pp)pp.textContent='';
   const ft=$('fileTree');if(ft)ft.style.display='';
-  _previewCurrentPath='';_previewCurrentMode='';_previewDirty=false;
+  _previewCurrentPath='';
+  if(typeof _previewOwner!=='undefined') _previewOwner=null;
+  if(typeof _previewPreserveArtifactPath!=='undefined') _previewPreserveArtifactPath=false;
+  _previewCurrentMode='';_previewDirty=false;
   if(closePanelAfter)closeWorkspacePanel();
   else if(keepPanelOpen&&_workspacePanelMode==='preview')openWorkspacePanel('browse');
   else syncWorkspacePanelUI();
