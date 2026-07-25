@@ -2800,7 +2800,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(!toolCallId) return;
     for(const [index,artifact] of turnArtifactReferencesFromToolCall(tc).entries()){
       const artifactObj = artifact && typeof artifact === 'object' ? artifact : null;
-      const path = typeof artifactObj.path === 'string' ? artifactObj.path.trim() : '';
+      const path = typeof artifactObj.path === 'string' ? artifactObj.path : '';
       const workspaceRoot = typeof artifactObj.workspace_root === 'string' ? artifactObj.workspace_root.trim() : '';
       const artifactCallId = typeof artifactObj.tool_call_id === 'string' ? artifactObj.tool_call_id.trim() : '';
       if(!artifactCallId || artifactCallId!==toolCallId) continue;

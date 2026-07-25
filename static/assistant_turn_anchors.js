@@ -1055,13 +1055,14 @@
       const toolCallId=_cleanString(_own(payload,'tool_call_id'));
       const toolName=_cleanString(_own(payload,'tool_name'));
       const workspaceRoot=_cleanString(_own(payload,'workspace_root')).replace(/\/+$/,'');
-      const path=_cleanString(_own(payload,'path'));
+      const rawPath=_own(payload,'path');
+      const path=typeof rawPath==='string' ? rawPath : '';
       const sourceSessionId=_cleanString(_own(event,'session_id'));
       const canonicalPayload={
         ..._copyObject(payload),
         tool_call_id: toolCallId || _cleanString(_own(event,'tool_call_id')),
         tool_name: toolName || _cleanString(_own(event,'tool_name')),
-        path: path || _cleanString(_own(event,'path')),
+        path: path || (typeof _own(event,'path')==='string' ? _own(event,'path') : ''),
         workspace_root: workspaceRoot || _cleanString(_own(event,'workspace_root')),
       };
       if(sourceSessionId){

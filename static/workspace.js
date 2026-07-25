@@ -516,8 +516,8 @@ function _nextWorkspaceOpenGeneration(){
 
 function _normalizeTypedArtifactPath(path){
   if(typeof path!=='string') return '';
-  const value=path.trim();
-  if(!value||value.length>512||value.includes('://')||/[\\\0]/.test(value)||value.startsWith('/')||/^[A-Za-z]:/.test(value)) return '';
+  const value=path;
+  if(!value||value.length>512||value.includes('://')||/[\\\0]/.test(value)||value.startsWith('/')||value.startsWith('~/')||/^[A-Za-z]:/.test(value)) return '';
   const parts=value.split('/');
   if(parts.some(part=>!part||part==='.'||part==='..')) return '';
   return value;
@@ -824,8 +824,9 @@ async function openArtifactPath(path){
   const owner = artifact
     ? _artifactOwnerFromArtifactValue(artifact)
     : _artifactOwnerFromCurrentSession();
-  const generation = _nextWorkspaceOpenGeneration();
   if(!pathValue || !owner) return;
+  if(typeof _artifactOwnerMatchesSession === 'function' && !_artifactOwnerMatchesSession(owner)) return;
+  const generation = _nextWorkspaceOpenGeneration();
   const ownerStillActive = () => typeof _artifactOwnerMatchesSession === 'function'
     ? generation===_workspaceOpenGeneration && _artifactOwnerMatchesSession(owner)
     : generation===_workspaceOpenGeneration;
@@ -1327,6 +1328,7 @@ async function openFile(path, opts={}){
     };
   const owner = resolveOwner(opts);
   if(!path || typeof path !== 'string' || !owner) return;
+  if(typeof _artifactOwnerMatchesSession === 'function' && !_artifactOwnerMatchesSession(owner)) return;
   const nextGeneration = typeof _nextWorkspaceOpenGeneration === 'function'
     ? _nextWorkspaceOpenGeneration
     : () => 1;

@@ -112,11 +112,13 @@ def test_typed_artifact_paths_preserve_punctuation_and_supported_length():
         + "turnArtifactReferencesFromToolCall({name:'write_file',tool_call_id:'call-1',artifacts:[{path:'output/report;',workspace_root:'/workspace',tool_call_id:'call-1',tool_name:'write_file'}]}),"
         + "turnArtifactReferencesFromToolCall({name:'write_file',tool_call_id:'call-2',artifacts:[{path:" + json.dumps(boundary) + ",workspace_root:'/workspace',tool_call_id:'call-2',tool_name:'write_file'}]}),"
         + "turnArtifactReferencesFromToolCall({name:'write_file',tool_call_id:'call-3',artifacts:[{path:" + json.dumps(boundary + 'x') + ",workspace_root:'/workspace',tool_call_id:'call-3',tool_name:'write_file'}]})"
+        + ",turnArtifactReferencesFromToolCall({name:'write_file',tool_call_id:'call-4',artifacts:[{path:' report.md ',workspace_root:'/workspace',tool_call_id:'call-4',tool_name:'write_file'}]})"
         + "]));"
     )
     assert output[0][0]["path"] == "output/report;"
     assert output[1][0]["path"] == boundary
     assert output[2] == []
+    assert output[3][0]["path"] == " report.md "
 
 
 def test_artifact_owner_match_requires_root_when_captured():
@@ -211,6 +213,13 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         + "  pending.shift().resolve({content:'# matching'}); await positive;\n"
         + "  const positiveSummary = {preview:previewMutations-beforePositive.preview,open:openMutations-beforePositive.open,breadcrumb:breadcrumbMutations-beforePositive.breadcrumb};\n"
         + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
+        + "  const currentTask = openArtifactPath('output/current.md');\n"
+        + "  pending.shift().resolve({entries:[{path:'output/current.md'}]}); await new Promise((resolve)=>setTimeout(resolve,0));\n"
+        + "  const currentRead = pending.shift();\n"
+        + "  const rejectedStale = openArtifactPath({path:'output/stale.md',owner:{session_id:'sid-old',workspace_root:'/old'}});\n"
+        + "  await rejectedStale; currentRead.resolve({content:'# current'}); await currentTask;\n"
+        + "  const staleOwnerPreservesCurrent = {raw:_previewRawContent,rawPath:_previewRawContentPath,currentPath:_previewCurrentPath};\n"
+        + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
         + "  const olderAttempt = openFile('output/older.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
         + "  const olderRead = pending.shift();\n"
         + "  const newerAttempt = openFile('output/newer.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
@@ -221,7 +230,7 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         + "  const image = nodes.previewImg; const imageTask = openArtifactPath('output/image.png');\n"
         + "  pending.shift().resolve({entries:[{path:'output/image.png'}]}); await imageTask;\n"
         + "  S.session = {session_id:'sid-1',workspace:''}; image.onerror();\n"
-        + "  console.log(JSON.stringify({staleResolved,staleRejected,staleDownload:staleDownloadDelta,positive:positiveSummary,sameOwnerRace,downloadMutations,status, imageErrorInstalled:typeof image.onerror==='function'}));\n"
+        + "  console.log(JSON.stringify({staleResolved,staleRejected,staleDownload:staleDownloadDelta,positive:positiveSummary,staleOwnerPreservesCurrent,sameOwnerRace,downloadMutations,status, imageErrorInstalled:typeof image.onerror==='function'}));\n"
         + "}\nrun().catch((error)=>{console.error(error);process.exit(1)});"
     )
     assert output["staleResolved"] == output["staleRejected"] == {
@@ -237,6 +246,7 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
     }
     assert output["staleDownload"] == 0
     assert output["positive"] == {"preview": 1, "open": 2, "breadcrumb": 1}
+    assert output["staleOwnerPreservesCurrent"] == {"raw": "# current", "rawPath": "output/current.md", "currentPath": "output/current.md"}
     assert output["sameOwnerRace"] == {"raw": "# newer", "rawPath": "output/newer.md", "currentPath": "output/newer.md"}
     assert output["downloadMutations"] == 0
     assert output["status"] == []
@@ -253,19 +263,23 @@ def test_anchor_projector_normalizes_real_artifact_event_for_renderer():
         + "const api=sandbox.window.HermesAssistantTurnAnchors;\n"
         + "const registry=api.createAssistantTurnAnchorRegistry({session_id:'sid-replay',turn_id:'turn-1'});\n"
         + "api.applyAssistantTurnAnchorSourceEvent(registry,{event:'artifact_reference',source_event_type:'artifact_reference',session_id:'sid-replay',payload:{path:'output/report.md',workspace_root:'/workspace',tool_name:'patch',tool_call_id:'call-replay'},event_id:'run-1:3',seq:3},{session_id:'sid-replay',stream_id:'stream-1'});\n"
+        + "api.applyAssistantTurnAnchorSourceEvent(registry,{event:'artifact_reference',source_event_type:'artifact_reference',session_id:'sid-replay',payload:{path:' report.md ',workspace_root:'/workspace',tool_name:'patch',tool_call_id:'call-spaced'},event_id:'run-1:4',seq:4},{session_id:'sid-replay',stream_id:'stream-1'});\n"
         + "const scene=api.projectAssistantTurnAnchorActivityScene(registry,{mode:'compact_worklog'});\n"
         + "const S={session:{workspace:'/workspace',session_id:'sid-replay'}}; const clicked=[]; const openArtifactPath=(entry)=>clicked.push(entry);\n"
         + "const document={createElement:()=>({className:'',title:'',type:'',innerHTML:'',children:[],append(...x){this.children.push(...x)},appendChild(x){this.children.push(x)},replaceChildren(...x){this.children=[...x]},setAttribute(){},addEventListener(_name,fn){this.onclick=fn}})};\n"
         + ui_helpers
         + "const segment={children:[],querySelectorAll:()=>[],appendChild(node){this.children.push(node)}}; const message={_anchor_activity_scene:scene};\n"
-        + "_renderTurnArtifactListForMessage(message,segment,0); segment.children[0].children[0].children[0].onclick();\n"
+        + "_renderTurnArtifactListForMessage(message,segment,0); segment.children[0].children[0].children[0].onclick(); segment.children[0].children[0].children[1].onclick();\n"
         + "console.log(JSON.stringify({scene,entries:_turnArtifactEntriesFromScene(scene),clicked}));"
     )
     artifact = output["entries"][0]
+    spaced = output["entries"][1]
     assert output["scene"]["artifacts"][0]["source_event_type"] == "artifact_reference"
     assert artifact["type"] == "artifact_reference"
     assert artifact["session_id"] == "sid-replay"
-    assert output["clicked"] == [artifact]
+    assert artifact["path"] == "output/report.md"
+    assert spaced["path"] == " report.md "
+    assert output["clicked"] == [artifact, spaced]
 
 
 def test_replay_restore_ignores_scalar_tool_calls_and_artifacts():
@@ -363,6 +377,7 @@ def test_final_answer_artifact_entries_are_turn_owned_and_workspace_scoped():
         "artifacts": [
             None,
             {"type":"artifact_reference","payload": {"path": "output/report.md", "workspace_root": "/workspace", "session_id":"sid-owner","tool_name":"write_file","tool_call_id":"call-1"}},
+            {"type":"artifact_reference","payload": {"path": " report.md ", "workspace_root": "/workspace", "session_id":"sid-owner","tool_name":"write_file","tool_call_id":"call-spaced"}},
             {"type":"artifact_reference","payload": {"path": "./output/report.md", "workspace_root": "/workspace", "session_id":"sid-owner","tool_name":"write_file","tool_call_id":"call-2"}},
             {"type":"artifact_reference","payload": {"path": "output/old-workspace.md", "workspace_root": "/workspace-a"}},
             {"type":"artifact_reference","payload": {"path": "/workspace/output/absolute.md", "workspace_root": "/workspace", "session_id":"sid-owner","tool_name":"write_file","tool_call_id":"call-3"}},
@@ -388,6 +403,17 @@ def test_final_answer_artifact_entries_are_turn_owned_and_workspace_scoped():
         "session_id": "sid-owner",
         "tool_name": "write_file",
         "tool_call_id": "call-1",
+        "type": "artifact_reference",
+        "owner": {
+            "session_id": "sid-owner",
+            "workspace_root": "/workspace",
+        },
+    }, {
+        "path": " report.md ",
+        "workspace_root": "/workspace",
+        "session_id": "sid-owner",
+        "tool_name": "write_file",
+        "tool_call_id": "call-spaced",
         "type": "artifact_reference",
         "owner": {
             "session_id": "sid-owner",

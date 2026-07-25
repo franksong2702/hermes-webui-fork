@@ -13633,8 +13633,9 @@ function _renderSettledAnchorSceneForMessage(message, segment, rawIdx){
 }
 function _turnArtifactWorkspacePath(path, workspaceRoot){
   if(typeof path!=='string'||typeof workspaceRoot!=='string') return '';
-  let value=String(path||'').trim().replace(/^(?:\.\/)+/,'');
-  if(!value||value.length>512||value.includes('://')||/[\\\0]/.test(value)||/^[A-Za-z]:/.test(value)) return '';
+  let value=String(path||'');
+  if(value.startsWith('./')) return '';
+  if(!value||value.length>512||value.includes('://')||/[\\\0]/.test(value)||value.startsWith('~/')||/^[A-Za-z]:/.test(value)) return '';
   const workspace=String(S&&S.session&&S.session.workspace||'').replace(/\/+$/,'');
   if(!workspace||String(workspaceRoot||'').replace(/\/+$/,'')!==workspace||value.startsWith('/')) return '';
   const parts=value.split('/');
