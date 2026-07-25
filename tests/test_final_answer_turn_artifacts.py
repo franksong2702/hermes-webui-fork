@@ -185,6 +185,45 @@ def test_direct_open_file_rejects_malformed_typed_paths_before_generation():
     assert output == {"generations": 0, "_workspaceOpenGeneration": 0}
 
 
+def test_public_artifact_existence_flow_uses_root_sentinel_and_rejects_invalid_exact_input():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    route_helpers = workspace[
+        workspace.index("function _escapeGrantStore") : workspace.index(
+            "async function authorizeWorkspaceEscapeNavigation"
+        )
+    ]
+    owner_helpers = workspace[
+        workspace.index("function _artifactScalarString(value){") : workspace.index(
+            "function _artifactCandidatesFromText", workspace.index("function _artifactScalarString(value){")
+        )
+    ]
+    path_exists = workspace[
+        workspace.index("async function _workspacePathExists") : workspace.index("function _artifactOwnerFromArtifactValue")
+    ]
+    artifact_owner = workspace[
+        workspace.index("function _artifactOwnerFromArtifactValue") : workspace.index("async function openArtifactPath")
+    ]
+    open_artifact = workspace[
+        workspace.index("async function openArtifactPath") : workspace.index("// ── Workspace file-tree")
+    ]
+    output = _run_node(
+        "const requests=[]; const S={session:{session_id:'sid-1',workspace:'/workspace'}};\n"
+        "const api=(route)=>{requests.push(route); return Promise.resolve({entries:[{path:'report.md',name:'report.md'}]});};\n"
+        "const ensureWorkspacePreviewVisible=()=>{}; const switchWorkspacePanelTab=()=>{}; const openFile=()=>Promise.resolve();\n"
+        "const setStatus=()=>{}; const t=(value)=>value;\n"
+        + route_helpers
+        + owner_helpers
+        + path_exists
+        + artifact_owner
+        + open_artifact
+        + "async function run(){ await openArtifactPath('report.md'); await openArtifactPath('./malformed.md'); console.log(JSON.stringify(requests)); } run().catch((error)=>{console.error(error);process.exit(1)});"
+    )
+    assert len(output) == 1
+    params = __import__("urllib.parse").parse.parse_qs(output[0].split("?", 1)[1])
+    assert params["path"] == ["."]
+    assert params["session_id"] == ["sid-1"]
+
+
 def test_direct_open_file_rejects_malformed_explicit_owner_before_generation():
     workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
     owner_helpers = workspace[
@@ -218,6 +257,15 @@ def test_preview_continuations_keep_captured_owner_and_exact_path_in_routes():
             "function _artifactCandidatesFromText", workspace.index("function _artifactScalarString(value){")
         )
     ]
+    path_exists = workspace[
+        workspace.index("async function _workspacePathExists") : workspace.index("function _artifactOwnerFromArtifactValue")
+    ]
+    artifact_owner = workspace[
+        workspace.index("function _artifactOwnerFromArtifactValue") : workspace.index("async function openArtifactPath")
+    ]
+    open_artifact = workspace[
+        workspace.index("async function openArtifactPath") : workspace.index("// ── Workspace file-tree")
+    ]
     open_file = workspace[workspace.index("async function openFile") : workspace.index("function downloadFile")]
     refresh = workspace[
         workspace.index("function _isOpenPreviewPathMutated()") : workspace.index("function collectSessionArtifacts")
@@ -232,28 +280,35 @@ def test_preview_continuations_keep_captured_owner_and_exact_path_in_routes():
         "const S={session:{session_id:'sid-1',workspace:'/workspace'}};\n"
         "const routes=[]; const nodes=new Proxy({}, {get:(target,key)=>target[key]||(target[key]={style:{display:'none'},classList:{add(){},remove(){}},textContent:'',innerHTML:'',src:'',onerror:null})});\n"
         "const $=(id)=>nodes[id]; const document={baseURI:'',createElement:()=>({}),body:{}}; const window={open:(url)=>routes.push(url)};\n"
-        "const api=(route)=>{routes.push(route); return Promise.resolve({content:'# spaced'});};\n"
+        "const api=(route)=>{routes.push(route); const params=new URLSearchParams(route.split('?')[1]); if(route.includes('/api/list?')) return Promise.resolve({entries:[{path:' dir / report.md ',name:' report.md '},{path:'dir/report.md',name:'report.md'}]}); return Promise.resolve({content:'# spaced'});};\n"
         "const fileExt=(path)=>path.slice(path.lastIndexOf('.')).toLowerCase(); const MD_EXTS=new Set(['.md']); const IMAGE_EXTS=new Set(); const AUDIO_EXTS=new Set(); const VIDEO_EXTS=new Set(); const PDF_EXTS=new Set(); const HTML_EXTS=new Set(); const DOWNLOAD_EXTS=new Set();\n"
         "const renderFileBreadcrumb=()=>{}; const showPreview=()=>{}; const renderMarkdownPreviewContent=()=>{}; const renderCodePreviewContent=()=>{}; const shouldRenderMarkdownPreviewAsPlainText=()=>false; const setLargeMarkdownForceRenderVisible=()=>{}; const setStatus=()=>{}; const t=(value)=>value; const downloadFile=()=>{};\n"
+        "const ensureWorkspacePreviewVisible=()=>{}; const switchWorkspacePanelTab=()=>{};\n"
         "let _previewCurrentPath=''; let _previewOwner=null; let _previewPreserveArtifactPath=false; let _previewRawContent=''; let _previewRawContentPath=''; let _previewDirty=false; let _previewServerEditable=null; let _previewPreviewKind=''; let _previewOfficeFormat=''; let _previewSaveRoute='';\n"
         "const _turnMutatedPreviewPaths=new Set();\n"
         "const _normalizeArtifactPath=(path)=>String(path||'').trim();\n"
         + route_helpers
         + owner_helpers
+        + path_exists
+        + artifact_owner
+        + open_artifact
         + open_file
         + refresh
         + force_render
         + open_browser
-        + "async function run(){ const owner={session_id:'sid-1',workspace_root:'/workspace'}; await openFile(' report.md ',{owner,_preserveArtifactPath:true}); _turnMutatedPreviewPaths.add('report.md'); await refreshOpenPreviewIfMutated(); forceRenderMarkdownPreview(); openInBrowser(); console.log(JSON.stringify(routes)); } run().catch((error)=>{console.error(error);process.exit(1)});"
+        + "async function run(){ const owner={session_id:'sid-1',workspace_root:'/workspace'}; await openArtifactPath({path:' dir / report.md ',owner}); _turnMutatedPreviewPaths.add('dir / report.md'); await refreshOpenPreviewIfMutated(); forceRenderMarkdownPreview(); openInBrowser(); console.log(JSON.stringify(routes)); } run().catch((error)=>{console.error(error);process.exit(1)});"
     )
-    assert len(output) == 3
-    for route in output[:2]:
-        params = route.split("?", 1)[1]
-        assert __import__("urllib.parse").parse.parse_qs(params)["session_id"] == ["sid-1"]
-        assert __import__("urllib.parse").parse.parse_qs(params)["path"] == [" report.md "]
-    browser = __import__("urllib.parse").parse.parse_qs(output[2].split("?", 1)[1])
+    assert len(output) == 4
+    list_params = __import__("urllib.parse").parse.parse_qs(output[0].split("?", 1)[1])
+    assert list_params["session_id"] == ["sid-1"]
+    assert list_params["path"] == [" dir "]
+    for route in output[1:3]:
+        params = __import__("urllib.parse").parse.parse_qs(route.split("?", 1)[1])
+        assert params["session_id"] == ["sid-1"]
+        assert params["path"] == [" dir / report.md "]
+    browser = __import__("urllib.parse").parse.parse_qs(output[3].split("?", 1)[1])
     assert browser["session_id"] == ["sid-1"]
-    assert browser["path"] == [" report.md "]
+    assert browser["path"] == [" dir / report.md "]
     assert browser["inline"] == ["1"]
 
 
@@ -352,12 +407,14 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         + "  const currentTask = openArtifactPath('output/current.md');\n"
         + "  pending.shift().resolve({entries:[{path:'output/current.md'}]}); await new Promise((resolve)=>setTimeout(resolve,0));\n"
         + "  const currentRead = pending.shift();\n"
-        + "  const rejectedStale = openArtifactPath({path:'output/stale.md',owner:{session_id:'sid-old',workspace_root:'/old'}});\n"
-        + "  const rejectedMalformed = openFile('./malformed.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
-        + "  const rejectedNul = openFile('bad\\0.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
-        + "  const rejectedDrive = openFile('C:/bad.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
-        + "  const rejectedOverLimit = openFile('a'.repeat(513)+'.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
-        + "  const rejectedMalformedOwner = openFile('output/malformed-owner.md',{owner:{workspace_root:'/old'}});\n"
+        + "  const rejectedGeneration = {};\n"
+        + "  const rejectedDirect = async (name, action) => { const before = _workspaceOpenGeneration; await action(); rejectedGeneration[name] = {before,after:_workspaceOpenGeneration}; };\n"
+        + "  const rejectedStale = rejectedDirect('staleOwner',()=>openFile('output/stale.md',{owner:{session_id:'sid-old',workspace_root:'/old'}}));\n"
+        + "  const rejectedMalformed = rejectedDirect('malformedPath',()=>openFile('./malformed.md',{owner:{session_id:'sid-1',workspace_root:'/old'}}));\n"
+        + "  const rejectedNul = rejectedDirect('nulPath',()=>openFile('bad\\0.md',{owner:{session_id:'sid-1',workspace_root:'/old'}}));\n"
+        + "  const rejectedDrive = rejectedDirect('drivePath',()=>openFile('C:/bad.md',{owner:{session_id:'sid-1',workspace_root:'/old'}}));\n"
+        + "  const rejectedOverLimit = rejectedDirect('overLimitPath',()=>openFile('a'.repeat(513)+'.md',{owner:{session_id:'sid-1',workspace_root:'/old'}}));\n"
+        + "  const rejectedMalformedOwner = rejectedDirect('malformedOwner',()=>openFile('output/malformed-owner.md',{owner:{workspace_root:'/old'}}));\n"
         + "  await Promise.all([rejectedStale,rejectedMalformed,rejectedNul,rejectedDrive,rejectedOverLimit,rejectedMalformedOwner]); currentRead.resolve({content:'# current'}); await currentTask;\n"
         + "  const staleOwnerPreservesCurrent = {raw:_previewRawContent,rawPath:_previewRawContentPath,currentPath:_previewCurrentPath};\n"
         + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
@@ -371,7 +428,7 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         + "  const image = nodes.previewImg; const imageTask = openArtifactPath('output/image.png');\n"
         + "  pending.shift().resolve({entries:[{path:'output/image.png'}]}); await imageTask;\n"
         + "  S.session = {session_id:'sid-1',workspace:''}; image.onerror();\n"
-        + "  console.log(JSON.stringify({staleResolved,staleRejected,staleDownload:staleDownloadDelta,positive:positiveSummary,staleOwnerPreservesCurrent,sameOwnerRace,downloadMutations,status, imageErrorInstalled:typeof image.onerror==='function'}));\n"
+        + "  console.log(JSON.stringify({staleResolved,staleRejected,staleDownload:staleDownloadDelta,positive:positiveSummary,staleOwnerPreservesCurrent,sameOwnerRace,rejectedGeneration,downloadMutations,status, imageErrorInstalled:typeof image.onerror==='function'}));\n"
         + "}\nrun().catch((error)=>{console.error(error);process.exit(1)});"
     )
     assert output["staleResolved"] == output["staleRejected"] == {
@@ -386,6 +443,10 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         "currentPathUnchanged": True,
     }
     assert output["staleDownload"] == 0
+    assert all(
+        row["before"] == row["after"]
+        for row in output["rejectedGeneration"].values()
+    )
     assert output["positive"] == {"preview": 1, "open": 2, "breadcrumb": 1}
     assert output["staleOwnerPreservesCurrent"] == {"raw": "# current", "rawPath": "output/current.md", "currentPath": "output/current.md"}
     assert output["sameOwnerRace"] == {"raw": "# newer", "rawPath": "output/newer.md", "currentPath": "output/newer.md"}
