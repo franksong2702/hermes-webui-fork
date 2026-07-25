@@ -765,9 +765,13 @@ def _raise_expected_mutation_failure(
 
 
 def _is_playwright_timeout(error: Exception) -> bool:
-    return PLAYWRIGHT_TIMEOUT_ERROR is not None and isinstance(
-        error,
-        PLAYWRIGHT_TIMEOUT_ERROR,
+    error_type = type(error)
+    return (
+        PLAYWRIGHT_TIMEOUT_ERROR is not None
+        and isinstance(error, PLAYWRIGHT_TIMEOUT_ERROR)
+    ) or (
+        error_type.__name__ == "TimeoutError"
+        and error_type.__module__ == "playwright._impl._errors"
     )
 
 
