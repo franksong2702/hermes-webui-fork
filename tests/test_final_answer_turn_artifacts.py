@@ -121,6 +121,21 @@ def test_typed_artifact_paths_preserve_punctuation_and_supported_length():
     assert output[3][0]["path"] == " report.md "
 
 
+def test_typed_artifact_path_reaches_real_route_without_rebinding():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    start = workspace.index("function _escapeGrantStore")
+    end = workspace.index("async function authorizeWorkspaceEscapeNavigation")
+    output = _run_node(
+        workspace[start:end]
+        + "\nconst S={session:{session_id:'sid-1',workspace:'/workspace'}};\n"
+        + "const owner={session_id:'sid-1',workspace_root:'/workspace'};\n"
+        + "const spaced=_workspaceRouteForPathRel(' report.md ','read',{owner,_preserveArtifactPath:true});\n"
+        + "const sibling=_workspaceRouteForPathRel('report.md','read',{owner,_preserveArtifactPath:true});\n"
+        + "console.log(JSON.stringify({spaced:new URLSearchParams(spaced.split('?')[1]).get('path'),sibling:new URLSearchParams(sibling.split('?')[1]).get('path')}));"
+    )
+    assert output == {"spaced": " report.md ", "sibling": "report.md"}
+
+
 def test_artifact_owner_match_requires_root_when_captured():
     workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
     start = workspace.index("function _artifactScalarString(value){")
@@ -217,7 +232,8 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         + "  pending.shift().resolve({entries:[{path:'output/current.md'}]}); await new Promise((resolve)=>setTimeout(resolve,0));\n"
         + "  const currentRead = pending.shift();\n"
         + "  const rejectedStale = openArtifactPath({path:'output/stale.md',owner:{session_id:'sid-old',workspace_root:'/old'}});\n"
-        + "  await rejectedStale; currentRead.resolve({content:'# current'}); await currentTask;\n"
+        + "  const rejectedMalformed = openFile('./malformed.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
+        + "  await rejectedStale; await rejectedMalformed; currentRead.resolve({content:'# current'}); await currentTask;\n"
         + "  const staleOwnerPreservesCurrent = {raw:_previewRawContent,rawPath:_previewRawContentPath,currentPath:_previewCurrentPath};\n"
         + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
         + "  const olderAttempt = openFile('output/older.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
@@ -1106,4 +1122,4 @@ def test_artifact_open_expands_a_closed_workspace_preview_before_loading_file():
     end = workspace.index("// ── Workspace file-tree", start)
     body = workspace[start:end]
     assert "ensureWorkspacePreviewVisible()" in body
-    assert body.index("ensureWorkspacePreviewVisible()") < body.index("openFile(rel,{owner,_openGeneration:generation});")
+    assert body.index("ensureWorkspacePreviewVisible()") < body.index("openFile(rel,{owner,_openGeneration:generation,_preserveArtifactPath:true});")

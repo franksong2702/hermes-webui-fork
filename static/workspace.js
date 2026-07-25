@@ -163,8 +163,15 @@ function _escapeGrantStore(){
   return S._escapeGrants;
 }
 
-function _normalizeWorkspaceRelPath(path){
-  let raw = String(path || '').trim().replace(/\\/g, '/');
+function _normalizeWorkspaceRelPath(path, preserveExact=false){
+  let raw = String(path || '');
+  if(preserveExact){
+    if(!raw || raw === '.' || raw.startsWith('/') || raw.includes('\\')) return '';
+    const exactParts=raw.split('/');
+    if(exactParts.some(part=>!part||part==='.'||part==='..')) return '';
+    return raw;
+  }
+  raw = raw.trim().replace(/\\/g, '/');
   if(!raw || raw === '.') return '.';
   if(raw.startsWith('/')) return '';
   const parts = [];
@@ -279,7 +286,7 @@ function _workspaceRouteForPathRel(path, kind, opts={}){
     };
   const owner = resolveOwner(opts);
   if(!owner) return '';
-  const normalizedPath = _normalizeWorkspaceRelPath(path);
+  const normalizedPath = _normalizeWorkspaceRelPath(path, !!opts._preserveArtifactPath);
   const ownerSessionId = owner.session_id;
   const activeSessionId = S.session ? S.session.session_id : null;
   const activeWorkspaceRoot = ownerScalar(S.session && S.session && S.session.workspace).replace(/\/+$/,'');
@@ -824,7 +831,8 @@ async function openArtifactPath(path){
   const owner = artifact
     ? _artifactOwnerFromArtifactValue(artifact)
     : _artifactOwnerFromCurrentSession();
-  if(!pathValue || !owner) return;
+  const rel = _normalizeTypedArtifactPath(pathValue);
+  if(!rel || !owner) return;
   if(typeof _artifactOwnerMatchesSession === 'function' && !_artifactOwnerMatchesSession(owner)) return;
   const generation = _nextWorkspaceOpenGeneration();
   const ownerStillActive = () => typeof _artifactOwnerMatchesSession === 'function'
@@ -838,18 +846,9 @@ async function openArtifactPath(path){
   if(!ownerStillActive()) return;
   switchWorkspacePanelTab('files');
   if(!ownerStillActive()) return;
-  let rel = pathValue.replace(/^~\//,'').replace(/^\.\/+/,'');
-  // Strip workspace prefix so /api/list receives a workspace-relative path.
-  const ws = owner.workspace_root;
-  if(ws){
-    const normWs = ws.replace(/\/+$/,'') + '/';
-    if(rel.startsWith(normWs)) rel = rel.slice(normWs.length);
-    else if(rel === ws.replace(/\/+$/,'')) rel = '.';
-  }
-  if(!rel) rel = '.';
   try{
     if(!ownerStillActive()) return;
-    if(!(await _workspacePathExists(rel,{owner}))){
+    if(!(await _workspacePathExists(rel,{owner,_preserveArtifactPath:true}))){
       if(ownerStillActive()) setStatus(t('file_open_failed'));
       return;
     }
@@ -858,7 +857,7 @@ async function openArtifactPath(path){
     return;
   }
   if(!ownerStillActive()) return;
-  await openFile(rel,{owner,_openGeneration:generation});
+  await openFile(rel,{owner,_openGeneration:generation,_preserveArtifactPath:true});
 }
 
 // ── Workspace file-tree loading skeleton (#4662 Phase 1) ────────────────────
@@ -1328,6 +1327,14 @@ async function openFile(path, opts={}){
     };
   const owner = resolveOwner(opts);
   if(!path || typeof path !== 'string' || !owner) return;
+  const exactParts=path.split('/');
+  if(
+    !path
+    || path.startsWith('/')
+    || path.startsWith('~/')
+    || path.includes('\\')
+    || exactParts.some(part=>!part||part==='.'||part==='..')
+  ) return;
   if(typeof _artifactOwnerMatchesSession === 'function' && !_artifactOwnerMatchesSession(owner)) return;
   const nextGeneration = typeof _nextWorkspaceOpenGeneration === 'function'
     ? _nextWorkspaceOpenGeneration
