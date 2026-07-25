@@ -6478,6 +6478,7 @@ main.main > .main-view:not([id="mainChat"]):not([id="mainSettings"]) .main-view-
 .turn-artifact-icon{display:grid;flex:0 0 20px;place-items:center;color:var(--muted);}
 .turn-artifact-icon svg{width:18px;height:18px;}
 .turn-artifact-path{min-width:0;overflow-wrap:anywhere;font-family:'SF Mono',ui-monospace,monospace;font-size:12px;line-height:1.4;}
+@media(max-width:600px){.turn-artifact-item{min-height:44px;box-sizing:border-box;}}
 .rightpanel[data-active-tab="artifacts"] .breadcrumb-bar,.rightpanel[data-active-tab="artifacts"] .file-tree,.rightpanel[data-active-tab="artifacts"] #wsEmptyState{display:none!important;}
 .rightpanel[data-active-tab="artifacts"] .workspace-artifacts{display:block;}
 .rightpanel[data-active-tab="files"] .workspace-artifacts{display:none!important;}

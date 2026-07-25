@@ -179,7 +179,7 @@ def test_direct_open_file_rejects_malformed_typed_paths_before_generation():
         + "Promise.all(["
         + "openFile('bad\\0.md',{owner:{session_id:'sid-1',workspace_root:'/workspace'}}),"
         + "openFile('C:/bad.md',{owner:{session_id:'sid-1',workspace_root:'/workspace'}}),"
-        + "openFile('a'.repeat(513)+'.md',{owner:{session_id:'sid-1',workspace_root:'/workspace'}})"
+        + "openFile('a'.repeat(513)+'.md',{owner:{session_id:'sid-1',workspace_root:'/workspace'},_preserveArtifactPath:true})"
         + "]).then(()=>console.log(JSON.stringify({generations,_workspaceOpenGeneration})));"
     )
     assert output == {"generations": 0, "_workspaceOpenGeneration": 0}
@@ -403,6 +403,10 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         + "  pending.shift().resolve({entries:[{path:'output/report.md'}]}); await new Promise((resolve)=>setTimeout(resolve,0));\n"
         + "  pending.shift().resolve({content:'# matching'}); await positive;\n"
         + "  const positiveSummary = {preview:previewMutations-beforePositive.preview,open:openMutations-beforePositive.open,breadcrumb:breadcrumbMutations-beforePositive.breadcrumb};\n"
+        + "  const absoluteTask = openArtifactPath('/old/output/legacy.md');\n"
+        + "  pending.shift().resolve({entries:[{path:'output/legacy.md'}]}); await new Promise((resolve)=>setTimeout(resolve,0));\n"
+        + "  pending.shift().resolve({content:'# legacy'}); await absoluteTask;\n"
+        + "  const absolutePath = _previewCurrentPath;\n"
         + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
         + "  const currentTask = openFile('output/current.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
         + "  const currentRead = pending.shift();\n"
@@ -412,10 +416,14 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         + "  const rejectedMalformed = rejectedDirect('malformedPath',()=>openFile('./malformed.md',{owner:{session_id:'sid-1',workspace_root:'/old'}}));\n"
         + "  const rejectedNul = rejectedDirect('nulPath',()=>openFile('bad\\0.md',{owner:{session_id:'sid-1',workspace_root:'/old'}}));\n"
         + "  const rejectedDrive = rejectedDirect('drivePath',()=>openFile('C:/bad.md',{owner:{session_id:'sid-1',workspace_root:'/old'}}));\n"
-        + "  const rejectedOverLimit = rejectedDirect('overLimitPath',()=>openFile('a'.repeat(513)+'.md',{owner:{session_id:'sid-1',workspace_root:'/old'}}));\n"
+        + "  const rejectedOverLimit = rejectedDirect('overLimitPath',()=>openFile('a'.repeat(513)+'.md',{owner:{session_id:'sid-1',workspace_root:'/old'},_preserveArtifactPath:true}));\n"
         + "  const rejectedMalformedOwner = rejectedDirect('malformedOwner',()=>openFile('output/malformed-owner.md',{owner:{workspace_root:'/old'}}));\n"
         + "  await Promise.all([rejectedStale,rejectedMalformed,rejectedNul,rejectedDrive,rejectedOverLimit,rejectedMalformedOwner]); currentRead.resolve({content:'# current'}); await currentTask;\n"
         + "  const staleOwnerPreservesCurrent = {raw:_previewRawContent,rawPath:_previewRawContentPath,currentPath:_previewCurrentPath};\n"
+        + "  const ordinaryLongPath = 'nested/'.repeat(100)+'report.md';\n"
+        + "  const ordinaryLongTask = openFile(ordinaryLongPath,{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
+        + "  pending.shift().resolve({content:'# long'}); await ordinaryLongTask;\n"
+        + "  const ordinaryLongOpenedPath = _previewCurrentPath;\n"
         + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
         + "  const olderAttempt = openFile('output/older.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
         + "  const olderRead = pending.shift();\n"
@@ -427,7 +435,7 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         + "  const image = nodes.previewImg; const imageTask = openArtifactPath('output/image.png');\n"
         + "  pending.shift().resolve({entries:[{path:'output/image.png'}]}); await imageTask;\n"
         + "  S.session = {session_id:'sid-1',workspace:''}; image.onerror();\n"
-        + "  console.log(JSON.stringify({staleResolved,staleRejected,staleDownload:staleDownloadDelta,positive:positiveSummary,staleOwnerPreservesCurrent,sameOwnerRace,rejectedGeneration,downloadMutations,status, imageErrorInstalled:typeof image.onerror==='function'}));\n"
+        + "  console.log(JSON.stringify({staleResolved,staleRejected,staleDownload:staleDownloadDelta,positive:positiveSummary,absolutePath,ordinaryLongOpenedPath,staleOwnerPreservesCurrent,sameOwnerRace,rejectedGeneration,downloadMutations,status, imageErrorInstalled:typeof image.onerror==='function'}));\n"
         + "}\nrun().catch((error)=>{console.error(error);process.exit(1)});"
     )
     assert output["staleResolved"] == output["staleRejected"] == {
@@ -447,6 +455,8 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         for row in output["rejectedGeneration"].values()
     )
     assert output["positive"] == {"preview": 1, "open": 2, "breadcrumb": 1}
+    assert output["absolutePath"] == "output/legacy.md"
+    assert len(output["ordinaryLongOpenedPath"]) > 512
     assert output["staleOwnerPreservesCurrent"] == {"raw": "# current", "rawPath": "output/current.md", "currentPath": "output/current.md"}
     assert output["sameOwnerRace"] == {"raw": "# newer", "rawPath": "output/newer.md", "currentPath": "output/newer.md"}
     assert output["downloadMutations"] == 0
@@ -470,7 +480,7 @@ def test_anchor_projector_normalizes_real_artifact_event_for_renderer():
         + "const document={createElement:()=>({className:'',title:'',type:'',innerHTML:'',children:[],append(...x){this.children.push(...x)},appendChild(x){this.children.push(x)},replaceChildren(...x){this.children=[...x]},setAttribute(){},addEventListener(_name,fn){this.onclick=fn}})};\n"
         + ui_helpers
         + "const segment={children:[],querySelectorAll:()=>[],appendChild(node){this.children.push(node)}}; const message={_anchor_activity_scene:scene};\n"
-        + "_renderTurnArtifactListForMessage(message,segment,0); segment.children[0].children[0].children[0].onclick(); segment.children[0].children[0].children[1].onclick();\n"
+        + "_renderTurnArtifactListForMessage(message,segment,0); segment.children[0].children[0].children[0].children[0].onclick(); segment.children[0].children[0].children[1].children[0].onclick();\n"
         + "console.log(JSON.stringify({scene,entries:_turnArtifactEntriesFromScene(scene),clicked}));"
     )
     artifact = output["entries"][0]
@@ -555,11 +565,12 @@ def test_turn_artifact_renderer_collapses_large_lists_with_accessible_toggle():
         + "const message={_anchor_activity_scene:{artifacts:"
         + json.dumps(artifacts)
         + "}}; _renderTurnArtifactListForMessage(message,segment,0);\n"
-        + "const list=segment.children[0]; const items=list.children[0]; const toggle=list.children[1]; const stableToggle=toggle; toggle.focus(); const collapsed={items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],type:toggle.type,controls:toggle.attributes['aria-controls'],target:items.id,focused:document.activeElement===toggle}; toggle.onclick(); const expanded={items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],stable:toggle===stableToggle,focused:document.activeElement===toggle}; toggle.onclick(); console.log(JSON.stringify({collapsed,expanded,collapsedAgain:{items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],stable:toggle===stableToggle,focused:document.activeElement===toggle}}));"
+        + "const list=segment.children[0]; const items=list.children[0]; const toggle=list.children[1]; const stableToggle=toggle; toggle.focus(); const collapsed={items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],type:toggle.type,controls:toggle.attributes['aria-controls'],target:items.id,focused:document.activeElement===toggle}; toggle.onclick(); const expanded={items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],stable:toggle===stableToggle,focused:document.activeElement===toggle}; const rerenderSegment=new Node(); rerenderSegment.querySelectorAll=()=>[]; _renderTurnArtifactListForMessage(message,rerenderSegment,0); const rerenderToggle=rerenderSegment.children[0].children[1]; const rerender={items:rerenderSegment.children[0].children[0].children.length,expanded:rerenderToggle.attributes['aria-expanded']}; toggle.onclick(); console.log(JSON.stringify({collapsed,expanded,rerender,collapsedAgain:{items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],stable:toggle===stableToggle,focused:document.activeElement===toggle}}));"
     )
     assert output == {
         "collapsed": {"items": 5, "toggle": "+7 more", "expanded": "false", "type": "button", "controls": output["collapsed"]["target"], "target": output["collapsed"]["target"], "focused": True},
         "expanded": {"items": 12, "toggle": "Show fewer artifacts", "expanded": "true", "stable": True, "focused": True},
+        "rerender": {"items": 12, "expanded": "true"},
         "collapsedAgain": {"items": 5, "toggle": "+7 more", "expanded": "false", "stable": True, "focused": True},
     }
     assert ".turn-artifact-toggle" in styles
@@ -979,7 +990,7 @@ def test_replay_collision_controls_feed_real_renderer_and_click_current_owner():
             + json.dumps(scene)
             + "};\n"
             + "_renderTurnArtifactListForMessage(message,segment,0);\n"
-            + "segment.children[0].children[0].children[0].onclick();\n"
+            + "segment.children[0].children[0].children[0].children[0].onclick();\n"
             + "console.log(JSON.stringify({entries:_turnArtifactEntriesFromScene(message._anchor_activity_scene),clicked}));"
         )
         expected = {

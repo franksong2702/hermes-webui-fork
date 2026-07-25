@@ -165,6 +165,7 @@ function _escapeGrantStore(){
 
 function _normalizeWorkspaceRelPath(path, preserveExact=false){
   let raw = String(path || '');
+  if(raw.includes('://') || raw.includes('\0') || raw.startsWith('~/') || /^[A-Za-z]:/.test(raw)) return '';
   if(preserveExact){
     if(!raw || raw === '.' || raw.startsWith('/') || raw.includes('\\')) return '';
     const exactParts=raw.split('/');
@@ -837,11 +838,20 @@ function _artifactOwnerFromArtifactValue(value){
 
 async function openArtifactPath(path){
   const artifact = path && typeof path === 'object' && !Array.isArray(path) ? path : null;
-  const pathValue = typeof path === 'string'
+  let pathValue = typeof path === 'string'
     ? path
     : artifact && typeof artifact.path === 'string'
       ? artifact.path
       : '';
+  // Artifacts-panel rows predate typed descriptors and may carry the absolute
+  // workspace path returned by the legacy list route. Keep that route usable;
+  // strict descriptor validation below remains reserved for typed artifacts.
+  if(!artifact && pathValue.startsWith('/')){
+    const workspaceRoot = String(S&&S.session&&S.session.workspace||'').replace(/\/+$/,'');
+    if(workspaceRoot && (pathValue===workspaceRoot || pathValue.startsWith(`${workspaceRoot}/`))){
+      pathValue = pathValue.slice(workspaceRoot.length).replace(/^\/+/, '');
+    }
+  }
   const owner = artifact
     ? _artifactOwnerFromArtifactValue(artifact)
     : _artifactOwnerFromCurrentSession();
@@ -1347,19 +1357,28 @@ async function openFile(path, opts={}){
     };
   const owner = resolveOwner(opts);
   if(!path || typeof path !== 'string' || !owner) return;
-  const typedPath = typeof _normalizeTypedArtifactPath === 'function'
-    ? _normalizeTypedArtifactPath(path)
-    : (
-      path.length<=512
-      && !path.includes('://')
-      && !/[\\\0]/.test(path)
-      && !path.startsWith('/')
-      && !path.startsWith('~/')
-      && !/^[A-Za-z]:/.test(path)
-      && !path.split('/').some(part=>!part||part==='.'||part==='..')
-        ? path
-        : ''
-    );
+  const normalizeWorkspacePath = typeof _normalizeWorkspaceRelPath === 'function'
+    ? _normalizeWorkspaceRelPath
+    : (value) => {
+      let raw=String(value||'').trim().replace(/\\/g,'/');
+      if(raw.includes('://') || raw.includes('\0') || raw.startsWith('~/') || /^[A-Za-z]:/.test(raw)) return '';
+      if(!raw||raw==='.') return '.';
+      if(raw.startsWith('/')) return '';
+      const parts=[];
+      for(const part of raw.split('/')){
+        if(!part||part==='.') continue;
+        if(part==='..'){
+          if(parts.length) parts.pop(); else return '';
+          continue;
+        }
+        parts.push(part);
+      }
+      return parts.join('/')||'.';
+    };
+  const hasMalformedSegments = path.split('/').some(part=>!part||part==='.'||part==='..');
+  const typedPath = opts&&opts._preserveArtifactPath
+    ? (typeof _normalizeTypedArtifactPath === 'function' ? _normalizeTypedArtifactPath(path) : '')
+    : (hasMalformedSegments ? '' : normalizeWorkspacePath(path));
   if(!typedPath) return;
   path = typedPath;
   if(typeof _artifactOwnerMatchesSession === 'function' && !_artifactOwnerMatchesSession(owner)) return;

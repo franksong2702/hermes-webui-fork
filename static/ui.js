@@ -13702,14 +13702,17 @@ function _renderTurnArtifactListForMessage(message, segment, rawIdx){
   const list=document.createElement('div');
   list.className='turn-artifact-list';
   list.setAttribute('data-turn-artifact-list','1');
+  list.setAttribute('role','group');
   list.setAttribute('aria-label',typeof t==='function'?t('turn_artifact_list_label'):'Turn artifacts');
   const items=document.createElement('div');
   items.className='turn-artifact-items';
+  items.setAttribute('role','list');
+  items.setAttribute('aria-label',typeof t==='function'?t('turn_artifact_list_label'):'Turn artifacts');
   const itemsId=`turn-artifact-items-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   items.id=itemsId;
   items.setAttribute('data-turn-artifact-items','1');
   const collapsedLimit=5;
-  let expanded=false;
+  let expanded=message._turnArtifactListExpanded===true;
   const toggle=entries.length>collapsedLimit?document.createElement('button'):null;
   if(toggle){
     toggle.type='button';
@@ -13720,6 +13723,8 @@ function _renderTurnArtifactListForMessage(message, segment, rawIdx){
     items.replaceChildren();
     const visibleEntries=expanded?entries:entries.slice(0,collapsedLimit);
     for(const entry of visibleEntries){
+      const row=document.createElement('div');
+      row.setAttribute('role','listitem');
       const item=document.createElement('button');
       item.type='button';
       item.className='turn-artifact-item';
@@ -13735,7 +13740,8 @@ function _renderTurnArtifactListForMessage(message, segment, rawIdx){
       item.addEventListener('click',()=>{
         if(typeof openArtifactPath==='function') openArtifactPath(entry);
       });
-      items.appendChild(item);
+      row.appendChild(item);
+      items.appendChild(row);
     }
     if(toggle){
       toggle.setAttribute('aria-expanded',expanded?'true':'false');
@@ -13744,7 +13750,7 @@ function _renderTurnArtifactListForMessage(message, segment, rawIdx){
         : (typeof t==='function'?t('turn_artifact_more',entries.length-collapsedLimit):`+${entries.length-collapsedLimit} more`);
     }
   };
-  if(toggle) toggle.addEventListener('click',()=>{ expanded=!expanded; renderItems(); });
+  if(toggle) toggle.addEventListener('click',()=>{ expanded=!expanded; message._turnArtifactListExpanded=expanded; renderItems(); });
   renderItems();
   list.appendChild(items);
   if(toggle) list.appendChild(toggle);
