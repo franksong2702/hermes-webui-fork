@@ -508,6 +508,21 @@ function _artifactOwnerMatchesSession(owner){
   return true;
 }
 
+let _workspaceOpenGeneration = 0;
+function _nextWorkspaceOpenGeneration(){
+  _workspaceOpenGeneration += 1;
+  return _workspaceOpenGeneration;
+}
+
+function _normalizeTypedArtifactPath(path){
+  if(typeof path!=='string') return '';
+  const value=path.trim();
+  if(!value||value.length>512||value.includes('://')||/[\\\0]/.test(value)||value.startsWith('/')||/^[A-Za-z]:/.test(value)) return '';
+  const parts=value.split('/');
+  if(parts.some(part=>!part||part==='.'||part==='..')) return '';
+  return value;
+}
+
 function _artifactCandidatesFromText(text){
   if(!text || typeof text !== 'string') return [];
   const out = [];
@@ -623,7 +638,7 @@ function turnArtifactReferencesFromToolCall(tc){
   for(const artifact of Array.isArray(tc.artifacts)?tc.artifacts:[]){
     if(!artifact||typeof artifact!=='object') continue;
     if(typeof artifact.path !== 'string' || typeof artifact.workspace_root !== 'string') continue;
-    const path=normalizeArtifactPath(artifact.path);
+    const path=_normalizeTypedArtifactPath(artifact.path);
     const workspaceRoot=artifact.workspace_root.replace(/\/+$/,'');
     const toolCallId=artifactScalarString(artifact.tool_call_id);
     const toolName=normalizeToolName(artifact.tool_name);
@@ -809,10 +824,11 @@ async function openArtifactPath(path){
   const owner = artifact
     ? _artifactOwnerFromArtifactValue(artifact)
     : _artifactOwnerFromCurrentSession();
+  const generation = _nextWorkspaceOpenGeneration();
   if(!pathValue || !owner) return;
   const ownerStillActive = () => typeof _artifactOwnerMatchesSession === 'function'
-    ? _artifactOwnerMatchesSession(owner)
-    : true;
+    ? generation===_workspaceOpenGeneration && _artifactOwnerMatchesSession(owner)
+    : generation===_workspaceOpenGeneration;
   if(!ownerStillActive()) return;
   // Artifact links are an explicit request to inspect a file. A closed
   // workspace panel must expand before openFile paints the preview, otherwise
@@ -841,7 +857,7 @@ async function openArtifactPath(path){
     return;
   }
   if(!ownerStillActive()) return;
-  await openFile(rel,{owner});
+  await openFile(rel,{owner,_openGeneration:generation});
 }
 
 // ── Workspace file-tree loading skeleton (#4662 Phase 1) ────────────────────
@@ -1311,16 +1327,20 @@ async function openFile(path, opts={}){
     };
   const owner = resolveOwner(opts);
   if(!path || typeof path !== 'string' || !owner) return;
+  const generation = Number.isInteger(opts&&opts._openGeneration)
+    ? opts._openGeneration
+    : _nextWorkspaceOpenGeneration();
   const openFileOwner = owner;
   const ownerStillActive = () => typeof _artifactOwnerMatchesSession === 'function'
-    ? _artifactOwnerMatchesSession(openFileOwner)
-    : true;
+    ? generation===_workspaceOpenGeneration && _artifactOwnerMatchesSession(openFileOwner)
+    : generation===_workspaceOpenGeneration;
   if(!ownerStillActive()) return;
   const ext=fileExt(path);
   const bustCache=!!(opts&&opts.bustCache);
   const forceRichMarkdown=!!(opts&&opts.forceRichMarkdown);
   const cacheBust=bustCache?`&_=${Date.now()}`:'';
   const routeOpts={...opts, owner};
+  delete routeOpts._openGeneration;
 
   // Binary/download-only formats: trigger browser download, don't preview
   if(DOWNLOAD_EXTS.has(ext)){

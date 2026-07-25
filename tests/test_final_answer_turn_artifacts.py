@@ -77,7 +77,7 @@ def test_turn_artifact_references_require_server_landed_descriptors():
 
 def test_turn_artifact_references_require_strict_identity_fields():
     workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
-    start = workspace.index("function turnArtifactReferencesFromToolCall(tc){")
+    start = workspace.index("function _normalizeTypedArtifactPath(path){")
     end = workspace.index("const _turnMutatedPreviewPaths")
     output = _run_node(
         workspace[start:end]
@@ -99,6 +99,24 @@ def test_turn_artifact_references_require_strict_identity_fields():
         ],
         [],
     ]
+
+
+def test_typed_artifact_paths_preserve_punctuation_and_supported_length():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    start = workspace.index("function _normalizeTypedArtifactPath(path){")
+    end = workspace.index("const _turnMutatedPreviewPaths")
+    boundary = "output/" + "a" * (512 - len("output/") - 1) + ";"
+    output = _run_node(
+        workspace[start:end]
+        + "\nconsole.log(JSON.stringify(["
+        + "turnArtifactReferencesFromToolCall({name:'write_file',tool_call_id:'call-1',artifacts:[{path:'output/report;',workspace_root:'/workspace',tool_call_id:'call-1',tool_name:'write_file'}]}),"
+        + "turnArtifactReferencesFromToolCall({name:'write_file',tool_call_id:'call-2',artifacts:[{path:" + json.dumps(boundary) + ",workspace_root:'/workspace',tool_call_id:'call-2',tool_name:'write_file'}]}),"
+        + "turnArtifactReferencesFromToolCall({name:'write_file',tool_call_id:'call-3',artifacts:[{path:" + json.dumps(boundary + 'x') + ",workspace_root:'/workspace',tool_call_id:'call-3',tool_name:'write_file'}]})"
+        + "]));"
+    )
+    assert output[0][0]["path"] == "output/report;"
+    assert output[1][0]["path"] == boundary
+    assert output[2] == []
 
 
 def test_artifact_owner_match_requires_root_when_captured():
@@ -191,10 +209,19 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         + "  const positive = openArtifactPath('output/report.md');\n"
         + "  pending.shift().resolve({entries:[{path:'output/report.md'}]}); await new Promise((resolve)=>setTimeout(resolve,0));\n"
         + "  pending.shift().resolve({content:'# matching'}); await positive;\n"
+        + "  const positiveSummary = {preview:previewMutations-beforePositive.preview,open:openMutations-beforePositive.open,breadcrumb:breadcrumbMutations-beforePositive.breadcrumb};\n"
+        + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
+        + "  const olderAttempt = openFile('output/older.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
+        + "  const olderRead = pending.shift();\n"
+        + "  const newerAttempt = openFile('output/newer.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
+        + "  const newerRead = pending.shift();\n"
+        + "  newerRead.resolve({content:'# newer'}); olderRead.resolve({content:'# older'});\n"
+        + "  await Promise.all([olderAttempt,newerAttempt]);\n"
+        + "  const sameOwnerRace = {raw:_previewRawContent,rawPath:_previewRawContentPath,currentPath:_previewCurrentPath};\n"
         + "  const image = nodes.previewImg; const imageTask = openArtifactPath('output/image.png');\n"
         + "  pending.shift().resolve({entries:[{path:'output/image.png'}]}); await imageTask;\n"
         + "  S.session = {session_id:'sid-1',workspace:''}; image.onerror();\n"
-        + "  console.log(JSON.stringify({staleResolved,staleRejected,staleDownload:staleDownloadDelta,positive:{preview:previewMutations-beforePositive.preview,open:openMutations-beforePositive.open,breadcrumb:breadcrumbMutations-beforePositive.breadcrumb},downloadMutations,status, imageErrorInstalled:typeof image.onerror==='function'}));\n"
+        + "  console.log(JSON.stringify({staleResolved,staleRejected,staleDownload:staleDownloadDelta,positive:positiveSummary,sameOwnerRace,downloadMutations,status, imageErrorInstalled:typeof image.onerror==='function'}));\n"
         + "}\nrun().catch((error)=>{console.error(error);process.exit(1)});"
     )
     assert output["staleResolved"] == output["staleRejected"] == {
@@ -209,7 +236,8 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         "currentPathUnchanged": True,
     }
     assert output["staleDownload"] == 0
-    assert output["positive"] == {"preview": 2, "open": 4, "breadcrumb": 2}
+    assert output["positive"] == {"preview": 1, "open": 2, "breadcrumb": 1}
+    assert output["sameOwnerRace"] == {"raw": "# newer", "rawPath": "output/newer.md", "currentPath": "output/newer.md"}
     assert output["downloadMutations"] == 0
     assert output["status"] == []
     assert output["imageErrorInstalled"] is True
@@ -583,6 +611,44 @@ def test_replay_replaces_under_typed_existing_anchor_artifacts_with_transcript_d
             },
         },
     ]
+
+
+def test_replay_discards_unbacked_and_forged_client_artifacts():
+    from api import routes
+
+    base_scene = {
+        "version": "activity_scene_v1",
+        "activity_rows": [{"type": "tool"}],
+        "artifacts": [{
+            "type": "artifact_reference",
+            "payload": {
+                "path": "output/report.md",
+                "workspace_root": "/workspace",
+                "session_id": "sid-client",
+                "tool_name": "write_file",
+                "tool_call_id": "forged",
+            },
+        }],
+    }
+    message = {"role": "assistant", "content": "final", "_anchor_activity_scene": base_scene}
+    assert routes._attach_replayed_turn_artifacts_to_anchor_scenes([message], {0: []})[0][
+        "_anchor_activity_scene"
+    ]["artifacts"] == []
+
+    canonical = {
+        "path": "output/report.md",
+        "workspace_root": "/workspace",
+        "session_id": "sid-server",
+        "tool_name": "patch",
+        "tool_call_id": "call-server",
+    }
+    hydrated = routes._attach_replayed_turn_artifacts_to_anchor_scenes(
+        [message], {0: [canonical]}
+    )
+    assert hydrated[0]["_anchor_activity_scene"]["artifacts"] == [{
+        "type": "artifact_reference",
+        "payload": {**canonical, "source": "transcript_replay"},
+    }]
 
 
 def test_replay_replaces_wrong_session_existing_anchor_artifacts_with_transcript_descriptors():
@@ -1014,4 +1080,4 @@ def test_artifact_open_expands_a_closed_workspace_preview_before_loading_file():
     end = workspace.index("// ── Workspace file-tree", start)
     body = workspace[start:end]
     assert "ensureWorkspacePreviewVisible()" in body
-    assert body.index("ensureWorkspacePreviewVisible()") < body.index("openFile(rel,{owner});")
+    assert body.index("ensureWorkspacePreviewVisible()") < body.index("openFile(rel,{owner,_openGeneration:generation});")

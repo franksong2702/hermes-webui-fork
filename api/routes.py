@@ -8947,59 +8947,19 @@ def _attach_replayed_turn_artifacts_to_anchor_scenes(messages, paths_by_final_in
     if not isinstance(messages, list) or not isinstance(paths_by_final_index, dict):
         return messages
 
-    def _strict_artifact_reference(payload: dict, event_type: str | None) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        workspace_root = payload.get("workspace_root")
-        path = payload.get("path")
-        tool_name = payload.get("tool_name")
-        tool_call_id = payload.get("tool_call_id")
-        session_id = payload.get("session_id")
-        if not isinstance(event_type, str) or event_type != "artifact_reference":
-            return False
-        if not (
-            isinstance(workspace_root, str)
-            and workspace_root.strip()
-            and isinstance(path, str)
-            and path.strip()
-            and isinstance(tool_name, str)
-            and tool_name.strip()
-            and isinstance(tool_call_id, str)
-            and tool_call_id.strip()
-            and isinstance(session_id, str)
-            and session_id.strip()
-        ):
-            return False
-        return True
-
     out = list(messages)
     for local_idx, message in enumerate(messages):
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        descriptors = paths_by_final_index.get(int(message_offset or 0) + local_idx)
-        if not descriptors:
-            continue
+        descriptors = paths_by_final_index.get(int(message_offset or 0) + local_idx) or []
         scene = message.get("_anchor_activity_scene")
+        if not descriptors and not (
+            isinstance(scene, dict) and scene.get("version") == "activity_scene_v1"
+        ):
+            continue
         next_scene = dict(scene) if isinstance(scene, dict) and scene.get("version") == "activity_scene_v1" else _artifact_only_anchor_scene(message)
-        raw_artifacts = next_scene.get("artifacts")
-        artifacts = list(raw_artifacts) if isinstance(raw_artifacts, list) else []
+        artifacts = []
         seen = set()
-        seen_to_first_index = {}
-        for idx, artifact in enumerate(artifacts):
-            if not isinstance(artifact, dict):
-                continue
-            payload = artifact.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            payload_workspace_root = payload.get("workspace_root")
-            payload_path = payload.get("path")
-            if not isinstance(payload_workspace_root, str) or not isinstance(payload_path, str):
-                continue
-            key = (payload_workspace_root, payload_path)
-            if not key[0] or not key[1]:
-                continue
-            seen_to_first_index.setdefault(key, idx)
-            seen.add(key)
         for descriptor in descriptors:
             if not isinstance(descriptor, dict):
                 continue
@@ -9011,49 +8971,6 @@ def _attach_replayed_turn_artifacts_to_anchor_scenes(messages, paths_by_final_in
             workspace_root = workspace_root.strip()
             key = (workspace_root, path)
             if not path or not workspace_root:
-                continue
-            if key in seen:
-                existing_index = seen_to_first_index.get(key)
-                if existing_index is not None and existing_index < len(artifacts):
-                    existing = artifacts[existing_index]
-                    existing_payload = existing.get("payload") if isinstance(existing, dict) else None
-                    existing_is_renderable = _strict_artifact_reference(
-                        existing_payload if isinstance(existing_payload, dict) else None,
-                        existing.get("type") if isinstance(existing, dict) else None,
-                    )
-                    replay_session_id = descriptor.get("session_id")
-                    replay_is_renderable = _strict_artifact_reference(descriptor, "artifact_reference")
-                    replay_has_tool_identity = (
-                        isinstance(descriptor, dict)
-                        and isinstance(descriptor.get("tool_name"), str)
-                        and descriptor.get("tool_name").strip()
-                        and isinstance(descriptor.get("tool_call_id"), str)
-                        and descriptor.get("tool_call_id").strip()
-                    )
-                    existing_session_id = (
-                        existing_payload.get("session_id")
-                        if isinstance(existing_payload, dict)
-                        else None
-                    )
-                    if (
-                        not existing_is_renderable
-                        or not isinstance(replay_session_id, str)
-                        or existing_session_id != replay_session_id
-                    ):
-                        if replay_has_tool_identity and replay_is_renderable:
-                            artifacts[existing_index] = {
-                                "type": "artifact_reference",
-                                "payload": {**descriptor, "source": "transcript_replay"},
-                            }
-                        else:
-                            artifacts[existing_index] = {
-                                "type": "artifact_reference",
-                                "payload": {
-                                    **(existing_payload if isinstance(existing_payload, dict) else {}),
-                                    "source": "transcript_replay",
-                                },
-                            }
-                seen.add(key)
                 continue
             seen.add(key)
             artifacts.append({"type": "artifact_reference", "payload": {**descriptor, "source": "transcript_replay"}})
