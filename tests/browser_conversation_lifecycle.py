@@ -38,6 +38,7 @@ TOOL_NAME = "read_file"
 TOOL_ID = "lifecycle-tool-1"
 TEST_BITE = os.environ.get("LIFECYCLE_TEST_BITE", "").strip()
 NEGATIVE_BITE = os.environ.get("LIFECYCLE_NEGATIVE_BITE", "").strip()
+HEALTH_GUARD_KNOCKOUT = os.environ.get("LIFECYCLE_HEALTH_GUARD_KNOCKOUT", "").strip()
 GATEWAY_ACTIVITY_TIMEOUT = 60.0
 ANCHOR_SCENE_PERSIST_TIMEOUT = 60.0
 ANCHOR_SCENE_PROJECTION_TIMEOUT = 10_000
@@ -85,6 +86,12 @@ DISCRIMINATOR_FAILURE_MARKERS = {
 
 class _InjectedWorklogFailure(RuntimeError):
     """Failure injected after the reloaded Worklog group is proven present."""
+
+
+class _CanaryHealthRejection(AssertionError):
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
 
 
 PLAYWRIGHT_TIMEOUT_ERROR = None
@@ -776,17 +783,29 @@ def _is_playwright_timeout(error: Exception) -> bool:
 
 
 def _assert_canary_health(page, errors: list, proc, *, cause: Exception, boundary: str) -> None:
-    if page is not None and page.is_closed():
-        raise AssertionError(
-            f"page closed before expected {boundary} failure"
+    if (
+        page is not None
+        and page.is_closed()
+        and HEALTH_GUARD_KNOCKOUT
+        not in {"page-closed", "page-closed-with-browser-error"}
+    ):
+        raise _CanaryHealthRejection(
+            "page-closed",
+            f"page closed before expected {boundary} failure",
         ) from cause
     if errors:
-        raise AssertionError(
-            f"unexpected browser errors before expected {boundary} failure: {errors!r}"
+        raise _CanaryHealthRejection(
+            "browser-errors",
+            f"unexpected browser errors before expected {boundary} failure: {errors!r}",
         ) from cause
-    if proc is not None and proc.poll() is not None:
-        raise AssertionError(
-            f"WebUI server exited before expected {boundary} failure: {proc.returncode}"
+    if (
+        proc is not None
+        and proc.poll() is not None
+        and HEALTH_GUARD_KNOCKOUT != "server-exited"
+    ):
+        raise _CanaryHealthRejection(
+            "server-exited",
+            f"WebUI server exited before expected {boundary} failure: {proc.returncode}",
         ) from cause
 
 
@@ -801,7 +820,13 @@ def _raise_rejected_crash_discriminator(
 ) -> None:
     try:
         _assert_canary_health(page, errors, proc, cause=cause, boundary=boundary)
-    except AssertionError as health_error:
+    except _CanaryHealthRejection as health_error:
+        expected_kind = "page-closed" if bite.startswith("close-") else "server-exited"
+        if health_error.kind != expected_kind:
+            raise AssertionError(
+                f"{bite} did not trigger the shared canary health rejection: kind "
+                f"{health_error.kind!r} did not match expected {expected_kind!r}"
+            ) from health_error
         if bite.startswith("close-") and page is not None and page.is_closed():
             raise AssertionError(DISCRIMINATOR_FAILURE_MARKERS[bite]) from health_error
         if bite.startswith("server-death-") and proc is not None and proc.poll() is not None:
@@ -877,6 +902,15 @@ def main() -> int:
         raise ValueError(
             "LIFECYCLE_NEGATIVE_BITE is only valid with "
             "LIFECYCLE_TEST_BITE=drop-anchor-persistence"
+        )
+    if HEALTH_GUARD_KNOCKOUT not in {
+        "",
+        "page-closed",
+        "page-closed-with-browser-error",
+        "server-exited",
+    }:
+        raise ValueError(
+            f"Unsupported LIFECYCLE_HEALTH_GUARD_KNOCKOUT {HEALTH_GUARD_KNOCKOUT!r}"
         )
     if TEST_BITE == "drop-terminal-anchor-row" and scenario != "terminal-error":
         raise ValueError(
@@ -1169,6 +1203,8 @@ def main() -> int:
         }:
             reload_text = "missing lifecycle final-text negative canary"
         if NEGATIVE_BITE == "close-reload-final-text":
+            if HEALTH_GUARD_KNOCKOUT == "page-closed-with-browser-error":
+                errors.append(("console", "synthetic competing browser error"))
             page.close()
         elif NEGATIVE_BITE == "server-death-reload-final-text":
             _terminate_process(proc)
@@ -1214,6 +1250,8 @@ def main() -> int:
         )
         if TEST_BITE == "drop-anchor-persistence":
             if NEGATIVE_BITE == "close-reloaded-anchor-group":
+                if HEALTH_GUARD_KNOCKOUT == "page-closed-with-browser-error":
+                    errors.append(("console", "synthetic competing browser error"))
                 page.close()
             elif NEGATIVE_BITE == "server-death-reloaded-anchor-group":
                 _terminate_process(proc)
