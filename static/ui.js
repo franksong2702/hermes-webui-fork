@@ -13647,6 +13647,7 @@ function _turnArtifactEntriesFromScene(scene){
   const entries=[];
   const currentSessionId = S&&S.session&&typeof S.session.session_id==='string' ? S.session.session_id : '';
   for(const artifact of artifacts){
+    if(!artifact||typeof artifact!=='object'||Array.isArray(artifact)) continue;
     const artifactType=artifact && typeof artifact.type === 'string' ? artifact.type : artifact && typeof artifact.source_event_type === 'string' ? artifact.source_event_type : '';
     const isReference = artifactType === 'artifact_reference';
     const payload=artifact&&artifact.payload&&typeof artifact.payload==='object'?artifact.payload:{};
@@ -13700,6 +13701,7 @@ function _renderTurnArtifactListForMessage(message, segment, rawIdx){
   const list=document.createElement('div');
   list.className='turn-artifact-list';
   list.setAttribute('data-turn-artifact-list','1');
+  list.setAttribute('aria-label',typeof t==='function'?t('turn_artifact_list_label'):'Turn artifacts');
   const items=document.createElement('div');
   items.className='turn-artifact-items';
   const itemsId=`turn-artifact-items-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -13736,14 +13738,18 @@ function _renderTurnArtifactListForMessage(message, segment, rawIdx){
     }
     if(toggle){
       toggle.setAttribute('aria-expanded',expanded?'true':'false');
-      toggle.textContent=expanded?'Show fewer artifacts':`+${entries.length-collapsedLimit} more`;
+      toggle.textContent=expanded
+        ? (typeof t==='function'?t('turn_artifact_show_fewer'):'Show fewer artifacts')
+        : (typeof t==='function'?t('turn_artifact_more',entries.length-collapsedLimit):`+${entries.length-collapsedLimit} more`);
     }
   };
   if(toggle) toggle.addEventListener('click',()=>{ expanded=!expanded; renderItems(); });
   renderItems();
   list.appendChild(items);
   if(toggle) list.appendChild(toggle);
-  segment.appendChild(list);
+  const footer=typeof segment.querySelector==='function'?segment.querySelector(':scope > .msg-foot'):null;
+  if(footer&&footer.parentNode===segment&&typeof segment.insertBefore==='function') segment.insertBefore(list,footer);
+  else segment.appendChild(list);
   return true;
 }
 function _syncLiveWorklogReasonsForAnchor(anchor, displayTextOverride){

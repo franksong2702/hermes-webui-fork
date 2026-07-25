@@ -3791,6 +3791,12 @@ def _sanitize_anchor_activity_scene(scene):
     if len(rows) > _ANCHOR_ACTIVITY_SCENE_MAX_ROWS:
         raise ValueError("scene.activity_rows is too large")
     scene_copy = copy.deepcopy(scene)
+    raw_artifacts = scene_copy.get("artifacts")
+    scene_copy["artifacts"] = (
+        [artifact for artifact in raw_artifacts if isinstance(artifact, dict)]
+        if isinstance(raw_artifacts, list)
+        else []
+    )
     encoded = json.dumps(scene_copy, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
     if len(encoded) > _ANCHOR_ACTIVITY_SCENE_MAX_BYTES:
         raise ValueError("scene payload is too large")

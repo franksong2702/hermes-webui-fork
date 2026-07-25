@@ -82,7 +82,7 @@ def test_turn_artifact_references_require_strict_identity_fields():
     output = _run_node(
         workspace[start:end]
         + "\nconsole.log(JSON.stringify(["
-        + "turnArtifactReferencesFromToolCall({name:'write_file',tool_call_id:'call-1',session_id:'sid-owner',artifacts:[{path:'output/report.md',workspace_root:'/workspace',tool_call_id:'call-1',tool_name:'write_file'}]})"
+        + "turnArtifactReferencesFromToolCall({name:'write_file',tool_call_id:'call-1',session_id:'sid-owner',artifacts:[{path:'output/report.md',workspace_root:'/workspace',session_id:'sid-artifact',tool_call_id:'call-1',tool_name:'write_file'}]})"
         + ","
         + "turnArtifactReferencesFromToolCall({name:'write_file',tool_call_id:1,artifacts:[{path:'output/report.md',workspace_root:'/workspace',tool_call_id:1,tool_name:'write_file'}]})"
         + "]));"
@@ -94,7 +94,7 @@ def test_turn_artifact_references_require_strict_identity_fields():
                 "workspace_root": "/workspace",
                 "tool_call_id": "call-1",
                 "tool_name": "write_file",
-                "session_id": "sid-owner",
+                "session_id": "sid-artifact",
             },
         ],
         [],
@@ -277,6 +277,13 @@ def test_replay_restore_ignores_scalar_tool_calls_and_artifacts():
             }
         ]
 
+    sanitized = routes._sanitize_anchor_activity_scene({
+        "version": "activity_scene_v1",
+        "activity_rows": [],
+        "artifacts": [None, 1, {"type": "artifact_reference"}],
+    })
+    assert sanitized["artifacts"] == [{"type": "artifact_reference"}]
+
 
 def test_turn_artifact_renderer_collapses_large_lists_with_accessible_toggle():
     helpers = _function_source(
@@ -326,6 +333,7 @@ def test_final_answer_artifact_entries_are_turn_owned_and_workspace_scoped():
     )
     scene = {
         "artifacts": [
+            None,
             {"type":"artifact_reference","payload": {"path": "output/report.md", "workspace_root": "/workspace", "session_id":"sid-owner","tool_name":"write_file","tool_call_id":"call-1"}},
             {"type":"artifact_reference","payload": {"path": "./output/report.md", "workspace_root": "/workspace", "session_id":"sid-owner","tool_name":"write_file","tool_call_id":"call-2"}},
             {"type":"artifact_reference","payload": {"path": "output/old-workspace.md", "workspace_root": "/workspace-a"}},

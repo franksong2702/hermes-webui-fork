@@ -600,14 +600,11 @@ function turnArtifactReferencesFromToolCall(tc){
       if(!(/[./]/.test(cleaned))) return '';
       return cleaned;
     };
-  const currentSessionId = (typeof S === 'object' && S && S.session)
-    ? (typeof S.session.session_id === 'string' ? S.session.session_id : '')
-    : '';
   const name=normalizeToolName(tc.name);
   if(!mutationTools.has(name)) return [];
   const allowArtifactCallIdFallback = name === 'patch';
   const explicitToolCallId = artifactScalarString(tc.tool_call_id || tc.id);
-  const completionSessionId = artifactScalarString(tc.session_id || currentSessionId);
+  const completionSessionId = artifactScalarString(tc.session_id);
   const completionToolCallId = artifactScalarString(
     explicitToolCallId
     || tc.tid
@@ -646,7 +643,8 @@ function turnArtifactReferencesFromToolCall(tc){
       tool_call_id:toolCallId,
       tool_name:toolName,
     };
-    if(completionSessionId) descriptor.session_id=completionSessionId;
+    const artifactSessionId = artifactScalarString(artifact.session_id) || completionSessionId;
+    if(artifactSessionId) descriptor.session_id=artifactSessionId;
     out.push(descriptor);
   }
   return out;
