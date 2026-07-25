@@ -61,6 +61,12 @@ NEGATIVE_MUTATION_FAILURE_MARKERS = {
         "after the reloaded Anchor group was present"
     ),
 }
+FORCED_WORKLOG_EXPANSION_FAILURE = (
+    "hermes lifecycle negative canary: forced Worklog expansion failure"
+)
+UNRELATED_WORKLOG_EXPANSION_FAILURE = (
+    "hermes lifecycle negative canary: unrelated Worklog expansion timeout"
+)
 
 
 def _latest_anchor_scene_from_disk(state_root: Path, session_id: str) -> dict | None:
@@ -569,15 +575,20 @@ def _activity_snapshot(page) -> dict:
     )
 
 
-def _expand_settled_worklog(page, *, force_failure: bool = False) -> None:
+def _expand_settled_worklog(
+    page,
+    *,
+    force_failure: bool = False,
+    failure_message: str = FORCED_WORKLOG_EXPANSION_FAILURE,
+) -> None:
     page.wait_for_function(
-        """({forceFailure}) => {
+        """({forceFailure, forceFailureMessage}) => {
           const group = Array.from(document.querySelectorAll(
             '.assistant-turn [data-anchor-settled-scene-owner="1"]'
           )).pop();
           if (!group) return false;
           if (forceFailure) {
-            throw new Error('forced Worklog expansion failure after group present');
+            throw new Error(forceFailureMessage);
           }
           const summary = group.querySelector('.tool-worklog-summary,.tool-call-group-summary');
           if (group.classList.contains('tool-call-group-collapsed') && summary) {
@@ -592,7 +603,10 @@ def _expand_settled_worklog(page, *, force_failure: bool = False) -> None:
           }
           return Boolean(group.querySelector('[data-anchor-scene-row="1"]'));
         }""",
-        arg={"forceFailure": force_failure},
+        arg={
+            "forceFailure": force_failure,
+            "forceFailureMessage": failure_message,
+        },
         timeout=10000,
     )
 
@@ -779,6 +793,7 @@ def main() -> int:
         "",
         "fail-reload-final-text",
         "throw-reloaded-worklog-expand",
+        "timeout-reloaded-worklog-expand",
     }:
         raise ValueError(
             f"Unsupported LIFECYCLE_NEGATIVE_BITE {NEGATIVE_BITE!r}; "
@@ -1113,15 +1128,38 @@ def main() -> int:
             try:
                 _expand_settled_worklog(
                     page,
-                    force_failure=NEGATIVE_BITE == "throw-reloaded-worklog-expand",
+                    force_failure=NEGATIVE_BITE
+                    in {
+                        "throw-reloaded-worklog-expand",
+                        "timeout-reloaded-worklog-expand",
+                    },
+                    failure_message=(
+                        UNRELATED_WORKLOG_EXPANSION_FAILURE
+                        if NEGATIVE_BITE == "timeout-reloaded-worklog-expand"
+                        else FORCED_WORKLOG_EXPANSION_FAILURE
+                    ),
                 )
             except Exception as exc:
                 if NEGATIVE_BITE == "throw-reloaded-worklog-expand":
+                    if FORCED_WORKLOG_EXPANSION_FAILURE not in str(exc):
+                        raise
+                    if errors:
+                        raise AssertionError(
+                            "unexpected browser errors before expected unmarked "
+                            f"Worklog failure: {errors!r}"
+                        ) from exc
+                    if proc is not None and proc.poll() is not None:
+                        raise AssertionError(
+                            "WebUI server exited before expected unmarked "
+                            f"Worklog failure: {proc.returncode}"
+                    ) from exc
                     raise AssertionError(
                         NEGATIVE_MUTATION_FAILURE_MARKERS[
                             "throw-reloaded-worklog-expand"
                         ]
                     ) from exc
+                if NEGATIVE_BITE == "timeout-reloaded-worklog-expand":
+                    raise
                 raise
             raise AssertionError(
                 "Mutation survived: drop-anchor-persistence still rendered a "

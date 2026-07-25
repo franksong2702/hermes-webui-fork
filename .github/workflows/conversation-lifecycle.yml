@@ -103,11 +103,18 @@ jobs:
             local name="$1"
             local expected_marker="$2"
             shift 2
-            local log="$LIFECYCLE_ARTIFACT_DIR/${name}.log"
+            local artifact_dir="$LIFECYCLE_ARTIFACT_DIR/$name"
+            mkdir "$artifact_dir"
+            local log="$artifact_dir/run.log"
+
+            if [ "$(find "$artifact_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+              echo "::error title=Dirty mutation artifacts::$name artifact directory is not empty"
+              return 1
+            fi
 
             echo "::group::$name"
             set +e
-            "$@" 2>&1 | tee "$log"
+            LIFECYCLE_ARTIFACT_DIR="$artifact_dir" "$@" 2>&1 | tee "$log"
             local status="${PIPESTATUS[0]}"
             set -e
             echo "::endgroup::"
@@ -129,11 +136,18 @@ jobs:
             local required_marker="$2"
             local forbidden_marker="$3"
             shift 3
-            local log="$LIFECYCLE_ARTIFACT_DIR/${name}.log"
+            local artifact_dir="$LIFECYCLE_ARTIFACT_DIR/$name"
+            mkdir "$artifact_dir"
+            local log="$artifact_dir/run.log"
+
+            if [ "$(find "$artifact_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+              echo "::error title=Dirty mutation artifacts::$name artifact directory is not empty"
+              return 1
+            fi
 
             echo "::group::$name"
             set +e
-            "$@" 2>&1 | tee "$log"
+            LIFECYCLE_ARTIFACT_DIR="$artifact_dir" "$@" 2>&1 | tee "$log"
             local status="${PIPESTATUS[0]}"
             set -e
             echo "::endgroup::"
@@ -153,6 +167,45 @@ jobs:
               return 1
             fi
             echo "$name failed without the mutation marker as expected"
+          }
+
+          run_unexpected_failure_rejects_marker() {
+            local name="$1"
+            local required_marker="$2"
+            local forbidden_marker="$3"
+            local rejected_marker="$4"
+            shift 4
+            local artifact_dir="$LIFECYCLE_ARTIFACT_DIR/$name"
+            mkdir "$artifact_dir"
+            local log="$artifact_dir/run.log"
+
+            if [ "$(find "$artifact_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+              echo "::error title=Dirty mutation artifacts::$name artifact directory is not empty"
+              return 1
+            fi
+
+            echo "::group::$name"
+            set +e
+            LIFECYCLE_ARTIFACT_DIR="$artifact_dir" "$@" 2>&1 | tee "$log"
+            local status="${PIPESTATUS[0]}"
+            set -e
+            echo "::endgroup::"
+
+            if [ "$status" -eq 0 ]; then
+              echo "::error title=Negative canary survived::$name unexpectedly passed"
+              return 1
+            fi
+            if ! grep -Fq -- "$required_marker" "$log"; then
+              echo "::error title=Missing injected failure::$name failed without required marker: $required_marker"
+              tail -200 "$log"
+              return 1
+            fi
+            if grep -Fq -- "$forbidden_marker" "$log" || grep -Fq -- "$rejected_marker" "$log"; then
+              echo "::error title=Over-broad mutation marker::$name emitted a forbidden classification marker"
+              tail -200 "$log"
+              return 1
+            fi
+            echo "$name rejected both mutation classifications as expected"
           }
 
           run_expected_failure normal-anchor-persistence \
@@ -175,6 +228,13 @@ jobs:
             'MUTATION CANARY EXPECTED FAILURE: drop-anchor-persistence removed the transcript-backed Anchor scene before hard reload' \
             env LIFECYCLE_TEST_BITE=drop-anchor-persistence \
             LIFECYCLE_NEGATIVE_BITE=throw-reloaded-worklog-expand \
+            python tests/browser_conversation_lifecycle.py
+          run_unexpected_failure_rejects_marker anchor-worklog-expand-timeout \
+            'hermes lifecycle negative canary: unrelated Worklog expansion timeout' \
+            'MUTATION CANARY EXPECTED FAILURE: drop-anchor-persistence removed the transcript-backed Anchor scene before hard reload' \
+            'NEGATIVE CANARY EXPECTED UNMARKED FAILURE: Worklog expansion failed after the reloaded Anchor group was present' \
+            env LIFECYCLE_TEST_BITE=drop-anchor-persistence \
+            LIFECYCLE_NEGATIVE_BITE=timeout-reloaded-worklog-expand \
             python tests/browser_conversation_lifecycle.py
 
       - name: Upload mutation artifacts
