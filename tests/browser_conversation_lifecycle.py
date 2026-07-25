@@ -790,6 +790,28 @@ def _assert_canary_health(page, errors: list, proc, *, cause: Exception, boundar
         ) from cause
 
 
+def _raise_rejected_crash_discriminator(
+    page,
+    errors: list,
+    proc,
+    *,
+    cause: Exception,
+    bite: str,
+    boundary: str,
+) -> None:
+    try:
+        _assert_canary_health(page, errors, proc, cause=cause, boundary=boundary)
+    except AssertionError as health_error:
+        if bite.startswith("close-") and page is not None and page.is_closed():
+            raise AssertionError(DISCRIMINATOR_FAILURE_MARKERS[bite]) from health_error
+        if bite.startswith("server-death-") and proc is not None and proc.poll() is not None:
+            raise AssertionError(DISCRIMINATOR_FAILURE_MARKERS[bite]) from health_error
+        raise
+    raise AssertionError(
+        f"{bite} did not trigger the shared canary health rejection"
+    ) from cause
+
+
 def _semantic_activity(snapshot: dict) -> list[dict]:
     """Canonical user-visible activity, independent of renderer row ordering."""
     semantic = []
@@ -1161,7 +1183,14 @@ def main() -> int:
                 "close-reload-final-text",
                 "server-death-reload-final-text",
             }:
-                raise AssertionError(DISCRIMINATOR_FAILURE_MARKERS[NEGATIVE_BITE]) from exc
+                _raise_rejected_crash_discriminator(
+                    page,
+                    errors,
+                    proc,
+                    cause=exc,
+                    bite=NEGATIVE_BITE,
+                    boundary="hard-reload final-text prerequisite",
+                )
             if NEGATIVE_BITE == "fail-reload-final-text":
                 if not _is_playwright_timeout(exc):
                     raise
@@ -1199,7 +1228,14 @@ def main() -> int:
                     "close-reloaded-anchor-group",
                     "server-death-reloaded-anchor-group",
                 }:
-                    raise AssertionError(DISCRIMINATOR_FAILURE_MARKERS[NEGATIVE_BITE]) from exc
+                    _raise_rejected_crash_discriminator(
+                        page,
+                        errors,
+                        proc,
+                        cause=exc,
+                        bite=NEGATIVE_BITE,
+                        boundary="reloaded Anchor-group classification",
+                    )
                 if not _is_playwright_timeout(exc):
                     raise
                 if not _mutation_event_observed(

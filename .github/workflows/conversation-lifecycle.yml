@@ -212,6 +212,19 @@ jobs:
               tail -200 "$log"
               return 1
             fi
+            local classification_markers=(
+              'MUTATION CANARY EXPECTED FAILURE: drop-anchor-persistence removed the transcript-backed Anchor scene before hard reload'
+              'MUTATION CANARY EXPECTED FAILURE: drop-terminal-anchor-row removed the terminal row from the hard-reloaded Anchor scene'
+              'NEGATIVE CANARY EXPECTED UNMARKED FAILURE: hard-reload final-text prerequisite failed before Anchor-scene classification'
+              'NEGATIVE CANARY EXPECTED UNMARKED FAILURE: Worklog expansion failed after the reloaded Anchor group was present'
+            )
+            for marker in "${classification_markers[@]}"; do
+              if grep -Fq -- "$marker" "$log"; then
+                echo "::error title=Over-broad mutation marker::$name emitted forbidden classification marker: $marker"
+                tail -200 "$log"
+                return 1
+              fi
+            done
             if grep -Fq -- "$forbidden_marker" "$log" || grep -Fq -- "$rejected_marker" "$log"; then
               echo "::error title=Over-broad mutation marker::$name emitted a forbidden classification marker"
               tail -200 "$log"
