@@ -798,7 +798,7 @@ def main() -> int:
         raise ValueError(
             f"Unsupported LIFECYCLE_NEGATIVE_BITE {NEGATIVE_BITE!r}; "
             "expected one of '', 'fail-reload-final-text', "
-            "'throw-reloaded-worklog-expand'"
+            "'throw-reloaded-worklog-expand', 'timeout-reloaded-worklog-expand'"
         )
     if NEGATIVE_BITE and TEST_BITE != "drop-anchor-persistence":
         raise ValueError(
@@ -871,7 +871,11 @@ def main() -> int:
             def _route_anchor_scene(route):
                 if (
                     TEST_BITE == "drop-anchor-persistence"
-                    and NEGATIVE_BITE != "throw-reloaded-worklog-expand"
+                    and NEGATIVE_BITE
+                    not in {
+                        "throw-reloaded-worklog-expand",
+                        "timeout-reloaded-worklog-expand",
+                    }
                 ):
                     anchor_scene_requests.append({
                         "type": "mutation",
