@@ -125,8 +125,14 @@ def test_typed_artifact_path_reaches_real_route_without_rebinding():
     workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
     start = workspace.index("function _escapeGrantStore")
     end = workspace.index("async function authorizeWorkspaceEscapeNavigation")
+    owner_helpers = workspace[
+        workspace.index("function _artifactScalarString(value){") : workspace.index(
+            "function _artifactCandidatesFromText", workspace.index("function _artifactScalarString(value){")
+        )
+    ]
     output = _run_node(
         workspace[start:end]
+        + owner_helpers
         + "\nconst S={session:{session_id:'sid-1',workspace:'/workspace'}};\n"
         + "const owner={session_id:'sid-1',workspace_root:'/workspace'};\n"
         + "const spaced=_workspaceRouteForPathRel(' report.md ','read',{owner,_preserveArtifactPath:true});\n"
@@ -134,6 +140,30 @@ def test_typed_artifact_path_reaches_real_route_without_rebinding():
         + "console.log(JSON.stringify({spaced:new URLSearchParams(spaced.split('?')[1]).get('path'),sibling:new URLSearchParams(sibling.split('?')[1]).get('path')}));"
     )
     assert output == {"spaced": " report.md ", "sibling": "report.md"}
+
+
+def test_exact_routes_have_an_explicit_root_sentinel_and_fail_closed():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    start = workspace.index("function _escapeGrantStore")
+    end = workspace.index("async function authorizeWorkspaceEscapeNavigation")
+    owner_helpers = workspace[
+        workspace.index("function _artifactScalarString(value){") : workspace.index(
+            "function _artifactCandidatesFromText", workspace.index("function _artifactScalarString(value){")
+        )
+    ]
+    output = _run_node(
+        workspace[start:end]
+        + owner_helpers
+        + "\nconst S={session:{session_id:'sid-1',workspace:'/workspace'}};\n"
+        + "const owner={session_id:'sid-1',workspace_root:'/workspace'};\n"
+        + "const route=(path,kind)=>_workspaceRouteForPathRel(path,kind,{owner,_preserveArtifactPath:true});\n"
+        + "console.log(JSON.stringify({root:route('.','list'),invalidList:route('.','read'),invalidRaw:route('.','raw'),invalidNested:route('./child','list'),malformedOwner:_workspaceRouteForPathRel('report.md','read',{owner:{workspace_root:'/workspace'}})}));"
+    )
+    assert output["root"].endswith("path=.")
+    assert output["invalidList"] == ""
+    assert output["invalidRaw"] == ""
+    assert output["invalidNested"] == ""
+    assert output["malformedOwner"] == ""
 
 
 def test_direct_open_file_rejects_malformed_typed_paths_before_generation():
@@ -153,6 +183,78 @@ def test_direct_open_file_rejects_malformed_typed_paths_before_generation():
         + "]).then(()=>console.log(JSON.stringify({generations,_workspaceOpenGeneration})));"
     )
     assert output == {"generations": 0, "_workspaceOpenGeneration": 0}
+
+
+def test_direct_open_file_rejects_malformed_explicit_owner_before_generation():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    owner_helpers = workspace[
+        workspace.index("function _artifactScalarString(value){") : workspace.index(
+            "function _artifactCandidatesFromText", workspace.index("function _artifactScalarString(value){")
+        )
+    ]
+    open_file = workspace[workspace.index("async function openFile") : workspace.index("function downloadFile")]
+    output = _run_node(
+        "const S={session:{session_id:'sid-1',workspace:'/workspace'}};\n"
+        + owner_helpers
+        + open_file
+        + "Promise.all(["
+        + "openFile('report.md',{owner:{workspace_root:'/workspace'}}),"
+        + "openFile('report.md',{owner:null}),"
+        + "openFile('report.md',{owner:{session_id:'sid-old',workspace_root:'/workspace'}})"
+        + "]).then(()=>console.log(JSON.stringify({_workspaceOpenGeneration})));"
+    )
+    assert output == {"_workspaceOpenGeneration": 0}
+
+
+def test_preview_continuations_keep_captured_owner_and_exact_path_in_routes():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    route_helpers = workspace[
+        workspace.index("function _escapeGrantStore") : workspace.index(
+            "async function authorizeWorkspaceEscapeNavigation"
+        )
+    ]
+    owner_helpers = workspace[
+        workspace.index("function _artifactScalarString(value){") : workspace.index(
+            "function _artifactCandidatesFromText", workspace.index("function _artifactScalarString(value){")
+        )
+    ]
+    open_file = workspace[workspace.index("async function openFile") : workspace.index("function downloadFile")]
+    refresh = workspace[
+        workspace.index("function _isOpenPreviewPathMutated()") : workspace.index("function collectSessionArtifacts")
+    ]
+    force_render = workspace[
+        workspace.index("function forceRenderMarkdownPreview()") : workspace.index("let _previewCurrentPath")
+    ]
+    open_browser = workspace[
+        workspace.index("function openInBrowser()") : workspace.index("// openInBrowser keeps")
+    ]
+    output = _run_node(
+        "const S={session:{session_id:'sid-1',workspace:'/workspace'}};\n"
+        "const routes=[]; const nodes=new Proxy({}, {get:(target,key)=>target[key]||(target[key]={style:{display:'none'},classList:{add(){},remove(){}},textContent:'',innerHTML:'',src:'',onerror:null})});\n"
+        "const $=(id)=>nodes[id]; const document={baseURI:'',createElement:()=>({}),body:{}}; const window={open:(url)=>routes.push(url)};\n"
+        "const api=(route)=>{routes.push(route); return Promise.resolve({content:'# spaced'});};\n"
+        "const fileExt=(path)=>path.slice(path.lastIndexOf('.')).toLowerCase(); const MD_EXTS=new Set(['.md']); const IMAGE_EXTS=new Set(); const AUDIO_EXTS=new Set(); const VIDEO_EXTS=new Set(); const PDF_EXTS=new Set(); const HTML_EXTS=new Set(); const DOWNLOAD_EXTS=new Set();\n"
+        "const renderFileBreadcrumb=()=>{}; const showPreview=()=>{}; const renderMarkdownPreviewContent=()=>{}; const renderCodePreviewContent=()=>{}; const shouldRenderMarkdownPreviewAsPlainText=()=>false; const setLargeMarkdownForceRenderVisible=()=>{}; const setStatus=()=>{}; const t=(value)=>value; const downloadFile=()=>{};\n"
+        "let _previewCurrentPath=''; let _previewOwner=null; let _previewPreserveArtifactPath=false; let _previewRawContent=''; let _previewRawContentPath=''; let _previewDirty=false; let _previewServerEditable=null; let _previewPreviewKind=''; let _previewOfficeFormat=''; let _previewSaveRoute='';\n"
+        "const _turnMutatedPreviewPaths=new Set();\n"
+        "const _normalizeArtifactPath=(path)=>String(path||'').trim();\n"
+        + route_helpers
+        + owner_helpers
+        + open_file
+        + refresh
+        + force_render
+        + open_browser
+        + "async function run(){ const owner={session_id:'sid-1',workspace_root:'/workspace'}; await openFile(' report.md ',{owner,_preserveArtifactPath:true}); _turnMutatedPreviewPaths.add('report.md'); await refreshOpenPreviewIfMutated(); forceRenderMarkdownPreview(); openInBrowser(); console.log(JSON.stringify(routes)); } run().catch((error)=>{console.error(error);process.exit(1)});"
+    )
+    assert len(output) == 3
+    for route in output[:2]:
+        params = route.split("?", 1)[1]
+        assert __import__("urllib.parse").parse.parse_qs(params)["session_id"] == ["sid-1"]
+        assert __import__("urllib.parse").parse.parse_qs(params)["path"] == [" report.md "]
+    browser = __import__("urllib.parse").parse.parse_qs(output[2].split("?", 1)[1])
+    assert browser["session_id"] == ["sid-1"]
+    assert browser["path"] == [" report.md "]
+    assert browser["inline"] == ["1"]
 
 
 def test_artifact_owner_match_requires_root_when_captured():
@@ -252,7 +354,11 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         + "  const currentRead = pending.shift();\n"
         + "  const rejectedStale = openArtifactPath({path:'output/stale.md',owner:{session_id:'sid-old',workspace_root:'/old'}});\n"
         + "  const rejectedMalformed = openFile('./malformed.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
-        + "  await rejectedStale; await rejectedMalformed; currentRead.resolve({content:'# current'}); await currentTask;\n"
+        + "  const rejectedNul = openFile('bad\\0.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
+        + "  const rejectedDrive = openFile('C:/bad.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
+        + "  const rejectedOverLimit = openFile('a'.repeat(513)+'.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"
+        + "  const rejectedMalformedOwner = openFile('output/malformed-owner.md',{owner:{workspace_root:'/old'}});\n"
+        + "  await Promise.all([rejectedStale,rejectedMalformed,rejectedNul,rejectedDrive,rejectedOverLimit,rejectedMalformedOwner]); currentRead.resolve({content:'# current'}); await currentTask;\n"
         + "  const staleOwnerPreservesCurrent = {raw:_previewRawContent,rawPath:_previewRawContentPath,currentPath:_previewCurrentPath};\n"
         + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
         + "  const olderAttempt = openFile('output/older.md',{owner:{session_id:'sid-1',workspace_root:'/old'}});\n"

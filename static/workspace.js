@@ -286,7 +286,10 @@ function _workspaceRouteForPathRel(path, kind, opts={}){
     };
   const owner = resolveOwner(opts);
   if(!owner) return '';
-  const normalizedPath = _normalizeWorkspaceRelPath(path, !!opts._preserveArtifactPath);
+  const preserveExact = !!opts._preserveArtifactPath;
+  let normalizedPath = _normalizeWorkspaceRelPath(path, preserveExact);
+  if(preserveExact && kind === 'list' && path === '.') normalizedPath = '.';
+  if(preserveExact && !normalizedPath) return '';
   const ownerSessionId = owner.session_id;
   const activeSessionId = S.session ? S.session.session_id : null;
   const activeWorkspaceRoot = ownerScalar(S.session && S.session && S.session.workspace).replace(/\/+$/,'');
@@ -300,7 +303,8 @@ function _workspaceRouteForPathRel(path, kind, opts={}){
     ? _workspaceEscapeGrantForPath(normalizedPath)
     : null;
   const sessionId = encodeURIComponent(ownerSessionId);
-  const params = new URLSearchParams({session_id:ownerSessionId, path:normalizedPath || '.'});
+  const routePath = preserveExact ? normalizedPath : (normalizedPath || '.');
+  const params = new URLSearchParams({session_id:ownerSessionId, path:routePath});
   if(grant){
     params.set('token', grant.token);
     if(kind === 'raw' && opts.download) params.set('download', '1');
@@ -309,15 +313,15 @@ function _workspaceRouteForPathRel(path, kind, opts={}){
     if(kind === 'read') return `/api/escape/file/read?${params.toString()}`;
     if(kind === 'raw') return `/api/escape/file/raw?${params.toString()}`;
   }
-  if(kind === 'list') return `/api/list?session_id=${sessionId}&path=${encodeURIComponent(normalizedPath || '.')}`;
-  if(kind === 'read') return `/api/file?session_id=${sessionId}&path=${encodeURIComponent(normalizedPath || '.')}`;
+  if(kind === 'list') return `/api/list?session_id=${sessionId}&path=${encodeURIComponent(routePath)}`;
+  if(kind === 'read') return `/api/file?session_id=${sessionId}&path=${encodeURIComponent(routePath)}`;
   if(kind === 'raw'){
     const extra = [];
     if(opts.download) extra.push('download=1');
     // Inline previews intentionally preserve a literal &inline=1 marker in this file.
     if(opts.inline) extra.push('inline=1');
     const suffix = extra.length ? `&${extra.join('&')}` : '';
-    return `/api/file/raw?session_id=${sessionId}&path=${encodeURIComponent(normalizedPath || '.')}${suffix}`;
+    return `/api/file/raw?session_id=${sessionId}&path=${encodeURIComponent(routePath)}${suffix}`;
   }
   return '';
 }
@@ -505,7 +509,10 @@ function _artifactOwnerFromContext(owner){
 }
 
 function _artifactOwnerFromOptions(opts){
-  return _artifactOwnerFromContext(opts && opts.owner) || _artifactOwnerFromCurrentSession();
+  if(opts && typeof opts === 'object' && Object.prototype.hasOwnProperty.call(opts, 'owner')){
+    return _artifactOwnerFromContext(opts.owner);
+  }
+  return _artifactOwnerFromCurrentSession();
 }
 
 function _artifactOwnerMatchesSession(owner){
