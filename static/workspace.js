@@ -1327,13 +1327,19 @@ async function openFile(path, opts={}){
     };
   const owner = resolveOwner(opts);
   if(!path || typeof path !== 'string' || !owner) return;
+  const nextGeneration = typeof _nextWorkspaceOpenGeneration === 'function'
+    ? _nextWorkspaceOpenGeneration
+    : () => 1;
+  const currentGeneration = () => typeof _workspaceOpenGeneration === 'number'
+    ? _workspaceOpenGeneration
+    : generation;
   const generation = Number.isInteger(opts&&opts._openGeneration)
     ? opts._openGeneration
-    : _nextWorkspaceOpenGeneration();
+    : nextGeneration();
   const openFileOwner = owner;
   const ownerStillActive = () => typeof _artifactOwnerMatchesSession === 'function'
-    ? generation===_workspaceOpenGeneration && _artifactOwnerMatchesSession(openFileOwner)
-    : generation===_workspaceOpenGeneration;
+    ? generation===currentGeneration() && _artifactOwnerMatchesSession(openFileOwner)
+    : generation===currentGeneration();
   if(!ownerStillActive()) return;
   const ext=fileExt(path);
   const bustCache=!!(opts&&opts.bustCache);
