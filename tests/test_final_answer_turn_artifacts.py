@@ -135,9 +135,12 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         "let previewMutations = 0;\n"
         "let openMutations = 0;\n"
         "let downloadMutations = 0;\n"
+        "let breadcrumbMutations = 0;\n"
+        "let domMutations = 0;\n"
         "const nodes = new Proxy({}, {get: (_target, key) => {\n"
-        "  if(!(key in _target)) _target[key] = {textContent:'',style:{},classList:{add(){},remove(){}},\n"
+        "  if(!(key in _target)){ const node={textContent:'',style:{},classList:{add(){},remove(){}},\n"
         "    appendChild(){},setAttribute(){},innerHTML:'',src:'',onerror:null};\n"
+        "    _target[key] = new Proxy(node,{set(target,name,value){domMutations++; target[name]=value; return true;}}); }\n"
         "  return _target[key];\n"
         "}});\n"
         "const $ = (id) => nodes[id];\n"
@@ -145,17 +148,19 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         "const window = {};\n"
         "const S = {session:{session_id:'sid-1',workspace:'/old'}};\n"
         "const IMAGE_EXTS = new Set(['.png']); const AUDIO_EXTS = new Set(); const VIDEO_EXTS = new Set();\n"
-        "const PDF_EXTS = new Set(); const MD_EXTS = new Set(); const HTML_EXTS = new Set(); const DOWNLOAD_EXTS = new Set();\n"
+        "const PDF_EXTS = new Set(); const MD_EXTS = new Set(['.md']); const HTML_EXTS = new Set(); const DOWNLOAD_EXTS = new Set();\n"
         "const api = () => new Promise((resolve, reject) => pending.push({resolve, reject}));\n"
         "const ensureWorkspacePreviewVisible = () => { openMutations++; };\n"
         "const switchWorkspacePanelTab = () => { openMutations++; };\n"
         "const setStatus = (value) => status.push(value); const t = (value) => value;\n"
         "const fileExt = (path) => path.slice(path.lastIndexOf('.')).toLowerCase();\n"
-        "const showPreview = () => { previewMutations++; }; const renderFileBreadcrumb = () => {};\n"
+        "const showPreview = () => { previewMutations++; }; const renderFileBreadcrumb = () => { breadcrumbMutations++; };\n"
+        "const renderMarkdownPreviewContent = () => { previewMutations++; };\n"
+        "const renderCodePreviewContent = () => { previewMutations++; };\n"
+        "const downloadFile = () => { downloadMutations++; };\n"
         "const _workspaceRouteForPath = () => '/raw'; const _workspaceRouteForPathRel = () => '/list';\n"
         "const _workspaceEscapeGrantForPath = () => null; const _clearWorkspaceEscapeGrant = () => {};\n"
         "const showToast = () => {}; const _mediaPlayerHtml = () => '';\n"
-        "const renderMarkdownPreviewContent = () => {}; const renderCodePreviewContent = () => {};\n"
         "const shouldRenderMarkdownPreviewAsPlainText = () => false; const setLargeMarkdownForceRenderVisible = () => {};\n"
         "const largeMarkdownPlainTextStatus = () => ''; let _previewServerEditable = null;\n"
         "let _previewSaveRoute = ''; let _previewOfficeFormat = ''; let _previewPreviewKind = '';\n"
@@ -164,26 +169,76 @@ def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
         + helpers
         + exists
         + open_file
+        + "async function settleStaleRead(settle){\n"
+        + "  const task = openArtifactPath('output/report.md');\n"
+        + "  pending.shift().resolve({entries:[{path:'output/report.md'}]}); await new Promise((resolve)=>setTimeout(resolve,0));\n"
+        + "  const before = {status:status.length,preview:previewMutations,open:openMutations,download:downloadMutations,breadcrumb:breadcrumbMutations,dom:domMutations,raw:_previewRawContent,rawPath:_previewRawContentPath,currentPath:_previewCurrentPath};\n"
+        + "  S.session = {session_id:'sid-1',workspace:''};\n"
+        + "  settle(pending.shift()); await task;\n"
+        + "  return {status:status.length-before.status,preview:previewMutations-before.preview,open:openMutations-before.open,download:downloadMutations-before.download,breadcrumb:breadcrumbMutations-before.breadcrumb,dom:domMutations-before.dom,rawUnchanged:_previewRawContent===before.raw,rawPathUnchanged:_previewRawContentPath===before.rawPath,currentPathUnchanged:_previewCurrentPath===before.currentPath};\n"
+        + "}\n"
         + "async function run(){\n"
-        + "  const stale = openArtifactPath('output/report.md');\n"
-        + "  S.session = {session_id:'sid-1',workspace:''};\n"
-        + "  pending[0].reject(new Error('switched')); await stale;\n"
+        + "  const staleResolved = await settleStaleRead((read)=>read.resolve({content:'# stale'}));\n"
         + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
-        + "  const positive = openArtifactPath('output/image.png');\n"
-        + "  pending[1].resolve({entries:[{path:'output/image.png'}]}); await positive;\n"
-        + "  const image = nodes.previewImg;\n"
-        + "  S.session = {session_id:'sid-1',workspace:''};\n"
-        + "  image.onerror();\n"
-        + "  console.log(JSON.stringify({status,previewMutations,openMutations,downloadMutations,imageErrorInstalled:typeof image.onerror==='function'}));\n"
+        + "  const staleRejected = await settleStaleRead((read)=>read.reject(new Error('switched')));\n"
+        + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
+        + "  const beforeDownload = downloadMutations; const staleDownload = openArtifactPath('output/archive.txt');\n"
+        + "  pending.shift().resolve({entries:[{path:'output/archive.txt'}]}); await new Promise((resolve)=>setTimeout(resolve,0));\n"
+        + "  S.session = {session_id:'sid-1',workspace:''}; pending.shift().resolve({binary:true}); await staleDownload;\n"
+        + "  const staleDownloadDelta = downloadMutations-beforeDownload;\n"
+        + "  S.session = {session_id:'sid-1',workspace:'/old'};\n"
+        + "  const beforePositive = {preview:previewMutations,open:openMutations,breadcrumb:breadcrumbMutations};\n"
+        + "  const positive = openArtifactPath('output/report.md');\n"
+        + "  pending.shift().resolve({entries:[{path:'output/report.md'}]}); await new Promise((resolve)=>setTimeout(resolve,0));\n"
+        + "  pending.shift().resolve({content:'# matching'}); await positive;\n"
+        + "  const image = nodes.previewImg; const imageTask = openArtifactPath('output/image.png');\n"
+        + "  pending.shift().resolve({entries:[{path:'output/image.png'}]}); await imageTask;\n"
+        + "  S.session = {session_id:'sid-1',workspace:''}; image.onerror();\n"
+        + "  console.log(JSON.stringify({staleResolved,staleRejected,staleDownload:staleDownloadDelta,positive:{preview:previewMutations-beforePositive.preview,open:openMutations-beforePositive.open,breadcrumb:breadcrumbMutations-beforePositive.breadcrumb},downloadMutations,status, imageErrorInstalled:typeof image.onerror==='function'}));\n"
         + "}\nrun().catch((error)=>{console.error(error);process.exit(1)});"
     )
-    assert output == {
-        "status": [],
-        "previewMutations": 1,
-        "openMutations": 4,
-        "downloadMutations": 0,
-        "imageErrorInstalled": True,
+    assert output["staleResolved"] == output["staleRejected"] == {
+        "status": 0,
+        "preview": 0,
+        "open": 0,
+        "download": 0,
+        "breadcrumb": 0,
+        "dom": 0,
+        "rawUnchanged": True,
+        "rawPathUnchanged": True,
+        "currentPathUnchanged": True,
     }
+    assert output["staleDownload"] == 0
+    assert output["positive"] == {"preview": 2, "open": 4, "breadcrumb": 2}
+    assert output["downloadMutations"] == 0
+    assert output["status"] == []
+    assert output["imageErrorInstalled"] is True
+
+
+def test_anchor_projector_normalizes_real_artifact_event_for_renderer():
+    anchors = (ROOT / "static/assistant_turn_anchors.js").read_text(encoding="utf-8")
+    ui_helpers = _function_source(
+        "static/ui.js", "function _turnArtifactWorkspacePath", "function _syncLiveWorklogReasonsForAnchor"
+    )
+    output = _run_node(
+        "const fs=require('fs'),vm=require('vm');\n"
+        + "const sandbox={window:{}}; vm.createContext(sandbox); vm.runInContext(fs.readFileSync('static/assistant_turn_anchors.js','utf8'),sandbox);\n"
+        + "const api=sandbox.window.HermesAssistantTurnAnchors;\n"
+        + "const registry=api.createAssistantTurnAnchorRegistry({session_id:'sid-replay',turn_id:'turn-1'});\n"
+        + "api.applyAssistantTurnAnchorSourceEvent(registry,{event:'artifact_reference',source_event_type:'artifact_reference',session_id:'sid-replay',payload:{path:'output/report.md',workspace_root:'/workspace',tool_name:'patch',tool_call_id:'call-replay'},event_id:'run-1:3',seq:3},{session_id:'sid-replay',stream_id:'stream-1'});\n"
+        + "const scene=api.projectAssistantTurnAnchorActivityScene(registry,{mode:'compact_worklog'});\n"
+        + "const S={session:{workspace:'/workspace',session_id:'sid-replay'}}; const clicked=[]; const openArtifactPath=(entry)=>clicked.push(entry);\n"
+        + "const document={createElement:()=>({className:'',title:'',type:'',innerHTML:'',children:[],append(...x){this.children.push(...x)},appendChild(x){this.children.push(x)},setAttribute(){},addEventListener(_name,fn){this.onclick=fn}})};\n"
+        + ui_helpers
+        + "const segment={children:[],querySelectorAll:()=>[],appendChild(node){this.children.push(node)}}; const message={_anchor_activity_scene:scene};\n"
+        + "_renderTurnArtifactListForMessage(message,segment,0); segment.children[0].children[0].onclick();\n"
+        + "console.log(JSON.stringify({scene,entries:_turnArtifactEntriesFromScene(scene),clicked}));"
+    )
+    artifact = output["entries"][0]
+    assert output["scene"]["artifacts"][0]["source_event_type"] == "artifact_reference"
+    assert artifact["type"] == "artifact_reference"
+    assert artifact["session_id"] == "sid-replay"
+    assert output["clicked"] == [artifact]
 
 
 def test_final_answer_artifact_entries_are_turn_owned_and_workspace_scoped():

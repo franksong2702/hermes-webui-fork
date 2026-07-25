@@ -830,8 +830,15 @@ def test_side_effect_owner_survives_scene_settlement_and_reload():
 
     assert settled_scene["artifacts"] == scene["artifacts"]
     artifact_payload = settled_scene["artifacts"][0]["payload"]
-    assert artifact_payload["kind"] == "workspace_file"
-    assert artifact_payload["path"] == "answer.txt"
+    assert artifact_payload == {
+        "kind": "workspace_file",
+        "path": "answer.txt",
+        "session_id": "sid-1",
+        "workspace_root": "",
+        "tool_name": "",
+        "tool_call_id": "",
+        "owner": {"session_id": "sid-1", "workspace_root": ""},
+    }
     assert settled_scene["side_effects"] == scene["side_effects"]
     assert settled_scene["side_effects"][0]["source_event_type"] == "state_saved"
     assert settled_scene["side_effects"][0]["payload"] == {
