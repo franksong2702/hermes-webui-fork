@@ -138,13 +138,19 @@ LIFECYCLE_NEGATIVE_BITE=fail-reload-final-text \
 LIFECYCLE_TEST_BITE=drop-anchor-persistence \
 LIFECYCLE_NEGATIVE_BITE=throw-reloaded-worklog-expand \
   python tests/browser_conversation_lifecycle.py
+
+# Negative classification check: an unrelated Worklog timeout after the reloaded
+# Anchor group exists must emit neither classification marker.
+LIFECYCLE_TEST_BITE=drop-anchor-persistence \
+LIFECYCLE_NEGATIVE_BITE=timeout-reloaded-worklog-expand \
+  python tests/browser_conversation_lifecycle.py
 ```
 
 The dedicated `Conversation lifecycle (informational)` workflow runs both current
 proof rows (`normal` and `terminal-error`) and automatically verifies the two
 mutation commands above still fail with their scenario-specific expected-failure
-marker. It also runs the two negative classification checks above and rejects them
-if they emit the positive mutation marker. Its `Lifecycle proof summary` result
+marker. It also runs the three negative classification checks above and rejects them
+if they emit either classification marker. Its `Lifecycle proof summary` result
 aggregates those checks, so a broken proof row, a mutation that unexpectedly
 survives, or an unrelated browser/server failure is visible as a failed workflow
 result. The workflow can also be started manually from the Actions page.

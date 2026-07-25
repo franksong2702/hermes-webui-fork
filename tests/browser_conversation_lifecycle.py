@@ -69,6 +69,10 @@ UNRELATED_WORKLOG_EXPANSION_FAILURE = (
 )
 
 
+class _InjectedWorklogFailure(RuntimeError):
+    """Failure injected after the reloaded Worklog group is proven present."""
+
+
 def _latest_anchor_scene_from_disk(state_root: Path, session_id: str) -> dict | None:
     session_file_candidates = [
         state_root / "webui-state" / "sessions" / f"{session_id}.json",
@@ -581,15 +585,14 @@ def _expand_settled_worklog(
     force_failure: bool = False,
     failure_message: str = FORCED_WORKLOG_EXPANSION_FAILURE,
 ) -> None:
+    if force_failure:
+        raise _InjectedWorklogFailure(failure_message)
     page.wait_for_function(
-        """({forceFailure, forceFailureMessage}) => {
+        """() => {
           const group = Array.from(document.querySelectorAll(
             '.assistant-turn [data-anchor-settled-scene-owner="1"]'
           )).pop();
           if (!group) return false;
-          if (forceFailure) {
-            throw new Error(forceFailureMessage);
-          }
           const summary = group.querySelector('.tool-worklog-summary,.tool-call-group-summary');
           if (group.classList.contains('tool-call-group-collapsed') && summary) {
             if (typeof _toggleActivityGroup === 'function') _toggleActivityGroup(summary);
@@ -603,10 +606,6 @@ def _expand_settled_worklog(
           }
           return Boolean(group.querySelector('[data-anchor-scene-row="1"]'));
         }""",
-        arg={
-            "forceFailure": force_failure,
-            "forceFailureMessage": failure_message,
-        },
         timeout=10000,
     )
 
@@ -1145,7 +1144,10 @@ def main() -> int:
                 )
             except Exception as exc:
                 if NEGATIVE_BITE == "throw-reloaded-worklog-expand":
-                    if FORCED_WORKLOG_EXPANSION_FAILURE not in str(exc):
+                    if not (
+                        isinstance(exc, _InjectedWorklogFailure)
+                        and str(exc) == FORCED_WORKLOG_EXPANSION_FAILURE
+                    ):
                         raise
                     if errors:
                         raise AssertionError(
