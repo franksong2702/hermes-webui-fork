@@ -13703,7 +13703,6 @@ function _renderTurnArtifactListForMessage(message, segment, rawIdx){
   list.className='turn-artifact-list';
   list.setAttribute('data-turn-artifact-list','1');
   list.setAttribute('role','group');
-  list.setAttribute('aria-label',typeof t==='function'?t('turn_artifact_list_label'):'Turn artifacts');
   const items=document.createElement('div');
   items.className='turn-artifact-items';
   items.setAttribute('role','list');

@@ -314,6 +314,40 @@ def test_preview_continuations_keep_captured_owner_and_exact_path_in_routes():
     assert browser["inline"] == ["1"]
 
 
+def test_preview_download_preserves_captured_owner_and_exact_path():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    owner_helpers = workspace[
+        workspace.index("function _artifactScalarString(value){") : workspace.index(
+            "function _artifactCandidatesFromText", workspace.index("function _artifactScalarString(value){")
+        )
+    ]
+    wrapper = workspace[
+        workspace.index("function downloadPreviewFile()") : workspace.index(
+            "async function copyPreviewRelativePath()"
+        )
+    ]
+    output = _run_node(
+        "let S={session:{session_id:'sid-owner',workspace:'/workspace'}};\n"
+        "let _previewCurrentPath=' report.md ';\n"
+        "let _previewOwner={session_id:'sid-owner',workspace_root:'/workspace'};\n"
+        "let _previewPreserveArtifactPath=true;\n"
+        "const calls=[]; const downloadFile=(path,opts)=>calls.push({path,opts});\n"
+        + owner_helpers
+        + wrapper
+        + "downloadPreviewFile();\n"
+        + "S={session:{session_id:'sid-other',workspace:'/other'}};\n"
+        + "downloadPreviewFile();\n"
+        + "console.log(JSON.stringify(calls));"
+    )
+    assert output == [{
+        "path": " report.md ",
+        "opts": {
+            "owner": {"session_id": "sid-owner", "workspace_root": "/workspace"},
+            "_preserveArtifactPath": True,
+        },
+    }]
+
+
 def test_artifact_owner_match_requires_root_when_captured():
     workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
     start = workspace.index("function _artifactScalarString(value){")

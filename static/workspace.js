@@ -1645,6 +1645,15 @@ function openInBrowser(){
 }
 // openInBrowser keeps the helper-based raw path, which expands to an explicit &inline=1 URL.
 
+function downloadPreviewFile(){
+  if(!_previewCurrentPath||!_previewOwner) return;
+  if(!_artifactOwnerMatchesSession(_previewOwner)) return;
+  downloadFile(_previewCurrentPath, {
+    owner:_previewOwner,
+    _preserveArtifactPath:_previewPreserveArtifactPath,
+  });
+}
+
 async function copyPreviewRelativePath(){
   if(!_previewCurrentPath) return;
   const btn=$('btnCopyPreviewRelPath');
