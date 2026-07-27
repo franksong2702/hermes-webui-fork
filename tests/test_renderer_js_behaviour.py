@@ -124,6 +124,26 @@ class TestSessionInternalLinks:
         assert 'href="/anything/foo/session/abc"' not in out
         assert '<a>bad</a>' in out
 
+
+class TestLabeledLinkDestinations:
+    def test_final_answer_keeps_unencoded_file_download_destination(self, driver_path):
+        url = "https://gw.example/api/files/download?path=/tmp/report final.pdf"
+        out = _render(driver_path, f"[Download]({url})")
+        assert f'href="{url}"' in out
+        assert ">Download</a>" in out
+
+    def test_final_answer_keeps_encoded_parentheses(self, driver_path):
+        url = "https://gw.example/api/files/download?path=%2Ftmp%2Freport%20final%20%28review%29.pdf"
+        out = _render(driver_path, f"[Download]({url})")
+        assert f'href="{url}"' in out
+
+    def test_table_link_keeps_unencoded_file_download_destination(self, driver_path):
+        url = "https://gw.example/api/files/download?path=/tmp/report final.pdf"
+        markdown = f"| File |\n| --- |\n| [Download]({url}) |"
+        out = _render(driver_path, markdown)
+        assert f'href="{url}"' in out
+        assert ">Download</a>" in out
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Blockquote prefix strip — the bug commit 04e7b53 introduced was a one-char
 # regex regression where `^>[\t]?` (only tab) replaced `^>[ \t]?` (space or

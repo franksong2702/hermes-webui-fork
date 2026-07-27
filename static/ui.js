@@ -7334,6 +7334,40 @@ function renderMd(raw){
   // Inline backtick spans: restore <code> tags produced in the stash callback above.
   // Must happen BEFORE bold/italic so **`code`** → <strong><code>code</code></strong>.
   s=s.replace(/\x00F(\d+)\x00/g,(_,i)=>fence_stash[+i]);
+  // Keep the settled renderer aligned with streaming-markdown: model/tool
+  // output can contain an unencoded space in a link destination. The old
+  // [^\s)] regex truncated those URLs after settlement.
+  function _stashMarkdownLinks(src, stash, marker){
+    const allowed=/^(?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)/i;
+    let out='', cursor=0;
+    while(cursor<src.length){
+      const open=src.indexOf('[',cursor);
+      if(open<0){out+=src.slice(cursor);break;}
+      const close=src.indexOf(']',open+1);
+      if(close<0||src[close+1]!=='('){out+=src.slice(cursor,open+1);cursor=open+1;continue;}
+      const label=src.slice(open+1,close);
+      let start=close+2, end=-1, rawUrl='';
+      for(let i=start;i<src.length;i++){
+        const ch=src[i];
+        if(ch==='\n'||ch==='\r')break;
+        if(ch===')'){
+          rawUrl=src.slice(start,i);
+          end=i+1;
+          break;
+        }
+      }
+      if(end<0||!allowed.test(rawUrl)){
+        out+=src.slice(cursor,open+1);
+        cursor=open+1;
+        continue;
+      }
+      out+=src.slice(cursor,open);
+      stash.push(_markdownAnchor(label,rawUrl));
+      out+=`\x00${marker}${stash.length-1}\x00`;
+      cursor=end;
+    }
+    return out;
+  }
   // inlineMd: process bold/italic/code/links within a single line of text.
   // Used inside list items and blockquotes where the text may already contain
   // HTML from the pre-pass → bold pipeline, so we cannot call esc() directly.
@@ -7357,7 +7391,7 @@ function renderMd(raw){
     t=t.replace(/\x00C(\d+)\x00/g,(_,i)=>_code_stash[+i]);
     // Stash [label](url) links before autolink so the URL in href= is not re-linked
     const _link_stash=[];
-    t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
+    t=_stashMarkdownLinks(t,_link_stash,'L');
     t=t.replace(/(https?:\/\/[^\s<>"')\]]+)/g,(url)=>{const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
     t=t.replace(/\x00L(\d+)\x00/g,(_,i)=>_link_stash[+i]);
     t=t.replace(/\x00G(\d+)\x00/g,(_,i)=>_img_stash[+i]);
@@ -7498,7 +7532,7 @@ function renderMd(raw){
   // Stash existing <a> tags first to avoid re-linking already-linked URLs.
   const _a_stash=[];
   s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>)/g,m=>{_a_stash.push(m);return `\x00A${_a_stash.length-1}\x00`;});
-  s=s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,label,url)=>_markdownAnchor(label,url));
+  s=_stashMarkdownLinks(s,_a_stash,'A');
   s=s.replace(/\x00A(\d+)\x00/g,(_,i)=>_a_stash[+i]);
   // Restore raw <pre> only after markdown rewrites so literal preformatted
   // content stays placeholder-protected, then let the sanitizer normalize tags.

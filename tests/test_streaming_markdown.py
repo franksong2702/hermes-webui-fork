@@ -223,6 +223,32 @@ class TestSmdHelpers:
             "_smdNewParser must guard on window.smd before using the library"
         )
 
+    def test_smd_keeps_unencoded_file_download_destination(self):
+        url = "https://gw.example/api/files/download?path=/tmp/report final.pdf"
+        script = f"""
+import * as smd from './static/vendor/smd.min.js';
+const hrefs=[];
+const renderer={{
+  data: {{}},
+  add_token() {{}},
+  end_token() {{}},
+  add_text() {{}},
+  set_attr(_data, attr, value) {{ if(attr===smd.HREF) hrefs.push(value); }},
+}};
+const parser=smd.parser(renderer);
+smd.parser_write(parser, '[Download]({url})');
+smd.parser_end(parser);
+console.log(JSON.stringify(hrefs));
+"""
+        completed = subprocess.run(
+            ["node", "--input-type=module", "-e", script],
+            cwd=REPO,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        assert json.loads(completed.stdout) == [url]
+
     def test_smd_end_parser_exists(self):
         fn = extract_fn(MESSAGES_JS, "_smdEndParser")
         assert fn is not None, "_smdEndParser function must be defined"
