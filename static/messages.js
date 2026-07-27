@@ -6253,8 +6253,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           } else if(d.session&&typeof d.session==='object'){
             S.session=d.session;
             const _nextMsgs3018=(d.session.messages||[]).filter(m=>m&&m.role);
-            _attachProjectedAnchorSceneToLastAssistant(_nextMsgs3018);
             S.messages=_carryForwardEphemeralTurnFields(S.messages||[], _nextMsgs3018);
+            // Project from the settled transcript after its live-only fields have
+            // been carried forward. Gateway terminal errors otherwise lose the
+            // reasoning/tool metadata needed to persist the Anchor scene.
+            _attachProjectedAnchorSceneToLastAssistant(S.messages);
             if(S.session&&S.session.session_id){
               try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
               if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);
