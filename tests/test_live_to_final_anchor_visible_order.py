@@ -854,6 +854,56 @@ def test_application_error_settlement_attaches_projected_anchor_scene_before_ren
     assert synthetic_push_idx < synthetic_attach_idx < render_idx
 
 
+def test_deferred_application_error_retry_is_owner_fenced_and_idempotent():
+    attach = _function_body(MESSAGES_JS, "_attachProjectedAnchorSceneToLastAssistant")
+    retry = _function_body(MESSAGES_JS, "_retrySettledAnchorScene")
+    script = f"""
+const activeSid='sid-A';
+const streamId='stream-A';
+const _anchorRegistry={{generation:'A'}};
+const _anchorRegistryMap=new Map([['stream-A',_anchorRegistry]]);
+const S={{session:{{session_id:'sid-A'}},activeStreamId:null,messages:[]}};
+const scene={{version:'activity_scene_v1',mode:'compact_worklog',activity_rows:[{{role:'tool'}}]}};
+let persisted=[];
+function _projectLiveAnchorActivityScene(){{ return scene; }}
+function _completeSettledAnchorSceneForTurn(messages,index,projected){{ return projected; }}
+function _anchorSceneHasOwnedOutcomes(){{ return false; }}
+function _anchorSceneHasWorklogWorthyRows(){{ return true; }}
+function _persistSettledAnchorScene(message,nextScene,index){{ persisted.push({{message,index,nextScene}}); }}
+function _attachProjectedAnchorSceneToLastAssistant(messages,targetMessage=null,targetIndex=null){{{attach}}}
+function _retrySettledAnchorScene(targetMessage,targetIndex,retryStreamId,retryRegistry){{{retry}}}
+const assistantA={{role:'assistant',content:'A'}};
+const assistantB={{role:'assistant',content:'B'}};
+S.messages=[assistantA];
+S.messages[0]=assistantB;
+const staleResult=_retrySettledAnchorScene(assistantA,0,'stream-A',_anchorRegistry);
+const staleState={{result:staleResult,bHasScene:Boolean(assistantB._anchor_activity_scene),persisted:persisted.length}};
+S.messages[0]=assistantA;
+const firstResult=_retrySettledAnchorScene(assistantA,0,'stream-A',_anchorRegistry);
+const secondResult=_retrySettledAnchorScene(assistantA,0,'stream-A',_anchorRegistry);
+const positiveState={{firstResult,secondResult,aHasScene:Boolean(assistantA._anchor_activity_scene),persisted:persisted.length}};
+S.activeStreamId='stream-B';
+const generationState={{result:_retrySettledAnchorScene(assistantA,0,'stream-A',_anchorRegistry),persisted:persisted.length}};
+S.activeStreamId=null;
+S.session={{session_id:'sid-B'}};
+const sessionState={{result:_retrySettledAnchorScene(assistantA,0,'stream-A',_anchorRegistry),persisted:persisted.length}};
+console.log(JSON.stringify({{staleState,positiveState,generationState,sessionState}}));
+"""
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["staleState"] == {"result": False, "bHasScene": False, "persisted": 0}
+    assert data["positiveState"] == {
+        "firstResult": True,
+        "secondResult": True,
+        "aHasScene": True,
+        "persisted": 1,
+    }
+    assert data["generationState"] == {"result": False, "persisted": 1}
+    assert data["sessionState"] == {"result": False, "persisted": 1}
+
+
 def test_connection_error_terminal_message_attaches_projected_anchor_scene_before_render():
     error = _function_body(MESSAGES_JS, "_handleStreamError")
 
