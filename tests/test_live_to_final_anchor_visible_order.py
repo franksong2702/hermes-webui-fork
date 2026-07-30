@@ -872,30 +872,33 @@ function _anchorSceneHasOwnedOutcomes(){{ return false; }}
 function _anchorSceneHasWorklogWorthyRows(){{ return true; }}
 function _persistSettledAnchorScene(message,nextScene,index){{ persisted.push({{message,index,nextScene}}); }}
 function _attachProjectedAnchorSceneToLastAssistant(messages,targetMessage=null,targetIndex=null){{{attach}}}
-function _retrySettledAnchorScene(targetMessage,targetIndex,retryStreamId,retryRegistry){{{retry}}}
-function scheduleRetry(targetMessage,targetIndex,retryStreamId,retryRegistry){{
-  deferredRetry=()=>_retrySettledAnchorScene(targetMessage,targetIndex,retryStreamId,retryRegistry);
+function _messageIdentityKey(message){{
+  return `${{message.role}}|${{message.timestamp||''}}|${{message.content||''}}`;
+}}
+function _retrySettledAnchorScene(targetMessage,targetIndex,retryStreamId,retryRegistry,retryMessageKey){{{retry}}}
+function scheduleRetry(targetMessage,targetIndex,retryStreamId,retryRegistry,retryMessageKey){{
+  deferredRetry=()=>_retrySettledAnchorScene(targetMessage,targetIndex,retryStreamId,retryRegistry,retryMessageKey);
 }}
 const assistantA={{role:'assistant',content:'A'}};
 const assistantB={{role:'assistant',content:'B'}};
 S.messages=[assistantA];
-scheduleRetry(assistantA,0,'stream-A',_anchorRegistry);
+scheduleRetry(assistantA,0,'stream-A',_anchorRegistry,_messageIdentityKey(assistantA));
 S.messages=[assistantB];
 const staleResult=deferredRetry();
 const staleState={{result:staleResult,bHasScene:Boolean(assistantB._anchor_activity_scene),bStreamId:assistantB._anchor_stream_id||null,persisted:persisted.length}};
 S.messages=[assistantA,assistantB];
-scheduleRetry(assistantA,0,'stream-A',_anchorRegistry);
+scheduleRetry(assistantA,0,'stream-A',_anchorRegistry,_messageIdentityKey(assistantA));
 const firstResult=deferredRetry();
-scheduleRetry(assistantA,0,'stream-A',_anchorRegistry);
+scheduleRetry(assistantA,0,'stream-A',_anchorRegistry,_messageIdentityKey(assistantA));
 const secondResult=deferredRetry();
 const positiveState={{firstResult,secondResult,aHasScene:Boolean(assistantA._anchor_activity_scene),bHasScene:Boolean(assistantB._anchor_activity_scene),persisted:persisted.length}};
 S.activeStreamId='stream-B';
-scheduleRetry(assistantA,0,'stream-A',_anchorRegistry);
+scheduleRetry(assistantA,0,'stream-A',_anchorRegistry,_messageIdentityKey(assistantA));
 deferredRetry();
 const generationState={{aHasScene:Boolean(assistantA._anchor_activity_scene),persisted:persisted.length}};
 S.activeStreamId=null;
 S.session={{session_id:'sid-B'}};
-scheduleRetry(assistantA,0,'stream-A',_anchorRegistry);
+scheduleRetry(assistantA,0,'stream-A',_anchorRegistry,_messageIdentityKey(assistantA));
 deferredRetry();
 const sessionState={{aHasScene:Boolean(assistantA._anchor_activity_scene),persisted:persisted.length}};
 console.log(JSON.stringify({{staleState,positiveState,generationState,sessionState}}));

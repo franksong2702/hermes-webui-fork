@@ -3753,13 +3753,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return false;
   }
-  function _retrySettledAnchorScene(targetMessage, targetIndex, retryStreamId, retryRegistry){
+  function _retrySettledAnchorScene(targetMessage, targetIndex, retryStreamId, retryRegistry, retryMessageKey){
     if(!targetMessage||!Number.isInteger(targetIndex)) return false;
     if(!S.session||S.session.session_id!==activeSid) return false;
     if(S.activeStreamId&&S.activeStreamId!==retryStreamId) return false;
     if(!_anchorRegistryMap||_anchorRegistryMap.get(retryStreamId)!==retryRegistry) return false;
-    if(!Array.isArray(S.messages)||S.messages[targetIndex]!==targetMessage) return false;
-    return _attachProjectedAnchorSceneToLastAssistant(S.messages,targetMessage,targetIndex);
+    if(!Array.isArray(S.messages)) return false;
+    const currentTarget=S.messages[targetIndex];
+    if(currentTarget!==targetMessage&&(!_messageIdentityKey(currentTarget)||_messageIdentityKey(currentTarget)!==retryMessageKey)) return false;
+    return _attachProjectedAnchorSceneToLastAssistant(S.messages,currentTarget,targetIndex);
   }
   function _upsertAnchorProcessProse(displayText, options={}){
     const text=String(displayText||'').trim();
@@ -6299,10 +6301,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const _retryIndex=_anchorRetryIndex;
           const _retryStreamId=streamId;
           const _retryRegistry=_anchorRegistry;
+          const _retryMessageKey=_messageIdentityKey(_retryTarget);
           // Retry only for the exact terminal assistant and registry generation.
-          // A same-session replacement must never inherit an older stream's scene.
+          // A same-session refresh may replace the object, but must retain the
+          // exact indexed message identity before the scene can be attached.
           setTimeout(()=>{
-            _retrySettledAnchorScene(_retryTarget,_retryIndex,_retryStreamId,_retryRegistry);
+            _retrySettledAnchorScene(_retryTarget,_retryIndex,_retryStreamId,_retryRegistry,_retryMessageKey);
           },0);
         }
         if(isRecoveryControlMessage){
