@@ -865,6 +865,7 @@ const _anchorRegistryMap=new Map([['stream-A',_anchorRegistry]]);
 const S={{session:{{session_id:'sid-A'}},activeStreamId:null,messages:[]}};
 const scene={{version:'activity_scene_v1',mode:'compact_worklog',activity_rows:[{{role:'tool'}}]}};
 let persisted=[];
+let deferredRetry=null;
 function _projectLiveAnchorActivityScene(){{ return scene; }}
 function _completeSettledAnchorSceneForTurn(messages,index,projected){{ return projected; }}
 function _anchorSceneHasOwnedOutcomes(){{ return false; }}
@@ -872,36 +873,52 @@ function _anchorSceneHasWorklogWorthyRows(){{ return true; }}
 function _persistSettledAnchorScene(message,nextScene,index){{ persisted.push({{message,index,nextScene}}); }}
 function _attachProjectedAnchorSceneToLastAssistant(messages,targetMessage=null,targetIndex=null){{{attach}}}
 function _retrySettledAnchorScene(targetMessage,targetIndex,retryStreamId,retryRegistry){{{retry}}}
+function scheduleRetry(targetMessage,targetIndex,retryStreamId,retryRegistry){{
+  deferredRetry=()=>_retrySettledAnchorScene(targetMessage,targetIndex,retryStreamId,retryRegistry);
+}}
 const assistantA={{role:'assistant',content:'A'}};
 const assistantB={{role:'assistant',content:'B'}};
 S.messages=[assistantA];
-S.messages[0]=assistantB;
-const staleResult=_retrySettledAnchorScene(assistantA,0,'stream-A',_anchorRegistry);
-const staleState={{result:staleResult,bHasScene:Boolean(assistantB._anchor_activity_scene),persisted:persisted.length}};
-S.messages[0]=assistantA;
-const firstResult=_retrySettledAnchorScene(assistantA,0,'stream-A',_anchorRegistry);
-const secondResult=_retrySettledAnchorScene(assistantA,0,'stream-A',_anchorRegistry);
-const positiveState={{firstResult,secondResult,aHasScene:Boolean(assistantA._anchor_activity_scene),persisted:persisted.length}};
+scheduleRetry(assistantA,0,'stream-A',_anchorRegistry);
+S.messages=[assistantB];
+const staleResult=deferredRetry();
+const staleState={{result:staleResult,bHasScene:Boolean(assistantB._anchor_activity_scene),bStreamId:assistantB._anchor_stream_id||null,persisted:persisted.length}};
+S.messages=[assistantA,assistantB];
+scheduleRetry(assistantA,0,'stream-A',_anchorRegistry);
+const firstResult=deferredRetry();
+scheduleRetry(assistantA,0,'stream-A',_anchorRegistry);
+const secondResult=deferredRetry();
+const positiveState={{firstResult,secondResult,aHasScene:Boolean(assistantA._anchor_activity_scene),bHasScene:Boolean(assistantB._anchor_activity_scene),persisted:persisted.length}};
 S.activeStreamId='stream-B';
-const generationState={{result:_retrySettledAnchorScene(assistantA,0,'stream-A',_anchorRegistry),persisted:persisted.length}};
+scheduleRetry(assistantA,0,'stream-A',_anchorRegistry);
+deferredRetry();
+const generationState={{aHasScene:Boolean(assistantA._anchor_activity_scene),persisted:persisted.length}};
 S.activeStreamId=null;
 S.session={{session_id:'sid-B'}};
-const sessionState={{result:_retrySettledAnchorScene(assistantA,0,'stream-A',_anchorRegistry),persisted:persisted.length}};
+scheduleRetry(assistantA,0,'stream-A',_anchorRegistry);
+deferredRetry();
+const sessionState={{aHasScene:Boolean(assistantA._anchor_activity_scene),persisted:persisted.length}};
 console.log(JSON.stringify({{staleState,positiveState,generationState,sessionState}}));
 """
     result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, check=False)
 
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
-    assert data["staleState"] == {"result": False, "bHasScene": False, "persisted": 0}
+    assert data["staleState"] == {
+        "result": False,
+        "bHasScene": False,
+        "bStreamId": None,
+        "persisted": 0,
+    }
     assert data["positiveState"] == {
         "firstResult": True,
         "secondResult": True,
         "aHasScene": True,
+        "bHasScene": False,
         "persisted": 1,
     }
-    assert data["generationState"] == {"result": False, "persisted": 1}
-    assert data["sessionState"] == {"result": False, "persisted": 1}
+    assert data["generationState"] == {"aHasScene": True, "persisted": 1}
+    assert data["sessionState"] == {"aHasScene": True, "persisted": 1}
 
 
 def test_connection_error_terminal_message_attaches_projected_anchor_scene_before_render():
