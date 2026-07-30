@@ -6264,6 +6264,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             S.messages.push({role:'assistant',content:`**${label}:** ${d.message}${hint}`,provider_details:details,provider_details_label:detailsLabel,_compressionRecovery:recovery||undefined});
             _attachProjectedAnchorSceneToLastAssistant(S.messages);
           }
+          // The app-error payload can replace the visible transcript while the
+          // terminal SSE callback is still draining queued activity events. Retry
+          // after this turn so the settled message owns the complete worklog.
+          setTimeout(()=>{
+            if(S.session&&S.session.session_id===activeSid){
+              _attachProjectedAnchorSceneToLastAssistant(S.messages);
+            }
+          },0);
         }catch(_){
           S.messages.push({role:'assistant',content:'**Error:** An error occurred. Check server logs.'});
           _attachProjectedAnchorSceneToLastAssistant(S.messages);
