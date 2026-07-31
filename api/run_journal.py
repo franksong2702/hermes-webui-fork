@@ -5,6 +5,7 @@ the existing in-process streaming path without changing execution ownership.
 """
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import re
@@ -521,6 +522,337 @@ def _serialized_event_size(event: dict) -> int:
     return len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
 
 
+class _StreamingJsonValidator:
+    """Validate one UTF-8 JSON value without retaining its payload."""
+
+    _MAX_NESTING = 128
+    _NUMBER_FINAL_STATES = frozenset({"zero", "integer", "fraction", "exponent"})
+    _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+    def __init__(self):
+        self._decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        self._frames: list[dict[str, str]] = []
+        self._started = False
+        self._done = False
+        self._invalid = False
+        self._finalized = False
+        self._mode: str | None = None
+        self._string_role = ""
+        self._escape_state = ""
+        self._unicode_digits = 0
+        self._literal = ""
+        self._literal_index = 0
+        self._number_state = ""
+
+    @staticmethod
+    def _is_value_delimiter(char: str) -> bool:
+        return char in " \t\r\n,}]"
+
+    def _push(self, kind: str) -> None:
+        if len(self._frames) >= self._MAX_NESTING:
+            self._invalid = True
+            return
+        state = "key_or_end" if kind == "object" else "value_or_end"
+        self._frames.append({"kind": kind, "state": state})
+
+    def _complete_value(self) -> None:
+        if not self._frames:
+            if not self._started or self._done:
+                self._invalid = True
+                return
+            self._done = True
+            return
+        frame = self._frames[-1]
+        if frame["kind"] == "object" and frame["state"] == "value":
+            frame["state"] = "comma_or_end"
+            return
+        if frame["kind"] == "array" and frame["state"] in {"value_or_end", "value"}:
+            frame["state"] = "comma_or_end"
+            return
+        self._invalid = True
+
+    def _close_container(self, kind: str) -> None:
+        if not self._frames or self._frames[-1]["kind"] != kind:
+            self._invalid = True
+            return
+        frame = self._frames[-1]
+        allowed = (
+            {"key_or_end", "comma_or_end"}
+            if kind == "object"
+            else {"value_or_end", "comma_or_end"}
+        )
+        if frame["state"] not in allowed:
+            self._invalid = True
+            return
+        self._frames.pop()
+        self._complete_value()
+
+    def _start_string(self, role: str) -> None:
+        self._mode = "string"
+        self._string_role = role
+        self._escape_state = ""
+        self._unicode_digits = 0
+
+    def _feed_string(self, char: str) -> None:
+        if self._escape_state == "unicode":
+            if char not in self._HEX_DIGITS:
+                self._invalid = True
+                return
+            self._unicode_digits += 1
+            if self._unicode_digits == 4:
+                self._escape_state = ""
+            return
+        if self._escape_state == "escape":
+            if char == "u":
+                self._escape_state = "unicode"
+                self._unicode_digits = 0
+            elif char in '\"\\/bfnrt':
+                self._escape_state = ""
+            else:
+                self._invalid = True
+            return
+        if char == "\\":
+            self._escape_state = "escape"
+            return
+        if char == '"':
+            role = self._string_role
+            self._mode = None
+            self._string_role = ""
+            if role == "key":
+                if not self._frames or self._frames[-1]["kind"] != "object":
+                    self._invalid = True
+                    return
+                self._frames[-1]["state"] = "colon"
+            else:
+                self._complete_value()
+            return
+        if ord(char) < 0x20:
+            self._invalid = True
+
+    def _start_literal(self, literal: str) -> None:
+        self._mode = "literal"
+        self._literal = literal
+        self._literal_index = 1
+
+    def _finish_scalar(self) -> None:
+        self._mode = None
+        self._literal = ""
+        self._literal_index = 0
+        self._number_state = ""
+        self._complete_value()
+
+    def _feed_literal(self, char: str) -> bool:
+        if self._literal_index < len(self._literal):
+            if char != self._literal[self._literal_index]:
+                self._invalid = True
+                return False
+            self._literal_index += 1
+            return False
+        if not self._is_value_delimiter(char):
+            self._invalid = True
+            return False
+        self._finish_scalar()
+        return True
+
+    def _start_number(self, char: str) -> None:
+        self._mode = "number"
+        if char == "-":
+            self._number_state = "sign"
+        elif char == "0":
+            self._number_state = "zero"
+        else:
+            self._number_state = "integer"
+
+    def _feed_number(self, char: str) -> bool:
+        state = self._number_state
+        if state == "sign":
+            if char == "0":
+                self._number_state = "zero"
+            elif char in "123456789":
+                self._number_state = "integer"
+            else:
+                self._invalid = True
+            return False
+        if state in {"zero", "integer"}:
+            if char.isascii() and char.isdigit() and state == "integer":
+                return False
+            if char == ".":
+                self._number_state = "decimal"
+                return False
+            if char in "eE":
+                self._number_state = "exponent_marker"
+                return False
+        elif state == "decimal":
+            if char.isascii() and char.isdigit():
+                self._number_state = "fraction"
+                return False
+            self._invalid = True
+            return False
+        elif state == "fraction":
+            if char.isascii() and char.isdigit():
+                return False
+            if char in "eE":
+                self._number_state = "exponent_marker"
+                return False
+        elif state == "exponent_marker":
+            if char in "+-":
+                self._number_state = "exponent_sign"
+                return False
+            if char.isascii() and char.isdigit():
+                self._number_state = "exponent"
+                return False
+            self._invalid = True
+            return False
+        elif state == "exponent_sign":
+            if char.isascii() and char.isdigit():
+                self._number_state = "exponent"
+            else:
+                self._invalid = True
+            return False
+        elif state == "exponent":
+            if char.isascii() and char.isdigit():
+                return False
+        if state not in self._NUMBER_FINAL_STATES or not self._is_value_delimiter(char):
+            self._invalid = True
+            return False
+        self._finish_scalar()
+        return True
+
+    def _start_value(self, char: str) -> None:
+        if char == '"':
+            self._start_string("value")
+        elif char == "{":
+            self._push("object")
+        elif char == "[":
+            self._push("array")
+        elif char == "t":
+            self._start_literal("true")
+        elif char == "f":
+            self._start_literal("false")
+        elif char == "n":
+            self._start_literal("null")
+        elif char == "-" or (char.isascii() and char.isdigit()):
+            self._start_number(char)
+        else:
+            self._invalid = True
+
+    def _feed_char(self, char: str) -> None:
+        reprocess = True
+        while reprocess and not self._invalid:
+            reprocess = False
+            if self._mode == "string":
+                self._feed_string(char)
+                return
+            if self._mode == "literal":
+                reprocess = self._feed_literal(char)
+                continue
+            if self._mode == "number":
+                reprocess = self._feed_number(char)
+                continue
+            if char in " \t\r\n":
+                return
+            if self._done:
+                self._invalid = True
+                return
+            if not self._started:
+                self._started = True
+                if char != "{":
+                    self._invalid = True
+                    return
+                self._push("object")
+                return
+            if not self._frames:
+                self._invalid = True
+                return
+            frame = self._frames[-1]
+            state = frame["state"]
+            if frame["kind"] == "object":
+                if state in {"key_or_end", "key"}:
+                    if char == '"':
+                        self._start_string("key")
+                    elif char == "}" and state == "key_or_end":
+                        self._close_container("object")
+                    else:
+                        self._invalid = True
+                    return
+                if state == "colon":
+                    if char == ":":
+                        frame["state"] = "value"
+                    else:
+                        self._invalid = True
+                    return
+                if state == "value":
+                    self._start_value(char)
+                    return
+                if state == "comma_or_end":
+                    if char == ",":
+                        frame["state"] = "key"
+                    elif char == "}":
+                        self._close_container("object")
+                    else:
+                        self._invalid = True
+                    return
+            else:
+                if state in {"value_or_end", "value"}:
+                    if char == "]" and state == "value_or_end":
+                        self._close_container("array")
+                    else:
+                        self._start_value(char)
+                    return
+                if state == "comma_or_end":
+                    if char == ",":
+                        frame["state"] = "value"
+                    elif char == "]":
+                        self._close_container("array")
+                    else:
+                        self._invalid = True
+                    return
+            self._invalid = True
+
+    def feed(self, chunk: bytes) -> None:
+        if self._invalid or self._finalized:
+            return
+        try:
+            decoded = self._decoder.decode(chunk, final=False)
+        except UnicodeDecodeError:
+            self._invalid = True
+            return
+        for char in decoded:
+            self._feed_char(char)
+            if self._invalid:
+                return
+
+    def valid(self) -> bool:
+        if not self._finalized:
+            self._finalized = True
+            try:
+                decoded = self._decoder.decode(b"", final=True)
+            except UnicodeDecodeError:
+                self._invalid = True
+                decoded = ""
+            for char in decoded:
+                self._feed_char(char)
+            if self._mode == "literal":
+                if self._literal_index == len(self._literal):
+                    self._finish_scalar()
+                else:
+                    self._invalid = True
+            elif self._mode == "number":
+                if self._number_state in self._NUMBER_FINAL_STATES:
+                    self._finish_scalar()
+                else:
+                    self._invalid = True
+            elif self._mode is not None:
+                self._invalid = True
+        return (
+            not self._invalid
+            and self._started
+            and self._done
+            and not self._frames
+            and self._mode is None
+        )
+
+
 class _TopLevelEnvelopeScanner:
     """Extract cursor identity from one JSON object without retaining its payload.
 
@@ -529,11 +861,14 @@ class _TopLevelEnvelopeScanner:
     ``"seq"`` can never become replay cursor authority.
     """
 
-    _STRING_FIELDS = frozenset({"event_id", "run_id", "session_id"})
+    _AUTHORITY_STRING_FIELDS = frozenset({"event_id", "run_id", "session_id"})
+    _TERMINAL_STRING_FIELDS = frozenset({"event", "terminal_state"})
+    _STRING_FIELDS = _AUTHORITY_STRING_FIELDS | _TERMINAL_STRING_FIELDS
     _CAPTURE_LIMIT = 1024
     _MAX_NESTING = 128
 
     def __init__(self):
+        self._validator = _StreamingJsonValidator()
         self._stack: list[int] = []
         self._state = "start"
         self._invalid = False
@@ -591,8 +926,10 @@ class _TopLevelEnvelopeScanner:
                 self._record_field("seq", None)
             elif self._active_key in self._STRING_FIELDS:
                 self._record_field(self._active_key, decoded)
-                if decoded is None:
+                if decoded is None and self._active_key in self._AUTHORITY_STRING_FIELDS:
                     self._invalid = True
+            elif self._active_key == "terminal":
+                self._record_field("terminal", None)
             self._active_key = None
             self._state = "comma_or_end"
 
@@ -610,7 +947,13 @@ class _TopLevelEnvelopeScanner:
             self._record_field("seq", value)
         elif key in self._STRING_FIELDS:
             self._record_field(key, None)
-            self._invalid = True
+            if key in self._AUTHORITY_STRING_FIELDS:
+                self._invalid = True
+        elif key == "terminal":
+            self._record_field(
+                "terminal",
+                True if token == b"true" else False if token == b"false" else None,
+            )
         self._primitive_buf = None
         self._primitive_overflow = False
         self._active_key = None
@@ -630,6 +973,7 @@ class _TopLevelEnvelopeScanner:
         self._stack.pop()
 
     def feed(self, chunk: bytes) -> None:
+        self._validator.feed(chunk)
         if self._invalid:
             return
         for value in chunk:
@@ -701,12 +1045,15 @@ class _TopLevelEnvelopeScanner:
                 continue
             if self._state == "value":
                 if value in {ord("{"), ord("[")}:
-                    if self._active_key in self._STRING_FIELDS or self._active_key == "seq":
+                    if self._active_key in self._STRING_FIELDS or self._active_key in {
+                        "seq", "terminal",
+                    }:
                         if self._active_key == "seq":
                             self._record_field("seq", None)
                         else:
                             self._record_field(self._active_key, None)
-                        self._invalid = True
+                        if self._active_key in self._AUTHORITY_STRING_FIELDS:
+                            self._invalid = True
                     self._push(value)
                     self._state = "value_nested"
                     continue
@@ -731,11 +1078,23 @@ class _TopLevelEnvelopeScanner:
                 self._invalid = True
                 return
 
-    def authoritative_seq(self, session_id: str, run_id: str) -> tuple[int | None, str]:
+    def authoritative_seq(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        require_complete_json: bool,
+    ) -> tuple[int | None, str]:
         seq = self._fields.get("seq")
         if self._seq_seen != 1 or isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
             return None, "replay_invalid_seq"
-        if self._invalid or self._state != "closed" or self._stack or self._in_string:
+        if (
+            (require_complete_json and not self._validator.valid())
+            or self._invalid
+            or self._state != "closed"
+            or self._stack
+            or self._in_string
+        ):
             return None, "replay_invalid_envelope"
         if (
             self._fields.get("session_id") != str(session_id)
@@ -744,6 +1103,20 @@ class _TopLevelEnvelopeScanner:
         ):
             return None, "replay_invalid_identity"
         return seq, ""
+
+    def recovered_terminal_event(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        max_seq: int | None,
+    ) -> dict | None:
+        return _recover_legacy_overcap_terminal_event(
+            self._fields,
+            session_id=session_id,
+            run_id=run_id,
+            max_seq=max_seq,
+        )
 
 
 def _read_bounded_physical_row(fh) -> tuple[bytes | None, _TopLevelEnvelopeScanner] | None:
@@ -840,7 +1213,9 @@ def read_run_events(
             if raw_bytes is not None and not raw_bytes.strip():
                 continue
             seq, identity_error = envelope.authoritative_seq(
-                str(session_id), str(run_id),
+                str(session_id),
+                str(run_id),
+                require_complete_json=raw_bytes is None,
             )
             if seq is None:
                 malformed.append({"line": line_no, "reason": identity_error})
@@ -870,14 +1245,42 @@ def read_run_events(
                     next_after_seq=next_after_seq,
                 )
             if raw_bytes is None:
-                # This row cannot be materialized within the hard-line ceiling.
-                # Its exact top-level identity has been consumed and the complete
-                # physical line drained, so the next page can safely advance.
-                return _replay_limit_result(
-                    str(session_id), str(run_id), events, malformed,
-                    line_no=line_no, reason="replay_limit_bytes",
-                    next_after_seq=seq,
+                recovered_event = envelope.recovered_terminal_event(
+                    session_id=str(session_id),
+                    run_id=str(run_id),
+                    max_seq=ceiling,
                 )
+                recovered_size = (
+                    _serialized_event_size(recovered_event)
+                    if recovered_event is not None
+                    else None
+                )
+                if recovered_event is None:
+                    # This row cannot be materialized within the hard-line ceiling.
+                    # Its exact top-level identity has been consumed and the complete
+                    # physical line drained, so the next page can safely advance.
+                    return _replay_limit_result(
+                        str(session_id), str(run_id), events, malformed,
+                        line_no=line_no, reason="replay_limit_bytes",
+                        next_after_seq=seq,
+                    )
+                assert recovered_size is not None
+                if byte_cap is not None and recovered_size > byte_cap:
+                    return _replay_limit_result(
+                        str(session_id), str(run_id), events, malformed,
+                        line_no=line_no, reason="replay_limit_bytes",
+                        next_after_seq=seq,
+                    )
+                if byte_cap is not None and emitted_bytes + recovered_size > byte_cap:
+                    return _replay_limit_result(
+                        str(session_id), str(run_id), events, malformed,
+                        line_no=line_no, reason="replay_limit_bytes",
+                        next_after_seq=next_after_seq,
+                    )
+                events.append(recovered_event)
+                emitted_bytes += recovered_size
+                next_after_seq = seq
+                continue
             assert event is not None
             event_size = _serialized_event_size(event)
             if byte_cap is not None and emitted_bytes + event_size > byte_cap:

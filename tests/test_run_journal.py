@@ -440,6 +440,166 @@ def test_run_journal_bounded_reader_ignores_nested_seq_in_hard_row(tmp_path, mon
     assert [event["seq"] for event in second_page["events"]] == [2]
 
 
+def test_run_journal_bounded_reader_rejects_malformed_hard_row_before_cursor_advance(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(run_journal, "_LEGACY_TERMINAL_RECOVERY_MAX_BYTES", 256)
+    session_id = "session_malformed_hard_row"
+    run_id = "run_malformed_hard_row"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True)
+    malformed = (
+        b'{"version":1,"event_id":"'
+        + f"{run_id}:999".encode("utf-8")
+        + b'","seq":999,"run_id":"'
+        + run_id.encode("utf-8")
+        + b'","session_id":"'
+        + session_id.encode("utf-8")
+        + b'","event":"token","type":"token","payload":{"text":"'
+        + b"x" * 512
+        + b'"},}\n'
+    )
+    valid = _bounded_event(session_id, run_id, 1, "valid")
+    path.write_bytes(
+        malformed
+        + json.dumps(valid, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+
+    journal = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=4096, max_rows=2,
+    )
+
+    assert [event["seq"] for event in journal["events"]] == [1]
+    assert journal["malformed"] == [
+        {"line": 1, "reason": "replay_invalid_envelope"},
+    ]
+    assert journal["next_after_seq"] == 1
+    assert journal["complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("payload", "root_suffix"),
+    [
+        (b'{"text":"' + b"x" * 512 + b'",}', b',"event":"token"}\n'),
+        (b'["' + b"x" * 512 + b'",]', b',"event":"token"}\n'),
+        (b'{"text":"' + b"x" * 512 + b'" "other":1}', b"}\n"),
+        (b'{"text":"' + b"x" * 512 + b'","other":}', b"}\n"),
+        (b'{"text":"' + b"x" * 512 + b'","other":truth}', b"}\n"),
+        (b'{"text":"' + b"x" * 512 + b'\\q"}', b"}\n"),
+        (b'{"text":"' + b"x" * 512 + b'\xff"}', b"}\n"),
+        (b'{"text":"' + b"x" * 512 + b'"', b"\n"),
+        (b'{"text":"' + b"x" * 512 + b'"}', b',"seq":998}\n'),
+    ],
+    ids=[
+        "trailing-object-comma",
+        "trailing-array-comma",
+        "missing-separator",
+        "missing-value",
+        "invalid-literal",
+        "invalid-escape",
+        "invalid-utf8",
+        "truncated-container",
+        "duplicate-authority",
+    ],
+)
+def test_run_journal_bounded_reader_rejects_invalid_hard_row_grammar(
+    tmp_path,
+    monkeypatch,
+    payload,
+    root_suffix,
+):
+    monkeypatch.setattr(run_journal, "_LEGACY_TERMINAL_RECOVERY_MAX_BYTES", 256)
+    session_id = "session_invalid_hard_grammar"
+    run_id = "run_invalid_hard_grammar"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True)
+    malformed = (
+        b'{"version":1,"event_id":"'
+        + f"{run_id}:999".encode("utf-8")
+        + b'","seq":999,"run_id":"'
+        + run_id.encode("utf-8")
+        + b'","session_id":"'
+        + session_id.encode("utf-8")
+        + b'","payload":'
+        + payload
+        + root_suffix
+    )
+    valid = _bounded_event(session_id, run_id, 1, "valid")
+    path.write_bytes(
+        malformed
+        + json.dumps(valid, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+
+    journal = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=4096, max_rows=2,
+    )
+
+    assert [event["seq"] for event in journal["events"]] == [1]
+    assert journal["malformed"][0]["line"] == 1
+    assert journal["next_after_seq"] == 1
+    assert journal["complete"] is True
+
+
+def test_run_journal_bounded_reader_pages_hard_terminal_recovery_marker(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(run_journal, "_LEGACY_TERMINAL_RECOVERY_MAX_BYTES", 256)
+    session_id = "session_hard_terminal_marker"
+    run_id = "run_hard_terminal_marker"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    first = _bounded_event(session_id, run_id, 1, "first")
+    terminal = _bounded_event(session_id, run_id, 2, "unused")
+    terminal.update({
+        "event": "done",
+        "type": "done",
+        "terminal": True,
+        "terminal_state": "completed",
+        "payload": {"session": {"messages": [{"content": "x" * 512}]}},
+    })
+    _write_bounded_events(path, [first, terminal])
+    marker = run_journal._recover_legacy_overcap_terminal_event(
+        terminal,
+        session_id=session_id,
+        run_id=run_id,
+        max_seq=None,
+    )
+    page_bytes = max(
+        run_journal._serialized_event_size(first),
+        run_journal._serialized_event_size(marker),
+    )
+
+    first_page = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=page_bytes,
+    )
+    second_page = read_run_events(
+        session_id,
+        run_id,
+        after_seq=first_page["next_after_seq"],
+        session_dir=tmp_path,
+        max_bytes=page_bytes,
+    )
+
+    assert [event["seq"] for event in first_page["events"]] == [1]
+    assert first_page["complete"] is False
+    assert first_page["limit_reason"] == "replay_limit_bytes"
+    assert first_page["next_after_seq"] == 1
+    assert [event["seq"] for event in second_page["events"]] == [2]
+    assert second_page["events"][0]["payload"]["terminal_disposition"] == {
+        "version": "terminal_disposition_v1",
+        "kind": "consumed_non_materializable",
+        "reason": "legacy_terminal_payload_too_large",
+        "session_id": session_id,
+        "run_id": run_id,
+        "stream_id": run_id,
+    }
+    assert second_page["complete"] is True
+    assert second_page["next_after_seq"] == 2
+
+
 def test_run_journal_bounded_reader_fails_closed_on_invalid_sequences(tmp_path):
     session_id = "session_invalid_sequences"
     run_id = "run_invalid_sequences"
