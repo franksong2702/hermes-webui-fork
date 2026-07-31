@@ -4543,7 +4543,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const rawHref=isHref&&typeof _normalizeMarkdownLinkDestination==='function'
         ? _normalizeMarkdownLinkDestination(value)
         : String(value||'').trim();
-      const attrValue=isHref?_smdLinkHref(rawHref):value;
+      const attrValue=isHref?_smdLinkHref(value):value;
       const allowed=isSrc?_smdImgSrcAllowed(value):_SMD_SAFE_URL_RE.test(String(attrValue||''));
       if(isHref&&/^(file|workspace|session):\/\//i.test(rawHref)){
         baseSetAttr(data,attr,attrValue);
@@ -4799,7 +4799,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const rawHref=isHref&&typeof _normalizeMarkdownLinkDestination==='function'
         ? _normalizeMarkdownLinkDestination(value)
         : String(value||'').trim();
-      const attrValue=isHref?_smdLinkHref(rawHref):value;
+      const attrValue=isHref?_smdLinkHref(value):value;
       const allowed=isSrc?_smdImgSrcAllowed(value):_SMD_SAFE_URL_RE.test(String(attrValue||''));
       if(isHref&&/^(file|workspace|session):\/\//i.test(rawHref)){
         baseSetAttr(data,attr,attrValue);

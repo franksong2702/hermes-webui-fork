@@ -7123,6 +7123,15 @@ function _normalizeMarkdownLinkDestination(raw){
 
 function renderMd(raw){
   let s=(raw||'').replace(/\r\n/g,'\n').replace(/\r/g,'\n');
+  // Some renderer contract tests execute renderMd() as a standalone extracted
+  // function. Keep that supported while using the shared helper in the browser.
+  const normalizeLinkDestination=typeof _normalizeMarkdownLinkDestination==='function'
+    ? _normalizeMarkdownLinkDestination
+    : rawValue=>{
+        const value=String(rawValue||'').trim();
+        const titled=value.match(/^([\s\S]*\S)\s+(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\((?:\\.|[^()\\])*\))$/);
+        return titled?titled[1]:value;
+      };
   // ── Entity decode: must run FIRST so &gt; lines become > for the blockquote
   // pre-pass below. LLMs sometimes emit HTML-entity-encoded output; without this
   // a blockquote sent as "&gt; text" would never be recognised as a blockquote.
@@ -7410,7 +7419,7 @@ function renderMd(raw){
           break;
         }
       }
-      const normalizedUrl=_normalizeMarkdownLinkDestination(rawUrl);
+      const normalizedUrl=normalizeLinkDestination(rawUrl);
       if(end<0||!normalizedUrl||!allowed.test(normalizedUrl)){
         out+=src.slice(cursor,open+1);
         cursor=open+1;
@@ -7602,7 +7611,7 @@ function renderMd(raw){
     return String(v||'').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&amp;/g,'&').trim();
   }
   function _markdownHref(raw){
-    const href=_normalizeMarkdownLinkDestination(raw).replace(/"/g,'%22');
+    const href=normalizeLinkDestination(raw).replace(/"/g,'%22');
     if(/^session:\/\//i.test(href)){
       const sid=href.replace(/^session:\/\//i,'').split(/[?#]/)[0];
       try{
@@ -7661,7 +7670,7 @@ function renderMd(raw){
     return esc(tokenized).replace(/\x00H(\d+)\x00/g,(_,i)=>_label_stash[+i]);
   }
   function _markdownAnchor(label,rawUrl){
-    const destination=_normalizeMarkdownLinkDestination(rawUrl);
+    const destination=normalizeLinkDestination(rawUrl);
     const href=_markdownHref(destination);
     const internal=/^session:\/\//i.test(destination) || _isInternalSessionHref(href);
     return `<a${internal?' class="session-link"':''} href="${href}"${internal?'':' target="_blank" rel="noopener"'}>${_markdownLabelHtml(label)}</a>`;
