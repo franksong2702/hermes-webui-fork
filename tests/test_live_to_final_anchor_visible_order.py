@@ -844,11 +844,11 @@ def test_application_error_settlement_attaches_projected_anchor_scene_before_ren
 
     assert "_applyToAnchor('apperror'" in apperror
     session_idx = apperror.index("const _nextMsgs3018=(d.session.messages||[]).filter(m=>m&&m.role);")
+    attach_idx = apperror.index("_attachProjectedAnchorSceneToLastAssistant(_nextMsgs3018);")
     carry_idx = apperror.index("S.messages=_carryForwardEphemeralTurnFields(S.messages||[], _nextMsgs3018);")
-    attach_idx = apperror.index("_attachProjectedAnchorSceneToLastAssistant(S.messages);")
     clear_idx = apperror.index("clearLiveToolCards();if(!assistantText)removeThinking();")
     render_idx = apperror.index("renderMessages({preserveScroll:true});")
-    assert session_idx < carry_idx < attach_idx < clear_idx < render_idx
+    assert session_idx < attach_idx < carry_idx < clear_idx < render_idx
 
     synthetic_push_idx = apperror.index("S.messages.push({role:'assistant',content:`**${label}:**")
     synthetic_attach_idx = apperror.index("_attachProjectedAnchorSceneToLastAssistant(S.messages);", synthetic_push_idx)
