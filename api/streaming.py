@@ -102,6 +102,27 @@ def _session_payload_with_full_messages(session, *, tool_calls=None):
     return raw
 
 
+_CANCEL_SURVIVING_STREAM_EVENTS = frozenset({
+    'cancel',
+    'apperror',
+    'error',
+    'artifact_reference',
+})
+
+
+def _stream_event_dropped_after_cancel(
+    event: str,
+    *,
+    cancelled: bool,
+    success_writeback_committed: bool,
+) -> bool:
+    return (
+        cancelled
+        and not success_writeback_committed
+        and event not in _CANCEL_SURVIVING_STREAM_EVENTS
+    )
+
+
 def _compact_for_echo_compare(value: str) -> str:
     """Normalize visible stream text for duplicate echo detection."""
     return re.sub(r'\s+', '', str(value or ''))
@@ -2151,6 +2172,7 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
         'message_ref': ref,
         'run_id': run_id,
         'stream_id': stream_id,
+        'owner_authority': 'server',
         'scene': scene,
         'updated_at': time.time(),
     }
@@ -8247,8 +8269,10 @@ def _run_agent_streaming(
         # artifacts. A tool may finish its on-disk write just after the cancel
         # flag is set; journaling that reference keeps the real side effect
         # recoverable without reopening the rest of the live event stream.
-        if cancel_event.is_set() and not _success_writeback_committed and event not in (
-            'cancel', 'apperror', 'error', 'artifact_reference'
+        if _stream_event_dropped_after_cancel(
+            event,
+            cancelled=cancel_event.is_set(),
+            success_writeback_committed=_success_writeback_committed,
         ):
             return None
         event_id = None
@@ -9013,9 +9037,7 @@ def _run_agent_streaming(
                     # registered (e.g. older approval module without gateway support).
                     try:
                         from api.route_approvals import (
-                            _gateway_queues as _approval_gateway_queues,
                             _lock as _approval_lock,
-                            _pending as _approval_pending,
                             reconcile_gateway_pending_mirror_locked as _reconcile_gateway_pending_mirror_locked,
                         )
                         from tools.approval import has_blocking_approval as _has_blocking_approval

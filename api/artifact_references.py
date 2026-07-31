@@ -223,7 +223,8 @@ def _mutation_landed(tool_name, result) -> bool:
     if not data or data.get('error'):
         return False
     if name == 'write_file':
-        return 'bytes_written' in data
+        bytes_written = data.get('bytes_written')
+        return type(bytes_written) is int and bytes_written >= 0
     return data.get('success') is True
 
 

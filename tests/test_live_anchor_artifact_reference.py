@@ -14,6 +14,7 @@ from api.artifact_references import (
     bound_anchor_artifact_events,
     derive_file_artifact_references,
 )
+from api.streaming import _stream_event_dropped_after_cancel
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -69,6 +70,12 @@ def test_failed_incomplete_or_read_only_results_do_not_become_artifacts(tmp_path
     cases = [
         ("write_file", {"path": path}, json.dumps({"error": "permission denied"})),
         ("write_file", {"path": path}, json.dumps({"resolved_path": path})),
+        ("write_file", {"path": path}, json.dumps({"bytes_written": None})),
+        ("write_file", {"path": path}, json.dumps({"bytes_written": True})),
+        ("write_file", {"path": path}, json.dumps({"bytes_written": False})),
+        ("write_file", {"path": path}, json.dumps({"bytes_written": "1"})),
+        ("write_file", {"path": path}, json.dumps({"bytes_written": 1.0})),
+        ("write_file", {"path": path}, json.dumps({"bytes_written": -1})),
         ("patch", {"path": path}, json.dumps({"success": False, "error": "stale"})),
         ("patch", {"path": path}, "truncated result"),
         ("read_file", {"path": path}, json.dumps({"bytes_written": 1})),
@@ -83,6 +90,19 @@ def test_failed_incomplete_or_read_only_results_do_not_become_artifacts(tmp_path
     assert derive_file_artifact_references(
         "write_file", {"path": path}, json.dumps({"bytes_written": 1}), ""
     ) == []
+
+    assert derive_file_artifact_references(
+        "write_file",
+        {"path": path},
+        json.dumps({"bytes_written": 0}),
+        workspace,
+        tool_call_id="call-empty-file",
+    ) == [{
+        "kind": "workspace_file",
+        "path": "failed.md",
+        "source_tool": "write_file",
+        "tool_call_id": "call-empty-file",
+    }]
 
 
 def test_successful_patch_keeps_result_order_dedupes_and_rejects_unsafe_paths(tmp_path):
@@ -497,7 +517,22 @@ def test_backend_emits_artifact_after_tool_completion_and_keeps_cancel_journalab
         artifact = block.index("put('artifact_reference', artifact_reference)")
         assert tool_complete < derive < artifact
 
-    assert "event not in ('cancel', 'error', 'artifact_reference')" in STREAMING_PY
+    for event in ("cancel", "apperror", "error", "artifact_reference"):
+        assert not _stream_event_dropped_after_cancel(
+            event,
+            cancelled=True,
+            success_writeback_committed=False,
+        )
+    assert _stream_event_dropped_after_cancel(
+        "tool_complete",
+        cancelled=True,
+        success_writeback_committed=False,
+    )
+    assert not _stream_event_dropped_after_cancel(
+        "tool_complete",
+        cancelled=True,
+        success_writeback_committed=True,
+    )
 
 
 def test_runtime_journal_snapshot_projects_artifact_references_for_reconnect(monkeypatch):

@@ -1053,6 +1053,7 @@ def test_anchor_scene_persistence_merges_browser_post_after_worker_settlement(tm
     raw = json.loads((session_dir / "artifact-post-after-worker.json").read_text(encoding="utf-8"))
     record = next(iter(raw["anchor_activity_scenes"].values()))
     scene = record["scene"]
+    assert record["owner_authority"] == "server"
     assert scene["activity_rows"] == stale_browser_scene["activity_rows"]
     assert scene["side_effects"] == stale_browser_scene["side_effects"]
     assert scene["terminal_state"] == "cancelled"
