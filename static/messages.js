@@ -3753,14 +3753,76 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return false;
   }
-  function _retrySettledAnchorScene(targetMessage, targetIndex, retryStreamId, retryRegistry, retryMessageKey){
+  function _settledAnchorRetryOwnerKey(messages, targetIndex, retryStreamId){
+    if(!Array.isArray(messages)||!Number.isInteger(targetIndex)) return '';
+    const target=messages[targetIndex];
+    if(!target||target.role!=='assistant') return '';
+    let turnStart=0;
+    for(let idx=targetIndex-1;idx>=0;idx-=1){
+      if(messages[idx]&&messages[idx].role==='user'){
+        turnStart=idx;
+        break;
+      }
+    }
+    let hasStableOwnerSignal=false;
+    const ownerRows=[];
+    const addUnique=(items,value)=>{
+      const normalized=String(value||'').trim();
+      if(normalized&&!items.includes(normalized)) items.push(normalized);
+    };
+    for(let idx=turnStart;idx<=targetIndex;idx+=1){
+      const message=messages[idx];
+      if(!message||typeof message!=='object') return '';
+      const explicitIds=[];
+      for(const field of ['id','message_id','turn_id','_turn_id','run_id','_run_id']){
+        addUnique(explicitIds,message[field]);
+      }
+      const toolCallIds=[];
+      addUnique(toolCallIds,message.tool_call_id);
+      const addToolOwner=(tool)=>{
+        if(!tool||typeof tool!=='object') return;
+        addUnique(toolCallIds,tool.id||tool.tid||tool.tool_call_id||tool.tool_use_id||tool.call_id);
+      };
+      for(const tool of (Array.isArray(message.tool_calls)?message.tool_calls:[])) addToolOwner(tool);
+      for(const tool of (Array.isArray(message._partial_tool_calls)?message._partial_tool_calls:[])) addToolOwner(tool);
+      for(const part of (Array.isArray(message.content)?message.content:[])) addToolOwner(part);
+      explicitIds.sort();
+      toolCallIds.sort();
+      if(explicitIds.length||toolCallIds.length) hasStableOwnerSignal=true;
+      ownerRows.push({
+        message_ref:_anchorSceneMessageRef(message),
+        reasoning:String(message.reasoning||message._reasoning||message.reasoning_content||message.thinking||'').replace(/\s+/g,' ').trim(),
+        partial:!!message._partial,
+        explicit_ids:explicitIds,
+        tool_call_ids:toolCallIds,
+      });
+    }
+    if(!hasStableOwnerSignal) return '';
+    return JSON.stringify({
+      session_id:activeSid||'',
+      stream_id:String(retryStreamId||''),
+      target_index:targetIndex,
+      messages:ownerRows,
+    });
+  }
+  function _retrySettledAnchorScene(targetMessage, targetIndex, retryStreamId, retryRegistry, retryOwnerKey){
     if(!targetMessage||!Number.isInteger(targetIndex)) return false;
     if(!S.session||S.session.session_id!==activeSid) return false;
     if(S.activeStreamId&&S.activeStreamId!==retryStreamId) return false;
     if(!_anchorRegistryMap||_anchorRegistryMap.get(retryStreamId)!==retryRegistry) return false;
     if(!Array.isArray(S.messages)) return false;
     const currentTarget=S.messages[targetIndex];
-    if(currentTarget!==targetMessage&&(!_messageIdentityKey(currentTarget)||_messageIdentityKey(currentTarget)!==retryMessageKey)) return false;
+    if(currentTarget!==targetMessage){
+      const currentOwnerKey=_settledAnchorRetryOwnerKey(S.messages,targetIndex,retryStreamId);
+      if(!retryOwnerKey||!currentOwnerKey||currentOwnerKey!==retryOwnerKey) return false;
+      if(targetMessage._anchor_stream_id===retryStreamId){
+        if(currentTarget._anchor_stream_id==null) currentTarget._anchor_stream_id=targetMessage._anchor_stream_id;
+        if(currentTarget._anchor_scene_persist_key==null) currentTarget._anchor_scene_persist_key=targetMessage._anchor_scene_persist_key;
+        if(!currentTarget._anchor_activity_scene&&targetMessage._anchor_activity_scene){
+          currentTarget._anchor_activity_scene=targetMessage._anchor_activity_scene;
+        }
+      }
+    }
     return _attachProjectedAnchorSceneToLastAssistant(S.messages,currentTarget,targetIndex);
   }
   function _upsertAnchorProcessProse(displayText, options={}){
@@ -6301,12 +6363,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const _retryIndex=_anchorRetryIndex;
           const _retryStreamId=streamId;
           const _retryRegistry=_anchorRegistry;
-          const _retryMessageKey=_messageIdentityKey(_retryTarget);
+          const _retryOwnerKey=_settledAnchorRetryOwnerKey(S.messages,_retryIndex,_retryStreamId);
           // Retry only for the exact terminal assistant and registry generation.
-          // A same-session refresh may replace the object, but must retain the
-          // exact indexed message identity before the scene can be attached.
+          // A refresh replacement must prove the same full turn and tool owner.
           setTimeout(()=>{
-            _retrySettledAnchorScene(_retryTarget,_retryIndex,_retryStreamId,_retryRegistry,_retryMessageKey);
+            _retrySettledAnchorScene(_retryTarget,_retryIndex,_retryStreamId,_retryRegistry,_retryOwnerKey);
           },0);
         }
         if(isRecoveryControlMessage){

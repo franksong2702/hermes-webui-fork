@@ -856,6 +856,8 @@ def test_application_error_settlement_attaches_projected_anchor_scene_before_ren
 
 def test_deferred_application_error_retry_is_owner_fenced_and_idempotent():
     attach = _function_body(MESSAGES_JS, "_attachProjectedAnchorSceneToLastAssistant")
+    message_ref = _function_body(MESSAGES_JS, "_anchorSceneMessageRef")
+    owner_key = _function_body(MESSAGES_JS, "_settledAnchorRetryOwnerKey")
     retry = _function_body(MESSAGES_JS, "_retrySettledAnchorScene")
     script = f"""
 const activeSid='sid-A';
@@ -863,7 +865,7 @@ const streamId='stream-A';
 const _anchorRegistry={{generation:'A'}};
 const _anchorRegistryMap=new Map([['stream-A',_anchorRegistry]]);
 const S={{session:{{session_id:'sid-A'}},activeStreamId:null,messages:[]}};
-const scene={{version:'activity_scene_v1',mode:'compact_worklog',activity_rows:[{{role:'tool'}}]}};
+let scene={{version:'activity_scene_v1',mode:'compact_worklog',activity_rows:[{{role:'tool'}}]}};
 let persisted=[];
 let deferredRetry=null;
 function _projectLiveAnchorActivityScene(){{ return scene; }}
@@ -872,56 +874,148 @@ function _anchorSceneHasOwnedOutcomes(){{ return false; }}
 function _anchorSceneHasWorklogWorthyRows(){{ return true; }}
 function _persistSettledAnchorScene(message,nextScene,index){{ persisted.push({{message,index,nextScene}}); }}
 function _attachProjectedAnchorSceneToLastAssistant(messages,targetMessage=null,targetIndex=null){{{attach}}}
-function _messageIdentityKey(message){{
-  return `${{message.role}}|${{message.timestamp||''}}|${{message.content||''}}`;
+function _anchorSceneMessageRef(message){{{message_ref}}}
+function _settledAnchorRetryOwnerKey(messages,targetIndex,retryStreamId){{{owner_key}}}
+function _retrySettledAnchorScene(targetMessage,targetIndex,retryStreamId,retryRegistry,retryOwnerKey){{{retry}}}
+function scheduleRetry(targetMessage,targetIndex,retryStreamId,retryRegistry,retryOwnerKey){{
+  deferredRetry=()=>_retrySettledAnchorScene(targetMessage,targetIndex,retryStreamId,retryRegistry,retryOwnerKey);
 }}
-function _retrySettledAnchorScene(targetMessage,targetIndex,retryStreamId,retryRegistry,retryMessageKey){{{retry}}}
-function scheduleRetry(targetMessage,targetIndex,retryStreamId,retryRegistry,retryMessageKey){{
-  deferredRetry=()=>_retrySettledAnchorScene(targetMessage,targetIndex,retryStreamId,retryRegistry,retryMessageKey);
-}}
-const assistantA={{role:'assistant',content:'A'}};
-const assistantB={{role:'assistant',content:'B'}};
-S.messages=[assistantA];
-scheduleRetry(assistantA,0,'stream-A',_anchorRegistry,_messageIdentityKey(assistantA));
-S.messages=[assistantB];
-const staleResult=deferredRetry();
-const staleState={{result:staleResult,bHasScene:Boolean(assistantB._anchor_activity_scene),bStreamId:assistantB._anchor_stream_id||null,persisted:persisted.length}};
-S.messages=[assistantA,assistantB];
-scheduleRetry(assistantA,0,'stream-A',_anchorRegistry,_messageIdentityKey(assistantA));
+const sharedPrefix='x'.repeat(160);
+const originalMessages=[
+  {{role:'user',content:'inspect the current turn'}},
+  {{
+    role:'assistant',
+    content:sharedPrefix+' owner-A tail',
+    tool_calls:[{{id:'tool-A',function:{{name:'terminal',arguments:'{{}}'}}}}],
+  }},
+  {{role:'assistant',content:'**Error:** gateway failed'}},
+];
+const assistantA=originalMessages[2];
+S.messages=originalMessages;
+const refreshedMessages=JSON.parse(JSON.stringify(originalMessages));
+const initialResult=_attachProjectedAnchorSceneToLastAssistant(S.messages,assistantA,2);
+const persistedAfterInitial=persisted.length;
+const ownerKey=_settledAnchorRetryOwnerKey(S.messages,2,'stream-A');
+scheduleRetry(assistantA,2,'stream-A',_anchorRegistry,ownerKey);
+S.messages=refreshedMessages;
+const refreshedA=S.messages[2];
 const firstResult=deferredRetry();
-scheduleRetry(assistantA,0,'stream-A',_anchorRegistry,_messageIdentityKey(assistantA));
+const persistedAfterRefresh=persisted.length;
+scene={{
+  version:'activity_scene_v1',
+  mode:'compact_worklog',
+  activity_rows:[{{role:'tool'}},{{role:'thinking'}}],
+}};
+scheduleRetry(assistantA,2,'stream-A',_anchorRegistry,ownerKey);
 const secondResult=deferredRetry();
-const positiveState={{firstResult,secondResult,aHasScene:Boolean(assistantA._anchor_activity_scene),bHasScene:Boolean(assistantB._anchor_activity_scene),persisted:persisted.length}};
+const persistedAfterLateRow=persisted.length;
+scheduleRetry(assistantA,2,'stream-A',_anchorRegistry,ownerKey);
+const thirdResult=deferredRetry();
+const positiveState={{
+  ownerKeyPresent:Boolean(ownerKey),
+  initialResult,
+  firstResult,
+  secondResult,
+  thirdResult,
+  persistedAfterInitial,
+  persistedAfterRefresh,
+  persistedAfterLateRow,
+  refreshedHasScene:Boolean(refreshedA._anchor_activity_scene),
+  persisted:persisted.length,
+}};
+
+const ambiguousB={{role:'assistant',content:'**Error:** gateway failed'}};
+S.messages=[
+  {{role:'user',content:'inspect the current turn'}},
+  {{
+    role:'assistant',
+    content:sharedPrefix+' owner-B tail',
+    tool_calls:[{{id:'tool-B',function:{{name:'terminal',arguments:'{{}}'}}}}],
+  }},
+  ambiguousB,
+];
+scheduleRetry(assistantA,2,'stream-A',_anchorRegistry,ownerKey);
+const ambiguousResult=deferredRetry();
+const ambiguousState={{
+  result:ambiguousResult,
+  bHasScene:Boolean(ambiguousB._anchor_activity_scene),
+  bStreamId:ambiguousB._anchor_stream_id||null,
+  persisted:persisted.length,
+}};
+
+const ownerlessA={{role:'assistant',content:'timestamp-less owner'}};
+S.messages=[ownerlessA];
+const ownerlessKey=_settledAnchorRetryOwnerKey(S.messages,0,'stream-A');
+scheduleRetry(ownerlessA,0,'stream-A',_anchorRegistry,ownerlessKey);
+const ownerlessExactResult=deferredRetry();
+const ownerlessB={{role:'assistant',content:'timestamp-less owner'}};
+S.messages=[ownerlessB];
+scheduleRetry(ownerlessA,0,'stream-A',_anchorRegistry,ownerlessKey);
+const ownerlessReplacementResult=deferredRetry();
+const ownerlessState={{
+  ownerKey:ownerlessKey,
+  exactResult:ownerlessExactResult,
+  replacementResult:ownerlessReplacementResult,
+  bHasScene:Boolean(ownerlessB._anchor_activity_scene),
+  persisted:persisted.length,
+}};
+
+S.messages=JSON.parse(JSON.stringify(originalMessages));
 S.activeStreamId='stream-B';
-scheduleRetry(assistantA,0,'stream-A',_anchorRegistry,_messageIdentityKey(assistantA));
-deferredRetry();
-const generationState={{aHasScene:Boolean(assistantA._anchor_activity_scene),persisted:persisted.length}};
+scheduleRetry(assistantA,2,'stream-A',_anchorRegistry,ownerKey);
+const streamResult=deferredRetry();
+const streamState={{result:streamResult,persisted:persisted.length}};
 S.activeStreamId=null;
+_anchorRegistryMap.set('stream-A',{{generation:'B'}});
+scheduleRetry(assistantA,2,'stream-A',_anchorRegistry,ownerKey);
+const registryResult=deferredRetry();
+const registryState={{result:registryResult,persisted:persisted.length}};
+_anchorRegistryMap.set('stream-A',_anchorRegistry);
 S.session={{session_id:'sid-B'}};
-scheduleRetry(assistantA,0,'stream-A',_anchorRegistry,_messageIdentityKey(assistantA));
-deferredRetry();
-const sessionState={{aHasScene:Boolean(assistantA._anchor_activity_scene),persisted:persisted.length}};
-console.log(JSON.stringify({{staleState,positiveState,generationState,sessionState}}));
+scheduleRetry(assistantA,2,'stream-A',_anchorRegistry,ownerKey);
+const sessionResult=deferredRetry();
+const sessionState={{result:sessionResult,persisted:persisted.length}};
+console.log(JSON.stringify({{
+  positiveState,
+  ambiguousState,
+  ownerlessState,
+  streamState,
+  registryState,
+  sessionState,
+}}));
 """
     result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, check=False)
 
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
-    assert data["staleState"] == {
+    assert data["positiveState"] == {
+        "ownerKeyPresent": True,
+        "initialResult": True,
+        "firstResult": True,
+        "secondResult": True,
+        "thirdResult": True,
+        "persistedAfterInitial": 1,
+        "persistedAfterRefresh": 1,
+        "persistedAfterLateRow": 2,
+        "refreshedHasScene": True,
+        "persisted": 2,
+    }
+    assert data["ambiguousState"] == {
         "result": False,
         "bHasScene": False,
         "bStreamId": None,
-        "persisted": 0,
+        "persisted": 2,
     }
-    assert data["positiveState"] == {
-        "firstResult": True,
-        "secondResult": True,
-        "aHasScene": True,
+    assert data["ownerlessState"] == {
+        "ownerKey": "",
+        "exactResult": True,
+        "replacementResult": False,
         "bHasScene": False,
-        "persisted": 1,
+        "persisted": 3,
     }
-    assert data["generationState"] == {"aHasScene": True, "persisted": 1}
-    assert data["sessionState"] == {"aHasScene": True, "persisted": 1}
+    assert data["streamState"] == {"result": False, "persisted": 3}
+    assert data["registryState"] == {"result": False, "persisted": 3}
+    assert data["sessionState"] == {"result": False, "persisted": 3}
 
 
 def test_connection_error_terminal_message_attaches_projected_anchor_scene_before_render():
