@@ -2112,7 +2112,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     : '';
   assistantText = _lastLiveAssistant ? _lastLiveAssistant : '';
   reasoningText=_lastLiveReasoning ? _lastLiveReasoning : '';
-  let liveReasoningText = reasoningText;
+  // Reattached reasoning is already represented by restored Anchor rows. New
+  // stream events belong to the fresh tail segment, not that aggregate text.
+  let liveReasoningText = reconnecting ? '' : reasoningText;
   let visibleInterimSnippets=[];
   let _latestGoalStatus=null;
   let _pendingGoalContinuation=null;
@@ -3336,6 +3338,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const text=_anchorSceneMessageText(message);
       const contentRows=_anchorSceneRowsFromContentParts(message,idx,{isFinalMessage:idx===lastAsstIndex});
       const hasOrderedContentRows=Array.isArray(contentRows)&&contentRows.length>0;
+      const hasOrderedContentThinking=hasOrderedContentRows&&contentRows.some(row=>row&&row.role==='thinking');
       const contentToolRows=[];
       const usedContentToolRows=new Set();
       const idFlexibleContentToolRows=new Set();
@@ -3352,7 +3355,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         pool.push({..._anchorSceneProseRow(text,0,idx),_phase:2,_encounter:encounter++});
       }
       const reasoning=_anchorSceneMessageReasoningText(message);
-      if(_anchorSceneCleanText(reasoning)&&_anchorSceneTextKey(reasoning)!==_anchorSceneTextKey(text)){
+      if(!hasOrderedContentThinking&&_anchorSceneCleanText(reasoning)&&_anchorSceneTextKey(reasoning)!==_anchorSceneTextKey(text)){
         pool.push({..._anchorSceneThinkingRow(reasoning,0,idx),_phase:0,_encounter:encounter++});
       }
       const messageTools=[];
@@ -3482,12 +3485,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return false;
   }
-  function _anchorSceneSettleLiveRunningRow(row, hasSettledThinking){
+  function _anchorSceneSettleLiveRunningRow(row, dropLiveThinking){
     if(!row||typeof row!=='object') return row;
     if(row.role!=='thinking'&&row.role!=='prose'&&row.role!=='tool') return row;
+    const hasLiveIdentity=_anchorSceneRowHasLiveIdentity(row);
+    if(row.role==='thinking'&&dropLiveThinking&&hasLiveIdentity) return null;
     if(String(row.status||'').toLowerCase()!=='running') return row;
-    if(!_anchorSceneRowHasLiveIdentity(row)) return row;
-    if(row.role==='thinking'&&hasSettledThinking) return null;
+    if(!hasLiveIdentity) return row;
     const sealed={...row,status:'completed'};
     if(row.payload&&typeof row.payload==='object'){
       sealed.payload={...row.payload,status:'completed'};
@@ -3573,6 +3577,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const seen=new Set();
     const seenTextKeys=[];
     const projectedRows=Array.isArray(base.activity_rows)?base.activity_rows:[];
+    const projectedReasoningKey=_anchorSceneTextKey(projectedRows
+      .filter(row=>row&&row.role==='thinking'&&_anchorSceneCleanText(row.text))
+      .map(row=>row.text).join(''));
+    const settledReasoningParts=[];
+    for(const bucket of messageRows.values()){
+      for(const row of (Array.isArray(bucket)?bucket:[])){
+        if(row&&row.role==='thinking'&&_anchorSceneCleanText(row.text)) settledReasoningParts.push(row.text);
+      }
+    }
+    const settledReasoningKey=_anchorSceneTextKey(settledReasoningParts.join(''));
+    const preferProjectedThinking=!!projectedReasoningKey&&(
+      !settledReasoningKey||projectedReasoningKey===settledReasoningKey
+    );
+    const dropProjectedThinking=hasSettledThinking&&!preferProjectedThinking;
     const orderedRows=[];
     for(const row of projectedRows){
       if(row&&row.role==='terminal') continue;
@@ -3580,7 +3598,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     for(let idx=turnStart+1;idx<=lastAsstIndex;idx+=1){
       const bucket=messageRows.get(idx)||[];
-      for(const row of bucket) orderedRows.push(row);
+      for(const row of bucket){
+        if(preferProjectedThinking&&row&&row.role==='thinking') continue;
+        orderedRows.push(row);
+      }
     }
     for(const row of projectedRows){
       if(row&&row.role==='terminal') orderedRows.push(row);
@@ -3603,7 +3624,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const pushRow=(row)=>{
       if(!row||typeof row!=='object') return;
       const finalSegmentEligible=finalSegmentLiveProseRows.has(row);
-      row=_anchorSceneSettleLiveRunningRow(row,hasSettledThinking);
+      row=_anchorSceneSettleLiveRunningRow(row,dropProjectedThinking);
       if(!row||typeof row!=='object') return;
       const textKey=_anchorSceneTextKey(row.text);
       if(rowIsLiveTokenFinalPrefix(row,textKey,finalSegmentEligible)) return;

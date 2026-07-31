@@ -128,6 +128,17 @@ def test_loadsession_has_generation_token_and_forwards_to_ensure_messages_loaded
     ), "loadSession() should preserve toast-based failure paths"
 
 
+def test_new_session_does_not_reclaim_newer_navigation_owner():
+    start = SESSIONS_SRC.index("async function newSession(")
+    end = SESSIONS_SRC.index("\nasync function ", start + 1)
+    body = SESSIONS_SRC[start:end]
+    assert "_loadSessionGeneration += 1" in body, (
+        "New Chat must invalidate an older load before its POST begins"
+    )
+    assert "const _newSessionGeneration=typeof _loadSessionGeneration==='number'?_loadSessionGeneration:null" in body
+    assert "if(_newSessionGeneration!==null && _loadSessionGeneration!==_newSessionGeneration) return;" in body, (
+        "a New Chat response must yield when a newer sidebar load owns the pane"
+    )
 def test_ensure_messages_loaded_ownership_guard_pre_and_post_await():
     body = ENSURE_MESSAGES_LOADED_SRC
     assert "_loadSessionGeneration" in body, "_ensureMessagesLoaded should read generation"
