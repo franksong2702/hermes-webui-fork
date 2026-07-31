@@ -810,7 +810,9 @@ def read_run_events(
             "malformed": malformed,
         }
 
-    row_cap = None if max_rows is None else max(0, int(max_rows))
+    row_cap = None if max_rows is None else int(max_rows)
+    if row_cap is not None and row_cap < 1:
+        raise ValueError("max_rows must be at least 1")
     byte_cap = None if max_bytes is None else max(0, int(max_bytes))
     floor = int(after_seq) if after_seq is not None else None
     ceiling = int(max_seq) if max_seq is not None else None
@@ -843,6 +845,16 @@ def read_run_events(
             if seq is None:
                 malformed.append({"line": line_no, "reason": identity_error})
                 continue
+            event = None
+            if raw_bytes is not None:
+                try:
+                    event = json.loads(raw_bytes.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    malformed.append({"line": line_no, "raw": ""})
+                    continue
+                if not isinstance(event, dict):
+                    malformed.append({"line": line_no, "raw": ""})
+                    continue
             if seq <= last_physical_seq:
                 malformed.append({"line": line_no, "reason": "replay_invalid_seq_order"})
                 continue
@@ -866,14 +878,7 @@ def read_run_events(
                     line_no=line_no, reason="replay_limit_bytes",
                     next_after_seq=seq,
                 )
-            try:
-                event = json.loads(raw_bytes.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                malformed.append({"line": line_no, "raw": ""})
-                continue
-            if not isinstance(event, dict):
-                malformed.append({"line": line_no, "raw": ""})
-                continue
+            assert event is not None
             event_size = _serialized_event_size(event)
             if byte_cap is not None and emitted_bytes + event_size > byte_cap:
                 if event_size <= byte_cap:

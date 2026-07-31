@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import api.run_journal as run_journal
 from api.run_journal import (
     RunJournalWriter,
@@ -490,6 +492,51 @@ def test_run_journal_bounded_reader_fails_closed_on_duplicate_and_out_of_order_s
     ]
     assert journal["next_after_seq"] == 4
     assert journal["complete"] is True
+
+
+def test_run_journal_bounded_reader_invalid_json_cannot_advance_seq_authority(tmp_path):
+    session_id = "session_invalid_json_order"
+    run_id = "run_invalid_json_order"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True)
+    malformed = (
+        b'{"version":1,"event_id":"'
+        + f"{run_id}:999".encode("utf-8")
+        + b'","seq":999,"run_id":"'
+        + run_id.encode("utf-8")
+        + b'","session_id":"'
+        + session_id.encode("utf-8")
+        + b'","event":"token","type":"token","payload":{,,,,}}\n'
+    )
+    valid = _bounded_event(session_id, run_id, 1, "valid")
+    path.write_bytes(
+        malformed
+        + json.dumps(valid, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+
+    journal = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=4096, max_rows=2,
+    )
+
+    assert [event["seq"] for event in journal["events"]] == [1]
+    assert journal["malformed"] == [{"line": 1, "raw": ""}]
+    assert journal["next_after_seq"] == 1
+    assert journal["complete"] is True
+
+
+@pytest.mark.parametrize("max_rows", [0, -1])
+def test_run_journal_bounded_reader_rejects_nonpositive_row_cap(tmp_path, max_rows):
+    session_id = "session_zero_row_cap"
+    run_id = "run_zero_row_cap"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    _write_bounded_events(path, [_bounded_event(session_id, run_id, 1, "one")])
+
+    for _attempt in range(2):
+        with pytest.raises(ValueError, match="max_rows must be at least 1"):
+            read_run_events(
+                session_id, run_id, session_dir=tmp_path, max_rows=max_rows,
+            )
 
 
 def test_run_journal_default_fsyncs_terminal_events_only(tmp_path, monkeypatch):
