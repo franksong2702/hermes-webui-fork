@@ -440,6 +440,22 @@ def test_anchor_scene_persistence_trims_artifact_budget_instead_of_rejecting_sce
         "artifacts": artifacts,
         "side_effects": [],
     }
+    monkeypatch.setattr(
+        routes,
+        "_run_journal_live_snapshot",
+        lambda stream_id, handler=None: {
+            "session_id": "artifact-budget",
+            "stream_id": stream_id,
+            "anchor_activity_scene": {
+                "identity": {
+                    "session_id": "artifact-budget",
+                    "run_id": "stream-budget",
+                    "stream_id": "stream-budget",
+                },
+                "artifacts": artifacts,
+            },
+        },
+    )
 
     captured = {}
     monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
@@ -962,6 +978,22 @@ def test_anchor_scene_persistence_accepts_stable_run_rotated_stream_once(tmp_pat
         event_id="run-stable:3",
         seq=3,
     )
+    monkeypatch.setattr(
+        routes,
+        "_run_journal_live_snapshot",
+        lambda stream_id, handler=None: {
+            "session_id": sid,
+            "stream_id": stream_id,
+            "anchor_activity_scene": {
+                "identity": {
+                    "session_id": sid,
+                    "run_id": "run-stable",
+                    "stream_id": "transport-new",
+                },
+                "artifacts": [old_transport_artifact],
+            },
+        },
+    )
 
     captured = _post_anchor_scene(
         monkeypatch,
@@ -1065,6 +1097,16 @@ def test_anchor_scene_persistence_merges_browser_post_after_worker_settlement(tm
     )
     session.save(skip_index=True)
 
+    wrong_source = json.loads(json.dumps(event))
+    wrong_source["payload"]["source_tool"] = "patch"
+    wrong_tool_call = json.loads(json.dumps(event))
+    wrong_tool_call["payload"]["tool_call_id"] = "call-invented"
+    wrong_event_id = json.loads(json.dumps(event))
+    wrong_event_id["event_id"] = "stream-late:999"
+    wrong_event_id["identity"]["event_id"] = "stream-late:999"
+    wrong_seq = json.loads(json.dumps(event))
+    wrong_seq["seq"] = 999
+    wrong_seq["identity"]["seq"] = 999
     stale_browser_scene = {
         "version": "activity_scene_v1",
         "mode": "compact_worklog",
@@ -1074,7 +1116,7 @@ def test_anchor_scene_persistence_merges_browser_post_after_worker_settlement(tm
             "stream_id": "stream-late",
         },
         "activity_rows": [{"row_id": "browser-tool", "role": "tool", "tool_call_id": "call-late"}],
-        "artifacts": [],
+        "artifacts": [event, wrong_source, wrong_tool_call, wrong_event_id, wrong_seq],
         "side_effects": [{"kind": "browser-row"}],
     }
 
@@ -1108,10 +1150,164 @@ def test_anchor_scene_persistence_merges_browser_post_after_worker_settlement(tm
     record = next(iter(raw["anchor_activity_scenes"].values()))
     scene = record["scene"]
     assert record["owner_authority"] == "server"
+    assert record["artifact_authority"] == "server"
     assert scene["activity_rows"] == stale_browser_scene["activity_rows"]
     assert scene["side_effects"] == stale_browser_scene["side_effects"]
     assert scene["terminal_state"] == "cancelled"
+    assert len(scene["artifacts"]) == 1
     assert scene["artifacts"][0]["payload"]["path"] == "reports/late-worker.md"
+    assert scene["artifacts"][0]["payload"]["source_tool"] == "write_file"
+    assert scene["artifacts"][0]["payload"]["tool_call_id"] == "call-late"
+
+
+def test_anchor_scene_persistence_drops_browser_artifact_without_server_evidence(tmp_path, monkeypatch):
+    from api import models, routes, streaming
+    from api.artifact_references import anchor_artifact_event_from_payload
+    from api.models import Session
+
+    session_dir = _install_anchor_scene_store(tmp_path, monkeypatch, models, routes)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sid = "artifact-browser-invention"
+    stream_id = "stream-browser-invention"
+    session = Session(
+        session_id=sid,
+        workspace=workspace,
+        messages=[{"role": "user", "content": "write then cancel", "timestamp": 1}],
+    )
+    streaming._finalize_cancelled_turn(
+        session,
+        stream_id=stream_id,
+        run_id=stream_id,
+        artifact_events=[],
+    )
+
+    invented = anchor_artifact_event_from_payload(
+        {
+            "kind": "workspace_file",
+            "path": "reports/never-written.md",
+            "source_tool": "write_file",
+            "tool_call_id": "call-never-ran",
+        },
+        session_id=sid,
+        run_id=stream_id,
+        stream_id=stream_id,
+        event_id=f"{stream_id}:7",
+        seq=7,
+    )
+    captured = _post_anchor_scene(
+        monkeypatch,
+        routes,
+        {
+            "session_id": sid,
+            "stream_id": stream_id,
+            "message_index": 1,
+            "scene": {
+                "version": "activity_scene_v1",
+                "mode": "compact_worklog",
+                "identity": {
+                    "session_id": sid,
+                    "run_id": stream_id,
+                    "stream_id": stream_id,
+                },
+                "activity_rows": [{"row_id": "browser-tool", "role": "tool"}],
+                "artifacts": [invented],
+            },
+        },
+    )
+
+    assert captured["status"] == 200
+    raw = json.loads((session_dir / f"{sid}.json").read_text(encoding="utf-8"))
+    record = next(iter(raw["anchor_activity_scenes"].values()))
+    assert record["scene"]["artifacts"] == []
+
+    loaded = Session.load(sid)
+    hydrated = routes._hydrate_anchor_activity_scenes(
+        loaded.messages,
+        loaded.anchor_activity_scenes,
+    )
+    assert hydrated[1]["_anchor_activity_scene"]["artifacts"] == []
+
+
+def test_anchor_scene_hydration_drops_legacy_and_corrupt_artifact_rows(tmp_path):
+    from api import routes
+    from api.artifact_references import anchor_artifact_event_from_payload
+
+    sid = "artifact-read-authority"
+    stream_id = "stream-read-authority"
+    messages = [
+        {"role": "user", "content": "write"},
+        {
+            "role": "assistant",
+            "content": "done",
+            "timestamp": 2,
+            "_anchor_run_id": stream_id,
+            "_anchor_stream_id": stream_id,
+        },
+    ]
+    message_ref = routes._assistant_anchor_scene_message_ref(messages[1])
+    event = anchor_artifact_event_from_payload(
+        {
+            "kind": "workspace_file",
+            "path": "reports/read-side.md",
+            "source_tool": "write_file",
+            "tool_call_id": "call-read-side",
+        },
+        session_id=sid,
+        run_id=stream_id,
+        stream_id=stream_id,
+        event_id=f"{stream_id}:4",
+        seq=4,
+    )
+    record = {
+        "message_index": 1,
+        "message_ref": message_ref,
+        "run_id": stream_id,
+        "stream_id": stream_id,
+        "owner_authority": "server",
+        "scene": {
+            "version": "activity_scene_v1",
+            "mode": "compact_worklog",
+            "identity": {
+                "session_id": sid,
+                "run_id": stream_id,
+                "stream_id": stream_id,
+            },
+            "activity_rows": [],
+            "artifacts": [event],
+        },
+    }
+
+    legacy = routes._hydrate_anchor_activity_scenes(
+        messages,
+        {message_ref: record},
+        session_id=sid,
+        workspace=tmp_path,
+    )
+    assert legacy[1]["_anchor_activity_scene"]["artifacts"] == []
+
+    corrupt_record = json.loads(json.dumps(record))
+    corrupt_record["artifact_authority"] = "server"
+    corrupt_record["scene"]["artifacts"][0]["run_id"] = "foreign-run"
+    corrupt_record["scene"]["artifacts"][0]["identity"]["run_id"] = "foreign-run"
+    corrupt = routes._hydrate_anchor_activity_scenes(
+        messages,
+        {message_ref: corrupt_record},
+        session_id=sid,
+        workspace=tmp_path,
+    )
+    assert corrupt[1]["_anchor_activity_scene"]["artifacts"] == []
+
+    unsafe_path_record = json.loads(json.dumps(record))
+    unsafe_path_record["artifact_authority"] = "server"
+    unsafe_path_record["scene"]["artifacts"][0]["payload"]["path"] = "../secret.md"
+    unsafe_path = routes._hydrate_anchor_activity_scenes(
+        messages,
+        {message_ref: unsafe_path_record},
+        session_id=sid,
+        workspace=tmp_path,
+    )
+    assert unsafe_path[1]["_anchor_activity_scene"]["artifacts"] == []
 
 
 def test_anchor_scene_persistence_prefers_unique_ref_over_stale_index(tmp_path, monkeypatch):

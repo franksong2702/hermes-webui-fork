@@ -666,6 +666,81 @@ def bound_anchor_artifact_events(
     return out
 
 
+def _artifact_authority_key(raw) -> tuple | None:
+    """Return the server event identity required to trust a browser projection."""
+    event = anchor_artifact_event_from_raw(raw)
+    if not event:
+        return None
+    payload = event.get('payload') if isinstance(event.get('payload'), dict) else {}
+    event_id = event.get('event_id')
+    session_id = event.get('session_id')
+    run_id = event.get('run_id')
+    stream_id = event.get('stream_id')
+    seq = event.get('seq')
+    path = payload.get('path')
+    source_tool = payload.get('source_tool')
+    if not all((session_id, run_id, stream_id, path, source_tool)) or seq is None:
+        return None
+    return (
+        event_id,
+        session_id,
+        run_id,
+        stream_id,
+        seq,
+        payload.get('kind'),
+        path,
+        source_tool,
+        payload.get('tool_call_id'),
+    )
+
+
+def retain_server_authoritative_artifact_events(
+    authoritative_events,
+    projected_events,
+    *,
+    session_id=None,
+    run_id=None,
+    stream_id=None,
+) -> list[dict]:
+    """Return canonical server events exactly represented by a client projection."""
+    canonical = bound_anchor_artifact_events(
+        list(authoritative_events or []),
+        session_id=session_id,
+        run_id=run_id,
+        stream_id=stream_id,
+        reject_owner_mismatch=True,
+        require_owner_authority=True,
+    )
+    by_key = {}
+    for event in canonical:
+        key = _artifact_authority_key(event)
+        if key is not None and key not in by_key:
+            by_key[key] = event
+
+    retained = []
+    for raw in projected_events if isinstance(projected_events, list) else []:
+        mismatch = anchor_artifact_owner_mismatch(
+            raw,
+            session_id=session_id,
+            run_id=run_id,
+            stream_id=stream_id,
+            require_owner_authority=True,
+        )
+        if mismatch:
+            raise ValueError(f'anchor scene owner mismatch: artifact.{mismatch}')
+        key = _artifact_authority_key(raw)
+        if key is not None and key in by_key:
+            retained.append(by_key[key])
+    return bound_anchor_artifact_events(
+        retained,
+        session_id=session_id,
+        run_id=run_id,
+        stream_id=stream_id,
+        reject_owner_mismatch=True,
+        require_owner_authority=True,
+    )
+
+
 def bound_anchor_activity_scene_artifacts(
     scene,
     *,

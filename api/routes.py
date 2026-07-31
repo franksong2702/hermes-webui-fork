@@ -66,6 +66,7 @@ from api.artifact_references import (
     bound_anchor_activity_scene_artifacts,
     bound_anchor_artifact_events,
     merge_anchor_activity_scene,
+    retain_server_authoritative_artifact_events,
     validate_anchor_activity_scene_artifact_paths,
 )
 
@@ -4912,7 +4913,15 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
     return repaired
 
 
-def _hydrate_anchor_activity_scenes(messages, records, *, message_offset=0, tool_calls=None):
+def _hydrate_anchor_activity_scenes(
+    messages,
+    records,
+    *,
+    message_offset=0,
+    tool_calls=None,
+    session_id=None,
+    workspace=None,
+):
     if not isinstance(messages, list) or not isinstance(records, dict) or not records:
         return messages
     by_ref = {}
@@ -4961,6 +4970,27 @@ def _hydrate_anchor_activity_scenes(messages, records, *, message_offset=0, tool
         scene = record.get("scene")
         if not isinstance(scene, dict):
             continue
+        scene = copy.deepcopy(scene)
+        raw_artifacts = scene.get("artifacts") if isinstance(scene.get("artifacts"), list) else []
+        if raw_artifacts:
+            if str(record.get("artifact_authority") or "") != "server":
+                scene["artifacts"] = []
+            else:
+                scene_identity = scene.get("identity") if isinstance(scene.get("identity"), dict) else {}
+                artifact_session_id = str(session_id or scene_identity.get("session_id") or "").strip()
+                artifact_run_id = str(record.get("run_id") or scene_identity.get("run_id") or "").strip()
+                artifact_stream_id = str(record.get("stream_id") or scene_identity.get("stream_id") or "").strip()
+                try:
+                    scene["artifacts"] = retain_server_authoritative_artifact_events(
+                        raw_artifacts,
+                        raw_artifacts,
+                        session_id=artifact_session_id,
+                        run_id=artifact_run_id,
+                        stream_id=artifact_stream_id,
+                    )
+                    validate_anchor_activity_scene_artifact_paths(scene, workspace)
+                except ValueError:
+                    scene["artifacts"] = []
         next_message = dict(message)
         stream_id = record.get("stream_id")
         scene_identity = scene.get("identity") if isinstance(scene.get("identity"), dict) else {}
@@ -5033,6 +5063,7 @@ def _handle_session_anchor_scene(handler, body):
         existing_scene = existing_record.get("scene") if isinstance(existing_record.get("scene"), dict) else {}
         existing_identity = existing_scene.get("identity") if isinstance(existing_scene.get("identity"), dict) else {}
         existing_authoritative = str(existing_record.get("owner_authority") or "") == "server"
+        existing_artifact_authoritative = str(existing_record.get("artifact_authority") or "") == "server"
         raw_artifacts = raw_scene.get("artifacts") if isinstance(raw_scene, dict) else None
         incoming_has_artifacts = isinstance(raw_artifacts, list) and bool(raw_artifacts)
         request_stream_id = str(body.get("stream_id") or "").strip()
@@ -5058,6 +5089,42 @@ def _handle_session_anchor_scene(handler, body):
             return bad(handler, "scene.stream_id does not match assistant message", 400)
         incoming_scene = copy.deepcopy(raw_scene) if isinstance(raw_scene, dict) else scene
         try:
+            authoritative_artifacts = []
+            if existing_artifact_authoritative:
+                authoritative_artifacts.extend(existing_scene.get("artifacts") or [])
+            if incoming_has_artifacts and trusted_run_id and trusted_stream_id:
+                snapshot = _run_journal_live_snapshot(trusted_stream_id, handler=handler)
+                snapshot_scene = (
+                    snapshot.get("anchor_activity_scene")
+                    if isinstance(snapshot, dict) and isinstance(snapshot.get("anchor_activity_scene"), dict)
+                    else {}
+                )
+                snapshot_identity = (
+                    snapshot_scene.get("identity")
+                    if isinstance(snapshot_scene.get("identity"), dict)
+                    else {}
+                )
+                if (
+                    str((snapshot or {}).get("session_id") or "").strip() == sid
+                    and str(snapshot_identity.get("run_id") or "").strip() == trusted_run_id
+                    and str(snapshot_identity.get("stream_id") or "").strip() == trusted_stream_id
+                ):
+                    authoritative_artifacts.extend(snapshot_scene.get("artifacts") or [])
+            existing_scene = copy.deepcopy(existing_scene)
+            existing_scene["artifacts"] = retain_server_authoritative_artifact_events(
+                authoritative_artifacts,
+                existing_scene.get("artifacts") or [],
+                session_id=sid,
+                run_id=trusted_run_id,
+                stream_id=trusted_stream_id,
+            )
+            incoming_scene["artifacts"] = retain_server_authoritative_artifact_events(
+                authoritative_artifacts,
+                raw_artifacts or [],
+                session_id=sid,
+                run_id=trusted_run_id,
+                stream_id=trusted_stream_id,
+            )
             scene = merge_anchor_activity_scene(
                 existing_scene,
                 incoming_scene,
@@ -5086,6 +5153,8 @@ def _handle_session_anchor_scene(handler, body):
         }
         if trusted_run_id and trusted_stream_id:
             record["owner_authority"] = "server"
+        if scene.get("artifacts") and authoritative_artifacts:
+            record["artifact_authority"] = "server"
         records[ref or f"index:{idx}"] = record
         if len(records) > 256:
             ordered = sorted(
@@ -12857,6 +12926,8 @@ def handle_get(handler, parsed) -> bool:
                     getattr(s, "anchor_activity_scenes", None),
                     message_offset=_messages_offset,
                     tool_calls=getattr(s, "tool_calls", None),
+                    session_id=getattr(s, "session_id", None),
+                    workspace=getattr(s, "workspace", None),
                 )
             else:
                 _truncated_msgs = []

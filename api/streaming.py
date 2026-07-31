@@ -2172,6 +2172,7 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
         'run_id': run_id,
         'stream_id': stream_id,
         'owner_authority': 'server',
+        'artifact_authority': 'server',
         'scene': scene,
         'updated_at': time.time(),
     }

@@ -354,6 +354,14 @@ cache/dependency/VCS paths, and root-level build output paths are excluded. The
 browser attaches the event to the active Anchor without adding a Worklog row or
 repainting the live scene.
 
+Browser scenes are projections, not artifact authority. Persistence retains a
+browser artifact only when its server-owned event identity and descriptor exactly
+match settlement or run-journal evidence for the same session, run, and stream.
+Run-journal event IDs are matched when available; the server-owned positive event
+sequence remains authoritative if journal ID creation failed.
+Reload hydration drops artifact rows from records without explicit server
+artifact authority or with invalid owner/path evidence.
+
 ## Dedupe Invariant
 
 Anchor event dedupe is intentionally independent of visible text and timestamps.

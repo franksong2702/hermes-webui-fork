@@ -752,7 +752,9 @@ def test_server_terminal_reconciliation_persists_artifact_only_scene_without_bro
     from api.models import Session
 
     session_dir = tmp_path / "sessions"
+    workspace = tmp_path / "workspace"
     session_dir.mkdir()
+    workspace.mkdir()
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
     monkeypatch.setattr(models, "SESSIONS", OrderedDict())
@@ -761,6 +763,7 @@ def test_server_terminal_reconciliation_persists_artifact_only_scene_without_bro
 
     session = Session(
         session_id="artifact-bg",
+        workspace=workspace,
         messages=[
             {"role": "user", "content": "write a file", "timestamp": 1},
             {"role": "assistant", "content": "done", "timestamp": 2},
@@ -776,7 +779,7 @@ def test_server_terminal_reconciliation_persists_artifact_only_scene_without_bro
         session_id=session.session_id,
         run_id="stream-bg",
         stream_id="stream-bg",
-        event_id="stream-bg:7",
+        event_id=None,
         seq=7,
     )
 
@@ -794,13 +797,17 @@ def test_server_terminal_reconciliation_persists_artifact_only_scene_without_bro
     record = next(iter(raw["anchor_activity_scenes"].values()))
     assert record["message_index"] == 1
     assert record["stream_id"] == "stream-bg"
+    assert record["artifact_authority"] == "server"
     assert record["scene"]["activity_rows"] == []
+    assert record["scene"]["artifacts"][0]["event_id"] is None
     assert record["scene"]["artifacts"][0]["payload"]["path"] == "reports/background.md"
 
     loaded = Session.load("artifact-bg")
     hydrated = routes._hydrate_anchor_activity_scenes(
         loaded.messages,
         loaded.anchor_activity_scenes,
+        session_id=loaded.session_id,
+        workspace=loaded.workspace,
     )
     assert hydrated[1]["_anchor_activity_scene"]["artifacts"][0]["payload"]["path"] == "reports/background.md"
 
