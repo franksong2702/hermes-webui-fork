@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import api.run_journal as run_journal
 from api.run_journal import (
     RunJournalWriter,
     append_run_event,
@@ -85,11 +86,102 @@ def test_run_journal_bounded_reader_keeps_suffix_after_large_prefix(tmp_path):
     append_run_event(session_id, run_id, "done", {"session": {}}, session_dir=tmp_path, seq=2)
 
     journal = read_run_events(
-        session_id, run_id, after_seq=1, session_dir=tmp_path, max_bytes=32, max_rows=1,
+        session_id, run_id, after_seq=1, session_dir=tmp_path, max_bytes=512, max_rows=1,
     )
 
     assert journal["complete"] is True
     assert [event["seq"] for event in journal["events"]] == [2]
+
+
+def test_run_journal_recovery_marker_is_inclusive_of_byte_cap(tmp_path):
+    session_id = "session_marker_cap"
+    run_id = "run_marker_cap"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True)
+    oversized_terminal = {
+        "version": 1, "event_id": f"{run_id}:1", "seq": 1, "run_id": run_id,
+        "session_id": session_id, "event": "done", "type": "done", "terminal": True,
+        "terminal_state": "completed", "payload": {"session": {"messages": [{"content": "x" * 1000}]}},
+    }
+    path.write_text(json.dumps(oversized_terminal) + "\n", encoding="utf-8")
+
+    journal = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=512, max_rows=1,
+    )
+
+    assert journal["complete"] is True
+    assert journal["events"][0]["payload"]["terminal_disposition"]["kind"] == "consumed_non_materializable"
+    assert run_journal._serialized_event_size(journal["events"][0]) <= 512
+
+
+def test_run_journal_bounded_reader_advances_past_oversized_nonterminal_row(tmp_path):
+    session_id = "session_bounded_cursor"
+    run_id = "run_bounded_cursor"
+    append_run_event(session_id, run_id, "token", {"text": "x" * 2048}, session_dir=tmp_path, seq=1)
+    append_run_event(session_id, run_id, "done", {"session": {}}, session_dir=tmp_path, seq=2)
+
+    first_page = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=64, max_rows=1,
+    )
+    second_page = read_run_events(
+        session_id, run_id, after_seq=first_page["next_after_seq"],
+        session_dir=tmp_path, max_bytes=512, max_rows=1,
+    )
+
+    assert first_page["events"] == []
+    assert first_page["complete"] is False
+    assert first_page["limit_reason"] == "replay_limit_bytes"
+    assert first_page["next_after_seq"] == 1
+    assert [event["seq"] for event in second_page["events"]] == [2]
+
+
+def test_run_journal_bounded_reader_ignores_overcap_row_outside_window(tmp_path):
+    session_id = "session_bounded_window"
+    run_id = "run_bounded_window"
+    append_run_event(session_id, run_id, "token", {"text": "ok"}, session_dir=tmp_path, seq=1)
+    append_run_event(session_id, run_id, "done", {"session": {"messages": [{"content": "x" * 1000}]}}, session_dir=tmp_path, seq=2)
+
+    journal = read_run_events(
+        session_id, run_id, max_seq=1, session_dir=tmp_path, max_bytes=512, max_rows=1,
+    )
+
+    assert journal["complete"] is True
+    assert journal["limit_reason"] is None
+    assert [event["seq"] for event in journal["events"]] == [1]
+
+
+def test_run_journal_bounded_reader_limits_line_read_before_decode(tmp_path, monkeypatch):
+    session_id = "session_bounded_read"
+    run_id = "run_bounded_read"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    oversized_row = b'{"seq":1,"event":"token","payload":{"text":"' + b"x" * (run_journal._LEGACY_TERMINAL_RECOVERY_MAX_BYTES + 1) + b'"}}\n'
+
+    class BoundedReader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def readline(self, limit):
+            assert limit == run_journal._LEGACY_TERMINAL_RECOVERY_MAX_BYTES + 1
+            return oversized_row[:limit]
+
+    real_open = Path.open
+
+    def patched_open(candidate, *args, **kwargs):
+        if candidate == path:
+            return BoundedReader()
+        return real_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", patched_open)
+    journal = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=512,
+    )
+
+    assert journal["complete"] is False
+    assert journal["limit_reason"] == "replay_limit_bytes"
+    assert journal["next_after_seq"] == 1
 
 
 def test_run_journal_default_fsyncs_terminal_events_only(tmp_path, monkeypatch):
