@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -167,32 +168,31 @@ def test_run_journal_bounded_reader_limits_line_read_before_decode(tmp_path, mon
         + b"x" * (run_journal._LEGACY_TERMINAL_RECOVERY_MAX_BYTES + 1)
         + b'"}}\n'
     )
+    path.parent.mkdir(parents=True)
+    path.write_bytes(oversized_row)
 
     class BoundedReader:
-        def __init__(self):
-            self.offset = 0
+        def __init__(self, fh):
+            self._fh = fh
 
         def __enter__(self):
             return self
 
-        def __exit__(self, *_args):
-            return None
+        def __exit__(self, *args):
+            return self._fh.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._fh, name)
 
         def readline(self, limit):
             assert 0 < limit <= run_journal._SESSION_REPLAY_READ_CHUNK_BYTES
-            if self.offset >= len(oversized_row):
-                return b""
-            end = min(self.offset + limit, len(oversized_row))
-            chunk = oversized_row[self.offset:end]
-            self.offset = end
-            return chunk
+            return self._fh.readline(limit)
 
     real_open = Path.open
 
     def patched_open(candidate, *args, **kwargs):
-        if candidate == path:
-            return BoundedReader()
-        return real_open(candidate, *args, **kwargs)
+        fh = real_open(candidate, *args, **kwargs)
+        return BoundedReader(fh) if candidate == path else fh
 
     monkeypatch.setattr(Path, "open", patched_open)
     journal = read_run_events(
@@ -598,6 +598,303 @@ def test_run_journal_bounded_reader_pages_hard_terminal_recovery_marker(
     }
     assert second_page["complete"] is True
     assert second_page["next_after_seq"] == 2
+
+
+@pytest.mark.parametrize("hard_row", [False, True], ids=["retained-row", "hard-row"])
+def test_run_journal_bounded_reader_retries_terminal_marker_after_too_small_page(
+    tmp_path,
+    monkeypatch,
+    hard_row,
+):
+    threshold = 256 if hard_row else 4096
+    monkeypatch.setattr(run_journal, "_LEGACY_TERMINAL_RECOVERY_MAX_BYTES", threshold)
+    session_id = f"session_terminal_retry_{hard_row}"
+    run_id = f"run_terminal_retry_{hard_row}"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    terminal = _bounded_event(session_id, run_id, 1, "unused")
+    terminal.update({
+        "event": "done",
+        "type": "done",
+        "terminal": True,
+        "terminal_state": "completed",
+        "payload": {"session": {"messages": [{"content": "x" * 1024}]}},
+    })
+    _write_bounded_events(path, [terminal])
+    marker = run_journal._recover_legacy_overcap_terminal_event(
+        terminal,
+        session_id=session_id,
+        run_id=run_id,
+        max_seq=None,
+    )
+    marker_size = run_journal._serialized_event_size(marker)
+
+    first_page = read_run_events(
+        session_id,
+        run_id,
+        session_dir=tmp_path,
+        max_bytes=marker_size - 1,
+        max_rows=1,
+    )
+    second_page = read_run_events(
+        session_id,
+        run_id,
+        after_seq=first_page["next_after_seq"],
+        resume_token=first_page["resume_token"],
+        session_dir=tmp_path,
+        max_bytes=marker_size,
+        max_rows=1,
+    )
+
+    assert first_page["events"] == []
+    assert first_page["complete"] is False
+    assert first_page["limit_reason"] == "replay_limit_bytes"
+    assert first_page["next_after_seq"] == 0
+    assert first_page["resume_token"]
+    assert [event["seq"] for event in second_page["events"]] == [1]
+    assert second_page["events"][0]["payload"]["terminal_disposition"]["kind"] == (
+        "consumed_non_materializable"
+    )
+    assert second_page["complete"] is True
+
+
+def test_run_journal_bounded_reader_resume_token_skips_delivered_prefix(tmp_path, monkeypatch):
+    session_id = "session_resume_offset"
+    run_id = "run_resume_offset"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    first = _bounded_event(session_id, run_id, 1, "one")
+    second = _bounded_event(session_id, run_id, 2, "two")
+    _write_bounded_events(path, [first, second])
+    expected_offset = len(json.dumps(first, separators=(",", ":")).encode("utf-8")) + 1
+
+    first_page = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_rows=1,
+    )
+    starts = []
+    original_reader = run_journal._read_bounded_physical_row
+
+    def tracked_reader(fh, *args, **kwargs):
+        starts.append(fh.tell())
+        return original_reader(fh, *args, **kwargs)
+
+    monkeypatch.setattr(run_journal, "_read_bounded_physical_row", tracked_reader)
+    second_page = read_run_events(
+        session_id,
+        run_id,
+        resume_token=first_page["resume_token"],
+        session_dir=tmp_path,
+        max_rows=1,
+    )
+
+    assert starts[0] == expected_offset
+    assert [event["seq"] for event in second_page["events"]] == [2]
+    assert second_page["complete"] is True
+
+
+def test_run_journal_bounded_reader_resume_token_survives_append(tmp_path):
+    session_id = "session_resume_append"
+    run_id = "run_resume_append"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    first = _bounded_event(session_id, run_id, 1, "one")
+    second = _bounded_event(session_id, run_id, 2, "two")
+    third = _bounded_event(session_id, run_id, 3, "three")
+    _write_bounded_events(path, [first, second])
+    first_page = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_rows=1,
+    )
+    with path.open("ab") as fh:
+        fh.write(json.dumps(third, separators=(",", ":")).encode("utf-8") + b"\n")
+
+    second_page = read_run_events(
+        session_id,
+        run_id,
+        resume_token=first_page["resume_token"],
+        session_dir=tmp_path,
+        max_rows=2,
+    )
+
+    assert [event["seq"] for event in second_page["events"]] == [2, 3]
+    assert second_page["complete"] is True
+
+
+def test_run_journal_bounded_reader_rejects_resume_token_after_window_change(tmp_path):
+    session_id = "session_resume_window"
+    run_id = "run_resume_window"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    _write_bounded_events(
+        path,
+        [
+            _bounded_event(session_id, run_id, 1, "one"),
+            _bounded_event(session_id, run_id, 2, "two"),
+            _bounded_event(session_id, run_id, 3, "three"),
+        ],
+    )
+    first_page = read_run_events(
+        session_id, run_id, max_seq=2, session_dir=tmp_path, max_rows=1,
+    )
+
+    resumed = read_run_events(
+        session_id,
+        run_id,
+        max_seq=3,
+        resume_token=first_page["resume_token"],
+        session_dir=tmp_path,
+        max_rows=1,
+    )
+
+    assert resumed["events"] == []
+    assert resumed["complete"] is False
+    assert resumed["limit_reason"] == "replay_cursor_invalid"
+
+
+def test_run_journal_bounded_reader_rejects_resume_token_after_file_replacement(tmp_path):
+    session_id = "session_replaced_resume"
+    run_id = "run_replaced_resume"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    events = [
+        _bounded_event(session_id, run_id, 1, "one"),
+        _bounded_event(session_id, run_id, 2, "two"),
+    ]
+    _write_bounded_events(path, events)
+    first_page = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_rows=1,
+    )
+    replacement = path.with_suffix(".replacement")
+    _write_bounded_events(replacement, events)
+    os.replace(replacement, path)
+
+    resumed = read_run_events(
+        session_id,
+        run_id,
+        after_seq=first_page["next_after_seq"],
+        resume_token=first_page["resume_token"],
+        session_dir=tmp_path,
+        max_rows=1,
+    )
+
+    assert resumed["events"] == []
+    assert resumed["complete"] is False
+    assert resumed["limit_reason"] == "replay_cursor_invalid"
+    assert resumed["next_after_seq"] == first_page["next_after_seq"]
+
+
+def test_run_journal_bounded_reader_caps_physical_scan_before_row_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_BOUNDED_REPLAY_MAX_SCAN_BYTES", 256, raising=False)
+    session_id = "session_scan_byte_cap"
+    run_id = "run_scan_byte_cap"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    _write_bounded_events(
+        path,
+        [_bounded_event(session_id, run_id, 1, "x" * 1024)],
+    )
+    real_open = Path.open
+    physical_bytes_read = 0
+
+    class CountingReader:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self._fh.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._fh, name)
+
+        def readline(self, limit=-1):
+            nonlocal physical_bytes_read
+            chunk = self._fh.readline(limit)
+            physical_bytes_read += len(chunk)
+            return chunk
+
+    def tracked_open(candidate, *args, **kwargs):
+        fh = real_open(candidate, *args, **kwargs)
+        return CountingReader(fh) if candidate == path else fh
+
+    monkeypatch.setattr(Path, "open", tracked_open)
+    journal = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=512, max_rows=1,
+    )
+
+    assert physical_bytes_read == 256
+    assert journal["events"] == []
+    assert journal["complete"] is False
+    assert journal["limit_reason"] == "replay_scan_limit_bytes"
+    assert journal["next_after_seq"] == 0
+    assert journal["scanned_bytes"] == 256
+
+
+def test_run_journal_bounded_reader_resumes_at_row_after_scan_budget_prefix(
+    tmp_path,
+    monkeypatch,
+):
+    session_id = "session_scan_prefix_resume"
+    run_id = "run_scan_prefix_resume"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    first = _bounded_event(session_id, run_id, 1, "one")
+    second = _bounded_event(session_id, run_id, 2, "x" * 1024)
+    _write_bounded_events(path, [first, second])
+    first_size = len(json.dumps(first, separators=(",", ":")).encode("utf-8")) + 1
+    monkeypatch.setattr(
+        run_journal,
+        "_BOUNDED_REPLAY_MAX_SCAN_BYTES",
+        first_size + 64,
+    )
+
+    first_page = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=4096, max_rows=2,
+    )
+    assert [event["seq"] for event in first_page["events"]] == [1]
+    assert first_page["complete"] is False
+    assert first_page["limit_reason"] == "replay_scan_limit_bytes"
+    assert first_page["next_after_seq"] == 1
+    assert first_page["resume_token"]
+
+    monkeypatch.setattr(run_journal, "_BOUNDED_REPLAY_MAX_SCAN_BYTES", 4096)
+    starts = []
+    original_reader = run_journal._read_bounded_physical_row
+
+    def tracked_reader(fh, *args, **kwargs):
+        starts.append(fh.tell())
+        return original_reader(fh, *args, **kwargs)
+
+    monkeypatch.setattr(run_journal, "_read_bounded_physical_row", tracked_reader)
+    second_page = read_run_events(
+        session_id,
+        run_id,
+        resume_token=first_page["resume_token"],
+        session_dir=tmp_path,
+        max_bytes=4096,
+        max_rows=2,
+    )
+
+    assert starts[0] == first_size
+    assert [event["seq"] for event in second_page["events"]] == [2]
+    assert second_page["complete"] is True
+
+
+def test_run_journal_bounded_reader_caps_malformed_flood_diagnostics(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_BOUNDED_REPLAY_MAX_SCAN_ROWS", 3, raising=False)
+    monkeypatch.setattr(run_journal, "_BOUNDED_REPLAY_MAX_MALFORMED", 2, raising=False)
+    session_id = "session_malformed_flood"
+    run_id = "run_malformed_flood"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"{bad}\n" * 10)
+
+    journal = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=512, max_rows=1,
+    )
+
+    assert journal["events"] == []
+    assert journal["complete"] is False
+    assert journal["limit_reason"] == "replay_scan_limit_rows"
+    assert journal["next_after_seq"] == 0
+    assert journal["scanned_rows"] == 3
+    assert journal["malformed_count"] == 3
+    assert len(journal["malformed"]) == 2
+    assert journal["resume_token"]
 
 
 def test_run_journal_bounded_reader_fails_closed_on_invalid_sequences(tmp_path):

@@ -5,6 +5,7 @@ the existing in-process streaming path without changing execution ownership.
 """
 from __future__ import annotations
 
+import base64
 import codecs
 import json
 import os
@@ -53,6 +54,10 @@ _SESSION_REPLAY_MAX_BYTES = 4 * 1024 * 1024
 _SESSION_REPLAY_MAX_ROWS = 4096
 _SESSION_REPLAY_READ_CHUNK_BYTES = 64 * 1024
 _LEGACY_TERMINAL_RECOVERY_MAX_BYTES = 16 * 1024 * 1024
+_BOUNDED_REPLAY_MAX_SCAN_BYTES = 32 * 1024 * 1024
+_BOUNDED_REPLAY_MAX_SCAN_ROWS = 4096
+_BOUNDED_REPLAY_MAX_MALFORMED = 64
+_REPLAY_RESUME_TOKEN_MAX_CHARS = 512
 _SNAPSHOT_ARGS_MAX_ITEMS = 64
 _SNAPSHOT_ARGS_MAX_DEPTH = 8
 _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
@@ -520,6 +525,89 @@ def _recover_legacy_overcap_terminal_event(
 
 def _serialized_event_size(event: dict) -> int:
     return len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
+
+
+def _encode_replay_resume_token(
+    fh,
+    *,
+    session_id: str,
+    run_id: str,
+    max_seq: int | None,
+    offset: int,
+    next_after_seq: int,
+    last_physical_seq: int,
+    line_no: int,
+) -> str:
+    stat = os.fstat(fh.fileno())
+    payload = {
+        "v": 1,
+        "d": int(stat.st_dev),
+        "i": int(stat.st_ino),
+        "o": int(offset),
+        "s": int(next_after_seq),
+        "p": int(last_physical_seq),
+        "l": int(line_no),
+        "c": max_seq,
+        "x": str(session_id),
+        "r": str(run_id),
+    }
+    encoded = json.dumps(payload, separators=(",", ":")).encode("ascii")
+    return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode("ascii")
+
+
+def _decode_replay_resume_token(
+    fh,
+    token: str,
+    *,
+    session_id: str,
+    run_id: str,
+    expected_after_seq: int | None,
+    expected_max_seq: int | None,
+) -> tuple[int, int, int, int] | None:
+    raw_token = str(token or "").strip()
+    if not raw_token or len(raw_token) > _REPLAY_RESUME_TOKEN_MAX_CHARS:
+        return None
+    try:
+        padding = "=" * (-len(raw_token) % 4)
+        raw = base64.b64decode(raw_token + padding, altchars=b"-_", validate=True)
+        payload = json.loads(raw.decode("ascii"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or set(payload) != {
+        "v", "d", "i", "o", "s", "p", "l", "c", "x", "r",
+    }:
+        return None
+    values = [payload[key] for key in ("v", "d", "i", "o", "s", "p", "l")]
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        return None
+    version, device, inode, offset, token_seq, physical_seq, line_no = values
+    token_max_seq = payload["c"]
+    if (
+        version != 1
+        or offset < 0
+        or token_seq < 0
+        or (expected_after_seq is not None and token_seq != expected_after_seq)
+        or physical_seq < token_seq
+        or line_no < 0
+        or isinstance(token_max_seq, bool)
+        or (token_max_seq is not None and not isinstance(token_max_seq, int))
+        or token_max_seq != expected_max_seq
+        or payload["x"] != str(session_id)
+        or payload["r"] != str(run_id)
+    ):
+        return None
+    try:
+        stat = os.fstat(fh.fileno())
+        if device != int(stat.st_dev) or inode != int(stat.st_ino) or offset > int(stat.st_size):
+            return None
+        if offset > 0 and offset != int(stat.st_size):
+            fh.seek(offset - 1)
+            if fh.read(1) != b"\n":
+                return None
+        fh.seek(offset)
+    except (OSError, ValueError):
+        return None
+    return offset, token_seq, physical_seq, line_no
 
 
 class _StreamingJsonValidator:
@@ -1119,13 +1207,18 @@ class _TopLevelEnvelopeScanner:
         )
 
 
-def _read_bounded_physical_row(fh) -> tuple[bytes | None, _TopLevelEnvelopeScanner] | None:
-    """Read and drain one JSONL row while retaining at most the hard-line ceiling."""
+def _read_bounded_physical_row(
+    fh,
+    *,
+    max_scan_bytes: int,
+) -> tuple[bytes | None, _TopLevelEnvelopeScanner, int, bool] | None:
+    """Read one JSONL row within the remaining aggregate physical-read budget."""
     scanner = _TopLevelEnvelopeScanner()
     retained = bytearray()
     total_bytes = 0
-    while True:
-        chunk = fh.readline(_SESSION_REPLAY_READ_CHUNK_BYTES)
+    while total_bytes < max_scan_bytes:
+        remaining_scan = max_scan_bytes - total_bytes
+        chunk = fh.readline(min(_SESSION_REPLAY_READ_CHUNK_BYTES, remaining_scan))
         if not chunk:
             break
         total_bytes += len(chunk)
@@ -1134,12 +1227,24 @@ def _read_bounded_physical_row(fh) -> tuple[bytes | None, _TopLevelEnvelopeScann
         if remaining > 0:
             retained.extend(chunk[:remaining])
         if chunk.endswith(b"\n"):
-            break
+            return (
+                None if total_bytes > _LEGACY_TERMINAL_RECOVERY_MAX_BYTES else bytes(retained),
+                scanner,
+                total_bytes,
+                True,
+            )
     if total_bytes == 0:
         return None
-    if total_bytes > _LEGACY_TERMINAL_RECOVERY_MAX_BYTES:
-        return None, scanner
-    return bytes(retained), scanner
+    try:
+        complete = fh.tell() >= int(os.fstat(fh.fileno()).st_size)
+    except (OSError, ValueError):
+        complete = False
+    return (
+        None if total_bytes > _LEGACY_TERMINAL_RECOVERY_MAX_BYTES else bytes(retained),
+        scanner,
+        total_bytes,
+        complete,
+    )
 
 
 def _replay_limit_result(
@@ -1151,11 +1256,23 @@ def _replay_limit_result(
     line_no: int,
     reason: str,
     next_after_seq: int,
+    resume_token: str | None,
+    scanned_bytes: int,
+    scanned_rows: int,
+    malformed_count: int,
+    record_limit_diagnostic: bool = True,
 ) -> dict:
+    diagnostics = list(malformed)
+    if record_limit_diagnostic and len(diagnostics) < _BOUNDED_REPLAY_MAX_MALFORMED:
+        diagnostics.append({"line": line_no, "reason": reason})
     return {
         "session_id": str(session_id), "run_id": str(run_id), "events": events,
-        "malformed": [*malformed, {"line": line_no, "reason": reason}],
+        "malformed": diagnostics,
         "complete": False, "limit_reason": reason, "next_after_seq": next_after_seq,
+        "resume_token": resume_token,
+        "scanned_bytes": scanned_bytes,
+        "scanned_rows": scanned_rows,
+        "malformed_count": malformed_count,
     }
 
 
@@ -1168,9 +1285,12 @@ def read_run_events(
     session_dir: Path | None = None,
     max_bytes: int | None = None,
     max_rows: int | None = None,
+    resume_token: str | None = None,
 ) -> dict:
     path = _run_path(session_id, run_id, session_dir=session_dir)
     if max_bytes is None and max_rows is None:
+        if resume_token is not None:
+            raise ValueError("resume_token requires bounded replay")
         events, malformed = _read_jsonl(path)
         if after_seq is not None:
             events = [event for event in events if int(event.get("seq") or 0) > int(after_seq)]
@@ -1191,7 +1311,10 @@ def read_run_events(
     ceiling = int(max_seq) if max_seq is not None else None
     events: list[dict] = []
     malformed: list[dict] = []
+    malformed_count = 0
     emitted_bytes = 0
+    scanned_bytes = 0
+    scanned_rows = 0
     next_after_seq = floor or 0
     last_physical_seq = 0
     try:
@@ -1201,15 +1324,116 @@ def read_run_events(
             "session_id": str(session_id), "run_id": str(run_id), "events": events,
             "malformed": malformed, "complete": True, "limit_reason": None,
             "next_after_seq": next_after_seq,
+            "resume_token": None, "scanned_bytes": 0, "scanned_rows": 0,
+            "malformed_count": 0,
         }
     with fh:
         line_no = 0
+
+        def continuation_token(
+            *,
+            offset: int,
+            logical_seq: int,
+            physical_seq: int,
+            completed_lines: int,
+        ) -> str:
+            return _encode_replay_resume_token(
+                fh,
+                session_id=str(session_id),
+                run_id=str(run_id),
+                max_seq=ceiling,
+                offset=offset,
+                next_after_seq=logical_seq,
+                last_physical_seq=physical_seq,
+                line_no=completed_lines,
+            )
+
+        if resume_token is not None:
+            resumed = _decode_replay_resume_token(
+                fh,
+                resume_token,
+                session_id=str(session_id),
+                run_id=str(run_id),
+                expected_after_seq=floor,
+                expected_max_seq=ceiling,
+            )
+            if resumed is None:
+                return _replay_limit_result(
+                    str(session_id), str(run_id), events, malformed,
+                    line_no=0, reason="replay_cursor_invalid",
+                    next_after_seq=next_after_seq, resume_token=None,
+                    scanned_bytes=0, scanned_rows=0, malformed_count=0,
+                    record_limit_diagnostic=False,
+                )
+            _offset, next_after_seq, last_physical_seq, line_no = resumed
+            floor = next_after_seq
+        page_start_offset = fh.tell()
         while True:
-            row = _read_bounded_physical_row(fh)
+            try:
+                at_eof = fh.tell() >= int(os.fstat(fh.fileno()).st_size)
+            except (OSError, ValueError):
+                at_eof = False
+            if at_eof:
+                break
+            if scanned_rows >= _BOUNDED_REPLAY_MAX_SCAN_ROWS:
+                continuation = continuation_token(
+                    offset=fh.tell(),
+                    logical_seq=next_after_seq,
+                    physical_seq=last_physical_seq,
+                    completed_lines=line_no,
+                )
+                return _replay_limit_result(
+                    str(session_id), str(run_id), events, malformed,
+                    line_no=line_no + 1, reason="replay_scan_limit_rows",
+                    next_after_seq=next_after_seq, resume_token=continuation,
+                    scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
+                    malformed_count=malformed_count, record_limit_diagnostic=False,
+                )
+            remaining_scan_bytes = _BOUNDED_REPLAY_MAX_SCAN_BYTES - scanned_bytes
+            if remaining_scan_bytes <= 0:
+                continuation = continuation_token(
+                    offset=fh.tell(),
+                    logical_seq=next_after_seq,
+                    physical_seq=last_physical_seq,
+                    completed_lines=line_no,
+                )
+                return _replay_limit_result(
+                    str(session_id), str(run_id), events, malformed,
+                    line_no=line_no + 1, reason="replay_scan_limit_bytes",
+                    next_after_seq=next_after_seq, resume_token=continuation,
+                    scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
+                    malformed_count=malformed_count, record_limit_diagnostic=False,
+                )
+            row_start_offset = fh.tell()
+            row_start_seq = next_after_seq
+            row_start_physical_seq = last_physical_seq
+            row_start_line_no = line_no
+            row = _read_bounded_physical_row(
+                fh,
+                max_scan_bytes=remaining_scan_bytes,
+            )
             if row is None:
                 break
             line_no += 1
-            raw_bytes, envelope = row
+            scanned_rows += 1
+            raw_bytes, envelope, row_bytes, row_complete = row
+            scanned_bytes += row_bytes
+            if not row_complete:
+                continuation = None
+                if row_start_offset > page_start_offset:
+                    continuation = continuation_token(
+                        offset=row_start_offset,
+                        logical_seq=row_start_seq,
+                        physical_seq=row_start_physical_seq,
+                        completed_lines=row_start_line_no,
+                    )
+                return _replay_limit_result(
+                    str(session_id), str(run_id), events, malformed,
+                    line_no=line_no, reason="replay_scan_limit_bytes",
+                    next_after_seq=row_start_seq, resume_token=continuation,
+                    scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
+                    malformed_count=malformed_count, record_limit_diagnostic=False,
+                )
             if raw_bytes is not None and not raw_bytes.strip():
                 continue
             seq, identity_error = envelope.authoritative_seq(
@@ -1218,20 +1442,28 @@ def read_run_events(
                 require_complete_json=raw_bytes is None,
             )
             if seq is None:
-                malformed.append({"line": line_no, "reason": identity_error})
+                malformed_count += 1
+                if len(malformed) < _BOUNDED_REPLAY_MAX_MALFORMED:
+                    malformed.append({"line": line_no, "reason": identity_error})
                 continue
             event = None
             if raw_bytes is not None:
                 try:
                     event = json.loads(raw_bytes.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
-                    malformed.append({"line": line_no, "raw": ""})
+                    malformed_count += 1
+                    if len(malformed) < _BOUNDED_REPLAY_MAX_MALFORMED:
+                        malformed.append({"line": line_no, "raw": ""})
                     continue
                 if not isinstance(event, dict):
-                    malformed.append({"line": line_no, "raw": ""})
+                    malformed_count += 1
+                    if len(malformed) < _BOUNDED_REPLAY_MAX_MALFORMED:
+                        malformed.append({"line": line_no, "raw": ""})
                     continue
             if seq <= last_physical_seq:
-                malformed.append({"line": line_no, "reason": "replay_invalid_seq_order"})
+                malformed_count += 1
+                if len(malformed) < _BOUNDED_REPLAY_MAX_MALFORMED:
+                    malformed.append({"line": line_no, "reason": "replay_invalid_seq_order"})
                 continue
             last_physical_seq = seq
             if floor is not None and seq <= floor:
@@ -1239,10 +1471,18 @@ def read_run_events(
             if ceiling is not None and seq > ceiling:
                 continue
             if row_cap is not None and len(events) >= row_cap:
+                continuation = continuation_token(
+                    offset=row_start_offset,
+                    logical_seq=row_start_seq,
+                    physical_seq=row_start_physical_seq,
+                    completed_lines=row_start_line_no,
+                )
                 return _replay_limit_result(
                     str(session_id), str(run_id), events, malformed,
                     line_no=line_no, reason="replay_limit_rows",
-                    next_after_seq=next_after_seq,
+                    next_after_seq=row_start_seq, resume_token=continuation,
+                    scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
+                    malformed_count=malformed_count,
                 )
             if raw_bytes is None:
                 recovered_event = envelope.recovered_terminal_event(
@@ -1259,23 +1499,47 @@ def read_run_events(
                     # This row cannot be materialized within the hard-line ceiling.
                     # Its exact top-level identity has been consumed and the complete
                     # physical line drained, so the next page can safely advance.
+                    continuation = continuation_token(
+                        offset=fh.tell(),
+                        logical_seq=seq,
+                        physical_seq=last_physical_seq,
+                        completed_lines=line_no,
+                    )
                     return _replay_limit_result(
                         str(session_id), str(run_id), events, malformed,
                         line_no=line_no, reason="replay_limit_bytes",
-                        next_after_seq=seq,
+                        next_after_seq=seq, resume_token=continuation,
+                        scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
+                        malformed_count=malformed_count,
                     )
                 assert recovered_size is not None
                 if byte_cap is not None and recovered_size > byte_cap:
+                    continuation = continuation_token(
+                        offset=row_start_offset,
+                        logical_seq=row_start_seq,
+                        physical_seq=row_start_physical_seq,
+                        completed_lines=row_start_line_no,
+                    )
                     return _replay_limit_result(
                         str(session_id), str(run_id), events, malformed,
                         line_no=line_no, reason="replay_limit_bytes",
-                        next_after_seq=seq,
+                        next_after_seq=row_start_seq, resume_token=continuation,
+                        scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
+                        malformed_count=malformed_count,
                     )
                 if byte_cap is not None and emitted_bytes + recovered_size > byte_cap:
+                    continuation = continuation_token(
+                        offset=row_start_offset,
+                        logical_seq=row_start_seq,
+                        physical_seq=row_start_physical_seq,
+                        completed_lines=row_start_line_no,
+                    )
                     return _replay_limit_result(
                         str(session_id), str(run_id), events, malformed,
                         line_no=line_no, reason="replay_limit_bytes",
-                        next_after_seq=next_after_seq,
+                        next_after_seq=row_start_seq, resume_token=continuation,
+                        scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
+                        malformed_count=malformed_count,
                     )
                 events.append(recovered_event)
                 emitted_bytes += recovered_size
@@ -1287,10 +1551,18 @@ def read_run_events(
                 if event_size <= byte_cap:
                     # The candidate fits a fresh page. It has not been emitted or
                     # dispositioned, so leave the cursor on the last delivered row.
+                    continuation = continuation_token(
+                        offset=row_start_offset,
+                        logical_seq=row_start_seq,
+                        physical_seq=row_start_physical_seq,
+                        completed_lines=row_start_line_no,
+                    )
                     return _replay_limit_result(
                         str(session_id), str(run_id), events, malformed,
                         line_no=line_no, reason="replay_limit_bytes",
-                        next_after_seq=next_after_seq,
+                        next_after_seq=row_start_seq, resume_token=continuation,
+                        scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
+                        malformed_count=malformed_count,
                     )
                 recovered_event = (
                     _recover_legacy_overcap_terminal_event(
@@ -1307,19 +1579,50 @@ def read_run_events(
                     if recovered_event is not None
                     else None
                 )
-                if recovered_event is None or recovered_size > byte_cap:
+                if recovered_event is None:
                     # This row cannot fit even on an empty page. Consume its exact
                     # sequence as a non-materializable disposition to ensure progress.
+                    continuation = continuation_token(
+                        offset=fh.tell(),
+                        logical_seq=seq,
+                        physical_seq=last_physical_seq,
+                        completed_lines=line_no,
+                    )
                     return _replay_limit_result(
                         str(session_id), str(run_id), events, malformed,
                         line_no=line_no, reason="replay_limit_bytes",
-                        next_after_seq=seq,
+                        next_after_seq=seq, resume_token=continuation,
+                        scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
+                        malformed_count=malformed_count,
+                    )
+                assert recovered_size is not None
+                if recovered_size > byte_cap:
+                    continuation = continuation_token(
+                        offset=row_start_offset,
+                        logical_seq=row_start_seq,
+                        physical_seq=row_start_physical_seq,
+                        completed_lines=row_start_line_no,
+                    )
+                    return _replay_limit_result(
+                        str(session_id), str(run_id), events, malformed,
+                        line_no=line_no, reason="replay_limit_bytes",
+                        next_after_seq=row_start_seq, resume_token=continuation,
+                        scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
+                        malformed_count=malformed_count,
                     )
                 if emitted_bytes + recovered_size > byte_cap:
+                    continuation = continuation_token(
+                        offset=row_start_offset,
+                        logical_seq=row_start_seq,
+                        physical_seq=row_start_physical_seq,
+                        completed_lines=row_start_line_no,
+                    )
                     return _replay_limit_result(
                         str(session_id), str(run_id), events, malformed,
                         line_no=line_no, reason="replay_limit_bytes",
-                        next_after_seq=next_after_seq,
+                        next_after_seq=row_start_seq, resume_token=continuation,
+                        scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
+                        malformed_count=malformed_count,
                     )
                 event = recovered_event
                 event_size = recovered_size
@@ -1330,6 +1633,8 @@ def read_run_events(
         "session_id": str(session_id), "run_id": str(run_id), "events": events,
         "malformed": malformed, "complete": True, "limit_reason": None,
         "next_after_seq": next_after_seq,
+        "resume_token": None, "scanned_bytes": scanned_bytes,
+        "scanned_rows": scanned_rows, "malformed_count": malformed_count,
     }
 
 
