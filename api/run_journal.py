@@ -51,6 +51,7 @@ _FSYNC_MODE_TERMINAL_ONLY = "terminal-only"
 _SESSION_REPLAY_MAX_BYTES = 4 * 1024 * 1024
 _SESSION_REPLAY_MAX_ROWS = 4096
 _SESSION_REPLAY_READ_CHUNK_BYTES = 64 * 1024
+_LEGACY_TERMINAL_RECOVERY_MAX_BYTES = 16 * 1024 * 1024
 _SNAPSHOT_ARGS_MAX_ITEMS = 64
 _SNAPSHOT_ARGS_MAX_DEPTH = 8
 _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
@@ -462,6 +463,57 @@ class RunJournalWriter:
         )
 
 
+def _recover_legacy_overcap_terminal_event(
+    raw_bytes: bytes,
+    *,
+    session_id: str,
+    run_id: str,
+    max_seq: int | None,
+) -> dict | None:
+    """Convert one bounded-size legacy terminal row into a safe recovery marker."""
+    if len(raw_bytes) > _LEGACY_TERMINAL_RECOVERY_MAX_BYTES:
+        return None
+    try:
+        event = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(event, dict) or event.get("terminal") is not True:
+        return None
+    try:
+        seq = int(event.get("seq") or 0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        seq <= 0
+        or (max_seq is not None and seq > int(max_seq))
+        or str(event.get("event_id") or "") != f"{run_id}:{seq}"
+        or str(event.get("run_id") or "") != str(run_id)
+        or str(event.get("session_id") or "") != str(session_id)
+        or str(event.get("event") or "") not in TERMINAL_SSE_EVENTS
+    ):
+        return None
+    recovered = {
+        key: event[key]
+        for key in (
+            "version", "event_id", "seq", "run_id", "session_id", "event", "type",
+            "created_at", "terminal", "terminal_state",
+        )
+        if key in event
+    }
+    recovered["payload"] = {
+        "terminal_session_persisted": False,
+        "terminal_disposition": {
+            "version": "terminal_disposition_v1",
+            "kind": "consumed_non_materializable",
+            "reason": "legacy_terminal_payload_too_large",
+            "session_id": str(session_id),
+            "run_id": str(run_id),
+            "stream_id": str(run_id),
+        },
+    }
+    return recovered
+
+
 def read_run_events(
     session_id: str,
     run_id: str,
@@ -469,18 +521,105 @@ def read_run_events(
     after_seq: int | None = None,
     max_seq: int | None = None,
     session_dir: Path | None = None,
+    max_bytes: int | None = None,
+    max_rows: int | None = None,
 ) -> dict:
     path = _run_path(session_id, run_id, session_dir=session_dir)
-    events, malformed = _read_jsonl(path)
-    if after_seq is not None:
-        events = [event for event in events if int(event.get("seq") or 0) > int(after_seq)]
-    if max_seq is not None:
-        events = [event for event in events if int(event.get("seq") or 0) <= int(max_seq)]
+    if max_bytes is None and max_rows is None:
+        events, malformed = _read_jsonl(path)
+        if after_seq is not None:
+            events = [event for event in events if int(event.get("seq") or 0) > int(after_seq)]
+        if max_seq is not None:
+            events = [event for event in events if int(event.get("seq") or 0) <= int(max_seq)]
+        return {
+            "session_id": str(session_id),
+            "run_id": str(run_id),
+            "events": events,
+            "malformed": malformed,
+        }
+
+    row_cap = None if max_rows is None else max(0, int(max_rows))
+    byte_cap = None if max_bytes is None else max(0, int(max_bytes))
+    floor = int(after_seq) if after_seq is not None else None
+    ceiling = int(max_seq) if max_seq is not None else None
+    events: list[dict] = []
+    malformed: list[dict] = []
+    emitted_bytes = 0
+    next_after_seq = floor
+    try:
+        fh = path.open("rb")
+    except FileNotFoundError:
+        return {
+            "session_id": str(session_id), "run_id": str(run_id), "events": events,
+            "malformed": malformed, "complete": True, "limit_reason": None,
+            "next_after_seq": next_after_seq,
+        }
+    with fh:
+        for line_no, raw_bytes in enumerate(fh, 1):
+            if not raw_bytes.strip():
+                continue
+            recovered = False
+            if (
+                (floor is None or floor <= 0)
+                and byte_cap is not None
+                and emitted_bytes + len(raw_bytes) > byte_cap
+            ):
+                recovered = _recover_legacy_overcap_terminal_event(
+                    raw_bytes, session_id=str(session_id), run_id=str(run_id), max_seq=ceiling,
+                )
+                if recovered is None:
+                    return {
+                        "session_id": str(session_id), "run_id": str(run_id), "events": events,
+                        "malformed": [{"line": line_no, "reason": "replay_limit_bytes"}],
+                        "complete": False, "limit_reason": "replay_limit_bytes",
+                        "next_after_seq": next_after_seq,
+                    }
+                event = recovered
+                recovered = True
+            else:
+                try:
+                    event = json.loads(raw_bytes.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    malformed.append({"line": line_no, "raw": ""})
+                    continue
+                if not isinstance(event, dict):
+                    malformed.append({"line": line_no, "raw": ""})
+                    continue
+            try:
+                seq = int(event.get("seq") or 0)
+            except (TypeError, ValueError):
+                malformed.append({"line": line_no, "raw": ""})
+                continue
+            if floor is not None and seq <= floor:
+                continue
+            if ceiling is not None and seq > ceiling:
+                continue
+            if row_cap is not None and len(events) >= row_cap:
+                return {
+                    "session_id": str(session_id), "run_id": str(run_id), "events": events,
+                    "malformed": [{"line": line_no, "reason": "replay_limit_rows"}],
+                    "complete": False, "limit_reason": "replay_limit_rows",
+                    "next_after_seq": next_after_seq,
+                }
+            if not recovered and byte_cap is not None and emitted_bytes + len(raw_bytes) > byte_cap:
+                recovered_event = _recover_legacy_overcap_terminal_event(
+                    raw_bytes, session_id=str(session_id), run_id=str(run_id), max_seq=ceiling,
+                )
+                if recovered_event is None:
+                    return {
+                        "session_id": str(session_id), "run_id": str(run_id), "events": events,
+                        "malformed": [{"line": line_no, "reason": "replay_limit_bytes"}],
+                        "complete": False, "limit_reason": "replay_limit_bytes",
+                        "next_after_seq": next_after_seq,
+                    }
+                event = recovered_event
+            events.append(event)
+            emitted_bytes += len(raw_bytes)
+            next_after_seq = seq
     return {
-        "session_id": str(session_id),
-        "run_id": str(run_id),
-        "events": events,
-        "malformed": malformed,
+        "session_id": str(session_id), "run_id": str(run_id), "events": events,
+        "malformed": malformed, "complete": True, "limit_reason": None,
+        "next_after_seq": next_after_seq,
     }
 
 
