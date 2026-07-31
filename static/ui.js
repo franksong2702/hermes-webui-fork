@@ -7662,7 +7662,8 @@ function renderMd(raw){
   }
   function _markdownLabelHtml(label){
     const _label_stash=[];
-    const tokenized=String(label||'').replace(/<\/?[a-z][^>]*>/gi,tag=>{
+    const restored=String(label||'').replace(/\x00T(\d+)\x00/g,(_,i)=>_htmlTagStash[+i]||'');
+    const tokenized=restored.replace(/<\/?[a-z][^>]*>/gi,tag=>{
       if(!_isSafeLabelInline(tag)) return tag;
       _label_stash.push(tag);
       return `\x00H${_label_stash.length-1}\x00`;
