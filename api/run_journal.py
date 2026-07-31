@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import base64
 import codecs
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -58,6 +60,8 @@ _BOUNDED_REPLAY_MAX_SCAN_BYTES = 32 * 1024 * 1024
 _BOUNDED_REPLAY_MAX_SCAN_ROWS = 4096
 _BOUNDED_REPLAY_MAX_MALFORMED = 64
 _REPLAY_RESUME_TOKEN_MAX_CHARS = 512
+_REPLAY_RESUME_TOKEN_VERSION = 2
+_REPLAY_RESUME_TOKEN_HMAC_DOMAIN = b"hermes-webui:run-journal-replay:v2\0"
 _SNAPSHOT_ARGS_MAX_ITEMS = 64
 _SNAPSHOT_ARGS_MAX_DEPTH = 8
 _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
@@ -527,6 +531,35 @@ def _serialized_event_size(event: dict) -> int:
     return len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
 
 
+def _replay_resume_signing_key() -> bytes:
+    # Reuse the installation-persistent key so valid cursors survive restarts
+    # without introducing a second secret lifecycle.
+    from api.auth import _signing_key
+
+    return _signing_key()
+
+
+def _replay_resume_payload_bytes(payload: dict) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+
+def _replay_resume_signature(payload_bytes: bytes) -> bytes:
+    return hmac.new(
+        _replay_resume_signing_key(),
+        _REPLAY_RESUME_TOKEN_HMAC_DOMAIN + payload_bytes,
+        hashlib.sha256,
+    ).digest()
+
+
+def _encode_urlsafe_unpadded(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _decode_urlsafe_unpadded(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.b64decode(value + padding, altchars=b"-_", validate=True)
+
+
 def _encode_replay_resume_token(
     fh,
     *,
@@ -540,7 +573,7 @@ def _encode_replay_resume_token(
 ) -> str:
     stat = os.fstat(fh.fileno())
     payload = {
-        "v": 1,
+        "v": _REPLAY_RESUME_TOKEN_VERSION,
         "d": int(stat.st_dev),
         "i": int(stat.st_ino),
         "o": int(offset),
@@ -551,8 +584,11 @@ def _encode_replay_resume_token(
         "x": str(session_id),
         "r": str(run_id),
     }
-    encoded = json.dumps(payload, separators=(",", ":")).encode("ascii")
-    return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode("ascii")
+    payload_bytes = _replay_resume_payload_bytes(payload)
+    return ".".join((
+        _encode_urlsafe_unpadded(payload_bytes),
+        _encode_urlsafe_unpadded(_replay_resume_signature(payload_bytes)),
+    ))
 
 
 def _decode_replay_resume_token(
@@ -563,19 +599,32 @@ def _decode_replay_resume_token(
     run_id: str,
     expected_after_seq: int | None,
     expected_max_seq: int | None,
-) -> tuple[int, int, int, int] | None:
+) -> tuple[int, int, int, int, int] | None:
     raw_token = str(token or "").strip()
-    if not raw_token or len(raw_token) > _REPLAY_RESUME_TOKEN_MAX_CHARS:
+    if (
+        not raw_token
+        or len(raw_token) > _REPLAY_RESUME_TOKEN_MAX_CHARS
+        or raw_token.count(".") != 1
+    ):
         return None
     try:
-        padding = "=" * (-len(raw_token) % 4)
-        raw = base64.b64decode(raw_token + padding, altchars=b"-_", validate=True)
-        payload = json.loads(raw.decode("ascii"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        payload_token, signature_token = raw_token.split(".")
+        payload_bytes = _decode_urlsafe_unpadded(payload_token)
+        signature = _decode_urlsafe_unpadded(signature_token)
+    except ValueError:
+        return None
+    if not hmac.compare_digest(signature, _replay_resume_signature(payload_bytes)):
+        return None
+    try:
+        payload = json.loads(payload_bytes.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict) or set(payload) != {
         "v", "d", "i", "o", "s", "p", "l", "c", "x", "r",
     }:
+        return None
+    canonical_payload = _replay_resume_payload_bytes(payload)
+    if not hmac.compare_digest(payload_bytes, canonical_payload):
         return None
     values = [payload[key] for key in ("v", "d", "i", "o", "s", "p", "l")]
     if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
@@ -583,7 +632,7 @@ def _decode_replay_resume_token(
     version, device, inode, offset, token_seq, physical_seq, line_no = values
     token_max_seq = payload["c"]
     if (
-        version != 1
+        version != _REPLAY_RESUME_TOKEN_VERSION
         or offset < 0
         or token_seq < 0
         or (expected_after_seq is not None and token_seq != expected_after_seq)
@@ -596,18 +645,21 @@ def _decode_replay_resume_token(
         or payload["r"] != str(run_id)
     ):
         return None
+    boundary_scan_bytes = 0
     try:
         stat = os.fstat(fh.fileno())
         if device != int(stat.st_dev) or inode != int(stat.st_ino) or offset > int(stat.st_size):
             return None
         if offset > 0 and offset != int(stat.st_size):
             fh.seek(offset - 1)
-            if fh.read(1) != b"\n":
+            boundary = fh.read(1)
+            boundary_scan_bytes = len(boundary)
+            if boundary != b"\n":
                 return None
         fh.seek(offset)
     except (OSError, ValueError):
         return None
-    return offset, token_seq, physical_seq, line_no
+    return offset, token_seq, physical_seq, line_no, boundary_scan_bytes
 
 
 class _StreamingJsonValidator:
@@ -1365,7 +1417,14 @@ def read_run_events(
                     scanned_bytes=0, scanned_rows=0, malformed_count=0,
                     record_limit_diagnostic=False,
                 )
-            _offset, next_after_seq, last_physical_seq, line_no = resumed
+            (
+                _offset,
+                next_after_seq,
+                last_physical_seq,
+                line_no,
+                boundary_scan_bytes,
+            ) = resumed
+            scanned_bytes += boundary_scan_bytes
             floor = next_after_seq
         page_start_offset = fh.tell()
         while True:
