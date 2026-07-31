@@ -774,6 +774,60 @@ def test_anchor_scene_persistence_rejects_ownerless_artifact_authority_bootstrap
     assert record["scene"]["artifacts"] == []
 
 
+def test_anchor_scene_persistence_rejects_non_workspace_artifact_path(tmp_path, monkeypatch):
+    from api import models, routes
+    from api.artifact_references import anchor_artifact_event_from_payload
+    from api.models import Session
+
+    session_dir = _install_anchor_scene_store(tmp_path, monkeypatch, models, routes)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sid = "artifact-path-escape"
+    Session(
+        session_id=sid,
+        workspace=workspace,
+        messages=[
+            {"role": "user", "content": "write a file"},
+            {
+                "role": "assistant",
+                "content": "done",
+                "timestamp": 10,
+                "_anchor_run_id": "run-good",
+                "_anchor_stream_id": "stream-good",
+            },
+        ],
+    ).save(skip_index=True)
+    artifact = anchor_artifact_event_from_payload(
+        {"kind": "workspace_file", "path": "../secret.md", "source_tool": "write_file"},
+        session_id=sid,
+        run_id="run-good",
+        stream_id="stream-good",
+        event_id="run-good:1",
+        seq=1,
+    )
+
+    captured = _post_anchor_scene(
+        monkeypatch,
+        routes,
+        {
+            "session_id": sid,
+            "stream_id": "stream-good",
+            "message_index": 1,
+            "scene": {
+                "version": "activity_scene_v1",
+                "mode": "compact_worklog",
+                "activity_rows": [],
+                "artifacts": [artifact],
+            },
+        },
+    )
+
+    assert captured["status"] == 400
+    assert "canonical workspace-relative path" in captured["error"]
+    raw = json.loads((session_dir / f"{sid}.json").read_text(encoding="utf-8"))
+    assert not raw.get("anchor_activity_scenes")
+
+
 def test_anchor_scene_persistence_rejects_malformed_parent_owner_with_artifact(tmp_path, monkeypatch):
     from api import models, routes
     from api.models import Session

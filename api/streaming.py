@@ -102,9 +102,7 @@ def _session_payload_with_full_messages(session, *, tool_calls=None):
     return raw
 
 
-_CANCEL_SURVIVING_STREAM_EVENTS = frozenset({
-    'cancel',
-    'apperror',
+_ADDITIONAL_CANCEL_SURVIVING_STREAM_EVENTS = frozenset({
     'error',
     'artifact_reference',
 })
@@ -119,7 +117,8 @@ def _stream_event_dropped_after_cancel(
     return (
         cancelled
         and not success_writeback_committed
-        and event not in _CANCEL_SURVIVING_STREAM_EVENTS
+        and event not in ('cancel', 'apperror')
+        and event not in _ADDITIONAL_CANCEL_SURVIVING_STREAM_EVENTS
     )
 
 
@@ -9037,7 +9036,9 @@ def _run_agent_streaming(
                     # registered (e.g. older approval module without gateway support).
                     try:
                         from api.route_approvals import (
+                            _gateway_queues as _approval_gateway_queues,
                             _lock as _approval_lock,
+                            _pending as _approval_pending,
                             reconcile_gateway_pending_mirror_locked as _reconcile_gateway_pending_mirror_locked,
                         )
                         from tools.approval import has_blocking_approval as _has_blocking_approval

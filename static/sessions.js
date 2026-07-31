@@ -1052,7 +1052,6 @@ function _serverLiveSnapshotInflight(snapshot, uploaded){
   const hasAnchorActivityScene=!!(anchorActivityScene&&(
     (Array.isArray(anchorActivityScene.activity_rows)&&anchorActivityScene.activity_rows.length)
     || (Array.isArray(anchorActivityScene.artifacts)&&anchorActivityScene.artifacts.length)
-    || (Array.isArray(anchorActivityScene.side_effects)&&anchorActivityScene.side_effects.length)
   ));
   if(!messages.length&&!toolCalls.length&&!lastAssistantText&&!lastReasoningText&&!hasAnchorActivityScene) return null;
   return {

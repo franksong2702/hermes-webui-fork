@@ -66,6 +66,7 @@ from api.artifact_references import (
     bound_anchor_activity_scene_artifacts,
     bound_anchor_artifact_events,
     merge_anchor_activity_scene,
+    validate_anchor_activity_scene_artifact_paths,
 )
 
 logger = logging.getLogger(__name__)
@@ -5008,6 +5009,10 @@ def _handle_session_anchor_scene(handler, body):
     # same shape the read path uses — and leave anchor_activity_scenes untouched.
     if not _session_visible_to_active_profile(getattr(s, "profile", None) or None, handler):
         return bad(handler, "Session not found", 404)
+    try:
+        validate_anchor_activity_scene_artifact_paths(scene, getattr(s, "workspace", None))
+    except ValueError as exc:
+        return bad(handler, str(exc), 400)
     with _get_session_agent_lock(sid):
         idx, message = _find_anchor_scene_message(
             getattr(s, "messages", None) or [],

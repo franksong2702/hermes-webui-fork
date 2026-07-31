@@ -298,6 +298,21 @@ def _workspace_relative_path(workspace, raw_path) -> str | None:
     return relative.as_posix()
 
 
+def validate_anchor_activity_scene_artifact_paths(scene, workspace) -> None:
+    """Reject persisted artifact paths that are not canonical workspace paths."""
+    if not isinstance(scene, dict) or not isinstance(scene.get('artifacts'), list):
+        return
+    for artifact in scene['artifacts']:
+        if not isinstance(artifact, dict):
+            continue
+        payload = artifact.get('payload') if isinstance(artifact.get('payload'), dict) else artifact
+        path = _raw_path_string(payload.get('path'))
+        if path is None:
+            continue
+        if _workspace_relative_path(workspace, path) != path:
+            raise ValueError('scene artifact path must be a canonical workspace-relative path')
+
+
 def derive_file_artifact_references(
     tool_name,
     args,
