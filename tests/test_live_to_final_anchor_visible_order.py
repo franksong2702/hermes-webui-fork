@@ -1414,6 +1414,7 @@ global._syncToolCallGroupSummary=()=>{{}};
     eval(extractFunc('_anchorSceneLiveTokenFinalPrefix'));
     eval(extractFunc('_anchorSceneTransparentNodeForRow'));
     eval(extractFunc('renderLiveAnchorActivityScene'));
+    eval(extractFunc('_restoreLiveAnchorScrollSnapshotAfterRebuild'));
     eval(extractFunc('_transparentLiveRowKey'));
     eval(extractFunc('_transparentLiveRowsCompatible'));
     eval(extractFunc('_transparentLiveRowAttributePairs'));
