@@ -52,7 +52,6 @@ _SESSION_REPLAY_MAX_BYTES = 4 * 1024 * 1024
 _SESSION_REPLAY_MAX_ROWS = 4096
 _SESSION_REPLAY_READ_CHUNK_BYTES = 64 * 1024
 _LEGACY_TERMINAL_RECOVERY_MAX_BYTES = 16 * 1024 * 1024
-_SEQ_PREFIX_RE = re.compile(rb'"seq"\s*:\s*(-?\d+)')
 _SNAPSHOT_ARGS_MAX_ITEMS = 64
 _SNAPSHOT_ARGS_MAX_DEPTH = 8
 _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
@@ -505,15 +504,15 @@ def _recover_legacy_overcap_terminal_event(
         "terminal": True,
         "terminal_state": terminal_state,
         "payload": {
-        "terminal_session_persisted": False,
-        "terminal_disposition": {
-            "version": "terminal_disposition_v1",
-            "kind": "consumed_non_materializable",
-            "reason": "legacy_terminal_payload_too_large",
-            "session_id": str(session_id),
-            "run_id": str(run_id),
-            "stream_id": str(run_id),
-        },
+            "terminal_session_persisted": False,
+            "terminal_disposition": {
+                "version": "terminal_disposition_v1",
+                "kind": "consumed_non_materializable",
+                "reason": "legacy_terminal_payload_too_large",
+                "session_id": str(session_id),
+                "run_id": str(run_id),
+                "stream_id": str(run_id),
+            },
         },
     }
 
@@ -522,21 +521,252 @@ def _serialized_event_size(event: dict) -> int:
     return len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
 
 
-def _cursor_after_row(current: int | None, seq: int | None) -> int:
-    """Advance after a consumed row, including a row whose sequence is unreadable."""
-    baseline = int(current or 0)
-    return max(baseline + 1, int(seq)) if seq is not None and int(seq) > 0 else baseline + 1
+class _TopLevelEnvelopeScanner:
+    """Extract cursor identity from one JSON object without retaining its payload.
+
+    Oversized legacy rows cannot be decoded as one allocation. This scanner only
+    accepts unique top-level ``seq``/owner fields, so a nested or truncated
+    ``"seq"`` can never become replay cursor authority.
+    """
+
+    _STRING_FIELDS = frozenset({"event_id", "run_id", "session_id"})
+    _CAPTURE_LIMIT = 1024
+    _MAX_NESTING = 128
+
+    def __init__(self):
+        self._stack: list[int] = []
+        self._state = "start"
+        self._invalid = False
+        self._in_string = False
+        self._escape = False
+        self._string_role = ""
+        self._string_buf = bytearray()
+        self._string_overflow = False
+        self._active_key: str | None = None
+        self._primitive_buf: bytearray | None = None
+        self._primitive_overflow = False
+        self._fields: dict[str, object] = {}
+        self._seq_seen = 0
+
+    @staticmethod
+    def _decode_string(raw: bytearray, overflow: bool) -> str | None:
+        if overflow:
+            return None
+        try:
+            value = json.loads((b'"' + bytes(raw) + b'"').decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, str) else None
+
+    def _append_string_byte(self, value: int) -> None:
+        if self._string_role not in {"key", "value"}:
+            return
+        if len(self._string_buf) >= self._CAPTURE_LIMIT:
+            self._string_overflow = True
+            return
+        self._string_buf.append(value)
+
+    def _record_field(self, key: str, value) -> None:
+        if key == "seq":
+            self._seq_seen += 1
+        if key in self._fields:
+            self._invalid = True
+            return
+        self._fields[key] = value
+
+    def _finish_string(self) -> None:
+        role = self._string_role
+        decoded = self._decode_string(self._string_buf, self._string_overflow)
+        self._in_string = False
+        self._escape = False
+        self._string_role = ""
+        self._string_buf.clear()
+        self._string_overflow = False
+        if role == "key":
+            self._active_key = decoded
+            self._state = "colon"
+            return
+        if role == "value":
+            if self._active_key == "seq":
+                self._record_field("seq", None)
+            elif self._active_key in self._STRING_FIELDS:
+                self._record_field(self._active_key, decoded)
+                if decoded is None:
+                    self._invalid = True
+            self._active_key = None
+            self._state = "comma_or_end"
+
+    def _finish_primitive(self) -> None:
+        key = self._active_key
+        token = bytes(self._primitive_buf or b"").strip()
+        if key == "seq":
+            if (
+                not self._primitive_overflow
+                and re.fullmatch(rb"-?(?:0|[1-9]\d*)", token)
+            ):
+                value = int(token)
+            else:
+                value = None
+            self._record_field("seq", value)
+        elif key in self._STRING_FIELDS:
+            self._record_field(key, None)
+            self._invalid = True
+        self._primitive_buf = None
+        self._primitive_overflow = False
+        self._active_key = None
+        self._state = "comma_or_end"
+
+    def _push(self, value: int) -> None:
+        if len(self._stack) >= self._MAX_NESTING:
+            self._invalid = True
+            return
+        self._stack.append(value)
+
+    def _pop(self, value: int) -> None:
+        expected = ord("{") if value == ord("}") else ord("[")
+        if not self._stack or self._stack[-1] != expected:
+            self._invalid = True
+            return
+        self._stack.pop()
+
+    def feed(self, chunk: bytes) -> None:
+        if self._invalid:
+            return
+        for value in chunk:
+            if self._in_string:
+                if self._escape:
+                    self._append_string_byte(value)
+                    self._escape = False
+                elif value == ord("\\"):
+                    self._append_string_byte(value)
+                    self._escape = True
+                elif value == ord('"'):
+                    self._finish_string()
+                else:
+                    self._append_string_byte(value)
+                continue
+
+            if self._primitive_buf is not None:
+                if len(self._stack) == 1 and value in {ord(","), ord("}")}:
+                    self._finish_primitive()
+                else:
+                    if len(self._primitive_buf) >= self._CAPTURE_LIMIT:
+                        self._primitive_overflow = True
+                    else:
+                        self._primitive_buf.append(value)
+                    continue
+
+            if value in b" \t\r\n":
+                continue
+            if self._state == "closed":
+                self._invalid = True
+                return
+            if self._state == "start":
+                if value != ord("{"):
+                    self._invalid = True
+                    return
+                self._push(value)
+                self._state = "key_or_end"
+                continue
+
+            depth = len(self._stack)
+            if value == ord('"'):
+                self._in_string = True
+                self._escape = False
+                self._string_buf.clear()
+                self._string_overflow = False
+                if depth == 1 and self._state == "key_or_end":
+                    self._string_role = "key"
+                elif depth == 1 and self._state == "value":
+                    self._string_role = "value"
+                else:
+                    self._string_role = "nested"
+                continue
+
+            if depth > 1:
+                if value in {ord("{"), ord("[")}:
+                    self._push(value)
+                elif value in {ord("}"), ord("]")}:
+                    self._pop(value)
+                    if len(self._stack) == 1 and self._state == "value_nested":
+                        self._active_key = None
+                        self._state = "comma_or_end"
+                continue
+
+            if self._state == "colon":
+                if value != ord(":"):
+                    self._invalid = True
+                    return
+                self._state = "value"
+                continue
+            if self._state == "value":
+                if value in {ord("{"), ord("[")}:
+                    if self._active_key in self._STRING_FIELDS or self._active_key == "seq":
+                        if self._active_key == "seq":
+                            self._record_field("seq", None)
+                        else:
+                            self._record_field(self._active_key, None)
+                        self._invalid = True
+                    self._push(value)
+                    self._state = "value_nested"
+                    continue
+                self._primitive_buf = bytearray([value])
+                self._primitive_overflow = False
+                continue
+            if self._state == "key_or_end":
+                if value == ord("}"):
+                    self._pop(value)
+                    self._state = "closed"
+                    continue
+                self._invalid = True
+                return
+            if self._state == "comma_or_end":
+                if value == ord(","):
+                    self._state = "key_or_end"
+                    continue
+                if value == ord("}"):
+                    self._pop(value)
+                    self._state = "closed"
+                    continue
+                self._invalid = True
+                return
+
+    def authoritative_seq(self, session_id: str, run_id: str) -> tuple[int | None, str]:
+        seq = self._fields.get("seq")
+        if self._seq_seen != 1 or isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
+            return None, "replay_invalid_seq"
+        if self._invalid or self._state != "closed" or self._stack or self._in_string:
+            return None, "replay_invalid_envelope"
+        if (
+            self._fields.get("session_id") != str(session_id)
+            or self._fields.get("run_id") != str(run_id)
+            or self._fields.get("event_id") != f"{run_id}:{seq}"
+        ):
+            return None, "replay_invalid_identity"
+        return seq, ""
 
 
-def _seq_from_bounded_row(raw_bytes: bytes) -> int | None:
-    match = _SEQ_PREFIX_RE.search(raw_bytes)
-    if not match:
+def _read_bounded_physical_row(fh) -> tuple[bytes | None, _TopLevelEnvelopeScanner] | None:
+    """Read and drain one JSONL row while retaining at most the hard-line ceiling."""
+    scanner = _TopLevelEnvelopeScanner()
+    retained = bytearray()
+    total_bytes = 0
+    while True:
+        chunk = fh.readline(_SESSION_REPLAY_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        scanner.feed(chunk)
+        remaining = _LEGACY_TERMINAL_RECOVERY_MAX_BYTES + 1 - len(retained)
+        if remaining > 0:
+            retained.extend(chunk[:remaining])
+        if chunk.endswith(b"\n"):
+            break
+    if total_bytes == 0:
         return None
-    try:
-        seq = int(match.group(1))
-    except (TypeError, ValueError):
-        return None
-    return seq if seq > 0 else None
+    if total_bytes > _LEGACY_TERMINAL_RECOVERY_MAX_BYTES:
+        return None, scanner
+    return bytes(retained), scanner
 
 
 def _replay_limit_result(
@@ -551,7 +781,7 @@ def _replay_limit_result(
 ) -> dict:
     return {
         "session_id": str(session_id), "run_id": str(run_id), "events": events,
-        "malformed": [{"line": line_no, "reason": reason}],
+        "malformed": [*malformed, {"line": line_no, "reason": reason}],
         "complete": False, "limit_reason": reason, "next_after_seq": next_after_seq,
     }
 
@@ -588,6 +818,7 @@ def read_run_events(
     malformed: list[dict] = []
     emitted_bytes = 0
     next_after_seq = floor or 0
+    last_physical_seq = 0
     try:
         fh = path.open("rb")
     except FileNotFoundError:
@@ -599,18 +830,41 @@ def read_run_events(
     with fh:
         line_no = 0
         while True:
-            raw_bytes = fh.readline(_LEGACY_TERMINAL_RECOVERY_MAX_BYTES + 1)
-            if not raw_bytes:
+            row = _read_bounded_physical_row(fh)
+            if row is None:
                 break
             line_no += 1
-            if not raw_bytes.strip():
+            raw_bytes, envelope = row
+            if raw_bytes is not None and not raw_bytes.strip():
                 continue
-            if len(raw_bytes) > _LEGACY_TERMINAL_RECOVERY_MAX_BYTES:
-                seq = _seq_from_bounded_row(raw_bytes)
+            seq, identity_error = envelope.authoritative_seq(
+                str(session_id), str(run_id),
+            )
+            if seq is None:
+                malformed.append({"line": line_no, "reason": identity_error})
+                continue
+            if seq <= last_physical_seq:
+                malformed.append({"line": line_no, "reason": "replay_invalid_seq_order"})
+                continue
+            last_physical_seq = seq
+            if floor is not None and seq <= floor:
+                continue
+            if ceiling is not None and seq > ceiling:
+                continue
+            if row_cap is not None and len(events) >= row_cap:
+                return _replay_limit_result(
+                    str(session_id), str(run_id), events, malformed,
+                    line_no=line_no, reason="replay_limit_rows",
+                    next_after_seq=next_after_seq,
+                )
+            if raw_bytes is None:
+                # This row cannot be materialized within the hard-line ceiling.
+                # Its exact top-level identity has been consumed and the complete
+                # physical line drained, so the next page can safely advance.
                 return _replay_limit_result(
                     str(session_id), str(run_id), events, malformed,
                     line_no=line_no, reason="replay_limit_bytes",
-                    next_after_seq=_cursor_after_row(next_after_seq, seq),
+                    next_after_seq=seq,
                 )
             try:
                 event = json.loads(raw_bytes.decode("utf-8"))
@@ -620,40 +874,47 @@ def read_run_events(
             if not isinstance(event, dict):
                 malformed.append({"line": line_no, "raw": ""})
                 continue
-            try:
-                seq = int(event.get("seq") or 0)
-            except (TypeError, ValueError):
-                malformed.append({"line": line_no, "raw": ""})
-                continue
-            if floor is not None and seq <= floor:
-                continue
-            if ceiling is not None and seq > ceiling:
-                continue
-            if row_cap is not None and len(events) >= row_cap:
-                return _replay_limit_result(
-                    str(session_id), str(run_id), events, malformed,
-                    line_no=line_no, reason="replay_limit_rows",
-                    next_after_seq=_cursor_after_row(next_after_seq, seq),
-                )
             event_size = _serialized_event_size(event)
             if byte_cap is not None and emitted_bytes + event_size > byte_cap:
-                recovered_event = _recover_legacy_overcap_terminal_event(
-                    event, session_id=str(session_id), run_id=str(run_id), max_seq=ceiling,
-                ) if event.get("terminal") is True else None
-                if recovered_event is None:
+                if event_size <= byte_cap:
+                    # The candidate fits a fresh page. It has not been emitted or
+                    # dispositioned, so leave the cursor on the last delivered row.
                     return _replay_limit_result(
                         str(session_id), str(run_id), events, malformed,
                         line_no=line_no, reason="replay_limit_bytes",
-                        next_after_seq=_cursor_after_row(next_after_seq, seq),
+                        next_after_seq=next_after_seq,
+                    )
+                recovered_event = (
+                    _recover_legacy_overcap_terminal_event(
+                        event,
+                        session_id=str(session_id),
+                        run_id=str(run_id),
+                        max_seq=ceiling,
+                    )
+                    if event.get("terminal") is True
+                    else None
+                )
+                recovered_size = (
+                    _serialized_event_size(recovered_event)
+                    if recovered_event is not None
+                    else None
+                )
+                if recovered_event is None or recovered_size > byte_cap:
+                    # This row cannot fit even on an empty page. Consume its exact
+                    # sequence as a non-materializable disposition to ensure progress.
+                    return _replay_limit_result(
+                        str(session_id), str(run_id), events, malformed,
+                        line_no=line_no, reason="replay_limit_bytes",
+                        next_after_seq=seq,
+                    )
+                if emitted_bytes + recovered_size > byte_cap:
+                    return _replay_limit_result(
+                        str(session_id), str(run_id), events, malformed,
+                        line_no=line_no, reason="replay_limit_bytes",
+                        next_after_seq=next_after_seq,
                     )
                 event = recovered_event
-                event_size = _serialized_event_size(event)
-                if emitted_bytes + event_size > byte_cap:
-                    return _replay_limit_result(
-                        str(session_id), str(run_id), events, malformed,
-                        line_no=line_no, reason="replay_limit_bytes",
-                        next_after_seq=_cursor_after_row(next_after_seq, seq),
-                    )
+                event_size = recovered_size
             events.append(event)
             emitted_bytes += event_size
             next_after_seq = seq

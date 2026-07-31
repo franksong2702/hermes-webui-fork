@@ -154,9 +154,22 @@ def test_run_journal_bounded_reader_limits_line_read_before_decode(tmp_path, mon
     session_id = "session_bounded_read"
     run_id = "run_bounded_read"
     path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
-    oversized_row = b'{"seq":1,"event":"token","payload":{"text":"' + b"x" * (run_journal._LEGACY_TERMINAL_RECOVERY_MAX_BYTES + 1) + b'"}}\n'
+    oversized_row = (
+        b'{"version":1,"event_id":"'
+        + f"{run_id}:1".encode("utf-8")
+        + b'","seq":1,"run_id":"'
+        + run_id.encode("utf-8")
+        + b'","session_id":"'
+        + session_id.encode("utf-8")
+        + b'","event":"token","type":"token","payload":{"text":"'
+        + b"x" * (run_journal._LEGACY_TERMINAL_RECOVERY_MAX_BYTES + 1)
+        + b'"}}\n'
+    )
 
     class BoundedReader:
+        def __init__(self):
+            self.offset = 0
+
         def __enter__(self):
             return self
 
@@ -164,8 +177,13 @@ def test_run_journal_bounded_reader_limits_line_read_before_decode(tmp_path, mon
             return None
 
         def readline(self, limit):
-            assert limit == run_journal._LEGACY_TERMINAL_RECOVERY_MAX_BYTES + 1
-            return oversized_row[:limit]
+            assert 0 < limit <= run_journal._SESSION_REPLAY_READ_CHUNK_BYTES
+            if self.offset >= len(oversized_row):
+                return b""
+            end = min(self.offset + limit, len(oversized_row))
+            chunk = oversized_row[self.offset:end]
+            self.offset = end
+            return chunk
 
     real_open = Path.open
 
@@ -182,6 +200,296 @@ def test_run_journal_bounded_reader_limits_line_read_before_decode(tmp_path, mon
     assert journal["complete"] is False
     assert journal["limit_reason"] == "replay_limit_bytes"
     assert journal["next_after_seq"] == 1
+
+
+def _bounded_event(session_id, run_id, seq, text):
+    return {
+        "version": 1,
+        "event_id": f"{run_id}:{seq}",
+        "seq": seq,
+        "run_id": run_id,
+        "session_id": session_id,
+        "event": "token",
+        "type": "token",
+        "terminal": False,
+        "terminal_state": None,
+        "payload": {"text": text},
+    }
+
+
+def _write_bounded_events(path, events):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        b"".join(
+            json.dumps(event, separators=(",", ":")).encode("utf-8") + b"\n"
+            for event in events
+        )
+    )
+
+
+def test_run_journal_bounded_reader_drains_actual_hard_row_before_next_page(tmp_path):
+    session_id = "session_hard_row_resume"
+    run_id = "run_hard_row_resume"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    hard_row = _bounded_event(
+        session_id,
+        run_id,
+        1,
+        "x" * (run_journal._LEGACY_TERMINAL_RECOVERY_MAX_BYTES + 1),
+    )
+    following = _bounded_event(session_id, run_id, 2, "following")
+    _write_bounded_events(path, [hard_row, following])
+
+    first_page = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=512, max_rows=1,
+    )
+    second_page = read_run_events(
+        session_id,
+        run_id,
+        after_seq=first_page["next_after_seq"],
+        session_dir=tmp_path,
+        max_bytes=512,
+        max_rows=1,
+    )
+
+    assert first_page["events"] == []
+    assert first_page["complete"] is False
+    assert first_page["limit_reason"] == "replay_limit_bytes"
+    assert first_page["next_after_seq"] == 1
+    assert [event["seq"] for event in second_page["events"]] == [2]
+    assert second_page["complete"] is True
+
+
+def test_run_journal_bounded_reader_row_pages_do_not_skip_candidate(tmp_path):
+    session_id = "session_row_pages"
+    run_id = "run_row_pages"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    _write_bounded_events(
+        path,
+        [
+            _bounded_event(session_id, run_id, 1, "one"),
+            _bounded_event(session_id, run_id, 2, "two"),
+            _bounded_event(session_id, run_id, 3, "three"),
+        ],
+    )
+
+    first_page = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_rows=1,
+    )
+    second_page = read_run_events(
+        session_id,
+        run_id,
+        after_seq=first_page["next_after_seq"],
+        session_dir=tmp_path,
+        max_rows=1,
+    )
+    third_page = read_run_events(
+        session_id,
+        run_id,
+        after_seq=second_page["next_after_seq"],
+        session_dir=tmp_path,
+        max_rows=1,
+    )
+
+    assert [event["seq"] for event in first_page["events"]] == [1]
+    assert first_page["complete"] is False
+    assert first_page["limit_reason"] == "replay_limit_rows"
+    assert first_page["next_after_seq"] == 1
+    assert [event["seq"] for event in second_page["events"]] == [2]
+    assert second_page["complete"] is False
+    assert second_page["limit_reason"] == "replay_limit_rows"
+    assert second_page["next_after_seq"] == 2
+    assert [event["seq"] for event in third_page["events"]] == [3]
+    assert third_page["complete"] is True
+
+
+def test_run_journal_bounded_reader_byte_pages_do_not_skip_candidate(tmp_path):
+    for case_name in ("ordinary", "terminal"):
+        session_id = f"session_byte_pages_{case_name}"
+        run_id = f"run_byte_pages_{case_name}"
+        path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+        first = _bounded_event(session_id, run_id, 1, "a" * 80)
+        second = _bounded_event(session_id, run_id, 2, "b" * 80)
+        if case_name == "terminal":
+            second.update({
+                "event": "done",
+                "type": "done",
+                "terminal": True,
+                "terminal_state": "completed",
+                "payload": {"session": {"messages": [{"content": "b" * 80}]}},
+            })
+        _write_bounded_events(path, [first, second])
+        page_bytes = max(
+            run_journal._serialized_event_size(first),
+            run_journal._serialized_event_size(second),
+        )
+
+        first_page = read_run_events(
+            session_id, run_id, session_dir=tmp_path, max_bytes=page_bytes,
+        )
+        second_page = read_run_events(
+            session_id,
+            run_id,
+            after_seq=first_page["next_after_seq"],
+            session_dir=tmp_path,
+            max_bytes=page_bytes,
+        )
+
+        assert [event["seq"] for event in first_page["events"]] == [1]
+        assert first_page["complete"] is False
+        assert first_page["limit_reason"] == "replay_limit_bytes"
+        assert first_page["next_after_seq"] == 1
+        assert [event["seq"] for event in second_page["events"]] == [2]
+        assert second_page["next_after_seq"] == 2
+        assert second_page["complete"] is True
+        if case_name == "terminal":
+            assert "terminal_disposition" not in second_page["events"][0]["payload"]
+
+
+def test_run_journal_bounded_reader_filters_hard_row_at_after_seq(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_LEGACY_TERMINAL_RECOVERY_MAX_BYTES", 256)
+    session_id = "session_hard_after"
+    run_id = "run_hard_after"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    _write_bounded_events(
+        path,
+        [
+            _bounded_event(session_id, run_id, 1, "x" * 512),
+            _bounded_event(session_id, run_id, 2, "visible"),
+        ],
+    )
+
+    journal = read_run_events(
+        session_id,
+        run_id,
+        after_seq=1,
+        session_dir=tmp_path,
+        max_bytes=512,
+        max_rows=1,
+    )
+
+    assert [event["seq"] for event in journal["events"]] == [2]
+    assert journal["complete"] is True
+
+
+def test_run_journal_bounded_reader_filters_hard_row_above_max_seq(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_LEGACY_TERMINAL_RECOVERY_MAX_BYTES", 256)
+    session_id = "session_hard_ceiling"
+    run_id = "run_hard_ceiling"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    _write_bounded_events(
+        path,
+        [
+            _bounded_event(session_id, run_id, 1, "visible"),
+            _bounded_event(session_id, run_id, 2, "x" * 512),
+        ],
+    )
+
+    journal = read_run_events(
+        session_id,
+        run_id,
+        max_seq=1,
+        session_dir=tmp_path,
+        max_bytes=512,
+        max_rows=1,
+    )
+
+    assert [event["seq"] for event in journal["events"]] == [1]
+    assert journal["complete"] is True
+    assert journal["limit_reason"] is None
+
+
+def test_run_journal_bounded_reader_ignores_nested_seq_in_hard_row(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_LEGACY_TERMINAL_RECOVERY_MAX_BYTES", 256)
+    session_id = "session_nested_seq"
+    run_id = "run_nested_seq"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True)
+    hard_row = (
+        b'{"payload":{"seq":999,"text":"'
+        + b"x" * 512
+        + b'"},"version":1,"event_id":"'
+        + f"{run_id}:1".encode("utf-8")
+        + b'","seq":1,"run_id":"'
+        + run_id.encode("utf-8")
+        + b'","session_id":"'
+        + session_id.encode("utf-8")
+        + b'","event":"token","type":"token"}\n'
+    )
+    following = _bounded_event(session_id, run_id, 2, "following")
+    path.write_bytes(
+        hard_row
+        + json.dumps(following, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+
+    first_page = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=128,
+    )
+    second_page = read_run_events(
+        session_id,
+        run_id,
+        after_seq=first_page["next_after_seq"],
+        session_dir=tmp_path,
+        max_bytes=512,
+    )
+
+    assert first_page["next_after_seq"] == 1
+    assert [event["seq"] for event in second_page["events"]] == [2]
+
+
+def test_run_journal_bounded_reader_fails_closed_on_invalid_sequences(tmp_path):
+    session_id = "session_invalid_sequences"
+    run_id = "run_invalid_sequences"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    missing = _bounded_event(session_id, run_id, 1, "missing")
+    missing.pop("seq")
+    nonpositive = _bounded_event(session_id, run_id, 0, "zero")
+    string_seq = _bounded_event(session_id, run_id, 1, "string")
+    string_seq["seq"] = "1"
+    valid = _bounded_event(session_id, run_id, 1, "valid")
+    _write_bounded_events(path, [missing, nonpositive, string_seq, valid])
+
+    journal = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=4096, max_rows=4,
+    )
+
+    assert [event["payload"]["text"] for event in journal["events"]] == ["valid"]
+    assert [entry["reason"] for entry in journal["malformed"]] == [
+        "replay_invalid_seq",
+        "replay_invalid_seq",
+        "replay_invalid_seq",
+    ]
+    assert journal["next_after_seq"] == 1
+    assert journal["complete"] is True
+
+
+def test_run_journal_bounded_reader_fails_closed_on_duplicate_and_out_of_order_seq(tmp_path):
+    session_id = "session_seq_order"
+    run_id = "run_seq_order"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    _write_bounded_events(
+        path,
+        [
+            _bounded_event(session_id, run_id, 1, "one"),
+            _bounded_event(session_id, run_id, 1, "duplicate"),
+            _bounded_event(session_id, run_id, 3, "three"),
+            _bounded_event(session_id, run_id, 2, "out-of-order"),
+            _bounded_event(session_id, run_id, 4, "four"),
+        ],
+    )
+
+    journal = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=4096, max_rows=5,
+    )
+
+    assert [event["seq"] for event in journal["events"]] == [1, 3, 4]
+    assert [entry["reason"] for entry in journal["malformed"]] == [
+        "replay_invalid_seq_order",
+        "replay_invalid_seq_order",
+    ]
+    assert journal["next_after_seq"] == 4
+    assert journal["complete"] is True
 
 
 def test_run_journal_default_fsyncs_terminal_events_only(tmp_path, monkeypatch):
