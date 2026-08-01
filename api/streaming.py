@@ -56,6 +56,8 @@ from api.artifact_references import (
     bound_anchor_artifact_events,
     derive_file_artifact_references,
     merge_anchor_activity_scene,
+    retain_server_authoritative_artifact_events,
+    validate_anchor_activity_scene_artifact_paths,
 )
 from api.metering import meter
 from api.run_journal import RunJournalWriter, _parse_run_journal_event_id
@@ -2125,6 +2127,38 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
     records = dict(getattr(session, 'anchor_activity_scenes', None) or {})
     record = records.get(key) if isinstance(records.get(key), dict) else {}
     existing_scene = record.get('scene') if isinstance(record.get('scene'), dict) else {}
+    existing_scene = copy.deepcopy(existing_scene)
+    existing_artifacts = existing_scene.get('artifacts') if isinstance(existing_scene.get('artifacts'), list) else []
+    if str(record.get('artifact_authority') or '') != 'server':
+        existing_scene['artifacts'] = []
+    else:
+        retained_artifacts = []
+        for raw_artifact in existing_artifacts:
+            candidate_scene = dict(existing_scene)
+            candidate_scene['artifacts'] = [raw_artifact]
+            try:
+                candidate_scene['artifacts'] = retain_server_authoritative_artifact_events(
+                    [raw_artifact],
+                    [raw_artifact],
+                    session_id=getattr(session, 'session_id', None),
+                    run_id=run_id,
+                    stream_id=stream_id,
+                )
+                validate_anchor_activity_scene_artifact_paths(
+                    candidate_scene,
+                    getattr(session, 'workspace', None),
+                )
+            except ValueError:
+                continue
+            retained_artifacts.extend(candidate_scene['artifacts'])
+        existing_scene['artifacts'] = bound_anchor_artifact_events(
+            retained_artifacts,
+            session_id=getattr(session, 'session_id', None),
+            run_id=run_id,
+            stream_id=stream_id,
+            reject_owner_mismatch=True,
+            require_owner_authority=True,
+        )
     final_answer = existing_scene.get('final_answer')
     if not isinstance(final_answer, str):
         final_answer = _assistant_message_plain_text(message)
