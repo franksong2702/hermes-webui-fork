@@ -1286,3 +1286,69 @@ def test_repeated_tool_complete_ingress_persists_bounded_artifact_prefix(tmp_pat
     assert artifacts[0]["stream_id"] == stream_id
     assert artifacts[0]["payload"]["path"] == "reports/000-artifact.md"
     assert artifacts[-1]["payload"]["path"] < "reports/096-artifact.md"
+
+
+def test_terminal_reconciliation_discards_untrusted_legacy_artifacts_before_persist_and_hydrate(tmp_path, monkeypatch):
+    """A legacy scene must not promote browser-supplied artifacts at terminal settlement."""
+    from collections import OrderedDict
+
+    from api import models, routes, streaming
+    from api.models import Session
+
+    session_dir = tmp_path / "sessions"
+    workspace = tmp_path / "workspace"
+    session_dir.mkdir()
+    workspace.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setattr(routes, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(routes, "SESSIONS", models.SESSIONS)
+
+    sid = "artifact-legacy-terminal"
+    run_id = "run-legacy-terminal"
+    stream_id = "stream-legacy-terminal"
+    session = Session(
+        session_id=sid,
+        workspace=workspace,
+        messages=[
+            {"role": "user", "content": "write", "timestamp": 1},
+            {"role": "assistant", "content": "done", "timestamp": 2},
+        ],
+    )
+    invented = anchor_artifact_event_from_payload(
+        {"kind": "workspace_file", "path": "reports/never-written.md", "source_tool": "write_file", "tool_call_id": "call-invented"},
+        session_id=sid, run_id=run_id, stream_id=stream_id, event_id=f"{run_id}:3", seq=3,
+    )
+    session.anchor_activity_scenes = {
+        "index:1": {
+            "version": "anchor_activity_scene_record_v1", "message_index": 1,
+            "run_id": run_id, "stream_id": stream_id, "owner_authority": "server",
+            "scene": {
+                "version": "activity_scene_v1", "mode": "compact_worklog",
+                "identity": {"session_id": sid, "run_id": run_id, "stream_id": stream_id},
+                "artifacts": [invented],
+            },
+        }
+    }
+    real = anchor_artifact_event_from_payload(
+        {"kind": "workspace_file", "path": "reports/really-written.md", "source_tool": "write_file", "tool_call_id": "call-real"},
+        session_id=sid, run_id=run_id, stream_id=stream_id, event_id=f"{run_id}:4", seq=4,
+    )
+
+    assert streaming._reconcile_stream_artifacts_into_terminal_anchor_scene(
+        session, stream_id, [real], terminal_state="completed", message_index=1, run_id=run_id,
+    )
+    session.save(skip_index=True)
+
+    loaded = Session.load(sid)
+    hydrated = routes._hydrate_anchor_activity_scenes(
+        loaded.messages, loaded.anchor_activity_scenes, session_id=sid, workspace=workspace,
+    )
+    artifacts = hydrated[1]["_anchor_activity_scene"]["artifacts"]
+    assert [artifact["payload"]["path"] for artifact in artifacts] == ["reports/really-written.md"]
+    artifact = artifacts[0]
+    assert artifact["event_id"] == f"{run_id}:4"
+    assert artifact["seq"] == 4
+    assert artifact["payload"]["source_tool"] == "write_file"
+    assert artifact["payload"]["tool_call_id"] == "call-real"
