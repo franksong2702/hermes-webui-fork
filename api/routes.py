@@ -26193,7 +26193,7 @@ def _mcp_profile_home_key(value) -> str:
         return str(Path(text).expanduser().resolve())
     except Exception:
         try:
-            return str(Path(text).expanduser().resolve())
+            return str(Path(text).expanduser())
         except Exception:
             return text
 

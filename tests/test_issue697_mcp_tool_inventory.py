@@ -2,11 +2,13 @@
 import json
 import sys
 import types
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from api.routes import (
     _handle_mcp_servers_list,
     _handle_mcp_tools_list,
+    _mcp_profile_home_key,
     _mcp_schema_summary,
     _mcp_tool_summary,
 )
@@ -31,6 +33,25 @@ def _read(relative_path: str) -> str:
 
 
 class TestMcpToolInventoryApi:
+    def test_profile_home_key_expands_user_without_resolve(self, monkeypatch, tmp_path):
+        home = tmp_path / "fake-home"
+        monkeypatch.setenv("HOME", str(home))
+
+        def fail_resolve(_path, *args, **kwargs):
+            raise OSError("resolve unavailable")
+
+        monkeypatch.setattr(Path, "resolve", fail_resolve)
+
+        assert _mcp_profile_home_key("~") == str(home)
+
+    def test_profile_home_key_returns_raw_input_when_expanduser_fails(self, monkeypatch):
+        def fail_expanduser(_path):
+            raise RuntimeError("expanduser unavailable")
+
+        monkeypatch.setattr(Path, "expanduser", fail_expanduser)
+
+        assert _mcp_profile_home_key("~/profile") == "~/profile"
+
     @patch("api.routes._mcp_runtime_status_by_name")
     @patch("api.routes._active_profile_mcp_config_data")
     @patch("api.routes.get_active_hermes_home")
