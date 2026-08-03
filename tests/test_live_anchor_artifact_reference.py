@@ -1341,6 +1341,19 @@ def test_terminal_reconciliation_discards_untrusted_legacy_artifacts_before_pers
     )
     session.save(skip_index=True)
 
+    raw = json.loads((session_dir / "artifact-legacy-terminal.json").read_text(encoding="utf-8"))
+    records = raw["anchor_activity_scenes"]
+    message_ref = routes._assistant_anchor_scene_message_ref(raw["messages"][1])
+    assert list(records) == [message_ref]
+    assert len(records) == 1
+    assert records[message_ref]["message_ref"] == message_ref
+    persisted_artifacts = records[message_ref]["scene"]["artifacts"]
+    assert [artifact["payload"]["path"] for artifact in persisted_artifacts] == ["reports/really-written.md"]
+    assert all(
+        artifact["payload"]["path"] != "reports/never-written.md"
+        for artifact in persisted_artifacts
+    )
+
     loaded = Session.load(sid)
     hydrated = routes._hydrate_anchor_activity_scenes(
         loaded.messages, loaded.anchor_activity_scenes, session_id=sid, workspace=workspace,
@@ -1352,3 +1365,67 @@ def test_terminal_reconciliation_discards_untrusted_legacy_artifacts_before_pers
     assert artifact["seq"] == 4
     assert artifact["payload"]["source_tool"] == "write_file"
     assert artifact["payload"]["tool_call_id"] == "call-real"
+
+
+def test_terminal_reconciliation_does_not_self_authenticate_persisted_artifacts(tmp_path, monkeypatch):
+    from collections import OrderedDict
+
+    from api import models, routes, streaming
+    from api.models import Session
+
+    session_dir = tmp_path / "sessions"
+    workspace = tmp_path / "workspace"
+    session_dir.mkdir()
+    workspace.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setattr(routes, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(routes, "SESSIONS", models.SESSIONS)
+
+    sid = "artifact-canonical-terminal"
+    run_id = "run-canonical-terminal"
+    stream_id = "stream-canonical-terminal"
+    session = Session(
+        session_id=sid,
+        workspace=workspace,
+        messages=[
+            {"role": "user", "content": "write", "timestamp": 1},
+            {"role": "assistant", "content": "done", "timestamp": 2},
+        ],
+    )
+    message_ref = routes._assistant_anchor_scene_message_ref(session.messages[1])
+    invented = anchor_artifact_event_from_payload(
+        {"kind": "workspace_file", "path": "reports/never-written.md", "source_tool": "write_file", "tool_call_id": "call-invented"},
+        session_id=sid, run_id=run_id, stream_id=stream_id, event_id=f"{run_id}:3", seq=3,
+    )
+    session.anchor_activity_scenes = {
+        message_ref: {
+            "version": "anchor_activity_scene_record_v1", "message_index": 1,
+            "message_ref": message_ref, "run_id": run_id, "stream_id": stream_id,
+            "owner_authority": "server", "artifact_authority": "server",
+            "scene": {
+                "version": "activity_scene_v1", "mode": "compact_worklog",
+                "identity": {"session_id": sid, "run_id": run_id, "stream_id": stream_id},
+                "artifacts": [invented],
+            },
+        }
+    }
+    real = anchor_artifact_event_from_payload(
+        {"kind": "workspace_file", "path": "reports/really-written.md", "source_tool": "write_file", "tool_call_id": "call-real"},
+        session_id=sid, run_id=run_id, stream_id=stream_id, event_id=f"{run_id}:4", seq=4,
+    )
+
+    assert streaming._reconcile_stream_artifacts_into_terminal_anchor_scene(
+        session, stream_id, [real], terminal_state="completed", message_index=1, run_id=run_id,
+    )
+    session.save(skip_index=True)
+
+    raw = json.loads((session_dir / "artifact-canonical-terminal.json").read_text(encoding="utf-8"))
+    record = raw["anchor_activity_scenes"][message_ref]
+    persisted_artifacts = record["scene"]["artifacts"]
+    assert [artifact["payload"]["path"] for artifact in persisted_artifacts] == ["reports/really-written.md"]
+    assert all(
+        artifact["payload"]["path"] != "reports/never-written.md"
+        for artifact in persisted_artifacts
+    )

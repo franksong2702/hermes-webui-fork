@@ -2065,6 +2065,43 @@ def _message_turn_duration(message):
     return None
 
 
+def _legacy_anchor_scene_record_matches_terminal_target(
+    record,
+    *,
+    message_index: int,
+    message_ref: str,
+    session_id: str,
+    run_id: str,
+    stream_id: str,
+) -> bool:
+    """Find one legacy index-keyed scene only when all owner claims agree."""
+    if not isinstance(record, dict):
+        return False
+    try:
+        if int(record.get('message_index')) != message_index:
+            return False
+    except (TypeError, ValueError):
+        return False
+    record_ref = str(record.get('message_ref') or '').strip()
+    if record_ref and record_ref != message_ref:
+        return False
+    if str(record.get('owner_authority') or '').strip() not in ('', 'server'):
+        return False
+    scene = record.get('scene') if isinstance(record.get('scene'), dict) else {}
+    identity = scene.get('identity') if isinstance(scene.get('identity'), dict) else {}
+    for field, expected in (
+        ('session_id', session_id),
+        ('run_id', run_id),
+        ('stream_id', stream_id),
+    ):
+        expected = str(expected or '').strip()
+        claims = [record.get(field), identity.get(field)]
+        explicit = [str(value).strip() for value in claims if value is not None and str(value).strip()]
+        if not expected or not explicit or any(value != expected for value in explicit):
+            return False
+    return True
+
+
 def _reconcile_stream_artifacts_into_terminal_anchor_scene(
     session,
     stream_id: str | None,
@@ -2126,39 +2163,48 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
     key = ref or f"index:{idx}"
     records = dict(getattr(session, 'anchor_activity_scenes', None) or {})
     record = records.get(key) if isinstance(records.get(key), dict) else {}
+    legacy_keys = []
+    if ref:
+        legacy_keys = [
+            candidate_key
+            for candidate_key, candidate_record in records.items()
+            if candidate_key != key
+            and _legacy_anchor_scene_record_matches_terminal_target(
+                candidate_record,
+                message_index=idx,
+                message_ref=ref,
+                session_id=getattr(session, 'session_id', None),
+                run_id=run_id,
+                stream_id=stream_id,
+            )
+        ]
+        if len(legacy_keys) > 1:
+            logger.debug("Rejected ambiguous legacy anchor scene records for terminal reconciliation")
+            return False
+        if not record and legacy_keys:
+            record = records.get(legacy_keys[0]) or {}
+        for legacy_key in legacy_keys:
+            records.pop(legacy_key, None)
     existing_scene = record.get('scene') if isinstance(record.get('scene'), dict) else {}
     existing_scene = copy.deepcopy(existing_scene)
     existing_artifacts = existing_scene.get('artifacts') if isinstance(existing_scene.get('artifacts'), list) else []
     if str(record.get('artifact_authority') or '') != 'server':
         existing_scene['artifacts'] = []
     else:
-        retained_artifacts = []
-        for raw_artifact in existing_artifacts:
-            candidate_scene = dict(existing_scene)
-            candidate_scene['artifacts'] = [raw_artifact]
-            try:
-                candidate_scene['artifacts'] = retain_server_authoritative_artifact_events(
-                    [raw_artifact],
-                    [raw_artifact],
-                    session_id=getattr(session, 'session_id', None),
-                    run_id=run_id,
-                    stream_id=stream_id,
-                )
-                validate_anchor_activity_scene_artifact_paths(
-                    candidate_scene,
-                    getattr(session, 'workspace', None),
-                )
-            except ValueError:
-                continue
-            retained_artifacts.extend(candidate_scene['artifacts'])
-        existing_scene['artifacts'] = bound_anchor_artifact_events(
-            retained_artifacts,
-            session_id=getattr(session, 'session_id', None),
-            run_id=run_id,
-            stream_id=stream_id,
-            reject_owner_mismatch=True,
-            require_owner_authority=True,
-        )
+        try:
+            existing_scene['artifacts'] = retain_server_authoritative_artifact_events(
+                artifacts,
+                existing_artifacts,
+                session_id=getattr(session, 'session_id', None),
+                run_id=run_id,
+                stream_id=stream_id,
+            )
+            validate_anchor_activity_scene_artifact_paths(
+                existing_scene,
+                getattr(session, 'workspace', None),
+            )
+        except ValueError:
+            existing_scene['artifacts'] = []
     final_answer = existing_scene.get('final_answer')
     if not isinstance(final_answer, str):
         final_answer = _assistant_message_plain_text(message)
