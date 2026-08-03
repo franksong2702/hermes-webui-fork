@@ -3629,24 +3629,50 @@ def _run_journal_snapshot_event_id_for_run(
 
 def _run_journal_summary_stable_run_id(summary: dict, stream_id: str) -> str | None:
     status = str(summary.get("stable_run_id_status") or "").strip().lower()
-    if status != "ok":
+
+    raw_stream_id = summary.get("stream_id")
+    summary_stream_id = _bounded_journal_outcome_string(
+        raw_stream_id,
+        limit=STABLE_RUN_ID_MAX_CHARS,
+    )
+    if raw_stream_id not in (None, "") and summary_stream_id is None:
         return None
-    summary_stream_id = str(
-        summary.get("stream_id") or summary.get("transport_run_id") or ""
-    ).strip()
-    if summary_stream_id and summary_stream_id != stream_id:
+    raw_transport_run_id = summary.get("transport_run_id")
+    transport_run_id = _bounded_journal_outcome_string(
+        raw_transport_run_id,
+        limit=STABLE_RUN_ID_MAX_CHARS,
+    )
+    if raw_transport_run_id not in (None, "") and transport_run_id is None:
         return None
+    transport_ids = [value for value in (summary_stream_id, transport_run_id) if value]
+    if any(value != stream_id for value in transport_ids):
+        return None
+
+    raw_stable_run_id = summary.get("stable_run_id")
     stable_run_id = _bounded_journal_outcome_string(
-        summary.get("stable_run_id"),
+        raw_stable_run_id,
         limit=STABLE_RUN_ID_MAX_CHARS,
     )
+    if raw_stable_run_id not in (None, "") and stable_run_id is None:
+        return None
+    raw_summary_run_id = summary.get("run_id")
     summary_run_id = _bounded_journal_outcome_string(
-        summary.get("run_id"),
+        raw_summary_run_id,
         limit=STABLE_RUN_ID_MAX_CHARS,
     )
+    if raw_summary_run_id not in (None, "") and summary_run_id is None:
+        return None
     if stable_run_id and summary_run_id and stable_run_id != summary_run_id:
         return None
-    return stable_run_id or summary_run_id
+    if status == "ok":
+        return stable_run_id or summary_run_id
+    if status != "absent":
+        return None
+    if stable_run_id or (summary_run_id and summary_run_id != stream_id):
+        return None
+    if not transport_ids and summary_run_id != stream_id:
+        return None
+    return stream_id
 
 
 def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict | None:

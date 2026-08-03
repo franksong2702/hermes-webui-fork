@@ -513,6 +513,22 @@ def test_snapshot_accepts_real_mixed_stream_envelopes_with_persisted_stable_outc
             ],
             "conflicting",
         ),
+        (
+            [
+                {
+                    "version": 1,
+                    "event_id": "stream_bad_stable:1",
+                    "seq": 1,
+                    "run_id": "stream_bad_stable",
+                    "session_id": "foreign_session",
+                    "stable_run_id": "run_stable_one",
+                    "event": "token",
+                    "type": "token",
+                    "payload": {"text": "foreign session"},
+                }
+            ],
+            "conflicting",
+        ),
     ],
 )
 def test_snapshot_fails_closed_on_malformed_or_conflicting_stable_authority(
@@ -542,7 +558,7 @@ def test_snapshot_fails_closed_on_malformed_or_conflicting_stable_authority(
     assert routes._run_journal_live_snapshot("stream_bad_stable") is None
 
 
-def test_snapshot_fails_closed_without_persisted_stable_authority(
+def test_snapshot_accepts_legacy_journal_without_persisted_stable_authority(
     monkeypatch,
     tmp_path,
 ):
@@ -560,7 +576,49 @@ def test_snapshot_fails_closed_without_persisted_stable_authority(
 
     assert summary is not None
     assert summary["stable_run_id_status"] == "absent"
-    assert routes._run_journal_live_snapshot("stream_no_authority") is None
+    snapshot = routes._run_journal_live_snapshot("stream_no_authority")
+
+    assert snapshot is not None
+    assert snapshot["stream_id"] == "stream_no_authority"
+    assert snapshot["messages"][0]["content"] == "legacy only"
+    scene_identity = snapshot["anchor_activity_scene"]["identity"]
+    assert scene_identity["run_id"] == "stream_no_authority"
+    assert scene_identity["stream_id"] == "stream_no_authority"
+
+
+def test_snapshot_rejects_missing_stable_run_id_status(monkeypatch):
+    from api import routes
+
+    stream_id = "stream_missing_authority_status"
+    monkeypatch.setattr(
+        routes,
+        "find_run_summary",
+        lambda _stream_id: {
+            "session_id": "session_missing_authority_status",
+            "run_id": None,
+            "stable_run_id": None,
+            "stream_id": stream_id,
+            "transport_run_id": stream_id,
+            "last_seq": 1,
+            "last_event_id": f"{stream_id}:1",
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "read_run_events",
+        lambda _session_id, _run_id: {
+            "events": [
+                {
+                    "seq": 1,
+                    "event": "token",
+                    "event_id": f"{stream_id}:1",
+                    "payload": {"text": "legacy transport-valid row"},
+                }
+            ]
+        },
+    )
+
+    assert routes._run_journal_live_snapshot(stream_id) is None
 
 
 def test_snapshot_rejects_outcomes_that_would_steer_scene_owner(monkeypatch):
