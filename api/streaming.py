@@ -2180,11 +2180,12 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
                 stream_id=stream_id,
             )
         ]
-        if len(legacy_keys) > 1:
-            logger.debug("Rejected ambiguous legacy anchor scene records for terminal reconciliation")
-            return False
-        if not record and legacy_keys:
-            record = records.get(legacy_keys[0]) or {}
+        if not record:
+            if len(legacy_keys) > 1:
+                logger.debug("Rejected ambiguous legacy anchor scene records for terminal reconciliation")
+                return False
+            if legacy_keys:
+                record = records.get(legacy_keys[0]) or {}
         for legacy_key in legacy_keys:
             records.pop(legacy_key, None)
     existing_scene = record.get('scene') if isinstance(record.get('scene'), dict) else {}

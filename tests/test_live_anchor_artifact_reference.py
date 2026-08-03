@@ -1348,7 +1348,7 @@ def test_terminal_reconciliation_discards_untrusted_legacy_artifacts_before_pers
     assert len(records) == 1
     assert records[message_ref]["message_ref"] == message_ref
     persisted_artifacts = records[message_ref]["scene"]["artifacts"]
-    assert [artifact["payload"]["path"] for artifact in persisted_artifacts] == ["reports/really-written.md"]
+    assert persisted_artifacts == [real]
     assert all(
         artifact["payload"]["path"] != "reports/never-written.md"
         for artifact in persisted_artifacts
@@ -1359,12 +1359,7 @@ def test_terminal_reconciliation_discards_untrusted_legacy_artifacts_before_pers
         loaded.messages, loaded.anchor_activity_scenes, session_id=sid, workspace=workspace,
     )
     artifacts = hydrated[1]["_anchor_activity_scene"]["artifacts"]
-    assert [artifact["payload"]["path"] for artifact in artifacts] == ["reports/really-written.md"]
-    artifact = artifacts[0]
-    assert artifact["event_id"] == f"{run_id}:4"
-    assert artifact["seq"] == 4
-    assert artifact["payload"]["source_tool"] == "write_file"
-    assert artifact["payload"]["tool_call_id"] == "call-real"
+    assert artifacts == [real]
 
 
 def test_terminal_reconciliation_does_not_self_authenticate_persisted_artifacts(tmp_path, monkeypatch):
@@ -1399,6 +1394,18 @@ def test_terminal_reconciliation_does_not_self_authenticate_persisted_artifacts(
         {"kind": "workspace_file", "path": "reports/never-written.md", "source_tool": "write_file", "tool_call_id": "call-invented"},
         session_id=sid, run_id=run_id, stream_id=stream_id, event_id=f"{run_id}:3", seq=3,
     )
+
+    def legacy_record():
+        return {
+            "version": "anchor_activity_scene_record_v1", "message_index": 1,
+            "run_id": run_id, "stream_id": stream_id, "owner_authority": "server",
+            "scene": {
+                "version": "activity_scene_v1", "mode": "compact_worklog",
+                "identity": {"session_id": sid, "run_id": run_id, "stream_id": stream_id},
+                "artifacts": [invented],
+            },
+        }
+
     session.anchor_activity_scenes = {
         message_ref: {
             "version": "anchor_activity_scene_record_v1", "message_index": 1,
@@ -1409,7 +1416,9 @@ def test_terminal_reconciliation_does_not_self_authenticate_persisted_artifacts(
                 "identity": {"session_id": sid, "run_id": run_id, "stream_id": stream_id},
                 "artifacts": [invented],
             },
-        }
+        },
+        "index:1": legacy_record(),
+        "legacy-index:1": legacy_record(),
     }
     real = anchor_artifact_event_from_payload(
         {"kind": "workspace_file", "path": "reports/really-written.md", "source_tool": "write_file", "tool_call_id": "call-real"},
@@ -1422,10 +1431,19 @@ def test_terminal_reconciliation_does_not_self_authenticate_persisted_artifacts(
     session.save(skip_index=True)
 
     raw = json.loads((session_dir / "artifact-canonical-terminal.json").read_text(encoding="utf-8"))
-    record = raw["anchor_activity_scenes"][message_ref]
+    records = raw["anchor_activity_scenes"]
+    assert list(records) == [message_ref]
+    assert len(records) == 1
+    record = records[message_ref]
     persisted_artifacts = record["scene"]["artifacts"]
-    assert [artifact["payload"]["path"] for artifact in persisted_artifacts] == ["reports/really-written.md"]
+    assert persisted_artifacts == [real]
     assert all(
         artifact["payload"]["path"] != "reports/never-written.md"
         for artifact in persisted_artifacts
     )
+
+    loaded = Session.load(sid)
+    hydrated = routes._hydrate_anchor_activity_scenes(
+        loaded.messages, loaded.anchor_activity_scenes, session_id=sid, workspace=workspace,
+    )
+    assert hydrated[1]["_anchor_activity_scene"]["artifacts"] == [real]
