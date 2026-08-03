@@ -111,6 +111,9 @@ python tests/browser_conversation_lifecycle.py
 
 # Terminal-error lifecycle gate (new row in the proof matrix).
 LIFECYCLE_SCENARIO=terminal-error python tests/browser_conversation_lifecycle.py
+
+# Historical ID-linked transcript hydration row.
+python tests/browser_historical_transcript_hydration.py
 ```
 
 To certify that the gate catches its target failure, the test owns an opt-in
@@ -126,6 +129,11 @@ LIFECYCLE_TEST_BITE=drop-anchor-persistence \
 LIFECYCLE_SCENARIO=terminal-error \
 LIFECYCLE_TEST_BITE=drop-terminal-anchor-row \
   python tests/browser_conversation_lifecycle.py
+
+# Historical-hydration mutation: corrupt one persisted tool-result link so the
+# strict Anchor projection must fail instead of claiming the legacy transcript.
+HISTORICAL_HYDRATION_TEST_BITE=break-tool-link \
+  python tests/browser_historical_transcript_hydration.py
 
 # Negative classification check: a hard-reload final-text prerequisite failure
 # must not emit the drop-anchor-persistence expected-failure marker.
@@ -158,14 +166,15 @@ for bite in \
 done
 ```
 
-The dedicated `Conversation lifecycle (informational)` workflow runs both current
-proof rows (`normal` and `terminal-error`) and automatically verifies the two
-mutation commands above still fail with their scenario-specific expected-failure
-marker. It also runs the seven negative classification and discriminator checks above and rejects them
-if they emit either classification marker. Its `Lifecycle proof summary` result
-aggregates those checks, so a broken proof row, a mutation that unexpectedly
-survives, or an unrelated browser/server failure is visible as a failed workflow
-result. The workflow can also be started manually from the Actions page.
+The dedicated `Conversation lifecycle (informational)` workflow runs the current
+proof rows (`normal`, `terminal-error`, and `historical-transcript-hydration`) and
+automatically verifies the mutation commands above still fail with their
+scenario-specific expected-failure marker. It also runs the seven negative
+classification and discriminator checks above and rejects them if they emit
+either classification marker. Its `Lifecycle proof summary` result aggregates
+those checks, so a broken proof row, a mutation that unexpectedly survives, or an
+unrelated browser/server failure is visible as a failed workflow result. The
+workflow can also be started manually from the Actions page.
 
 It remains informational: this change does not make it a required merge check.
 The maintainer's private QA harness remains broader; later public slices will add
