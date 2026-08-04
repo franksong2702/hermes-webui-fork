@@ -5490,30 +5490,43 @@ def _process_wakeup_arc_closed(rows, start, end, stream_id):
         for row in segment
     ):
         return False
-    calls = [
-        call_id
-        for row in segment
-        if row.get('role') == 'assistant'
-        for call in row.get('tool_calls') or []
-        if isinstance(call, dict)
-        and (call_id := str(call.get('id') or call.get('call_id') or '').strip())
-    ]
-    results = [
-        result_id
-        for row in segment
-        if row.get('role') == 'tool'
-        and (
-            result_id := str(
+    final = segment[-1]
+    if (
+        final.get('role') != 'assistant'
+        or final.get('_partial')
+        or not _assistant_message_has_final_visible_text(final)
+        or _message_stream_owner(final) != str(stream_id or '')
+        or final.get('tool_calls')
+    ):
+        return False
+
+    pending_calls = []
+    seen_calls = set()
+    for row in segment[:-1]:
+        if row.get('role') == 'assistant':
+            tool_calls = row.get('tool_calls')
+            if not isinstance(tool_calls, list) or not tool_calls or pending_calls:
+                return False
+            row_calls = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    return False
+                call_id = str(call.get('id') or call.get('call_id') or '').strip()
+                if not call_id or call_id in seen_calls or call_id in row_calls:
+                    return False
+                row_calls.append(call_id)
+                seen_calls.add(call_id)
+            pending_calls.extend(row_calls)
+        elif row.get('role') == 'tool':
+            result_id = str(
                 row.get('tool_call_id') or row.get('tool_use_id') or ''
             ).strip()
-        )
-    ]
-    return (
-        _message_stream_owner(segment[-1]) == str(stream_id or '')
-        and bool(calls)
-        and calls == results
-        and len(calls) == len(set(calls))
-    )
+            if not result_id or not pending_calls or result_id != pending_calls[0]:
+                return False
+            pending_calls.pop(0)
+        else:
+            return False
+    return bool(seen_calls) and not pending_calls
 
 
 def _strip_replayed_process_wakeup_arc(previous_display, candidates, active_identity):

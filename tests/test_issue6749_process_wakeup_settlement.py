@@ -756,3 +756,65 @@ def test_process_wakeup_replay_strip_preserves_older_identical_answer():
         and row.get("content") == "Final wakeup answer"
         for row in settled
     ) == 1
+
+
+def test_process_wakeup_replay_strip_rejects_tool_before_call():
+    stream_id = "stream-6749-tool-before-call"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-tool-before-call-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        "issue6749-tool-before-call-candidates",
+        stream_id,
+    ).messages
+    active_index = next(
+        index for index, row in enumerate(candidates)
+        if row.get("_source") == "process_wakeup"
+    )
+    candidates[active_index + 1], candidates[active_index + 2] = (
+        candidates[active_index + 2],
+        candidates[active_index + 1],
+    )
+    previous[2], previous[3] = previous[3], previous[2]
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+    }
+    assert streaming._strip_replayed_process_wakeup_arc(
+        previous, candidates, identity
+    ) == previous
+
+
+def test_process_wakeup_replay_strip_rejects_intermediary_plain_assistant():
+    stream_id = "stream-6749-intermediary-assistant"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-intermediary-assistant-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        "issue6749-intermediary-assistant-candidates",
+        stream_id,
+    ).messages
+    active_index = next(
+        index for index, row in enumerate(candidates)
+        if row.get("_source") == "process_wakeup"
+    )
+    candidates.insert(
+        active_index + 1,
+        {"role": "assistant", "content": "intermediary text"},
+    )
+    previous.insert(2, {"role": "assistant", "content": "intermediary text"})
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+    }
+    assert streaming._strip_replayed_process_wakeup_arc(
+        previous, candidates, identity
+    ) == previous
