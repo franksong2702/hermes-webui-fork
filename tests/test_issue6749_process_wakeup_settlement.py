@@ -1,0 +1,758 @@
+"""Faithful process-wakeup final-settlement trace for issue #6749.
+
+This test intentionally models the crash/recovery ordering called out by the
+issue: the same wakeup run has already persisted its final assistant row, but
+the late display snapshot still contains an empty partial assistant row.  The
+Agent result carries an independent normal-completion contract and the
+canonical tool history remains paired.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import queue
+import sys
+import types
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+import api.config as config
+import api.models as models
+import api.streaming as streaming
+from api.models import Session
+from api.run_journal import read_run_events
+from api.turn_journal import read_turn_journal
+
+
+@pytest.fixture(autouse=True)
+def _isolate_session_dir(tmp_path, monkeypatch):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    models.SESSIONS.clear()
+    yield
+    models.SESSIONS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_stream_state():
+    config.STREAMS.clear()
+    config.CANCEL_FLAGS.clear()
+    config.AGENT_INSTANCES.clear()
+    config.STREAM_PARTIAL_TEXT.clear()
+    if hasattr(config, "STREAM_REASONING_TEXT"):
+        config.STREAM_REASONING_TEXT.clear()
+    if hasattr(config, "STREAM_LIVE_TOOL_CALLS"):
+        config.STREAM_LIVE_TOOL_CALLS.clear()
+    yield
+    config.STREAMS.clear()
+    config.CANCEL_FLAGS.clear()
+    config.AGENT_INSTANCES.clear()
+    config.STREAM_PARTIAL_TEXT.clear()
+    if hasattr(config, "STREAM_REASONING_TEXT"):
+        config.STREAM_REASONING_TEXT.clear()
+    if hasattr(config, "STREAM_LIVE_TOOL_CALLS"):
+        config.STREAM_LIVE_TOOL_CALLS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_agent_locks():
+    config.SESSION_AGENT_LOCKS.clear()
+    yield
+    config.SESSION_AGENT_LOCKS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _mock_hermes_modules(monkeypatch):
+    fake_runtime_module = types.ModuleType("hermes_cli.runtime_provider")
+    fake_runtime_module.resolve_runtime_provider = lambda requested=None, **_kw: {
+        "provider": requested or "test-provider",
+        "api_key": "synthetic-key",
+        "base_url": None,
+    }
+    fake_hermes_cli = types.ModuleType("hermes_cli")
+    fake_hermes_cli.runtime_provider = fake_runtime_module
+    fake_hermes_state = types.ModuleType("hermes_state")
+    fake_hermes_state.SessionDB = mock.Mock(return_value=None)
+    injected = {
+        "hermes_cli": fake_hermes_cli,
+        "hermes_cli.runtime_provider": fake_runtime_module,
+        "hermes_state": fake_hermes_state,
+    }
+    missing = object()
+    saved = {name: sys.modules.get(name, missing) for name in injected}
+    sys.modules.update(injected)
+    yield
+    for name, previous in saved.items():
+        if previous is missing:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+
+
+class _FaithfulCompletedAgent:
+    """Synthetic Agent shaped like turn_finalizer's normal completion result."""
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id")
+        self.model = kwargs.get("model")
+        self.provider = kwargs.get("provider")
+        self.base_url = kwargs.get("base_url")
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.reasoning_callback = kwargs.get("reasoning_callback")
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.status_callback = kwargs.get("status_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.session_prompt_tokens = 1
+        self.session_completion_tokens = 1
+        self.session_estimated_cost_usd = 0.0
+        self.session_cache_read_tokens = 0
+        self.session_cache_write_tokens = 0
+        self.session_api_calls = 1
+        self.context_compressor = None
+        self._last_error = None
+        self._current_turn_id = "turn-6749-wakeup"
+        # Deliberately leave this unset/None: recovery has not materialized the
+        # pending process-wakeup user row when the final assistant is persisted.
+        self._persist_user_message_idx = None
+        self.ephemeral_system_prompt = None
+
+    def run_conversation(self, **kwargs):
+        history = copy.deepcopy(list(kwargs.get("conversation_history") or []))
+        active_user = {
+            "role": "user",
+            "content": self.trace_user_message,
+            "timestamp": self.trace_pending_started_at,
+            "_source": "process_wakeup",
+            "_active_turn_token": streaming.build_active_turn_token(
+                self.trace_stream_id,
+                self.trace_pending_started_at,
+            ),
+        }
+        first_active_tool = next(
+            (
+                index
+                for index, row in enumerate(history)
+                if isinstance(row, dict)
+                and row.get("role") == "assistant"
+                and row.get("tool_calls")
+            ),
+            len(history),
+        )
+        history.insert(first_active_tool, active_user)
+        final_rows = [
+            row
+            for row in history
+            if isinstance(row, dict)
+            and row.get("role") == "assistant"
+            and row.get("content") == "Final wakeup answer"
+        ]
+        assert len(final_rows) == 1, "faithful trace must carry one persisted final row"
+        final_rows[0]["_recovered_from_run_journal"] = True
+        final_rows[0]["_recovered_stream_id"] = self.result_owner_stream_id
+        # This is the reported late display snapshot: it repeats the completed
+        # answer and carries WebUI-only tool activity.  The canonical Agent
+        # assistant/tool rows above, not these display flags, prove closure.
+        history.append(
+            {
+                "role": "assistant",
+                "content": "Final wakeup answer",
+                "_partial": True,
+                "_partial_tool_calls": [
+                    {
+                        "tid": "call-6749-1",
+                        "name": "inspect_1",
+                        "done": True,
+                        "snippet": "tool result 1",
+                    },
+                    {
+                        "tid": "call-6749-2",
+                        "name": "inspect_2",
+                        "done": True,
+                        "snippet": "tool result 2",
+                    },
+                ],
+                "_recovered_from_run_journal": True,
+                "_recovered_stream_id": self.trace_stream_id,
+            }
+        )
+        return {
+            "messages": history,
+            "completed": True,
+            "failed": False,
+            "interrupted": False,
+            "partial": False,
+            "status": "ok",
+            "turn_exit_reason": "text_response(stop)",
+            "finish_reason": "stop",
+            "final_response": "Final wakeup answer",
+            "turn_id": self._current_turn_id,
+            "session_id": self.session_id,
+            "error": None,
+        }
+
+    def interrupt(self, _message):
+        return None
+
+
+class _HealthyProcessWakeupAgent(_FaithfulCompletedAgent):
+    """Normal wakeup result with no recovery rows or tool arc."""
+
+    def run_conversation(self, **kwargs):
+        history = copy.deepcopy(list(kwargs.get("conversation_history") or []))
+        history.append(
+            {
+                "role": "user",
+                "content": self.trace_user_message,
+                "timestamp": self.trace_pending_started_at,
+                "_source": "process_wakeup",
+                "_active_turn_token": streaming.build_active_turn_token(
+                    self.trace_stream_id,
+                    self.trace_pending_started_at,
+                ),
+            }
+        )
+        history.append({"role": "assistant", "content": "Healthy wakeup answer"})
+        return {
+            "messages": history,
+            "completed": True,
+            "failed": False,
+            "interrupted": False,
+            "partial": False,
+            "status": "ok",
+            "turn_exit_reason": "text_response(stop)",
+            "finish_reason": "stop",
+            "final_response": "Healthy wakeup answer",
+            "turn_id": self._current_turn_id,
+            "session_id": self.session_id,
+            "error": None,
+        }
+
+
+def _tool_pair(index: int) -> tuple[dict, dict]:
+    tool_id = f"call-6749-{index}"
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": tool_id,
+                "type": "function",
+                "function": {
+                    "name": f"inspect_{index}",
+                    "arguments": json.dumps({"index": index}),
+                },
+            }
+        ],
+    }
+    result = {
+        "role": "tool",
+        "tool_call_id": tool_id,
+        "content": f"tool result {index}",
+    }
+    return assistant, result
+
+
+def _prepare_persisted_wakeup_final(
+    session_id: str,
+    stream_id: str,
+    wakeup_prompt: str,
+    *,
+    final_owner_stream_id: str | None = None,
+) -> Session:
+    session = Session(
+        session_id=session_id,
+        title="Issue 6749 faithful trace",
+        workspace=str(Path.cwd()),
+        model="test-model",
+        model_provider="test-provider",
+    )
+    messages = [
+        {"role": "user", "content": "Earlier turn", "timestamp": 1},
+        {"role": "assistant", "content": "Earlier answer", "timestamp": 2},
+    ]
+    for index in (1, 2):
+        assistant, result = _tool_pair(index)
+        messages.extend((assistant, result))
+    messages.append(
+        {
+            "role": "assistant",
+            "content": "Final wakeup answer",
+            "timestamp": 10,
+            "_recovered_from_run_journal": True,
+            "_recovered_stream_id": stream_id,
+            "turn_id": "turn-6749-wakeup",
+        }
+    )
+    # The final row is already durable, while the pending wakeup user row has
+    # not yet been materialized.  The agent result materializes the active
+    # synthetic user immediately before this turn's tool closure.
+    final_owner_stream_id = final_owner_stream_id or stream_id
+    for row in messages:
+        if row.get("content") == "Final wakeup answer":
+            row["_recovered_stream_id"] = final_owner_stream_id
+    session.messages = copy.deepcopy(messages)
+    session.context_messages = copy.deepcopy(messages)
+    session.pending_user_message = wakeup_prompt
+    session.pending_attachments = []
+    session.pending_started_at = 1234567890.0
+    session.pending_user_source = "process_wakeup"
+    session.active_stream_id = stream_id
+    session.save()
+    models.SESSIONS[session_id] = session
+    return session
+
+
+def _prepare_healthy_wakeup(session_id: str, stream_id: str, wakeup_prompt: str) -> Session:
+    session = Session(
+        session_id=session_id,
+        title="Issue 6749 healthy wakeup",
+        workspace=str(Path.cwd()),
+        model="test-model",
+        model_provider="test-provider",
+    )
+    session.messages = [
+        {"role": "user", "content": "Earlier turn", "timestamp": 1},
+        {"role": "assistant", "content": "Earlier answer", "timestamp": 2},
+    ]
+    session.context_messages = copy.deepcopy(session.messages)
+    session.pending_user_message = wakeup_prompt
+    session.pending_attachments = []
+    session.pending_started_at = 1234567890.0
+    session.pending_user_source = "process_wakeup"
+    session.active_stream_id = stream_id
+    session.save()
+    models.SESSIONS[session_id] = session
+    return session
+
+
+def _closed_wakeup_session(session_id: str, stream_id: str, *, partial=None) -> Session:
+    session = _prepare_persisted_wakeup_final(
+        session_id,
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    active_user = {
+        "role": "user",
+        "content": session.pending_user_message,
+        "timestamp": session.pending_started_at,
+        "_source": "process_wakeup",
+        "_active_turn_token": streaming.build_active_turn_token(
+            stream_id,
+            session.pending_started_at,
+        ),
+    }
+    rows = copy.deepcopy(session.messages)
+    rows.insert(2, active_user)
+    if partial is not None:
+        rows.append(partial)
+    session.messages = rows
+    session.context_messages = copy.deepcopy(rows)
+    return session
+
+
+def _queue_events(fake_queue):
+    return [(item[0], item[1]) for item in list(fake_queue.queue)]
+
+
+def _run_stream(session, stream_id: str, agent_cls, workspace: str):
+    fake_queue = queue.Queue()
+    streaming.STREAMS[stream_id] = fake_queue
+    config.STREAM_PARTIAL_TEXT[stream_id] = ""
+    class BoundAgent(agent_cls):
+        trace_stream_id = stream_id
+        trace_user_message = session.pending_user_message
+        trace_pending_started_at = session.pending_started_at
+        result_owner_stream_id = getattr(agent_cls, "result_owner_stream_id", stream_id)
+
+    with mock.patch.object(streaming, "get_session", return_value=session), \
+         mock.patch.object(streaming, "_get_ai_agent", return_value=BoundAgent), \
+         mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
+         mock.patch("api.config.get_config", return_value={}), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]):
+        streaming._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text=session.pending_user_message,
+            model="test-model",
+            workspace=workspace,
+            stream_id=stream_id,
+        )
+    return fake_queue
+
+
+def _trace_payload(session, fake_queue, stream_id: str):
+    saved = Session.load(session.session_id)
+    stream_events = _queue_events(fake_queue)
+    run_events = read_run_events(session.session_id, stream_id)["events"]
+    turn_events = read_turn_journal(session.session_id)["events"]
+    return {
+        "stream_events": [event for event, _data in stream_events],
+        "stream_terminal_payloads": [
+            data for event, data in stream_events if event in {"done", "apperror", "stream_end"}
+        ],
+        "saved_messages": [
+            {
+                "role": row.get("role"),
+                "content": row.get("content"),
+                "partial": bool(row.get("_partial")),
+                "error": bool(row.get("_error")),
+                "recovered_stream_id": row.get("_recovered_stream_id"),
+                "id": row.get("id"),
+                "turn_id": row.get("turn_id"),
+                "tool_call_ids": [
+                    call.get("id")
+                    for call in row.get("tool_calls") or []
+                    if isinstance(call, dict)
+                ],
+                "tool_call_id": row.get("tool_call_id"),
+            }
+            for row in (saved.messages if saved else [])
+            if isinstance(row, dict)
+        ],
+        "run_journal": [
+            {
+                "event": row.get("event"),
+                "terminal": row.get("terminal"),
+                "terminal_state": row.get("terminal_state"),
+                "seq": row.get("seq"),
+            }
+            for row in run_events
+        ],
+        "turn_journal": [
+            {
+                "event": row.get("event"),
+                "terminal": row.get("terminal"),
+                "stream_id": row.get("stream_id"),
+                "turn_id": row.get("turn_id"),
+                "assistant_message_index": row.get("assistant_message_index"),
+            }
+            for row in turn_events
+        ],
+    }
+
+
+def test_process_wakeup_normal_completion_beats_late_partial_snapshot(tmp_path, monkeypatch):
+    session_id = "issue6749-wakeup"
+    stream_id = "stream-6749-wakeup"
+    wakeup_prompt = "[IMPORTANT: Background process completed]"
+    session = _prepare_persisted_wakeup_final(session_id, stream_id, wakeup_prompt)
+    fake_queue = _run_stream(
+        session,
+        stream_id,
+        _FaithfulCompletedAgent,
+        str(tmp_path),
+    )
+
+    trace = _trace_payload(session, fake_queue, stream_id)
+    trace_path = tmp_path / "issue-6749-faithful-trace.json"
+    trace_path.write_text(json.dumps(trace, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    saved = Session.load(session_id)
+    assert saved is not None
+    final_rows = [
+        row
+        for row in saved.messages
+        if row.get("role") == "assistant" and row.get("content") == "Final wakeup answer"
+    ]
+    stream_event_names = trace["stream_events"]
+    assert stream_event_names.count("done") == 1, f"faithful trace emitted wrong terminal events; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+    assert "apperror" not in stream_event_names, f"faithful trace emitted generated failure; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+    assert len(final_rows) == 1, f"final assistant ownership was not preserved; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+    assert not any(row.get("_error") for row in saved.messages), f"error row persisted; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+    assert not any(row.get("_partial") for row in saved.messages), f"late partial marker survived; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+    final_index = saved.messages.index(final_rows[0])
+    active_user_index = next(
+        index
+        for index, row in enumerate(saved.messages)
+        if row.get("role") == "user" and row.get("_source") == "process_wakeup"
+    )
+    assert final_index > active_user_index, f"final row not settled behind its owner; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+    current_arc = saved.messages[active_user_index + 1 : final_index]
+    call_ids = [
+        call.get("id")
+        for row in current_arc
+        if row.get("role") == "assistant"
+        for call in row.get("tool_calls") or []
+        if isinstance(call, dict) and call.get("id")
+    ]
+    result_ids = [
+        row.get("tool_call_id")
+        for row in current_arc
+        if row.get("role") == "tool" and row.get("tool_call_id")
+    ]
+    assert call_ids == ["call-6749-1", "call-6749-2"]
+    assert result_ids == call_ids
+    assert [row.get("role") for row in current_arc] == ["assistant", "tool", "assistant", "tool"]
+    all_call_ids = [
+        call.get("id")
+        for row in saved.messages
+        if row.get("role") == "assistant"
+        for call in row.get("tool_calls") or []
+        if isinstance(call, dict) and call.get("id")
+    ]
+    all_result_ids = [
+        row.get("tool_call_id")
+        for row in saved.messages
+        if row.get("role") == "tool" and row.get("tool_call_id")
+    ]
+    assert all_call_ids.count("call-6749-1") == 1
+    assert all_call_ids.count("call-6749-2") == 1
+    assert all_result_ids.count("call-6749-1") == 1
+    assert all_result_ids.count("call-6749-2") == 1
+    assert not any(
+        row.get("role") == "assistant"
+        and any(call.get("id") in {"call-6749-1", "call-6749-2"} for call in row.get("tool_calls") or [])
+        for row in saved.messages[:active_user_index]
+    )
+    assert not any(
+        row.get("role") == "tool"
+        and row.get("tool_call_id") in {"call-6749-1", "call-6749-2"}
+        for row in saved.messages[:active_user_index]
+    )
+    assert next(
+        row["terminal_state"]
+        for row in trace["run_journal"]
+        if row["event"] == "done"
+    ) == "completed", f"run journal did not settle completed; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+    assert any(row.get("event") == "completed" for row in trace["turn_journal"]), f"turn journal missing completed; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+
+
+class _ProviderErrorAfterFinalAgent(_FaithfulCompletedAgent):
+    def run_conversation(self, **kwargs):
+        result = super().run_conversation(**kwargs)
+        result.update(
+            {
+                "completed": False,
+                "failed": True,
+                "error": {"message": "provider failed after final"},
+            }
+        )
+        return result
+
+
+class _MissingToolResultAgent(_FaithfulCompletedAgent):
+    def run_conversation(self, **kwargs):
+        result = super().run_conversation(**kwargs)
+        result["messages"] = [
+            row for row in result["messages"]
+            if not (
+                isinstance(row, dict)
+                and row.get("role") == "tool"
+                and row.get("tool_call_id") == "call-6749-2"
+            )
+        ]
+        result.update(
+            {
+                "completed": False,
+                "partial": True,
+                "turn_exit_reason": "tool_result_missing",
+                "final_response": "",
+            }
+        )
+        return result
+
+
+class _GenuinelyPartialAgent(_FaithfulCompletedAgent):
+    def run_conversation(self, **kwargs):
+        result = super().run_conversation(**kwargs)
+        result["messages"] = [
+            row for row in result["messages"]
+            if not (
+                isinstance(row, dict)
+                and row.get("role") == "assistant"
+                and row.get("content") == "Final wakeup answer"
+            )
+        ]
+        result.update(
+            {
+                "completed": False,
+                "partial": True,
+                "turn_exit_reason": "max_iterations_reached(30/30)",
+                "final_response": "",
+            }
+        )
+        return result
+
+
+class _MismatchedRunAgent(_FaithfulCompletedAgent):
+    result_owner_stream_id = "other-stream"
+
+    def run_conversation(self, **kwargs):
+        result = super().run_conversation(**kwargs)
+        result["messages"] = [
+            row for row in result["messages"]
+            if not (
+                isinstance(row, dict)
+                and row.get("role") == "assistant"
+                and row.get("content") == "Final wakeup answer"
+            )
+        ]
+        return result
+
+
+def _assert_failure_settlement(session, fake_queue, stream_id: str, tmp_path):
+    trace = _trace_payload(session, fake_queue, stream_id)
+    trace_path = tmp_path / f"{stream_id}-trace.json"
+    trace_path.write_text(json.dumps(trace, indent=2, ensure_ascii=False), encoding="utf-8")
+    events = trace["stream_events"]
+    assert "done" not in events, f"negative trace settled done; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+    assert "apperror" in events, f"negative trace lost terminal failure; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert any(row.get("_error") for row in saved.messages), f"negative trace has no persisted error; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+
+
+def test_process_wakeup_missing_tool_result_keeps_failure(tmp_path, monkeypatch):
+    session_id = "issue6749-missing-tool-result"
+    stream_id = "stream-6749-missing-tool-result"
+    session = _prepare_persisted_wakeup_final(
+        session_id,
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    session.messages = [
+        row
+        for row in session.messages
+        if row.get("tool_call_id") != "call-6749-2"
+    ]
+    session.context_messages = copy.deepcopy(session.messages)
+    session.save()
+    fake_queue = _run_stream(session, stream_id, _MissingToolResultAgent, str(tmp_path))
+    _assert_failure_settlement(session, fake_queue, stream_id, tmp_path)
+
+
+def test_process_wakeup_provider_error_after_final_keeps_failure(tmp_path, monkeypatch):
+    session_id = "issue6749-provider-error"
+    stream_id = "stream-6749-provider-error"
+    session = _prepare_persisted_wakeup_final(
+        session_id,
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    fake_queue = _run_stream(session, stream_id, _ProviderErrorAfterFinalAgent, str(tmp_path))
+    _assert_failure_settlement(session, fake_queue, stream_id, tmp_path)
+
+
+def test_process_wakeup_mismatched_run_identity_keeps_failure(tmp_path, monkeypatch):
+    session_id = "issue6749-mismatched-run"
+    stream_id = "stream-6749-mismatched-run"
+    session = _prepare_persisted_wakeup_final(
+        session_id,
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+        final_owner_stream_id="other-stream",
+    )
+    fake_queue = _run_stream(session, stream_id, _MismatchedRunAgent, str(tmp_path))
+    _assert_failure_settlement(session, fake_queue, stream_id, tmp_path)
+
+
+def test_process_wakeup_genuinely_partial_result_keeps_failure(tmp_path, monkeypatch):
+    session_id = "issue6749-genuinely-partial"
+    stream_id = "stream-6749-genuinely-partial"
+    session = _prepare_persisted_wakeup_final(
+        session_id,
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    fake_queue = _run_stream(session, stream_id, _GenuinelyPartialAgent, str(tmp_path))
+    _assert_failure_settlement(session, fake_queue, stream_id, tmp_path)
+
+
+def test_process_wakeup_healthy_result_without_recovery_shape_succeeds(tmp_path):
+    session_id = "issue6749-healthy"
+    stream_id = "stream-6749-healthy"
+    session = _prepare_healthy_wakeup(
+        session_id,
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    fake_queue = _run_stream(session, stream_id, _HealthyProcessWakeupAgent, str(tmp_path))
+    trace = _trace_payload(session, fake_queue, stream_id)
+    assert trace["stream_events"].count("done") == 1
+    assert "apperror" not in trace["stream_events"]
+    saved = Session.load(session_id)
+    assert saved is not None
+    assert any(row.get("content") == "Healthy wakeup answer" for row in saved.messages)
+    assert not any(row.get("_recovered_stream_id") for row in saved.messages)
+    assert not any(row.get("role") == "tool" for row in saved.messages)
+
+
+def test_process_wakeup_replay_strip_is_scoped_to_process_wakeup_source():
+    stream_id = "stream-6749-source-scope"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-source-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        "issue6749-source-candidates",
+        stream_id,
+    ).messages
+    identity = {
+        "source": "webui",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+    }
+    assert streaming._strip_replayed_process_wakeup_arc(previous, candidates, identity) == previous
+
+
+def test_process_wakeup_replay_strip_rejects_mismatched_turn_identity():
+    stream_id = "stream-6749-turn-scope"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-turn-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        "issue6749-turn-candidates",
+        stream_id,
+    ).messages
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "different-turn",
+    }
+    assert streaming._strip_replayed_process_wakeup_arc(previous, candidates, identity) == previous
+
+
+def test_process_wakeup_replay_strip_preserves_older_identical_answer():
+    stream_id = "stream-6749-older-answer"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-older-answer-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    older = {
+        "role": "assistant",
+        "content": "Final wakeup answer",
+        "timestamp": 0,
+    }
+    previous = [older, *copy.deepcopy(previous_session.messages)]
+    candidates = _closed_wakeup_session(
+        "issue6749-older-answer-candidates",
+        stream_id,
+    ).messages
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+    }
+    settled = streaming._strip_replayed_process_wakeup_arc(
+        previous,
+        candidates,
+        identity,
+    )
+    assert settled[0] is older
+    assert sum(
+        row.get("role") == "assistant"
+        and row.get("content") == "Final wakeup answer"
+        for row in settled
+    ) == 1
