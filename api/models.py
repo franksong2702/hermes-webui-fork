@@ -8073,8 +8073,6 @@ def get_state_db_session_messages(
                 # provenance field so duplicate reconciliation can align a
                 # state.db sidecar without changing the existing ``id`` key
                 # used by WebUI transcript merge/dedup logic.
-                if id_col and row['id'] is not None:
-                    msg['_state_db_row_id'] = row['id']
                 for col in optional:
                     if col not in row.keys():
                         continue
@@ -8084,6 +8082,16 @@ def get_state_db_session_messages(
                     if col in {'tool_calls', 'reasoning_details', 'codex_reasoning_items', 'codex_message_items'}:
                         value = _json_loads_if_string(value)
                     msg[col] = value
+                # Keep durable provenance only alongside a real Agent replay
+                # sidecar. Ordinary state.db rows must retain their historic
+                # shape and must not acquire internal bookkeeping fields.
+                if (
+                    id_col
+                    and row['id'] is not None
+                    and isinstance(msg.get('api_content'), str)
+                    and msg['api_content']
+                ):
+                    msg['_state_db_row_id'] = row['id']
                 if msg.get('role') == 'tool' and msg.get('tool_name') and not msg.get('name'):
                     msg['name'] = msg['tool_name']
                 msgs.append(msg)
@@ -8465,8 +8473,9 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
             used_sources.add(source_index)
             break
 
-    # 2. Exact role + timestamp.  Pair repeated same-timestamp rows by their
-    # source sequence, so even a timestamp collision cannot cross-bind rows.
+    # 2. Exact role + timestamp. A bucket is safe only when it has one
+    # remaining candidate on each side. Equal timestamps are not provenance;
+    # never guess by list order when a bucket is ambiguous.
     sidecar_by_exact_timestamp = {}
     state_by_exact_timestamp = {}
     for index, message in enumerate(sidecar):
@@ -8483,14 +8492,17 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
             state_by_exact_timestamp.setdefault((role, timestamp), []).append((source_index, message))
     for key, state_rows in state_by_exact_timestamp.items():
         candidates = [index for index in sidecar_by_exact_timestamp.get(key, ()) if index not in used_targets]
-        for index, (source_index, message) in zip(candidates, state_rows, strict=False):
-            _copy_api_content_sidecar(sidecar[index], message)
-            used_targets.add(index)
-            used_sources.add(source_index)
+        if len(candidates) != 1 or len(state_rows) != 1:
+            continue
+        index = candidates[0]
+        source_index, message = state_rows[0]
+        _copy_api_content_sidecar(sidecar[index], message)
+        used_targets.add(index)
+        used_sources.add(source_index)
 
-    # 3. Sequence-aware fallback only when *both* records lack timestamp and
-    # durable row identity.  This covers legacy schemas without weakening the
-    # no-cross-binding rule for rows that expose contradictory identity data.
+    # 3. Metadata-free fallback is safe only for a unique role bucket. A
+    # repeated role with no durable identity has no principled ordering, so it
+    # must remain unattached rather than being paired by zip/list position.
     sidecar_by_role_sequence = {}
     state_by_role_sequence = {}
     for index, message in enumerate(sidecar):
@@ -8505,10 +8517,13 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
             state_by_role_sequence.setdefault(role, []).append((source_index, message))
     for role, state_rows in state_by_role_sequence.items():
         candidates = [index for index in sidecar_by_role_sequence.get(role, ()) if index not in used_targets]
-        for index, (source_index, message) in zip(candidates, state_rows, strict=False):
-            _copy_api_content_sidecar(sidecar[index], message)
-            used_targets.add(index)
-            used_sources.add(source_index)
+        if len(candidates) != 1 or len(state_rows) != 1:
+            continue
+        index = candidates[0]
+        source_index, message = state_rows[0]
+        _copy_api_content_sidecar(sidecar[index], message)
+        used_targets.add(index)
+        used_sources.add(source_index)
 
 
 def _session_message_dedup_key(msg: dict):

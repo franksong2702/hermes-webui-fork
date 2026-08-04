@@ -183,7 +183,7 @@ def test_issue6751_reconciliation_fails_closed_when_row_id_roles_disagree():
     assert "api_content" not in merged[0]
 
 
-def test_issue6751_sequence_fallback_is_used_only_without_durable_metadata():
+def test_issue6751_ambiguous_metadata_free_sequence_fails_closed():
     from api.models import merge_session_messages_append_only
 
     sidecar = [
@@ -197,7 +197,68 @@ def test_issue6751_sequence_fallback_is_used_only_without_durable_metadata():
 
     merged = merge_session_messages_append_only(sidecar, state)
 
-    assert [message.get("api_content") for message in merged] == ["wire-one", "wire-two"]
+    assert [message.get("api_content") for message in merged] == [None, None]
+
+
+def test_issue6751_partial_metadata_bucket_fails_closed_instead_of_zipping():
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {"role": "assistant", "content": "first"},
+        {"role": "assistant", "content": "second"},
+    ]
+    state = [
+        {"role": "assistant", "content": "first", "timestamp": 10.0, "api_content": "wire-first"},
+        {"role": "assistant", "content": "second", "api_content": "wire-second"},
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert [message.get("api_content") for message in merged] == [None, None]
+
+
+def test_issue6751_state_db_reader_preserves_shape_without_api_content(monkeypatch, tmp_path):
+    import api.models as models
+
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, timestamp REAL)"
+    )
+    conn.execute(
+        "INSERT INTO messages VALUES (7, ?, ?, ?, ?)",
+        ("shape-session", "user", "ordinary", 1.0),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db_path)
+
+    assert models.get_state_db_session_messages("shape-session") == [
+        {"role": "user", "content": "ordinary", "timestamp": 1.0}
+    ]
+
+
+def test_issue6751_public_message_projection_strips_internal_replay_fields(monkeypatch):
+    import api.helpers as helpers
+    import api.config as config
+
+    monkeypatch.setattr(config, "load_settings", lambda: {"api_redact_enabled": False})
+    safe = helpers.redact_session_data(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "visible",
+                    "api_content": "wire",
+                    "_state_db_row_id": 7,
+                    "_db_row_id": 8,
+                    "state_db_row_id": 9,
+                }
+            ]
+        }
+    )
+
+    assert safe["messages"] == [{"role": "user", "content": "visible"}]
 
 
 def test_issue6751_provider_projection_still_strips_api_content_by_default():

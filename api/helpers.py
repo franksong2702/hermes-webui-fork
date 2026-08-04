@@ -14,6 +14,13 @@ from api.config import IMAGE_EXTS, MD_EXTS
 
 logger = logging.getLogger(__name__)
 
+_PUBLIC_MESSAGE_INTERNAL_FIELDS = frozenset({
+    "api_content",
+    "_state_db_row_id",
+    "_db_row_id",
+    "state_db_row_id",
+})
+
 
 # Treat stalled/closed HTTP clients as normal disconnects.  Long-lived SSE
 # connections often end this way when a browser tab sleeps, a phone switches
@@ -985,26 +992,29 @@ def _redact_message_content_part(part, *, _enabled: bool):
     return result
 
 
+def _public_message_projection(message, *, _enabled: bool):
+    """Return one public transcript message without internal replay fields."""
+    if not isinstance(message, dict):
+        return _redact_value(message, _enabled=_enabled)
+    item = {}
+    allow_native_image = message.get("role") == "user"
+    for key, value in message.items():
+        if key in _PUBLIC_MESSAGE_INTERNAL_FIELDS:
+            continue
+        if allow_native_image and key == "content" and isinstance(value, list):
+            item[key] = [
+                _redact_message_content_part(part, _enabled=_enabled)
+                for part in value
+            ]
+        else:
+            item[key] = _redact_value(value, _enabled=_enabled)
+    return item
+
+
 def _redact_messages(messages, *, _enabled: bool):
     if not isinstance(messages, list):
         return _redact_value(messages, _enabled=_enabled)
-    redacted = []
-    for message in messages:
-        if not isinstance(message, dict):
-            redacted.append(_redact_value(message, _enabled=_enabled))
-            continue
-        item = {}
-        allow_native_image = message.get("role") == "user"
-        for key, value in message.items():
-            if allow_native_image and key == "content" and isinstance(value, list):
-                item[key] = [
-                    _redact_message_content_part(part, _enabled=_enabled)
-                    for part in value
-                ]
-            else:
-                item[key] = _redact_value(value, _enabled=_enabled)
-        redacted.append(item)
-    return redacted
+    return [_public_message_projection(message, _enabled=_enabled) for message in messages]
 
 
 def redact_session_data(session_dict: dict) -> dict:
