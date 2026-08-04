@@ -818,3 +818,82 @@ def test_process_wakeup_replay_strip_rejects_intermediary_plain_assistant():
     assert streaming._strip_replayed_process_wakeup_arc(
         previous, candidates, identity
     ) == previous
+
+
+def test_process_wakeup_replay_strip_rejects_lossy_content_match():
+    stream_id = "stream-6749-lossy-content"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-lossy-content-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        "issue6749-lossy-content-candidates",
+        stream_id,
+    ).messages
+    previous[3]["content"] = "x" * 500 + "previous-tail"
+    candidates[4]["content"] = "x" * 500 + "candidate-tail"
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+    }
+    assert streaming._strip_replayed_process_wakeup_arc(
+        previous, candidates, identity
+    ) == previous
+
+
+def test_process_wakeup_replay_strip_is_idempotent_with_ambiguous_matches():
+    stream_id = "stream-6749-idempotent"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-idempotent-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    previous.extend(copy.deepcopy(previous_session.messages[2:]))
+    candidates = _closed_wakeup_session(
+        "issue6749-idempotent-candidates",
+        stream_id,
+    ).messages
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+    }
+    settled = streaming._strip_replayed_process_wakeup_arc(
+        previous, candidates, identity
+    )
+    assert streaming._strip_replayed_process_wakeup_arc(
+        settled, candidates, identity
+    ) == settled
+
+
+def test_process_wakeup_replay_strip_rejects_any_turn_identity_disagreement():
+    stream_id = "stream-6749-turn-identities"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-turn-identities-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        "issue6749-turn-identities-candidates",
+        stream_id,
+    ).messages
+    candidate_final = next(
+        row for row in candidates
+        if row.get("role") == "assistant"
+        and row.get("content") == "Final wakeup answer"
+    )
+    candidate_final.pop("turn_id")
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "current-turn",
+    }
+    assert streaming._strip_replayed_process_wakeup_arc(
+        previous, candidates, identity
+    ) == previous

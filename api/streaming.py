@@ -5452,6 +5452,18 @@ def _message_replay_key(msg):
     )
 
 
+def _process_wakeup_replay_key(msg):
+    """Return a lossless key for the destructive wakeup-arc comparison."""
+    if not isinstance(msg, dict):
+        return None
+    return (
+        str(msg.get('role') or ''),
+        msg.get('content'),
+        str(msg.get('tool_call_id') or msg.get('tool_use_id') or ''),
+        json.dumps(msg.get('tool_calls') or [], sort_keys=True, ensure_ascii=False),
+    )
+
+
 def _strip_replayed_prefix(existing_messages, candidates):
     """Drop a candidate prefix that is already the suffix of existing_messages.
 
@@ -5575,33 +5587,41 @@ def _strip_replayed_process_wakeup_arc(previous_display, candidates, active_iden
     candidate_final = candidate_rows[final_index]
     active_turn_id = str(active_identity.get('turn_id') or '').strip()
     candidate_turn_id = str(candidate_final.get('turn_id') or '').strip()
-    if active_turn_id and candidate_turn_id and active_turn_id != candidate_turn_id:
-        return previous
-
     arc = candidate_rows[active_index + 1:final_index + 1]
-    arc_keys = [_message_replay_key(row) for row in arc]
-    old_final = next(
-        (
-            index
-            for index in range(len(previous) - 1, -1, -1)
-            if isinstance(previous[index], dict)
-            and previous[index].get('role') == 'assistant'
-            and not previous[index].get('_partial')
-            and _assistant_message_has_final_visible_text(previous[index])
-            and _message_stream_owner(previous[index]) == stream_id
-        ),
-        None,
-    )
-    if old_final is None:
+    arc_keys = [_process_wakeup_replay_key(row) for row in arc]
+    matching_windows = []
+    for index in range(len(previous) - len(arc_keys) + 1):
+        if (
+            [_process_wakeup_replay_key(row) for row in previous[index:index + len(arc_keys)]]
+            == arc_keys
+        ):
+            matching_windows.append(index)
+    if len(matching_windows) != 1:
+        return previous
+    start = matching_windows[0]
+    old_final = start + len(arc_keys) - 1
+    if (
+        not isinstance(previous[old_final], dict)
+        or previous[old_final].get('role') != 'assistant'
+        or previous[old_final].get('_partial')
+        or not _assistant_message_has_final_visible_text(previous[old_final])
+        or _message_stream_owner(previous[old_final]) != stream_id
+    ):
         return previous
     old_turn_id = str(previous[old_final].get('turn_id') or '').strip()
-    if candidate_turn_id and old_turn_id and candidate_turn_id != old_turn_id:
+    available_turn_ids = {
+        turn_id for turn_id in (active_turn_id, candidate_turn_id, old_turn_id)
+        if turn_id
+    }
+    if len(available_turn_ids) > 1:
         return previous
-    start = old_final - len(arc_keys) + 1
-    if (
-        start < 0
-        or [_message_replay_key(row) for row in previous[start:old_final + 1]]
-        != arc_keys
+    checkpoint_indices = [
+        index for index, row in enumerate(previous)
+        if _active_turn_token_matches(row, active_identity)
+    ]
+    if checkpoint_indices and (
+        len(checkpoint_indices) != 1
+        or start + len(arc_keys) != checkpoint_indices[0]
     ):
         return previous
     return previous[:start] + previous[old_final + 1:]
