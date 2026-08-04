@@ -1449,6 +1449,7 @@ def _active_turn_authority(session, stream_id, msg_text):
     pending_text = getattr(session, 'pending_user_message', None)
     return {
         'token': build_active_turn_token(stream_id, getattr(session, 'pending_started_at', None)),
+        'stream_id': str(stream_id or ''),
         'text': pending_text if pending_text is not None else msg_text,
         'timestamp': getattr(session, 'pending_started_at', None),
         'source': getattr(session, 'pending_user_source', None) or 'webui',
@@ -5470,6 +5471,129 @@ def _strip_replayed_prefix(existing_messages, candidates):
     return candidates
 
 
+def _message_stream_owner(message):
+    """Return the first explicit stream/run owner carried by a message."""
+    if not isinstance(message, dict):
+        return ''
+    for key in ('_recovered_stream_id', '_stream_id', 'stream_id', '_run_id', 'run_id'):
+        value = str(message.get(key) or '').strip()
+        if value:
+            return value
+    return ''
+
+
+def _process_wakeup_arc_closed(rows, start, end, stream_id):
+    """Verify one canonical assistant/tool arc before its owned final row."""
+    segment = list(rows or [])[start:end + 1]
+    if not segment or any(
+        not isinstance(row, dict) or row.get('role') not in {'assistant', 'tool'}
+        for row in segment
+    ):
+        return False
+    calls = [
+        call_id
+        for row in segment
+        if row.get('role') == 'assistant'
+        for call in row.get('tool_calls') or []
+        if isinstance(call, dict)
+        and (call_id := str(call.get('id') or call.get('call_id') or '').strip())
+    ]
+    results = [
+        result_id
+        for row in segment
+        if row.get('role') == 'tool'
+        and (
+            result_id := str(
+                row.get('tool_call_id') or row.get('tool_use_id') or ''
+            ).strip()
+        )
+    ]
+    return (
+        _message_stream_owner(segment[-1]) == str(stream_id or '')
+        and bool(calls)
+        and calls == results
+        and len(calls) == len(set(calls))
+    )
+
+
+def _strip_replayed_process_wakeup_arc(previous_display, candidates, active_identity):
+    """Drop one exact closed replay arc displaced before its active checkpoint."""
+    previous = list(previous_display or [])
+    if (
+        not isinstance(active_identity, dict)
+        or active_identity.get('source') != 'process_wakeup'
+    ):
+        return previous
+    stream_id = str(active_identity.get('stream_id') or '').strip()
+    if not stream_id or not active_identity.get('token'):
+        return previous
+    candidate_rows = list(candidates or [])
+    active_index = next(
+        (
+            index
+            for index, row in enumerate(candidate_rows)
+            if _active_turn_token_matches(row, active_identity)
+        ),
+        None,
+    )
+    if active_index is None:
+        return previous
+    final_index = next(
+        (
+            index
+            for index, row in enumerate(
+                candidate_rows[active_index + 1:], active_index + 1
+            )
+            if isinstance(row, dict)
+            and row.get('role') == 'assistant'
+            and not row.get('_partial')
+            and _assistant_message_has_final_visible_text(row)
+            and _message_stream_owner(row) == stream_id
+        ),
+        None,
+    )
+    if final_index is None or not _process_wakeup_arc_closed(
+        candidate_rows,
+        active_index + 1,
+        final_index,
+        stream_id,
+    ):
+        return previous
+    candidate_final = candidate_rows[final_index]
+    active_turn_id = str(active_identity.get('turn_id') or '').strip()
+    candidate_turn_id = str(candidate_final.get('turn_id') or '').strip()
+    if active_turn_id and candidate_turn_id and active_turn_id != candidate_turn_id:
+        return previous
+
+    arc = candidate_rows[active_index + 1:final_index + 1]
+    arc_keys = [_message_replay_key(row) for row in arc]
+    old_final = next(
+        (
+            index
+            for index in range(len(previous) - 1, -1, -1)
+            if isinstance(previous[index], dict)
+            and previous[index].get('role') == 'assistant'
+            and not previous[index].get('_partial')
+            and _assistant_message_has_final_visible_text(previous[index])
+            and _message_stream_owner(previous[index]) == stream_id
+        ),
+        None,
+    )
+    if old_final is None:
+        return previous
+    old_turn_id = str(previous[old_final].get('turn_id') or '').strip()
+    if candidate_turn_id and old_turn_id and candidate_turn_id != old_turn_id:
+        return previous
+    start = old_final - len(arc_keys) + 1
+    if (
+        start < 0
+        or [_message_replay_key(row) for row in previous[start:old_final + 1]]
+        != arc_keys
+    ):
+        return previous
+    return previous[:start] + previous[old_final + 1:]
+
+
 def _looks_like_replayed_session_arc_summary(previous_msg, candidate_msg):
     """Return True for repeated LCM/session summaries with refreshed hints.
 
@@ -6346,6 +6470,12 @@ def _merge_display_messages_after_agent_result(
                 previous_context=previous_context,
             )
         candidates = turn_candidates
+
+    previous_display = _strip_replayed_process_wakeup_arc(
+        previous_display,
+        candidates,
+        _active_turn_identity,
+    )
 
     merged = previous_display[:]
     seen = {_message_identity(m) for m in merged}
