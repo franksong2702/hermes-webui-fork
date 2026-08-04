@@ -4783,6 +4783,7 @@ def _sanitize_messages_for_api(
     effective_model: str | None = None,
     effective_provider: str | None = None,
     effective_base_url: str | None = None,
+    preserve_api_content: bool = False,
 ):
     """Return a deep copy of messages with only API-safe fields.
 
@@ -4803,6 +4804,12 @@ def _sanitize_messages_for_api(
     causing 400s on every later text-only turn (#2297).
     """
     strip_native_images = cfg is not None and _resolve_image_input_mode(cfg) == "text"
+    allowed_keys = _API_SAFE_MSG_KEYS
+    if preserve_api_content:
+        # ``api_content`` is an internal Agent replay sidecar.  It is opt-in
+        # here because direct provider/compression projections must continue to
+        # reject unknown bookkeeping fields.
+        allowed_keys = _API_SAFE_MSG_KEYS | {"api_content"}
     # First pass: collect all tool_call_ids declared by assistant messages.
     # Handles both OpenAI ('id') and Anthropic ('call_id') field names.
     valid_tool_call_ids: set = set()
@@ -4848,7 +4855,11 @@ def _sanitize_messages_for_api(
             if not tid or tid not in valid_tool_call_ids:
                 # Orphaned tool result — skip to avoid 400 from strict providers.
                 continue
-        sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        sanitized = {k: v for k, v in msg.items() if k in allowed_keys}
+        if sanitized.get("role") not in {"user", "assistant"}:
+            sanitized.pop("api_content", None)
+        elif not isinstance(sanitized.get("api_content"), str) or not sanitized.get("api_content"):
+            sanitized.pop("api_content", None)
         # Drop empty tool_calls — strict providers (DeepSeek, newer OpenAI)
         # reject tool_calls: [] with HTTP 400 even when no orphaned calls exist.
         if 'tool_calls' in sanitized and not sanitized['tool_calls']:
@@ -4930,6 +4941,31 @@ def _sanitize_messages_for_api(
             msg = {k: v for k, v in msg.items() if k != '_recovered'}
         final.append(msg)
     return final
+
+
+def _sanitize_messages_for_agent(
+    messages,
+    *,
+    cfg: dict = None,
+    effective_model: str | None = None,
+    effective_provider: str | None = None,
+    effective_base_url: str | None = None,
+):
+    """Build the internal Agent replay projection with ``api_content`` intact.
+
+    ``api_content`` is a durable provider-facing sidecar, not a direct-provider
+    payload field.  Keep this opt-in at one named boundary so every Agent
+    history call uses the same contract while ordinary API/compression callers
+    continue to use the default-stripping sanitizer.
+    """
+    return _sanitize_messages_for_api(
+        messages,
+        cfg=cfg,
+        effective_model=effective_model,
+        effective_provider=effective_provider,
+        effective_base_url=effective_base_url,
+        preserve_api_content=True,
+    )
 
 
 def _api_safe_message_positions(messages):
@@ -9546,7 +9582,7 @@ def _run_agent_streaming(
             _run_conversation_kwargs = dict(
                 user_message=user_message,
                 system_message=workspace_system_msg,
-                conversation_history=_sanitize_messages_for_api(
+                conversation_history=_sanitize_messages_for_agent(
                     _previous_context_messages,
                     cfg=_cfg,
                     effective_model=resolved_model,
@@ -10030,7 +10066,7 @@ def _run_agent_streaming(
                                 _heal_kwargs = dict(
                                     user_message=user_message,
                                     system_message=workspace_system_msg,
-                                    conversation_history=_sanitize_messages_for_api(
+                                    conversation_history=_sanitize_messages_for_agent(
                                         _previous_context_messages,
                                         cfg=_cfg,
                                         effective_model=resolved_model,
@@ -11254,7 +11290,7 @@ def _run_agent_streaming(
                         _heal_kwargs2 = dict(
                             user_message=user_message,
                             system_message=workspace_system_msg,
-                            conversation_history=_sanitize_messages_for_api(
+                            conversation_history=_sanitize_messages_for_agent(
                                 _previous_context_messages,
                                 cfg=_cfg,
                                 effective_model=resolved_model,

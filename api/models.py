@@ -7959,6 +7959,11 @@ def get_state_db_session_messages(
                 'codex_reasoning_items',
                 'reasoning_content',
                 'codex_message_items',
+                # Hermes Agent stores the exact provider-facing text here when
+                # it differs from the clean transcript content.  Keep this
+                # sidecar in the WebUI's internal history; the provider-safe
+                # projection strips it before any direct API request.
+                'api_content',
             ]
             id_col = ['id'] if 'id' in available else []
             selected = id_col + ['role', 'content', 'timestamp'] + [c for c in optional if c in available]
@@ -8063,6 +8068,13 @@ def get_state_db_session_messages(
                     'content': row['content'],
                     'timestamp': row['timestamp'],
                 }
+                # ``id`` is the durable SQLite row identity, not the WebUI's
+                # session-local stable message id.  Keep it in a private
+                # provenance field so duplicate reconciliation can align a
+                # state.db sidecar without changing the existing ``id`` key
+                # used by WebUI transcript merge/dedup logic.
+                if id_col and row['id'] is not None:
+                    msg['_state_db_row_id'] = row['id']
                 for col in optional:
                     if col not in row.keys():
                         continue
@@ -8357,6 +8369,146 @@ def _merge_session_display_metadata(target: dict | None, source: dict | None) ->
         value = source.get(key)
         if _message_display_metadata_value_present(value):
             target[key] = copy.deepcopy(value)
+
+
+def _state_db_row_identity(message: dict | None):
+    """Return durable state.db provenance without treating WebUI ``id`` as it."""
+    if not isinstance(message, dict):
+        return None
+    for key in ("_state_db_row_id", "_db_row_id", "state_db_row_id"):
+        value = message.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _message_exact_timestamp(message: dict | None):
+    """Return a numeric transcript timestamp, preserving ``0`` as valid."""
+    if not isinstance(message, dict):
+        return None
+    value = message.get("timestamp")
+    if value in (None, ""):
+        value = message.get("_ts")
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed else None  # reject NaN
+
+
+def _message_sidecar_role(message: dict | None):
+    if not isinstance(message, dict):
+        return None
+    role = str(message.get("role") or "").strip().lower()
+    return role if role in {"user", "assistant"} else None
+
+
+def _copy_api_content_sidecar(target: dict | None, source: dict | None) -> None:
+    """Copy a non-empty internal sidecar without replacing an existing one."""
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return
+    target_role = _message_sidecar_role(target)
+    source_role = _message_sidecar_role(source)
+    if target_role is None or target_role != source_role:
+        return
+    if target.get("api_content") not in (None, ""):
+        return
+    api_content = source.get("api_content")
+    if isinstance(api_content, str) and api_content:
+        target["api_content"] = api_content
+
+
+def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list) -> None:
+    """Attach state.db ``api_content`` to the matching sidecar transcript rows.
+
+    Matching is intentionally stricter than the visible transcript dedupe.  A
+    durable row id wins when both sides carry the private state.db provenance;
+    otherwise an exact role + timestamp match is used.  When timestamps are
+    absent on both sides, rows are paired by per-role sequence only when the
+    available durable metadata does not contradict that pairing.  We never use
+    role + normalized visible text alone, because repeated user text is valid
+    and must not inherit another turn's provider-facing bytes.
+    """
+    sidecar = [message for message in sidecar_messages or () if isinstance(message, dict)]
+    state = [
+        message
+        for message in state_messages or ()
+        if isinstance(message, dict)
+        and _message_sidecar_role(message) is not None
+        and isinstance(message.get("api_content"), str)
+        and message.get("api_content")
+    ]
+    if not sidecar or not state:
+        return
+
+    used_targets: set[int] = set()
+    used_sources: set[int] = set()
+
+    # 1. Durable row identity.  This path is unambiguous and deliberately does
+    # not inspect visible content.
+    targets_by_row_id = {}
+    for index, message in enumerate(sidecar):
+        row_id = _state_db_row_identity(message)
+        if row_id is not None:
+            targets_by_row_id.setdefault(row_id, []).append(index)
+    for source_index, message in enumerate(state):
+        row_id = _state_db_row_identity(message)
+        if row_id is None:
+            continue
+        for index in targets_by_row_id.get(row_id, ()):
+            if index in used_targets:
+                continue
+            _copy_api_content_sidecar(sidecar[index], message)
+            used_targets.add(index)
+            used_sources.add(source_index)
+            break
+
+    # 2. Exact role + timestamp.  Pair repeated same-timestamp rows by their
+    # source sequence, so even a timestamp collision cannot cross-bind rows.
+    sidecar_by_exact_timestamp = {}
+    state_by_exact_timestamp = {}
+    for index, message in enumerate(sidecar):
+        role = _message_sidecar_role(message)
+        timestamp = _message_exact_timestamp(message)
+        if role is not None and timestamp is not None:
+            sidecar_by_exact_timestamp.setdefault((role, timestamp), []).append(index)
+    for source_index, message in enumerate(state):
+        if source_index in used_sources:
+            continue
+        role = _message_sidecar_role(message)
+        timestamp = _message_exact_timestamp(message)
+        if role is not None and timestamp is not None:
+            state_by_exact_timestamp.setdefault((role, timestamp), []).append((source_index, message))
+    for key, state_rows in state_by_exact_timestamp.items():
+        candidates = [index for index in sidecar_by_exact_timestamp.get(key, ()) if index not in used_targets]
+        for index, (source_index, message) in zip(candidates, state_rows, strict=False):
+            _copy_api_content_sidecar(sidecar[index], message)
+            used_targets.add(index)
+            used_sources.add(source_index)
+
+    # 3. Sequence-aware fallback only when *both* records lack timestamp and
+    # durable row identity.  This covers legacy schemas without weakening the
+    # no-cross-binding rule for rows that expose contradictory identity data.
+    sidecar_by_role_sequence = {}
+    state_by_role_sequence = {}
+    for index, message in enumerate(sidecar):
+        role = _message_sidecar_role(message)
+        if role is not None and _state_db_row_identity(message) is None and _message_exact_timestamp(message) is None:
+            sidecar_by_role_sequence.setdefault(role, []).append(index)
+    for source_index, message in enumerate(state):
+        if source_index in used_sources:
+            continue
+        role = _message_sidecar_role(message)
+        if role is not None and _state_db_row_identity(message) is None and _message_exact_timestamp(message) is None:
+            state_by_role_sequence.setdefault(role, []).append((source_index, message))
+    for role, state_rows in state_by_role_sequence.items():
+        candidates = [index for index in sidecar_by_role_sequence.get(role, ()) if index not in used_targets]
+        for index, (source_index, message) in zip(candidates, state_rows, strict=False):
+            _copy_api_content_sidecar(sidecar[index], message)
+            used_targets.add(index)
+            used_sources.add(source_index)
 
 
 def _session_message_dedup_key(msg: dict):
@@ -8809,6 +8961,7 @@ def merge_session_messages_append_only(
     """
     sidecar_messages = list(sidecar_messages or [])
     state_messages = list(state_messages or [])
+    _reconcile_api_content_sidecars(sidecar_messages, state_messages)
     # Per-invocation cache keyed by message identity. Sidecar/state message objects
     # are retained for this call, and this function does not mutate key-defining
     # fields before each helper call.

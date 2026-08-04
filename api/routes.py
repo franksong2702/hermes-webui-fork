@@ -22488,7 +22488,7 @@ def _handle_chat_sync(handler, body):
                 _merge_display_messages_after_agent_result,
                 _restore_display_reasoning_metadata,
                 _restore_reasoning_metadata,
-                _sanitize_messages_for_api,
+                _sanitize_messages_for_agent,
                 _compact_session_image_parts_for_persistence,
                 _context_messages_for_new_turn,
                 _workspace_context_prefix,
@@ -22519,7 +22519,7 @@ def _handle_chat_sync(handler, body):
             result = agent.run_conversation(
                 user_message=workspace_ctx + msg,
                 system_message=workspace_system_msg,
-                conversation_history=_sanitize_messages_for_api(
+                conversation_history=_sanitize_messages_for_agent(
                     _previous_context_messages,
                     cfg=get_config(),
                     effective_model=_model,
