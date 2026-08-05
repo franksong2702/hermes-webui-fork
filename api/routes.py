@@ -26110,9 +26110,15 @@ def _handle_session_import(handler, body):
     """Import a session from a JSON export. Creates a new session with a new ID."""
     if not body or not isinstance(body, dict):
         return bad(handler, "Request body must be a JSON object")
-    messages = strip_public_internal_fields(body.get("messages"))
+    messages = strip_public_internal_fields(
+        body.get("messages"),
+        message_records=True,
+    )
     if not isinstance(messages, list):
         return bad(handler, 'JSON must contain a "messages" array')
+    raw_tool_calls = body.get("tool_calls", [])
+    if not isinstance(raw_tool_calls, list):
+        return bad(handler, 'JSON "tool_calls" must be an array')
     title = body.get("title", "Imported session")
     try:
         workspace = str(resolve_trusted_workspace(body.get("workspace", str(DEFAULT_WORKSPACE))))
@@ -26124,7 +26130,7 @@ def _handle_session_import(handler, body):
         workspace=workspace,
         model=model,
         messages=messages,
-        tool_calls=strip_public_internal_fields(body.get("tool_calls", [])),
+        tool_calls=strip_public_internal_fields(raw_tool_calls),
         profile=get_active_profile_name(),
     )
     s.pinned = body.get("pinned", False)

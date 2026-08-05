@@ -5091,7 +5091,11 @@ def _deduplicate_context_messages(messages):
         if _is_compressed_context_tool_result_summary_message(msg) and not msg.get('tool_call_id'):
             deduped.append(msg)
             continue
-        key = _message_identity(msg)
+        # Context ownership is provider-facing: two rows with identical visible
+        # text but different durable ``api_content`` sidecars are distinct turns.
+        # Keep the display identity unchanged so ordinary transcript dedup still
+        # collapses the same visible row.
+        key = _message_replay_key(msg)
         if isinstance(msg, dict) and msg.get('role') == 'user' and key is not None:
             user_exact_key = (
                 key,
@@ -5470,11 +5474,12 @@ def _message_identity(msg):
     )
 
 
-def _messages_have_prefix(messages, prefix):
+def _messages_have_prefix(messages, prefix, *, key_fn=None):
+    key_fn = key_fn or _message_identity
     if len(messages or []) < len(prefix or []):
         return False
     for idx, expected in enumerate(prefix or []):
-        if _message_identity((messages or [])[idx]) != _message_identity(expected):
+        if key_fn((messages or [])[idx]) != key_fn(expected):
             return False
     return True
 
@@ -5482,16 +5487,30 @@ def _messages_have_prefix(messages, prefix):
 def _message_replay_key(msg):
     """Return a stable comparison key for replay/overlap de-duplication."""
     identity = _message_identity(msg)
+    # ``api_content`` is a provider-facing replay sidecar.  It must participate
+    # in context/replay overlap identity or two same-visible turns can collapse
+    # before the Agent sees the original wire bytes.  Keep synthetic/adjacent
+    # partial collapse on the existing identity path; partial rows are display
+    # bookkeeping rather than durable provider turns.
+    raw_sidecar = (
+        msg.get("api_content")
+        if isinstance(msg, dict) and not msg.get("_partial")
+        else None
+    )
+    sidecar = raw_sidecar if isinstance(raw_sidecar, str) and raw_sidecar else None
     if identity is not None:
+        if sidecar is not None:
+            return (*identity, sidecar)
         return identity
     if not isinstance(msg, dict):
         return None
-    return (
+    key = (
         str(msg.get('role') or ''),
         _message_text(msg.get('content', '')),
         str(msg.get('tool_call_id') or ''),
         json.dumps(msg.get('tool_calls') or [], sort_keys=True, ensure_ascii=False),
     )
+    return (*key, sidecar) if sidecar is not None else key
 
 
 def _strip_replayed_prefix(existing_messages, candidates):
@@ -5580,7 +5599,11 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
     if not previous_context or not result_messages:
         return result_messages
     previous_user_tail = _stale_user_tail_candidate(_last_user_row(previous_context))
-    if not _messages_have_prefix(result_messages, previous_context):
+    if not _messages_have_prefix(
+        result_messages,
+        previous_context,
+        key_fn=_message_replay_key,
+    ):
         # Agent-side role-sequence repair can replace the last prior user row
         # with a repaired current-user row. In that shape the result no longer
         # has `previous_context` as an exact prefix, but it should still be
@@ -5589,7 +5612,11 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
             msg_text
             and len(previous_context) >= 1
             and len(result_messages) >= len(previous_context)
-            and _messages_have_prefix(result_messages, previous_context[:-1])
+            and _messages_have_prefix(
+                result_messages,
+                previous_context[:-1],
+                key_fn=_message_replay_key,
+            )
         ):
             boundary_idx = len(previous_context) - 1
             boundary_row = result_messages[boundary_idx]

@@ -595,6 +595,251 @@ def test_issue6751_json_import_strips_internal_aliases_before_persistence(monkey
     assert persisted["tool_calls"][0]["arguments"]["_db_row_id"] == 42
 
 
+def test_issue6751_json_import_nested_tool_calls_are_removed_at_agent_boundary(
+    monkeypatch, tmp_path
+):
+    """Import, reload, and the sync Agent boundary must not pass nested aliases."""
+    from collections import OrderedDict
+
+    import api.config as config
+    import api.models as models
+    import api.routes as routes
+
+    state_dir = tmp_path / "state"
+    session_dir = state_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    sessions = OrderedDict()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", state_dir / "session_index.json")
+    monkeypatch.setattr(models, "SESSIONS", sessions)
+    monkeypatch.setattr(routes, "SESSION_INDEX_FILE", state_dir / "session_index.json")
+    monkeypatch.setattr(routes, "SESSIONS", sessions)
+    monkeypatch.setattr(routes, "resolve_trusted_workspace", lambda value: tmp_path)
+    monkeypatch.setattr(routes, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(config, "load_settings", lambda: {"api_redact_enabled": False})
+    monkeypatch.setattr(config, "get_config", lambda: {"model": "test-model", "provider": "test-provider"})
+    monkeypatch.setattr(routes, "get_config", lambda: {"model": "test-model", "provider": "test-provider"})
+    monkeypatch.setattr(routes, "_resolve_cli_toolsets", lambda: [])
+    captured_response = {}
+
+    def fake_json(handler, payload, status=200, **_kwargs):
+        captured_response["payload"] = payload
+        captured_response["status"] = status
+        return True
+
+    _real_routes_json = routes.j
+    monkeypatch.setattr(routes, "j", fake_json)
+    routes._handle_session_import(
+        None,
+        {
+            "title": "nested-import",
+            "workspace": str(tmp_path),
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "answer",
+                            "api_content": "ordinary content field",
+                        }
+                    ],
+                    "_state_db_row_id": 1,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "api_content": "nested provider bytes",
+                            "_db_row_id": 2,
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"api_content":"ordinary argument field"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "lookup result",
+                },
+            ],
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "api_content": "session provider bytes",
+                    "state_db_row_id": 3,
+                    "arguments": {"_db_row_id": 4},
+                }
+            ],
+        },
+    )
+
+    assert captured_response["status"] == 200
+    imported = next(iter(sessions.values()))
+    # Reload from the persisted sidecar to cover the import -> disk -> load path.
+    reloaded = models.Session.load(imported.session_id)
+    assert reloaded is not None
+    nested = reloaded.messages[0]
+    aliases = ("api_content", "_state_db_row_id", "_db_row_id", "state_db_row_id")
+    assert all(alias not in nested for alias in aliases)
+    assert all(alias not in nested["tool_calls"][0] for alias in aliases)
+    assert nested["content"][0]["api_content"] == "ordinary content field"
+    assert nested["tool_calls"][0]["function"]["arguments"] == (
+        '{"api_content":"ordinary argument field"}'
+    )
+    assert reloaded.tool_calls == [{"id": "call-1", "arguments": {"_db_row_id": 4}}]
+
+    # Restore the real response writer for the production sync route below.
+    monkeypatch.setattr(routes, "j", _real_routes_json)
+
+    captured_agent = {}
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, **kwargs):
+            captured_agent["history"] = list(kwargs.get("conversation_history") or [])
+            return {
+                "messages": captured_agent["history"]
+                + [
+                    {"role": "user", "content": kwargs["persist_user_message"]},
+                    {"role": "assistant", "content": "ok"},
+                ],
+                "final_response": "ok",
+                "completed": True,
+            }
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(routes, "get_session", lambda _sid: reloaded)
+
+    class Handler:
+        def __init__(self):
+            self.headers = {}
+            self.status = None
+            self.wfile = SimpleNamespace(write=lambda _body: None)
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, _name, _value):
+            return None
+
+        def end_headers(self):
+            return None
+
+    handler = Handler()
+    routes._handle_chat_sync(
+        handler,
+        {
+            "session_id": reloaded.session_id,
+            "message": "follow-up",
+            "workspace": str(tmp_path),
+        },
+    )
+
+    assert handler.status == 200
+    agent_history_row = next(
+        message for message in captured_agent["history"] if message.get("role") == "assistant"
+    )
+    assert all(alias not in agent_history_row for alias in aliases)
+    assert all(alias not in agent_history_row["tool_calls"][0] for alias in aliases)
+
+
+def test_issue6751_json_import_rejects_non_list_session_tool_calls(monkeypatch, tmp_path):
+    """Session-level tool_calls are a list schema, not an arbitrary JSON value."""
+    from collections import OrderedDict
+
+    import api.config as config
+    import api.helpers as helpers
+    import api.models as models
+    import api.routes as routes
+
+    state_dir = tmp_path / "state"
+    session_dir = state_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    sessions = OrderedDict()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", state_dir / "session_index.json")
+    monkeypatch.setattr(models, "SESSIONS", sessions)
+    monkeypatch.setattr(routes, "SESSION_INDEX_FILE", state_dir / "session_index.json")
+    monkeypatch.setattr(routes, "SESSIONS", sessions)
+    monkeypatch.setattr(routes, "resolve_trusted_workspace", lambda value: tmp_path)
+    monkeypatch.setattr(config, "load_settings", lambda: {"api_redact_enabled": False})
+    captured = {}
+
+    def fake_json(handler, payload, status=200, **_kwargs):
+        captured["payload"] = payload
+        captured["status"] = status
+        return True
+
+    monkeypatch.setattr(routes, "j", fake_json)
+    monkeypatch.setattr(helpers, "j", fake_json)
+    routes._handle_session_import(
+        None,
+        {
+            "title": "invalid-tool-calls",
+            "workspace": str(tmp_path),
+            "messages": [],
+            "tool_calls": {"api_content": "must-not-be-a-session-list"},
+        },
+    )
+
+    assert captured["status"] == 400
+    assert sessions == OrderedDict()
+
+
+def test_issue6751_context_dedup_keeps_distinct_api_content_histories():
+    from api.streaming import _deduplicate_context_messages
+
+    history = [
+        {"role": "user", "content": "same visible", "api_content": "wire-one"},
+        {"role": "user", "content": "same visible", "api_content": "wire-two"},
+    ]
+
+    deduped = _deduplicate_context_messages(history)
+
+    assert [message["api_content"] for message in deduped] == ["wire-one", "wire-two"]
+
+
+def test_issue6751_context_dedup_ignores_malformed_api_content():
+    from api.streaming import _deduplicate_context_messages
+
+    history = [
+        {"role": "user", "content": "same visible", "api_content": {"bad": True}},
+        {"role": "user", "content": "same visible"},
+    ]
+
+    assert _deduplicate_context_messages(history) == history[:1]
+
+
+def test_issue6751_source_only_duplicate_durable_id_does_not_fallback_attach():
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [{"role": "user", "content": "same", "timestamp": 100.0}]
+    state = [
+        {
+            "role": "user",
+            "content": "same",
+            "timestamp": 100.0,
+            "_state_db_row_id": 7,
+            "api_content": "wire-one",
+        },
+        {
+            "role": "user",
+            "content": "same",
+            "timestamp": 200.0,
+            "_state_db_row_id": 7,
+            "api_content": "wire-two",
+        },
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert merged[0].get("api_content") is None
+
+
 def test_issue6751_ephemeral_terminal_sse_projects_agent_messages(monkeypatch):
     import api.config as config
     from api.streaming import _ephemeral_session_payload

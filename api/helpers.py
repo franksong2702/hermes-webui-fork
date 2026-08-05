@@ -1044,7 +1044,32 @@ def public_session_projection(session_dict: dict) -> dict:
     return redact_session_data(session_dict)
 
 
-def strip_public_internal_fields(value):
+def _strip_public_record(record):
+    """Copy one imported record while dropping its own replay aliases."""
+    if not isinstance(record, dict):
+        return _copy_json_value(record)
+    return {
+        key: _copy_json_value(child)
+        for key, child in record.items()
+        if key not in _PUBLIC_MESSAGE_INTERNAL_FIELDS
+    }
+
+
+def _strip_public_message_record(record):
+    """Copy one message and sanitize only its direct tool-call records.
+
+    ``content`` and tool-call ``function.arguments`` are business payloads;
+    aliases nested there must remain untouched.  ``messages[*].tool_calls`` is
+    the one known nested record container whose entries carry replay metadata.
+    """
+    result = _strip_public_record(record)
+    if not isinstance(record, dict) or not isinstance(record.get("tool_calls"), list):
+        return result
+    result["tool_calls"] = [_strip_public_record(tool_call) for tool_call in record["tool_calls"]]
+    return result
+
+
+def strip_public_internal_fields(value, *, message_records: bool = False):
     """Deep-copy imported records while dropping only record-level aliases.
 
     JSON import uses this before constructing or saving a ``Session``.  The
@@ -1052,20 +1077,13 @@ def strip_public_internal_fields(value):
     names inside user content or tool arguments are ordinary JSON and must be
     preserved.  This is intentionally independent of the credential-redaction
     setting: caller-supplied provider sidecars must never become durable WebUI
-    session state.
+    session state.  When ``message_records`` is true, sanitize the direct
+    ``tool_calls`` array on each message record as well; generic nested arrays
+    remain untouched.
     """
     if isinstance(value, list):
-        result = []
-        for item in value:
-            if isinstance(item, dict):
-                result.append({
-                    key: _copy_json_value(child)
-                    for key, child in item.items()
-                    if key not in _PUBLIC_MESSAGE_INTERNAL_FIELDS
-                })
-            else:
-                result.append(_copy_json_value(item))
-        return result
+        sanitizer = _strip_public_message_record if message_records else _strip_public_record
+        return [sanitizer(item) for item in value]
     return _copy_json_value(value)
 
 

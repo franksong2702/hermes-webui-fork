@@ -8531,6 +8531,14 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
         elif row_id is not None:
             state_by_row_id.setdefault(row_id, []).append(source_index)
 
+    # Reject duplicate source buckets independently of the target map.  A
+    # source-only duplicate id has no target loop iteration to consume it, so
+    # without this pre-pass it would descend into timestamp/metadata-free
+    # matching and attach one arbitrary provider sidecar.
+    for source_indexes in state_by_row_id.values():
+        if len(source_indexes) > 1:
+            used_sources.update(source_indexes)
+
     for row_id, target_indexes in targets_by_row_id.items():
         source_indexes = state_by_row_id.get(row_id, [])
         if len(target_indexes) != 1 or len(source_indexes) != 1:
