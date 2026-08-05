@@ -12,6 +12,7 @@ from api.artifact_references import (
     MAX_ANCHOR_ARTIFACT_REFERENCES,
     anchor_artifact_event_from_payload,
     bound_anchor_artifact_events,
+    canonical_workspace_identity,
     derive_file_artifact_references,
 )
 from api.streaming import _stream_event_dropped_after_cancel
@@ -779,6 +780,7 @@ def test_server_terminal_reconciliation_persists_artifact_only_scene_without_bro
         session_id=session.session_id,
         run_id="stream-bg",
         stream_id="stream-bg",
+        workspace_id=canonical_workspace_identity(workspace),
         event_id=None,
         seq=7,
     )
@@ -810,6 +812,197 @@ def test_server_terminal_reconciliation_persists_artifact_only_scene_without_bro
         workspace=loaded.workspace,
     )
     assert hydrated[1]["_anchor_activity_scene"]["artifacts"][0]["payload"]["path"] == "reports/background.md"
+
+
+def test_workspace_rebinding_drops_artifact_but_preserves_scene_content(tmp_path, monkeypatch):
+    """Artifact authority is tied to the source workspace, not its relative path."""
+    from collections import OrderedDict
+
+    from api import models, routes, streaming
+    from api.artifact_references import anchor_artifact_event_from_payload
+    from api.models import Session
+
+    session_dir = tmp_path / "sessions"
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    session_dir.mkdir()
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    (workspace_a / "report.md").write_text("artifact from A", encoding="utf-8")
+    (workspace_b / "report.md").write_text("unrelated file from B", encoding="utf-8")
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setattr(routes, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(routes, "SESSIONS", models.SESSIONS)
+    monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(streaming, "SESSIONS", models.SESSIONS)
+
+    sid = "artifact-workspace-rebind"
+    stream_id = "stream-workspace-rebind"
+    session = Session(
+        session_id=sid,
+        workspace=str(workspace_a),
+        messages=[
+            {"role": "user", "content": "write report"},
+            {"role": "assistant", "content": "done", "timestamp": 2},
+        ],
+    )
+    message_ref = routes._assistant_anchor_scene_message_ref(session.messages[1])
+    session.anchor_activity_scenes = {
+        message_ref: {
+            "version": "anchor_activity_scene_record_v1",
+            "message_index": 1,
+            "message_ref": message_ref,
+            "scene": {
+                "version": "activity_scene_v1",
+                "mode": "compact_worklog",
+                "identity": {"session_id": sid, "run_id": stream_id, "stream_id": stream_id},
+                "activity_rows": [{"role": "prose", "kind": "process_prose", "text": "kept"}],
+                "artifacts": [],
+            },
+        }
+    }
+    event = anchor_artifact_event_from_payload(
+        {"kind": "workspace_file", "path": "report.md", "source_tool": "write_file", "tool_call_id": "call-a"},
+        session_id=sid,
+        run_id=stream_id,
+        stream_id=stream_id,
+        workspace_id=canonical_workspace_identity(workspace_a),
+        event_id=f"{stream_id}:1",
+        seq=1,
+    )
+    assert streaming._reconcile_stream_artifacts_into_terminal_anchor_scene(
+        session,
+        stream_id,
+        [event],
+        terminal_state="completed",
+        message_index=1,
+    )
+    session.save(skip_index=True)
+
+    rebound = Session.load(sid)
+    rebound.workspace = str(workspace_b)
+    rebound.save(skip_index=True)
+    reloaded = Session.load(sid)
+    hydrated = routes._hydrate_anchor_activity_scenes(
+        reloaded.messages,
+        reloaded.anchor_activity_scenes,
+        session_id=sid,
+        workspace=str(workspace_b),
+    )
+
+    scene = hydrated[1]["_anchor_activity_scene"]
+    assert [row["text"] for row in scene["activity_rows"] if row.get("role") == "prose"] == ["kept"]
+    assert scene["artifacts"] == []
+
+
+def test_terminal_reconciliation_drops_foreign_workspace_artifact_but_keeps_prose(tmp_path):
+    from api import routes, streaming
+    from api.artifact_references import canonical_workspace_identity
+    from api.models import Session
+
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    sid = "artifact-terminal-workspace-b"
+    stream_id = "stream-terminal-workspace-b"
+    workspace_b_id = canonical_workspace_identity(workspace_b)
+    session = Session(
+        session_id=sid,
+        workspace=workspace_b,
+        messages=[
+            {"role": "user", "content": "write report"},
+            {
+                "role": "assistant",
+                "content": "done",
+                "timestamp": 2,
+                "_anchor_stream_id": stream_id,
+                "_anchor_run_id": stream_id,
+            },
+        ],
+    )
+    message_ref = routes._assistant_anchor_scene_message_ref(session.messages[1])
+    session.anchor_activity_scenes = {
+        message_ref: {
+            "version": "anchor_activity_scene_record_v1",
+            "message_index": 1,
+            "message_ref": message_ref,
+            "run_id": stream_id,
+            "stream_id": stream_id,
+            "workspace_id": workspace_b_id,
+            "owner_authority": "server",
+            "artifact_authority": "server",
+            "scene": {
+                "version": "activity_scene_v1",
+                "mode": "compact_worklog",
+                "identity": {
+                    "session_id": sid,
+                    "run_id": stream_id,
+                    "stream_id": stream_id,
+                    "workspace_id": workspace_b_id,
+                },
+                "activity_rows": [{"role": "prose", "text": "kept from B"}],
+                "artifacts": [],
+            },
+        }
+    }
+    foreign = anchor_artifact_event_from_payload(
+        {
+            "kind": "workspace_file",
+            "path": "report.md",
+            "source_tool": "write_file",
+        },
+        session_id=sid,
+        run_id=stream_id,
+        stream_id=stream_id,
+        workspace_id=canonical_workspace_identity(workspace_a),
+        event_id=f"{stream_id}:1",
+        seq=1,
+    )
+
+    assert not streaming._reconcile_stream_artifacts_into_terminal_anchor_scene(
+        session,
+        stream_id,
+        [foreign],
+        terminal_state="completed",
+        message_index=1,
+    )
+    missing_workspace = anchor_artifact_event_from_payload(
+        {
+            "kind": "workspace_file",
+            "path": "report-legacy.md",
+            "source_tool": "write_file",
+        },
+        session_id=sid,
+        run_id=stream_id,
+        stream_id=stream_id,
+        event_id=f"{stream_id}:2",
+        seq=2,
+    )
+    assert not streaming._reconcile_stream_artifacts_into_terminal_anchor_scene(
+        session,
+        stream_id,
+        [missing_workspace],
+        terminal_state="completed",
+        message_index=1,
+    )
+    scene = session.anchor_activity_scenes[message_ref]["scene"]
+    assert [row["text"] for row in scene["activity_rows"] if row.get("role") == "prose"] == ["kept from B"]
+    assert scene["artifacts"] == []
+
+
+def test_anchor_artifact_event_rejects_conflicting_workspace_argument():
+    assert anchor_artifact_event_from_payload(
+        {
+            "kind": "workspace_file",
+            "path": "reports/conflict.md",
+            "source_tool": "write_file",
+            "workspace_id": "a" * 64,
+        },
+        workspace_id="b" * 64,
+    ) is None
 
 
 def test_late_cancel_artifact_reconciles_onto_cancelled_message_once(tmp_path, monkeypatch):
@@ -844,6 +1037,7 @@ def test_late_cancel_artifact_reconciles_onto_cancelled_message_once(tmp_path, m
         session_id=session.session_id,
         run_id="stream-cancel",
         stream_id="stream-cancel",
+        workspace_id=canonical_workspace_identity(session.workspace),
         event_id="stream-cancel:9",
         seq=9,
     )
@@ -903,6 +1097,7 @@ def test_terminal_reconciliation_rejects_foreign_stream_owner(tmp_path, monkeypa
         session_id=session.session_id,
         run_id="stream-old",
         stream_id="stream-old",
+        workspace_id=canonical_workspace_identity(session.workspace),
         event_id="stream-old:3",
         seq=3,
     )
@@ -983,6 +1178,7 @@ def test_terminal_reconciliation_accepts_stable_run_rotated_stream_once(tmp_path
         session_id=session.session_id,
         run_id="run-stable",
         stream_id="transport-old",
+        workspace_id=canonical_workspace_identity(session.workspace),
         event_id="run-stable:3",
         seq=3,
     )
@@ -1333,7 +1529,9 @@ def test_terminal_reconciliation_discards_untrusted_legacy_artifacts_before_pers
     }
     real = anchor_artifact_event_from_payload(
         {"kind": "workspace_file", "path": "reports/really-written.md", "source_tool": "write_file", "tool_call_id": "call-real"},
-        session_id=sid, run_id=run_id, stream_id=stream_id, event_id=f"{run_id}:4", seq=4,
+        session_id=sid, run_id=run_id, stream_id=stream_id,
+        workspace_id=canonical_workspace_identity(workspace),
+        event_id=f"{run_id}:4", seq=4,
     )
 
     assert streaming._reconcile_stream_artifacts_into_terminal_anchor_scene(
@@ -1422,7 +1620,9 @@ def test_terminal_reconciliation_does_not_self_authenticate_persisted_artifacts(
     }
     real = anchor_artifact_event_from_payload(
         {"kind": "workspace_file", "path": "reports/really-written.md", "source_tool": "write_file", "tool_call_id": "call-real"},
-        session_id=sid, run_id=run_id, stream_id=stream_id, event_id=f"{run_id}:4", seq=4,
+        session_id=sid, run_id=run_id, stream_id=stream_id,
+        workspace_id=canonical_workspace_identity(workspace),
+        event_id=f"{run_id}:4", seq=4,
     )
 
     assert streaming._reconcile_stream_artifacts_into_terminal_anchor_scene(

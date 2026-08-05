@@ -2,6 +2,8 @@ import json
 from collections import OrderedDict
 from types import SimpleNamespace
 
+import pytest
+
 
 def _install_anchor_scene_store(tmp_path, monkeypatch, models, routes):
     session_dir = tmp_path / "sessions"
@@ -443,7 +445,7 @@ def test_anchor_scene_persistence_trims_artifact_budget_instead_of_rejecting_sce
     monkeypatch.setattr(
         routes,
         "_run_journal_live_snapshot",
-        lambda stream_id, handler=None: {
+        lambda stream_id, handler=None, session_id=None, workspace_id=None: {
             "session_id": "artifact-budget",
             "stream_id": stream_id,
             "anchor_activity_scene": {
@@ -451,6 +453,7 @@ def test_anchor_scene_persistence_trims_artifact_budget_instead_of_rejecting_sce
                     "session_id": "artifact-budget",
                     "run_id": "stream-budget",
                     "stream_id": "stream-budget",
+                    "workspace_id": workspace_id,
                 },
                 "artifacts": artifacts,
             },
@@ -500,6 +503,271 @@ def test_anchor_scene_persistence_trims_artifact_budget_instead_of_rejecting_sce
     assert artifact_bytes <= MAX_ANCHOR_ARTIFACT_BYTES
     assert len(encoded) < routes._ANCHOR_ACTIVITY_SCENE_MAX_BYTES
     assert sanitized["artifacts"][0]["payload"]["path"].startswith("reports/000-")
+
+
+def test_anchor_scene_rejects_oversized_raw_artifact_array_before_copying(tmp_path):
+    from api import routes
+    from api.artifact_references import MAX_RAW_ANCHOR_ARTIFACT_REFERENCES
+
+    scene = {
+        "version": "activity_scene_v1",
+        "activity_rows": [],
+        "artifacts": [{} for _ in range(MAX_RAW_ANCHOR_ARTIFACT_REFERENCES + 1)],
+    }
+
+    with pytest.raises(ValueError, match="scene.artifacts"):
+        routes._sanitize_anchor_activity_scene(scene)
+
+
+def test_anchor_scene_rejects_duplicate_heavy_raw_artifacts_before_normalization(monkeypatch):
+    from api import routes
+    from api.artifact_references import MAX_RAW_ANCHOR_ARTIFACT_REFERENCES
+
+    artifact = {
+        "session_id": "s",
+        "run_id": "r",
+        "stream_id": "r",
+        "payload": {
+            "kind": "workspace_file",
+            "path": "reports/duplicate.md",
+            "source_tool": "write_file",
+        },
+    }
+    scene = {
+        "version": "activity_scene_v1",
+        "activity_rows": [],
+        "artifacts": [artifact] * (MAX_RAW_ANCHOR_ARTIFACT_REFERENCES + 1),
+    }
+
+    monkeypatch.setattr(
+        routes.copy,
+        "deepcopy",
+        lambda _value: (_ for _ in ()).throw(AssertionError("raw artifacts were copied before rejection")),
+    )
+    with pytest.raises(ValueError, match="scene.artifacts"):
+        routes._sanitize_anchor_activity_scene(scene)
+
+
+def test_anchor_scene_journal_snapshot_runs_before_session_lock(tmp_path, monkeypatch):
+    from api import models, routes
+    from api.artifact_references import anchor_artifact_event_from_payload, canonical_workspace_identity
+    from api.models import Session
+
+    _install_anchor_scene_store(tmp_path, monkeypatch, models, routes)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sid = "artifact-evidence-before-lock"
+    stream_id = "stream-evidence-before-lock"
+    session = Session(
+        session_id=sid,
+        workspace=workspace,
+        messages=[
+            {"role": "user", "content": "write a file"},
+            {
+                "role": "assistant",
+                "content": "done",
+                "timestamp": 10,
+                "_anchor_run_id": stream_id,
+                "_anchor_stream_id": stream_id,
+            },
+        ],
+    )
+    session.save(skip_index=True)
+    workspace_id = canonical_workspace_identity(workspace)
+    event = anchor_artifact_event_from_payload(
+        {
+            "kind": "workspace_file",
+            "path": "reports/evidence-before-lock.md",
+            "source_tool": "write_file",
+            "tool_call_id": "call-evidence-before-lock",
+        },
+        session_id=sid,
+        run_id=stream_id,
+        stream_id=stream_id,
+        workspace_id=workspace_id,
+        event_id=f"{stream_id}:1",
+        seq=1,
+    )
+    observed = {}
+
+    def snapshot(stream, *, handler=None, session_id=None, workspace_id=None):
+        del handler
+        observed["args"] = (stream, session_id, workspace_id)
+        lock = routes._get_session_agent_lock(sid)
+        acquired = lock.acquire(blocking=False)
+        observed["lock_available"] = acquired
+        if acquired:
+            lock.release()
+        return {
+            "session_id": sid,
+            "stream_id": stream,
+            "anchor_activity_scene": {
+                "identity": {
+                    "session_id": sid,
+                    "run_id": stream_id,
+                    "stream_id": stream_id,
+                    "workspace_id": workspace_id,
+                },
+                "artifacts": [event],
+            },
+        }
+
+    monkeypatch.setattr(routes, "_run_journal_live_snapshot", snapshot)
+    captured = _post_anchor_scene(
+        monkeypatch,
+        routes,
+        {
+            "session_id": sid,
+            "stream_id": stream_id,
+            "message_index": 1,
+            "scene": {
+                "version": "activity_scene_v1",
+                "mode": "compact_worklog",
+                "activity_rows": [],
+                "artifacts": [event],
+            },
+        },
+    )
+
+    assert captured["status"] == 200
+    assert observed["lock_available"] is True
+    assert observed["args"] == (stream_id, sid, workspace_id)
+
+
+def test_anchor_scene_repeated_same_session_posts_serialize_without_locking_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from api import models, routes
+    from api.artifact_references import anchor_artifact_event_from_payload, canonical_workspace_identity
+    from api.models import Session
+
+    _install_anchor_scene_store(tmp_path, monkeypatch, models, routes)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sid = "artifact-evidence-concurrent-post"
+    stream_id = "stream-evidence-concurrent-post"
+    Session(
+        session_id=sid,
+        workspace=workspace,
+        messages=[
+            {"role": "user", "content": "write a file"},
+            {
+                "role": "assistant",
+                "content": "done",
+                "timestamp": 10,
+                "_anchor_run_id": stream_id,
+                "_anchor_stream_id": stream_id,
+            },
+        ],
+    ).save(skip_index=True)
+    workspace_id = canonical_workspace_identity(workspace)
+    event = anchor_artifact_event_from_payload(
+        {
+            "kind": "workspace_file",
+            "path": "reports/concurrent.md",
+            "source_tool": "write_file",
+            "tool_call_id": "call-concurrent",
+        },
+        session_id=sid,
+        run_id=stream_id,
+        stream_id=stream_id,
+        workspace_id=workspace_id,
+        event_id=f"{stream_id}:1",
+        seq=1,
+    )
+    snapshot_calls = []
+
+    def snapshot(stream, *, handler=None, session_id=None, workspace_id=None):
+        del handler
+        snapshot_calls.append((stream, session_id, workspace_id))
+        return {
+            "session_id": sid,
+            "stream_id": stream,
+            "anchor_activity_scene": {
+                "identity": {
+                    "session_id": sid,
+                    "run_id": stream_id,
+                    "stream_id": stream_id,
+                    "workspace_id": workspace_id,
+                },
+                "artifacts": [event],
+            },
+        }
+
+    monkeypatch.setattr(routes, "_run_journal_live_snapshot", snapshot)
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda handler, payload, status=200, extra_headers=None: {"payload": payload, "status": status},
+    )
+    monkeypatch.setattr(
+        routes,
+        "bad",
+        lambda handler, message, status=400: {"error": message, "status": status},
+    )
+    body = {
+        "session_id": sid,
+        "stream_id": stream_id,
+        "message_index": 1,
+        "scene": {
+            "version": "activity_scene_v1",
+            "mode": "compact_worklog",
+            "activity_rows": [],
+            "artifacts": [event],
+        },
+    }
+
+    def submit_once():
+        return routes._handle_session_anchor_scene(SimpleNamespace(), body)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _item: submit_once(), range(4)))
+
+    assert all(result["status"] == 200 for result in results)
+    assert len(snapshot_calls) == 4
+
+
+def test_anchor_scene_browser_workspace_claim_cannot_override_server_digest(tmp_path, monkeypatch):
+    from api import models, routes
+    from api.artifact_references import canonical_workspace_identity
+    from api.models import Session
+
+    _install_anchor_scene_store(tmp_path, monkeypatch, models, routes)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sid = "artifact-browser-workspace-claim"
+    Session(
+        session_id=sid,
+        workspace=workspace,
+        messages=[
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "done", "timestamp": 10},
+        ],
+    ).save(skip_index=True)
+    captured = _post_anchor_scene(
+        monkeypatch,
+        routes,
+        {
+            "session_id": sid,
+            "message_index": 1,
+            "scene": {
+                "version": "activity_scene_v1",
+                "mode": "compact_worklog",
+                "identity": {"workspace_id": "b" * 64},
+                "activity_rows": [{"role": "prose", "text": "kept"}],
+                "artifacts": [],
+            },
+        },
+    )
+
+    assert captured["status"] == 400
+    assert "workspace_id" in captured["error"]
+    raw = json.loads((tmp_path / "sessions" / f"{sid}.json").read_text(encoding="utf-8"))
+    assert raw.get("anchor_activity_scenes") in (None, {})
+    assert canonical_workspace_identity(workspace) != "b" * 64
 
 
 def test_anchor_scene_persistence_rejects_explicit_foreign_artifact_owner(tmp_path, monkeypatch):
@@ -981,7 +1249,7 @@ def test_anchor_scene_persistence_accepts_stable_run_rotated_stream_once(tmp_pat
     monkeypatch.setattr(
         routes,
         "_run_journal_live_snapshot",
-        lambda stream_id, handler=None: {
+        lambda stream_id, handler=None, session_id=None, workspace_id=None: {
             "session_id": sid,
             "stream_id": stream_id,
             "anchor_activity_scene": {
@@ -989,6 +1257,7 @@ def test_anchor_scene_persistence_accepts_stable_run_rotated_stream_once(tmp_pat
                     "session_id": sid,
                     "run_id": "run-stable",
                     "stream_id": "transport-new",
+                    "workspace_id": workspace_id,
                 },
                 "artifacts": [old_transport_artifact],
             },
@@ -1057,7 +1326,7 @@ def test_anchor_scene_persistence_accepts_stable_run_rotated_stream_once(tmp_pat
 
 def test_anchor_scene_persistence_merges_browser_post_after_worker_settlement(tmp_path, monkeypatch):
     from api import models, routes, streaming
-    from api.artifact_references import anchor_artifact_event_from_payload
+    from api.artifact_references import anchor_artifact_event_from_payload, canonical_workspace_identity
     from api.models import Session
 
     session_dir = tmp_path / "sessions"
@@ -1085,6 +1354,7 @@ def test_anchor_scene_persistence_merges_browser_post_after_worker_settlement(tm
         session_id=session.session_id,
         run_id="stream-late",
         stream_id="stream-late",
+        workspace_id=canonical_workspace_identity(session.workspace),
         event_id="stream-late:2",
         seq=2,
     )

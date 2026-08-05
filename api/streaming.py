@@ -54,6 +54,7 @@ from api.compression_recovery import stamp_compression_exhausted_recovery
 from api.artifact_references import (
     anchor_artifact_event_from_payload,
     bound_anchor_artifact_events,
+    canonical_workspace_identity,
     derive_file_artifact_references,
     merge_anchor_activity_scene,
     retain_server_authoritative_artifact_events,
@@ -2075,6 +2076,7 @@ def _legacy_anchor_scene_record_matches_terminal_target(
     session_id: str,
     run_id: str,
     stream_id: str,
+    workspace_id: str | None = None,
 ) -> bool:
     """Find one legacy index-keyed scene only when all owner claims agree."""
     if not isinstance(record, dict):
@@ -2101,6 +2103,11 @@ def _legacy_anchor_scene_record_matches_terminal_target(
         explicit = [str(value).strip() for value in claims if value is not None and str(value).strip()]
         if not expected or not explicit or any(value != expected for value in explicit):
             return False
+    if workspace_id:
+        claims = [record.get('workspace_id'), identity.get('workspace_id')]
+        explicit = [str(value).strip() for value in claims if value is not None and str(value).strip()]
+        if explicit and any(value != str(workspace_id).strip() for value in explicit):
+            return False
     return True
 
 
@@ -2119,12 +2126,17 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
         return False
     run_id = str(run_id or stream_id or '').strip()
     try:
+        workspace_id = canonical_workspace_identity(getattr(session, 'workspace', None))
+        if not workspace_id:
+            return False
         artifacts = bound_anchor_artifact_events(
             list(artifact_events or []),
             session_id=getattr(session, 'session_id', None),
             stream_id=stream_id,
             run_id=run_id,
+            workspace_id=workspace_id,
             reject_owner_mismatch=True,
+            require_owner_authority=True,
         )
     except ValueError:
         logger.debug("Rejected foreign-owned anchor artifact during terminal reconciliation", exc_info=True)
@@ -2178,6 +2190,7 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
                 session_id=getattr(session, 'session_id', None),
                 run_id=run_id,
                 stream_id=stream_id,
+                workspace_id=workspace_id,
             )
         ]
         if not record:
@@ -2191,7 +2204,14 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
     existing_scene = record.get('scene') if isinstance(record.get('scene'), dict) else {}
     existing_scene = copy.deepcopy(existing_scene)
     existing_artifacts = existing_scene.get('artifacts') if isinstance(existing_scene.get('artifacts'), list) else []
-    if str(record.get('artifact_authority') or '') != 'server':
+    record_workspace_id = str(record.get('workspace_id') or '').strip()
+    existing_identity = existing_scene.get('identity') if isinstance(existing_scene.get('identity'), dict) else {}
+    scene_workspace_id = str(existing_identity.get('workspace_id') or '').strip()
+    existing_workspace_authoritative = (
+        record_workspace_id == workspace_id
+        and scene_workspace_id == workspace_id
+    )
+    if str(record.get('artifact_authority') or '') != 'server' or not existing_workspace_authoritative:
         existing_scene['artifacts'] = []
     else:
         try:
@@ -2201,6 +2221,8 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
                 session_id=getattr(session, 'session_id', None),
                 run_id=run_id,
                 stream_id=stream_id,
+                workspace_id=workspace_id,
+                allow_missing_workspace=True,
             )
             validate_anchor_activity_scene_artifact_paths(
                 existing_scene,
@@ -2219,6 +2241,7 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
             'session_id': getattr(session, 'session_id', None),
             'run_id': run_id,
             'stream_id': stream_id,
+            'workspace_id': workspace_id,
             'source_message_refs': [ref] if ref else [],
         },
         'lifecycle': {
@@ -2239,11 +2262,14 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
             stream_id=stream_id,
             owner_run_id=run_id,
             owner_stream_id=stream_id,
+            owner_workspace_id=workspace_id,
+            workspace_id=workspace_id,
             terminal_state=terminal_state,
             final_answer=final_answer,
             final_message_ref=ref,
             turn_duration=duration,
             reject_owner_mismatch=True,
+            allow_missing_workspace=True,
         )
     except ValueError:
         logger.debug("Rejected foreign-owned anchor scene during terminal reconciliation", exc_info=True)
@@ -2254,6 +2280,7 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
         'message_ref': ref,
         'run_id': run_id,
         'stream_id': stream_id,
+        'workspace_id': workspace_id,
         'owner_authority': 'server',
         'artifact_authority': 'server',
         'scene': scene,
@@ -8299,6 +8326,14 @@ def _run_agent_streaming(
     _success_writeback_committed = False
     _anchor_artifact_events: list[dict] = []
     _anchor_run_id = [stream_id]
+    _anchor_workspace_id = canonical_workspace_identity(workspace)
+
+    def _anchor_artifact_reference_with_workspace(artifact_reference):
+        if not isinstance(artifact_reference, dict) or not _anchor_workspace_id:
+            return None
+        enriched = dict(artifact_reference)
+        enriched['workspace_id'] = _anchor_workspace_id
+        return enriched
 
     def _anchor_artifact_event_from_reference(artifact_reference, event_id=None, *, reserve_event_id=False):
         event_run_id, event_seq = _parse_run_journal_event_id(event_id)
@@ -8316,6 +8351,7 @@ def _run_agent_streaming(
             session_id=session_id,
             run_id=active_run_id,
             stream_id=stream_id,
+            workspace_id=_anchor_workspace_id,
             event_id=anchor_event_id,
             seq=event_seq,
             created_at=time.time(),
@@ -9184,6 +9220,9 @@ def _run_agent_streaming(
                             s.workspace,
                         )
                         for artifact_reference in artifact_references:
+                            artifact_reference = _anchor_artifact_reference_with_workspace(artifact_reference)
+                            if not artifact_reference:
+                                break
                             if not _anchor_artifact_reference_within_stream_budget(artifact_reference):
                                 break
                             artifact_event_id = put('artifact_reference', artifact_reference)
@@ -9297,6 +9336,9 @@ def _run_agent_streaming(
                                 tool_call_id=tool_call_id,
                             )
                             for artifact_reference in artifact_references:
+                                artifact_reference = _anchor_artifact_reference_with_workspace(artifact_reference)
+                                if not artifact_reference:
+                                    break
                                 if not _anchor_artifact_reference_within_stream_budget(artifact_reference):
                                     break
                                 artifact_event_id = put('artifact_reference', artifact_reference)

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import copy
+import hashlib
 from pathlib import Path
 
 
@@ -24,6 +25,12 @@ _MAX_TOTAL_PATH_BYTES = 16 * 1024
 _MAX_TOOL_CALL_ID_BYTES = 256
 MAX_ANCHOR_ARTIFACT_REFERENCES = 64
 MAX_ANCHOR_ARTIFACT_BYTES = 32 * 1024
+# Raw browser artifact lists are an input budget, distinct from the retained
+# scene budget above.  Rejecting these before deepcopy/normalization prevents a
+# client from spending unbounded work on invalid or duplicate rows that can
+# never survive the retained output cap.
+MAX_RAW_ANCHOR_ARTIFACT_REFERENCES = MAX_ANCHOR_ARTIFACT_REFERENCES * 4
+MAX_RAW_ANCHOR_ARTIFACT_BYTES = 128 * 1024
 _ANCHOR_ARTIFACT_STRING_LIMITS = {
     'kind': 64,
     'path': _MAX_PATH_BYTES,
@@ -37,9 +44,34 @@ _ANCHOR_ARTIFACT_EVENT_STRING_LIMITS = {
     'turn_id': 512,
     'run_id': 512,
     'stream_id': 512,
+    'workspace_id': 128,
 }
 _INVALID_OWNER_CLAIM = object()
 _MAX_JSON_NESTING = 256
+
+
+def canonical_workspace_identity(workspace) -> str | None:
+    """Return an opaque digest of the server-resolved workspace root.
+
+    The digest is safe to carry through browser/journal projections without
+    exposing the absolute filesystem path.  Callers must compute it from the
+    server-owned session workspace; browser-provided values are claims only.
+    """
+    if workspace is None:
+        return None
+    try:
+        raw = os.fspath(workspace)
+    except TypeError:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        canonical = str(Path(raw).expanduser().resolve())
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not canonical:
+        return None
+    return hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _utf8_size(value: str) -> int:
@@ -183,6 +215,33 @@ def _json_within_bytes(value, limit: int) -> bool:
         remaining = limit - total
         size = _json_scalar_size(item, remaining)
         if size is None or not add(size):
+            return False
+    return True
+
+
+def raw_anchor_artifact_input_within_limits(events) -> bool:
+    """Check raw artifact input without copying or scanning past its budget."""
+    if not isinstance(events, list):
+        return True
+    if len(events) > MAX_RAW_ANCHOR_ARTIFACT_REFERENCES:
+        return False
+    total = 2  # Complete serialized list framing: '[' + ']'.
+    for raw in events:
+        framing = 1 if total > 2 else 0
+        remaining = MAX_RAW_ANCHOR_ARTIFACT_BYTES - total - framing
+        if remaining < 0 or not _json_within_bytes(raw, remaining):
+            return False
+        try:
+            encoded = json.dumps(
+                raw,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8", "surrogatepass")
+        except (TypeError, ValueError, OverflowError):
+            return False
+        total += framing + len(encoded)
+        if total > MAX_RAW_ANCHOR_ARTIFACT_BYTES:
             return False
     return True
 
@@ -410,6 +469,7 @@ def anchor_artifact_event_from_payload(
     turn_id=None,
     run_id=None,
     stream_id=None,
+    workspace_id=None,
     event_id=None,
     seq=None,
     created_at=None,
@@ -424,6 +484,20 @@ def anchor_artifact_event_from_payload(
     clean_turn_id = _bounded_event_string(turn_id, 'turn_id')
     clean_run_id = _bounded_event_string(run_id, 'run_id')
     clean_stream_id = _bounded_event_string(stream_id, 'stream_id')
+    payload_workspace_id = payload.get('workspace_id') if isinstance(payload, dict) else None
+    clean_arg_workspace_id = _bounded_event_string(workspace_id, 'workspace_id')
+    clean_payload_workspace_id = _bounded_event_string(payload_workspace_id, 'workspace_id')
+    if workspace_id is not None and not clean_arg_workspace_id:
+        return None
+    if payload_workspace_id is not None and not clean_payload_workspace_id:
+        return None
+    if (
+        clean_arg_workspace_id
+        and clean_payload_workspace_id
+        and clean_arg_workspace_id != clean_payload_workspace_id
+    ):
+        return None
+    clean_workspace_id = clean_arg_workspace_id or clean_payload_workspace_id
     clean_seq = _coerce_positive_seq(seq)
     clean_local_id = (
         _bounded_event_string(local_id, 'local_id')
@@ -458,21 +532,40 @@ def anchor_artifact_event_from_payload(
         },
         'payload': clean_payload,
     }
+    if clean_workspace_id:
+        artifact['workspace_id'] = clean_workspace_id
+        artifact['identity']['workspace_id'] = clean_workspace_id
     return artifact
 
 
-def anchor_artifact_event_from_raw(raw, *, session_id=None, run_id=None, stream_id=None) -> dict | None:
+def anchor_artifact_event_from_raw(
+    raw,
+    *,
+    session_id=None,
+    run_id=None,
+    stream_id=None,
+    workspace_id=None,
+) -> dict | None:
     """Normalize an existing persisted/live artifact object into the bounded event shape."""
     if not isinstance(raw, dict):
         return None
     payload = raw.get('payload') if isinstance(raw.get('payload'), dict) else raw
     identity = raw.get('identity') if isinstance(raw.get('identity'), dict) else {}
+    if 'workspace_id' in raw:
+        raw_workspace_id = raw.get('workspace_id')
+    elif 'workspace_id' in identity:
+        raw_workspace_id = identity.get('workspace_id')
+    elif isinstance(payload, dict) and 'workspace_id' in payload:
+        raw_workspace_id = payload.get('workspace_id')
+    else:
+        raw_workspace_id = workspace_id
     return anchor_artifact_event_from_payload(
         payload,
         session_id=raw.get('session_id') or identity.get('session_id') or session_id,
         turn_id=raw.get('turn_id') or identity.get('turn_id'),
         run_id=raw.get('run_id') or identity.get('run_id') or run_id,
         stream_id=raw.get('stream_id') or identity.get('stream_id') or stream_id,
+        workspace_id=raw_workspace_id,
         event_id=raw.get('event_id') or identity.get('event_id'),
         seq=raw.get('seq') if raw.get('seq') is not None else identity.get('seq'),
         created_at=raw.get('created_at'),
@@ -518,7 +611,9 @@ def anchor_artifact_owner_mismatch(
     session_id=None,
     run_id=None,
     stream_id=None,
+    workspace_id=None,
     require_owner_authority: bool = False,
+    allow_missing_workspace: bool = False,
 ) -> str | None:
     """Return the first explicit owner field that conflicts with the expected owner."""
     if not isinstance(raw, dict):
@@ -535,6 +630,10 @@ def anchor_artifact_owner_mismatch(
     expected_stream_id = _bounded_clean_string(
         stream_id,
         _ANCHOR_ARTIFACT_EVENT_STRING_LIMITS['stream_id'],
+    )
+    expected_workspace_id = _bounded_clean_string(
+        workspace_id,
+        _ANCHOR_ARTIFACT_EVENT_STRING_LIMITS['workspace_id'],
     )
     raw_session_id, identity_session_id = _anchor_owner_claim(raw, identity, 'session_id')
     if raw_session_id is _INVALID_OWNER_CLAIM or identity_session_id is _INVALID_OWNER_CLAIM:
@@ -575,6 +674,36 @@ def anchor_artifact_owner_mismatch(
         )
         if not same_durable_run:
             return 'stream_id'
+    raw_workspace_id, identity_workspace_id = _anchor_owner_claim(raw, identity, 'workspace_id')
+    payload_workspace_id = _owner_claim_value(
+        raw.get('payload') if isinstance(raw.get('payload'), dict) else {},
+        'workspace_id',
+    )
+    if (
+        raw_workspace_id is _INVALID_OWNER_CLAIM
+        or identity_workspace_id is _INVALID_OWNER_CLAIM
+        or payload_workspace_id is _INVALID_OWNER_CLAIM
+    ):
+        return 'workspace_id'
+    workspace_claims = [
+        value
+        for value in (raw_workspace_id, identity_workspace_id, payload_workspace_id)
+        if value
+    ]
+    if len(set(workspace_claims)) > 1:
+        return 'workspace_id'
+    explicit_workspace_id = next(iter(workspace_claims), None)
+    if explicit_workspace_id and require_owner_authority and not expected_workspace_id:
+        return 'workspace_id'
+    if explicit_workspace_id and expected_workspace_id and explicit_workspace_id != expected_workspace_id:
+        return 'workspace_id'
+    if (
+        require_owner_authority
+        and expected_workspace_id
+        and not explicit_workspace_id
+        and not allow_missing_workspace
+    ):
+        return 'workspace_id'
     return None
 
 
@@ -584,7 +713,9 @@ def anchor_activity_scene_owner_mismatch(
     session_id=None,
     run_id=None,
     stream_id=None,
+    workspace_id=None,
     require_artifact_owner_authority: bool = False,
+    allow_missing_workspace: bool = False,
 ) -> str | None:
     """Return the first explicit scene/artifact owner mismatch, if any."""
     if not isinstance(scene, dict):
@@ -597,7 +728,9 @@ def anchor_activity_scene_owner_mismatch(
             session_id=session_id,
             run_id=run_id,
             stream_id=stream_id,
+            workspace_id=workspace_id,
             require_owner_authority=require_artifact_owner_authority and bool(artifacts),
+            allow_missing_workspace=allow_missing_workspace,
         )
         if mismatch:
             return f'identity.{mismatch}'
@@ -607,7 +740,9 @@ def anchor_activity_scene_owner_mismatch(
             session_id=session_id,
             run_id=run_id,
             stream_id=stream_id,
+            workspace_id=workspace_id,
             require_owner_authority=require_artifact_owner_authority,
+            allow_missing_workspace=allow_missing_workspace,
         )
         if mismatch:
             return f'artifact.{mismatch}'
@@ -620,10 +755,12 @@ def bound_anchor_artifact_events(
     session_id=None,
     run_id=None,
     stream_id=None,
+    workspace_id=None,
     max_count: int = MAX_ANCHOR_ARTIFACT_REFERENCES,
     max_bytes: int = MAX_ANCHOR_ARTIFACT_BYTES,
     reject_owner_mismatch: bool = False,
     require_owner_authority: bool = False,
+    allow_missing_workspace: bool = False,
 ) -> list[dict]:
     """Return a deterministic bounded prefix of valid Anchor artifact events."""
     out: list[dict] = []
@@ -636,7 +773,9 @@ def bound_anchor_artifact_events(
                 session_id=session_id,
                 run_id=run_id,
                 stream_id=stream_id,
+                workspace_id=workspace_id,
                 require_owner_authority=require_owner_authority,
+                allow_missing_workspace=allow_missing_workspace,
             )
             if mismatch:
                 raise ValueError(f'artifact owner mismatch: {mismatch}')
@@ -701,6 +840,8 @@ def retain_server_authoritative_artifact_events(
     session_id=None,
     run_id=None,
     stream_id=None,
+    workspace_id=None,
+    allow_missing_workspace: bool = False,
 ) -> list[dict]:
     """Return canonical server events exactly represented by a client projection."""
     canonical = bound_anchor_artifact_events(
@@ -708,8 +849,10 @@ def retain_server_authoritative_artifact_events(
         session_id=session_id,
         run_id=run_id,
         stream_id=stream_id,
+        workspace_id=workspace_id,
         reject_owner_mismatch=True,
         require_owner_authority=True,
+        allow_missing_workspace=allow_missing_workspace,
     )
     by_key = {}
     for event in canonical:
@@ -724,7 +867,9 @@ def retain_server_authoritative_artifact_events(
             session_id=session_id,
             run_id=run_id,
             stream_id=stream_id,
+            workspace_id=workspace_id,
             require_owner_authority=True,
+            allow_missing_workspace=allow_missing_workspace,
         )
         if mismatch:
             raise ValueError(f'anchor scene owner mismatch: artifact.{mismatch}')
@@ -736,8 +881,10 @@ def retain_server_authoritative_artifact_events(
         session_id=session_id,
         run_id=run_id,
         stream_id=stream_id,
+        workspace_id=workspace_id,
         reject_owner_mismatch=True,
         require_owner_authority=True,
+        allow_missing_workspace=allow_missing_workspace,
     )
 
 
@@ -747,8 +894,10 @@ def bound_anchor_activity_scene_artifacts(
     session_id=None,
     run_id=None,
     stream_id=None,
+    workspace_id=None,
     reject_owner_mismatch: bool = False,
     require_owner_authority: bool = False,
+    allow_missing_workspace: bool = False,
 ):
     """Defensively cap scene artifacts without rejecting the whole Anchor scene."""
     if not isinstance(scene, dict):
@@ -759,8 +908,10 @@ def bound_anchor_activity_scene_artifacts(
         session_id=session_id,
         run_id=run_id,
         stream_id=stream_id,
+        workspace_id=workspace_id,
         reject_owner_mismatch=reject_owner_mismatch,
         require_owner_authority=require_owner_authority,
+        allow_missing_workspace=allow_missing_workspace,
     )
     return next_scene
 
@@ -782,6 +933,7 @@ def merge_anchor_activity_scene(
     session_id=None,
     run_id=None,
     stream_id=None,
+    workspace_id=None,
     terminal_state=None,
     final_answer=None,
     final_message_ref=None,
@@ -790,7 +942,9 @@ def merge_anchor_activity_scene(
     owner_session_id=None,
     owner_run_id=None,
     owner_stream_id=None,
+    owner_workspace_id=None,
     require_owner_authority: bool = False,
+    allow_missing_workspace: bool = False,
 ) -> dict:
     """Merge browser and worker Anchor scenes with shared artifact ownership rules."""
     existing = copy.deepcopy(existing_scene) if isinstance(existing_scene, dict) else {}
@@ -798,6 +952,7 @@ def merge_anchor_activity_scene(
     validation_session_id = owner_session_id if owner_session_id is not None else session_id
     validation_run_id = owner_run_id if owner_run_id is not None else run_id
     validation_stream_id = owner_stream_id if owner_stream_id is not None else stream_id
+    validation_workspace_id = owner_workspace_id if owner_workspace_id is not None else workspace_id
     if reject_owner_mismatch:
         for scene in (existing, incoming):
             mismatch = anchor_activity_scene_owner_mismatch(
@@ -805,7 +960,9 @@ def merge_anchor_activity_scene(
                 session_id=validation_session_id,
                 run_id=validation_run_id,
                 stream_id=validation_stream_id,
+                workspace_id=validation_workspace_id,
                 require_artifact_owner_authority=require_owner_authority,
+                allow_missing_workspace=allow_missing_workspace,
             )
             if mismatch:
                 raise ValueError(f'anchor scene owner mismatch: {mismatch}')
@@ -828,6 +985,10 @@ def merge_anchor_activity_scene(
         stream_id,
         _ANCHOR_ARTIFACT_EVENT_STRING_LIMITS['stream_id'],
     )
+    clean_workspace_id = _bounded_clean_string(
+        workspace_id,
+        _ANCHOR_ARTIFACT_EVENT_STRING_LIMITS['workspace_id'],
+    )
     if clean_session_id:
         identity['session_id'] = clean_session_id
     if clean_run_id:
@@ -836,6 +997,8 @@ def merge_anchor_activity_scene(
         identity['run_id'] = clean_stream_id
     if clean_stream_id:
         identity['stream_id'] = clean_stream_id
+    if clean_workspace_id:
+        identity['workspace_id'] = clean_workspace_id
     source_refs = [
         str(item)
         for item in identity.get('source_message_refs', [])
@@ -886,7 +1049,9 @@ def merge_anchor_activity_scene(
         session_id=validation_session_id if reject_owner_mismatch else clean_session_id,
         run_id=validation_run_id if reject_owner_mismatch else (clean_run_id or clean_stream_id),
         stream_id=validation_stream_id if reject_owner_mismatch else clean_stream_id,
+        workspace_id=validation_workspace_id if reject_owner_mismatch else clean_workspace_id,
         reject_owner_mismatch=reject_owner_mismatch,
         require_owner_authority=require_owner_authority,
+        allow_missing_workspace=allow_missing_workspace,
     )
     return merged
