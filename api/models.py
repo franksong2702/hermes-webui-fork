@@ -8379,15 +8379,29 @@ def _merge_session_display_metadata(target: dict | None, source: dict | None) ->
             target[key] = copy.deepcopy(value)
 
 
+def _state_db_row_identity_details(message: dict | None) -> tuple[str | None, bool]:
+    """Return ``(row_id, valid)`` for private state.db provenance aliases.
+
+    A message carrying two different aliases is contradictory provenance.  It
+    must not silently fall through to timestamp/sequence matching, because that
+    would turn an identity conflict into a guessed provider-side payload.
+    """
+    if not isinstance(message, dict):
+        return None, True
+    values = {
+        str(value)
+        for key in ("_state_db_row_id", "_db_row_id", "state_db_row_id")
+        if (value := message.get(key)) not in (None, "")
+    }
+    if len(values) > 1:
+        return None, False
+    return (next(iter(values)) if values else None), True
+
+
 def _state_db_row_identity(message: dict | None):
     """Return durable state.db provenance without treating WebUI ``id`` as it."""
-    if not isinstance(message, dict):
-        return None
-    for key in ("_state_db_row_id", "_db_row_id", "state_db_row_id"):
-        value = message.get(key)
-        if value not in (None, ""):
-            return str(value)
-    return None
+    identity, valid = _state_db_row_identity_details(message)
+    return identity if valid else None
 
 
 def _message_exact_timestamp(message: dict | None):
@@ -8413,19 +8427,63 @@ def _message_sidecar_role(message: dict | None):
     return role if role in {"user", "assistant"} else None
 
 
-def _copy_api_content_sidecar(target: dict | None, source: dict | None) -> None:
+_WORKSPACE_PREFIX_RE = re.compile(r"^\s*\[Workspace(?:::v1)?:[^\]]+\]\s*")
+
+
+def _message_visible_content_key(message: dict | None):
+    """Return a canonical visible-content key for sidecar reconciliation."""
+    if not isinstance(message, dict):
+        return None
+    role = _message_sidecar_role(message)
+    if role is None:
+        return None
+
+    def _normalize(value, *, strip_prefix=False):
+        if isinstance(value, str):
+            text = value
+            if strip_prefix:
+                text = _WORKSPACE_PREFIX_RE.sub("", text, count=1)
+            return " ".join(text.split())
+        if isinstance(value, list):
+            return [_normalize(item, strip_prefix=strip_prefix) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: _normalize(child, strip_prefix=False)
+                for key, child in value.items()
+                if key not in {"api_content", "_state_db_row_id", "_db_row_id", "state_db_row_id"}
+            }
+        return value
+
+    normalized = _normalize(message.get("content"), strip_prefix=(role == "user"))
+    try:
+        content = json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        content = repr(normalized)
+    return role, content
+
+
+def _visible_content_compatible(target: dict | None, source: dict | None) -> bool:
+    """Return True only when role and visible content agree exactly."""
+    return _message_visible_content_key(target) == _message_visible_content_key(source)
+
+
+def _copy_api_content_sidecar(target: dict | None, source: dict | None) -> bool:
     """Copy a non-empty internal sidecar without replacing an existing one."""
     if not isinstance(target, dict) or not isinstance(source, dict):
-        return
+        return False
     target_role = _message_sidecar_role(target)
     source_role = _message_sidecar_role(source)
     if target_role is None or target_role != source_role:
-        return
+        return False
+    if not _visible_content_compatible(target, source):
+        return False
     if target.get("api_content") not in (None, ""):
-        return
+        return True
     api_content = source.get("api_content")
     if isinstance(api_content, str) and api_content:
         target["api_content"] = api_content
+        return True
+    return False
 
 
 def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list) -> None:
@@ -8454,24 +8512,36 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
     used_targets: set[int] = set()
     used_sources: set[int] = set()
 
-    # 1. Durable row identity.  This path is unambiguous and deliberately does
-    # not inspect visible content.
+    # 1. Durable row identity.  This path is unambiguous only when every
+    # alias agrees, each row id occurs once on each side, and visible content
+    # is compatible.  Any duplicate/conflicting id is consumed and rejected;
+    # it must not fall through to a weaker tier.
     targets_by_row_id = {}
     for index, message in enumerate(sidecar):
-        row_id = _state_db_row_identity(message)
-        if row_id is not None:
-            targets_by_row_id.setdefault(row_id, []).append(index)
-    for source_index, message in enumerate(state):
-        row_id = _state_db_row_identity(message)
-        if row_id is None:
-            continue
-        for index in targets_by_row_id.get(row_id, ()):
-            if index in used_targets:
-                continue
-            _copy_api_content_sidecar(sidecar[index], message)
+        row_id, valid = _state_db_row_identity_details(message)
+        if not valid:
             used_targets.add(index)
+        elif row_id is not None:
+            targets_by_row_id.setdefault(row_id, []).append(index)
+    state_by_row_id = {}
+    for source_index, message in enumerate(state):
+        row_id, valid = _state_db_row_identity_details(message)
+        if not valid:
             used_sources.add(source_index)
-            break
+        elif row_id is not None:
+            state_by_row_id.setdefault(row_id, []).append(source_index)
+
+    for row_id, target_indexes in targets_by_row_id.items():
+        source_indexes = state_by_row_id.get(row_id, [])
+        if len(target_indexes) != 1 or len(source_indexes) != 1:
+            used_targets.update(target_indexes)
+            used_sources.update(source_indexes)
+            continue
+        target_index = target_indexes[0]
+        source_index = source_indexes[0]
+        used_targets.add(target_index)
+        used_sources.add(source_index)
+        _copy_api_content_sidecar(sidecar[target_index], state[source_index])
 
     # 2. Exact role + timestamp. A bucket is safe only when it has one
     # remaining candidate on each side. Equal timestamps are not provenance;
@@ -8479,26 +8549,32 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
     sidecar_by_exact_timestamp = {}
     state_by_exact_timestamp = {}
     for index, message in enumerate(sidecar):
+        if index in used_targets:
+            continue
         role = _message_sidecar_role(message)
         timestamp = _message_exact_timestamp(message)
-        if role is not None and timestamp is not None:
+        row_id, valid = _state_db_row_identity_details(message)
+        if valid and row_id is None and role is not None and timestamp is not None:
             sidecar_by_exact_timestamp.setdefault((role, timestamp), []).append(index)
     for source_index, message in enumerate(state):
         if source_index in used_sources:
             continue
         role = _message_sidecar_role(message)
         timestamp = _message_exact_timestamp(message)
-        if role is not None and timestamp is not None:
+        _, valid = _state_db_row_identity_details(message)
+        if valid and role is not None and timestamp is not None:
             state_by_exact_timestamp.setdefault((role, timestamp), []).append((source_index, message))
     for key, state_rows in state_by_exact_timestamp.items():
         candidates = [index for index in sidecar_by_exact_timestamp.get(key, ()) if index not in used_targets]
         if len(candidates) != 1 or len(state_rows) != 1:
+            used_targets.update(candidates)
+            used_sources.update(source_index for source_index, _ in state_rows)
             continue
         index = candidates[0]
         source_index, message = state_rows[0]
-        _copy_api_content_sidecar(sidecar[index], message)
         used_targets.add(index)
         used_sources.add(source_index)
+        _copy_api_content_sidecar(sidecar[index], message)
 
     # 3. Metadata-free fallback is safe only for a unique role bucket. A
     # repeated role with no durable identity has no principled ordering, so it
@@ -8506,24 +8582,30 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
     sidecar_by_role_sequence = {}
     state_by_role_sequence = {}
     for index, message in enumerate(sidecar):
+        if index in used_targets:
+            continue
         role = _message_sidecar_role(message)
-        if role is not None and _state_db_row_identity(message) is None and _message_exact_timestamp(message) is None:
+        row_id, valid = _state_db_row_identity_details(message)
+        if valid and row_id is None and role is not None and _message_exact_timestamp(message) is None:
             sidecar_by_role_sequence.setdefault(role, []).append(index)
     for source_index, message in enumerate(state):
         if source_index in used_sources:
             continue
         role = _message_sidecar_role(message)
-        if role is not None and _state_db_row_identity(message) is None and _message_exact_timestamp(message) is None:
+        row_id, valid = _state_db_row_identity_details(message)
+        if valid and row_id is None and role is not None and _message_exact_timestamp(message) is None:
             state_by_role_sequence.setdefault(role, []).append((source_index, message))
     for role, state_rows in state_by_role_sequence.items():
         candidates = [index for index in sidecar_by_role_sequence.get(role, ()) if index not in used_targets]
         if len(candidates) != 1 or len(state_rows) != 1:
+            used_targets.update(candidates)
+            used_sources.update(source_index for source_index, _ in state_rows)
             continue
         index = candidates[0]
         source_index, message = state_rows[0]
-        _copy_api_content_sidecar(sidecar[index], message)
         used_targets.add(index)
         used_sources.add(source_index)
+        _copy_api_content_sidecar(sidecar[index], message)
 
 
 def _session_message_dedup_key(msg: dict):

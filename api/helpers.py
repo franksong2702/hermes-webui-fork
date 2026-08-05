@@ -956,10 +956,7 @@ def _redact_value(v, *, _enabled: bool | None = None):
     if isinstance(v, str):
         return _redact_text(v, _enabled=_enabled)
     if isinstance(v, dict):
-        return {
-            key: _redact_value(value, _enabled=_enabled)
-            for key, value in v.items()
-        }
+        return {key: _redact_value(value, _enabled=_enabled) for key, value in v.items()}
     if isinstance(v, list):
         return [_redact_value(item, _enabled=_enabled) for item in v]
     return v
@@ -1017,6 +1014,70 @@ def _redact_messages(messages, *, _enabled: bool):
     return [_public_message_projection(message, _enabled=_enabled) for message in messages]
 
 
+def _redact_nested_message_containers(value, *, _enabled: bool):
+    """Redact known nested message arrays without filtering generic dicts.
+
+    Runtime journal snapshots are metadata envelopes that can contain a
+    ``messages`` or ``context_messages`` array.  Only those schema positions
+    are message-bearing; arbitrary tool/user payload dictionaries may legally
+    use the same field names as replay aliases and must remain intact.
+    """
+    if isinstance(value, dict):
+        result = {}
+        for key, child in value.items():
+            if key in {"messages", "context_messages"}:
+                result[key] = _redact_messages(child, _enabled=_enabled)
+            else:
+                result[key] = _redact_nested_message_containers(child, _enabled=_enabled)
+        return result
+    if isinstance(value, list):
+        return [_redact_nested_message_containers(item, _enabled=_enabled) for item in value]
+    return _redact_value(value, _enabled=_enabled)
+
+
+def public_session_projection(session_dict: dict) -> dict:
+    """Return a public session payload with redaction and alias stripping.
+
+    Callers use this for every response/export/SSE session payload.  It never
+    mutates the in-memory session or the caller's dictionary.
+    """
+    return redact_session_data(session_dict)
+
+
+def strip_public_internal_fields(value):
+    """Deep-copy imported records while dropping only record-level aliases.
+
+    JSON import uses this before constructing or saving a ``Session``.  The
+    four replay aliases belong to a message/tool-call record itself; matching
+    names inside user content or tool arguments are ordinary JSON and must be
+    preserved.  This is intentionally independent of the credential-redaction
+    setting: caller-supplied provider sidecars must never become durable WebUI
+    session state.
+    """
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            if isinstance(item, dict):
+                result.append({
+                    key: _copy_json_value(child)
+                    for key, child in item.items()
+                    if key not in _PUBLIC_MESSAGE_INTERNAL_FIELDS
+                })
+            else:
+                result.append(_copy_json_value(item))
+        return result
+    return _copy_json_value(value)
+
+
+def _copy_json_value(value):
+    """Deep-copy JSON-shaped data without applying message-field filtering."""
+    if isinstance(value, dict):
+        return {key: _copy_json_value(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_copy_json_value(child) for child in value]
+    return value
+
+
 def redact_session_data(session_dict: dict) -> dict:
     """Redact credentials from message content, tool data, and session sidecars.
 
@@ -1032,20 +1093,20 @@ def redact_session_data(session_dict: dict) -> dict:
     """
     from api.config import load_settings
     _enabled = bool(load_settings().get("api_redact_enabled", True))
-    result = dict(session_dict)
-    if isinstance(result.get('title'), str):
-        result['title'] = _redact_text(result['title'], _enabled=_enabled)
-    if 'messages' in result:
-        result['messages'] = _redact_messages(result['messages'], _enabled=_enabled)
-    if 'tool_calls' in result:
-        result['tool_calls'] = _redact_value(result['tool_calls'], _enabled=_enabled)
-    if 'todo_state' in result:
-        result['todo_state'] = _redact_value(result['todo_state'], _enabled=_enabled)
-    if 'runtime_journal_snapshot' in result:
-        result['runtime_journal_snapshot'] = _redact_value(
-            result['runtime_journal_snapshot'],
-            _enabled=_enabled,
-        )
+    if not isinstance(session_dict, dict):
+        return {}
+    result = {}
+    for key, value in session_dict.items():
+        if key in _PUBLIC_MESSAGE_INTERNAL_FIELDS:
+            continue
+        if key == 'title' and isinstance(value, str):
+            result[key] = _redact_text(value, _enabled=_enabled)
+        elif key in {'messages', 'context_messages'}:
+            result[key] = _redact_messages(value, _enabled=_enabled)
+        elif key == 'runtime_journal_snapshot':
+            result[key] = _redact_nested_message_containers(value, _enabled=_enabled)
+        else:
+            result[key] = _redact_value(value, _enabled=_enabled)
     return result
 
 

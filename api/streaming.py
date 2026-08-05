@@ -126,6 +126,13 @@ def _redacted_session_payload_with_full_messages(session, *, tool_calls=None) ->
         return None
 
 
+def _ephemeral_session_payload(session_id: str, messages) -> dict:
+    """Project the non-persistent ``/btw`` terminal session for public SSE."""
+    return redact_session_data(
+        {'session_id': session_id, 'messages': messages if isinstance(messages, list) else []}
+    )
+
+
 def _cancel_event_payload(
     message: str = "Cancelled by user",
     *,
@@ -9668,8 +9675,15 @@ def _run_agent_streaming(
                     if isinstance(_m, dict) and _m.get('role') == 'assistant':
                         _answer = str(_m.get('content', ''))
                         break
+                # /btw is intentionally non-persistent, but its terminal SSE
+                # payload is still public output.  Project the ephemeral
+                # session before enqueueing it so raw Agent ``api_content`` or
+                # provenance aliases cannot cross the wire.
+                _ephemeral_session = _ephemeral_session_payload(
+                    session_id, result.get('messages', [])
+                )
                 put('done', {
-                    'session': {'session_id': session_id, 'messages': result.get('messages', [])},
+                    'session': _ephemeral_session,
                     'usage': {'input_tokens': 0, 'output_tokens': 0},
                     'ephemeral': True,
                     'answer': _answer,

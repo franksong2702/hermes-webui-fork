@@ -9,6 +9,7 @@ observed if it crosses the rows.
 
 import sqlite3
 import sys
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -183,6 +184,75 @@ def test_issue6751_reconciliation_fails_closed_when_row_id_roles_disagree():
     assert "api_content" not in merged[0]
 
 
+def test_issue6751_duplicate_durable_row_ids_fail_closed():
+    """A row id shared by multiple sidecar targets must never guess a target."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {"role": "user", "content": "same", "_state_db_row_id": 7},
+        {"role": "user", "content": "same", "_state_db_row_id": 7},
+    ]
+    state = [
+        {
+            "role": "user",
+            "content": "same",
+            "_state_db_row_id": 7,
+            "api_content": "wire",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert [message.get("api_content") for message in merged[:2]] == [None, None]
+
+
+def test_issue6751_conflicting_row_id_aliases_fail_closed():
+    """Contradictory private aliases are invalid provenance, not a fallback hint."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "_state_db_row_id": 7,
+            "_db_row_id": 8,
+        }
+    ]
+    state = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "_state_db_row_id": 7,
+            "api_content": "wire",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert "api_content" not in merged[0]
+
+
+def test_issue6751_incompatible_visible_content_fails_closed():
+    """A matching durable id cannot override an incompatible visible turn."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {"role": "user", "content": "visible one", "_state_db_row_id": 7}
+    ]
+    state = [
+        {
+            "role": "user",
+            "content": "visible two",
+            "_state_db_row_id": 7,
+            "api_content": "wire-two",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert "api_content" not in merged[0]
+
+
 def test_issue6751_ambiguous_metadata_free_sequence_fails_closed():
     from api.models import merge_session_messages_append_only
 
@@ -259,6 +329,69 @@ def test_issue6751_public_message_projection_strips_internal_replay_fields(monke
     )
 
     assert safe["messages"] == [{"role": "user", "content": "visible"}]
+
+
+def test_issue6751_public_session_projection_strips_context_aliases(monkeypatch):
+    import api.config as config
+    from api.helpers import public_session_projection
+
+    monkeypatch.setattr(config, "load_settings", lambda: {"api_redact_enabled": False})
+    safe = public_session_projection(
+        {
+            "messages": [{"role": "user", "content": "visible", "api_content": "wire"}],
+            "context_messages": [
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "api_content": "provider bytes",
+                    "_state_db_row_id": 7,
+                    "_db_row_id": 8,
+                    "state_db_row_id": 9,
+                }
+            ],
+            "runtime_journal_snapshot": {
+                "messages": [{"role": "assistant", "api_content": "nested"}]
+            },
+        }
+    )
+
+    assert safe["messages"] == [{"role": "user", "content": "visible"}]
+    assert safe["context_messages"] == [{"role": "assistant", "content": "answer"}]
+    assert safe["runtime_journal_snapshot"]["messages"] == [{"role": "assistant"}]
+
+
+def test_issue6751_public_projection_preserves_non_message_alias_keys(monkeypatch):
+    import api.config as config
+    from api.helpers import public_session_projection
+
+    monkeypatch.setattr(config, "load_settings", lambda: {"api_redact_enabled": False})
+    safe = public_session_projection(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {
+                        "api_content": "user-json-field",
+                        "_db_row_id": 41,
+                    },
+                }
+            ],
+            "tool_calls": [
+                {
+                    "name": "tool",
+                    "api_content": "tool-payload-field",
+                    "_db_row_id": 42,
+                }
+            ],
+        }
+    )
+
+    assert safe["messages"][0]["content"] == {
+        "api_content": "user-json-field",
+        "_db_row_id": 41,
+    }
+    assert safe["tool_calls"][0]["api_content"] == "tool-payload-field"
+    assert safe["tool_calls"][0]["_db_row_id"] == 42
 
 
 def test_issue6751_provider_projection_still_strips_api_content_by_default():
@@ -364,3 +497,124 @@ def test_issue6751_sync_chat_agent_receives_original_api_content_bytes(monkeypat
     assert [message.get("api_content") for message in captured["history"] if message.get("role") == "user"] == [
         original_wire
     ]
+
+
+def test_issue6751_json_import_strips_internal_aliases_before_persistence(monkeypatch, tmp_path):
+    """Caller-supplied provider bytes never become durable imported context."""
+    from collections import OrderedDict
+
+    import api.config as config
+    import api.models as models
+    import api.routes as routes
+
+    state_dir = tmp_path / "state"
+    session_dir = state_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    sessions = OrderedDict()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", state_dir / "session_index.json")
+    monkeypatch.setattr(models, "SESSIONS", sessions)
+    monkeypatch.setattr(routes, "SESSIONS", sessions)
+    monkeypatch.setattr(routes, "resolve_trusted_workspace", lambda value: tmp_path)
+    monkeypatch.setattr(routes, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(config, "load_settings", lambda: {"api_redact_enabled": False})
+    captured = {}
+
+    def fake_json(handler, payload, status=200, **_kwargs):
+        captured["payload"] = payload
+        captured["status"] = status
+        return True
+
+    monkeypatch.setattr(routes, "j", fake_json)
+    routes._handle_session_import(
+        None,
+        {
+            "title": "imported",
+            "workspace": str(tmp_path),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {
+                        "visible": "visible",
+                        "api_content": "user-json-field",
+                        "_db_row_id": 41,
+                    },
+                    "api_content": "caller provider bytes",
+                    "_state_db_row_id": 1,
+                    "_db_row_id": 2,
+                    "state_db_row_id": 3,
+                }
+            ],
+            "context_messages": [
+                {"role": "assistant", "content": "answer", "api_content": "hidden"}
+            ],
+            "tool_calls": [
+                {
+                    "name": "tool",
+                    "api_content": "nested hidden",
+                    "_db_row_id": 3,
+                    "arguments": {
+                        "api_content": "tool-argument-field",
+                        "_db_row_id": 42,
+                    },
+                }
+            ],
+        },
+    )
+
+    assert captured["status"] == 200
+    imported = next(iter(sessions.values()))
+    assert imported.messages == [
+        {
+            "role": "user",
+            "content": {
+                "visible": "visible",
+                "api_content": "user-json-field",
+                "_db_row_id": 41,
+            },
+        }
+    ]
+    assert imported.context_messages == []
+    assert imported.tool_calls == [
+        {
+            "name": "tool",
+            "arguments": {
+                "api_content": "tool-argument-field",
+                "_db_row_id": 42,
+            },
+        }
+    ]
+    persisted = json.loads(imported.path.read_text(encoding="utf-8"))
+    aliases = ("api_content", "_state_db_row_id", "_db_row_id", "state_db_row_id")
+    assert all(alias not in persisted["messages"][0] for alias in aliases)
+    assert all(alias not in persisted["tool_calls"][0] for alias in aliases)
+    assert persisted["messages"][0]["content"]["api_content"] == "user-json-field"
+    assert persisted["messages"][0]["content"]["_db_row_id"] == 41
+    assert persisted["tool_calls"][0]["arguments"]["api_content"] == "tool-argument-field"
+    assert persisted["tool_calls"][0]["arguments"]["_db_row_id"] == 42
+
+
+def test_issue6751_ephemeral_terminal_sse_projects_agent_messages(monkeypatch):
+    import api.config as config
+    from api.streaming import _ephemeral_session_payload
+
+    monkeypatch.setattr(config, "load_settings", lambda: {"api_redact_enabled": False})
+    payload = _ephemeral_session_payload(
+        "ephemeral-sid",
+        [
+            {
+                "role": "assistant",
+                "content": "visible",
+                "api_content": "raw provider bytes",
+                "_state_db_row_id": 7,
+                "_db_row_id": 8,
+                "state_db_row_id": 9,
+            }
+        ],
+    )
+
+    assert payload == {
+        "session_id": "ephemeral-sid",
+        "messages": [{"role": "assistant", "content": "visible"}],
+    }

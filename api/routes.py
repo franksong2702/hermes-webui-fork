@@ -2846,6 +2846,8 @@ from api.helpers import (
     _security_headers,
     _sanitize_error,
     redact_session_data,
+    public_session_projection,
+    strip_public_internal_fields,
     _redact_text,
     _CLIENT_DISCONNECT_ERRORS,
 )
@@ -13061,7 +13063,7 @@ def handle_get(handler, parsed) -> bool:
             }
             attach_todo_state(sess, msgs)
             sess = _merge_cli_sidebar_metadata(sess, cli_meta)
-            return j(handler, {"session": redact_session_data(sess)})
+            return j(handler, {"session": public_session_projection(sess)})
 
     if parsed.path == "/api/session/lineage/report":
         sid = parse_qs(parsed.query).get("session_id", [""])[0]
@@ -14186,7 +14188,9 @@ def handle_post(handler, parsed) -> bool:
                     "created_at": share_meta["share_created_at"],
                     "updated_at": share_meta["share_updated_at"],
                 },
-                "session": response_session.compact() | {"messages": response_session.messages},
+                "session": public_session_projection(
+                    response_session.compact() | {"messages": response_session.messages}
+                ),
             },
         )
 
@@ -14225,7 +14229,9 @@ def handle_post(handler, parsed) -> bool:
             handler,
             {
                 "ok": True,
-                "session": response_session.compact() | {"messages": response_session.messages},
+                "session": public_session_projection(
+                    response_session.compact() | {"messages": response_session.messages}
+                ),
             },
         )
 
@@ -14355,7 +14361,9 @@ def handle_post(handler, parsed) -> bool:
                 profile=getattr(s, "profile", None),
                 session_id=getattr(s, "session_id", None),
             )
-        payload = {"session": s.compact() | {"messages": s.messages}}
+        payload = {
+            "session": public_session_projection(s.compact() | {"messages": s.messages})
+        }
         if worktree_skipped:
             # Config-default worktree was skipped (non-git workspace); tell the
             # client the session is plain so the UI doesn't assume isolation.
@@ -14452,7 +14460,14 @@ def handle_post(handler, parsed) -> bool:
                 session_id=getattr(copied_session, "session_id", None),
             )
 
-            return j(handler, {"session": copied_session.compact() | {"messages": copied_session.messages}})
+            return j(
+                handler,
+                {
+                    "session": public_session_projection(
+                        copied_session.compact() | {"messages": copied_session.messages}
+                    )
+                },
+            )
         except Exception as e:
             return bad(handler, str(e))
 
@@ -14851,7 +14866,10 @@ def handle_post(handler, parsed) -> bool:
             except Exception:
                 logger.debug("Failed to close workspace terminal after workspace update")
         set_last_workspace(new_ws)
-        return j(handler, {"session": s.compact() | {"messages": s.messages}})
+        return j(
+            handler,
+            {"session": public_session_projection(s.compact() | {"messages": s.messages})},
+        )
     if parsed.path == "/api/session/worktree/remove":
         sid = body.get("session_id", "")
         if not sid or not isinstance(sid, str) or not sid.strip():
@@ -15128,7 +15146,13 @@ def handle_post(handler, parsed) -> bool:
         from api.config import _evict_session_agent
         _evict_session_agent(body["session_id"])
         return j(
-            handler, {"ok": True, "session": s.compact() | {"messages": s.messages}}
+            handler,
+            {
+                "ok": True,
+                "session": public_session_projection(
+                    s.compact() | {"messages": s.messages}
+                ),
+            },
         )
 
     if parsed.path == "/api/session/branch":
@@ -16769,7 +16793,10 @@ def _handle_session_export(handler, parsed):
     active_profile = get_active_profile_name()
     if not _profiles_match(getattr(s, "profile", None), active_profile):
         return bad(handler, "Session not found", 404)
-    safe = redact_session_data(s.__dict__)
+    # ``public_session_projection`` supersedes the narrower
+    # ``redact_session_data`` path so export context_messages uses the same
+    # alias-stripping boundary as the visible transcript.
+    safe = public_session_projection(s.__dict__)
     qs = parse_qs(parsed.query)
     fmt = qs.get("format", ["json"])[0].lower()
     if fmt == "html":
@@ -22601,7 +22628,7 @@ def _handle_chat_sync(handler, body):
         {
             "answer": result.get("final_response") or "",
             "status": "done" if result.get("completed", True) else "partial",
-            "session": s.compact() | {"messages": s.messages},
+            "session": public_session_projection(s.compact() | {"messages": s.messages}),
             "result": {k: v for k, v in result.items() if k != "messages"},
         },
     )
@@ -25918,19 +25945,21 @@ def _handle_session_import_cli(handler, body):
         return j(
             handler,
             {
-                "session": existing.compact()
-                | {
-                    "messages": existing.messages,
-                    "is_cli_session": (False if _existing_is_sa else True),
-                    # Greptile #4911 follow-up: read read_only from
-                    # the persisted Session, NOT from cli_meta.  This
-                    # refresh path is for an already-WebUI-owned
-                    # session; the WebUI's persisted view is the
-                    # source of truth for the response, not the
-                    # foreign store's current value.  (Mirrors the
-                    # GET /api/session fix.)
-                    "read_only": bool(getattr(existing, "read_only", False)),
-                },
+                "session": public_session_projection(
+                    existing.compact()
+                    | {
+                        "messages": existing.messages,
+                        "is_cli_session": (False if _existing_is_sa else True),
+                        # Greptile #4911 follow-up: read read_only from
+                        # the persisted Session, NOT from cli_meta.  This
+                        # refresh path is for an already-WebUI-owned
+                        # session; the WebUI's persisted view is the
+                        # source of truth for the response, not the
+                        # foreign store's current value.  (Mirrors the
+                        # GET /api/session fix.)
+                        "read_only": bool(getattr(existing, "read_only", False)),
+                    }
+                ),
                 "imported": False,
             },
         )
@@ -26014,7 +26043,13 @@ def _handle_session_import_cli(handler, body):
             "messages": msgs,
             "tool_calls": [],
         }
-        return j(handler, {"session": session_payload, "imported": False})
+        return j(
+            handler,
+            {
+                "session": public_session_projection(session_payload),
+                "imported": False,
+            },
+        )
 
     s = import_cli_session(
         sid,
@@ -26059,11 +26094,13 @@ def _handle_session_import_cli(handler, body):
     return j(
         handler,
         {
-            "session": s.compact()
-            | {
-                "messages": msgs,
-                "is_cli_session": True,
-            },
+            "session": public_session_projection(
+                s.compact()
+                | {
+                    "messages": msgs,
+                    "is_cli_session": True,
+                }
+            ),
             "imported": True,
         },
     )
@@ -26073,7 +26110,7 @@ def _handle_session_import(handler, body):
     """Import a session from a JSON export. Creates a new session with a new ID."""
     if not body or not isinstance(body, dict):
         return bad(handler, "Request body must be a JSON object")
-    messages = body.get("messages")
+    messages = strip_public_internal_fields(body.get("messages"))
     if not isinstance(messages, list):
         return bad(handler, 'JSON must contain a "messages" array')
     title = body.get("title", "Imported session")
@@ -26087,7 +26124,7 @@ def _handle_session_import(handler, body):
         workspace=workspace,
         model=model,
         messages=messages,
-        tool_calls=body.get("tool_calls", []),
+        tool_calls=strip_public_internal_fields(body.get("tool_calls", [])),
         profile=get_active_profile_name(),
     )
     s.pinned = body.get("pinned", False)
@@ -26097,7 +26134,13 @@ def _handle_session_import(handler, body):
         _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
     s.save()
     publish_session_list_changed("session_import")
-    return j(handler, {"ok": True, "session": s.compact() | {"messages": s.messages}})
+    return j(
+        handler,
+        {
+            "ok": True,
+            "session": public_session_projection(s.compact() | {"messages": s.messages}),
+        },
+    )
 
 
 def _mask_secrets(obj):
