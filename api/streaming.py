@@ -5655,7 +5655,7 @@ def _transfer_process_wakeup_reasoning_metadata(source_rows, target_rows):
         return False
     staged = []
     try:
-        for source, target in zip(source_rows, target_rows):
+        for source, target in zip(source_rows, target_rows, strict=True):
             if (
                 not isinstance(source, dict)
                 or not isinstance(target, dict)
