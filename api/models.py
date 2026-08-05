@@ -8124,6 +8124,8 @@ def get_state_db_session_message_prefix_summary(
         before_ts = float(before_timestamp)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(before_ts):
+        return None
 
     if isinstance(profile, str) and profile:
         db_path = _get_profile_home(profile) / 'state.db'
@@ -8212,12 +8214,13 @@ def get_state_db_session_message_keys_before_timestamp(
             available = {str(row['name']) for row in cur.fetchall()}
             if not {'id', 'session_id', 'role', 'content', 'timestamp', 'tool_calls'}.issubset(available):
                 return None
+            api_content_select = ", api_content" if "api_content" in available else ""
             cur.execute(
-                """
+                f"""
                 SELECT
                     COALESCE(role, '') AS role,
                     COALESCE(content, '') AS content,
-                    tool_calls
+                    tool_calls{api_content_select}
                 FROM messages
                 WHERE session_id = ? AND timestamp IS NOT NULL AND timestamp < ?
                 ORDER BY timestamp ASC, id ASC
@@ -8230,6 +8233,7 @@ def get_state_db_session_message_keys_before_timestamp(
                         "role": row["role"],
                         "content": row["content"],
                         "tool_calls": _json_loads_if_string(row["tool_calls"]),
+                        "api_content": row["api_content"] if "api_content" in available else None,
                     }
                 )
                 for row in cur.fetchall()
@@ -8292,6 +8296,11 @@ def _normalized_message_timestamp_for_key(value):
         timestamp = float(value)
     except (TypeError, ValueError):
         return str(value)
+    if not math.isfinite(timestamp):
+        # Keep malformed metadata from crashing key construction.  The
+        # reconciliation layer separately marks this row invalid so it cannot
+        # fall through to a weaker metadata-free match.
+        return f"<invalid:{value!r}>"
     # Truncate to second-level granularity so that sub-second drift between
     # the sidecar JSON write and the state.db created_at write does not cause
     # the legacy dedup key to differ for the same logical message.
@@ -8305,9 +8314,29 @@ def _message_timestamp_as_float(msg):
     if value is None or value == "":
         return None
     try:
-        return float(value)
+        timestamp = float(value)
     except (TypeError, ValueError):
         return None
+    return timestamp if math.isfinite(timestamp) else None
+
+
+def _session_message_api_content_key(msg: dict):
+    """Return the exact trusted provider sidecar used in duplicate identity."""
+    if not isinstance(msg, dict):
+        return None
+    value = msg.get("api_content")
+    return value if isinstance(value, str) and value else None
+
+
+def _session_message_key_with_sidecar(base_key: tuple, msg: dict) -> tuple:
+    """Append provider sidecar identity only when one is actually present.
+
+    The no-sidecar key shape is an internal compatibility surface used by
+    reconciliation tests and callers.  A present sidecar must extend that
+    identity so different provider bytes cannot collapse into one duplicate.
+    """
+    sidecar = _session_message_api_content_key(msg)
+    return base_key if sidecar is None else (*base_key, sidecar)
 
 
 def _session_message_merge_key(msg: dict):
@@ -8315,7 +8344,9 @@ def _session_message_merge_key(msg: dict):
         return ("non_dict", repr(msg))
     message_identity = msg.get("id") or msg.get("message_id")
     if message_identity:
-        return ("message_id", str(message_identity))
+        return _session_message_key_with_sidecar(
+            ("message_id", str(message_identity)), msg
+        )
     # Include tool_calls so assistant messages that invoke different tools
     # (but share identical empty content and same-second timestamp) are not
     # collapsed by the merge-key guard at line ~4216.  Without this,
@@ -8324,7 +8355,7 @@ def _session_message_merge_key(msg: dict):
     # every state.db tool-call after the first one registered by the sidecar.
     _tc = msg.get("tool_calls")
     _tc_key = json.dumps(_tc, sort_keys=True, default=str) if _tc else ""
-    return (
+    return _session_message_key_with_sidecar((
         "legacy",
         str(msg.get("role") or ""),
         str(msg.get("content") or ""),
@@ -8332,7 +8363,7 @@ def _session_message_merge_key(msg: dict):
         str(msg.get("tool_call_id") or ""),
         str(msg.get("tool_name") or msg.get("name") or ""),
         _tc_key,
-    )
+    ), msg)
 
 
 def _session_messages_have_prefix(messages, prefix) -> bool:
@@ -8388,11 +8419,27 @@ def _state_db_row_identity_details(message: dict | None) -> tuple[str | None, bo
     """
     if not isinstance(message, dict):
         return None, True
-    values = {
-        str(value)
-        for key in ("_state_db_row_id", "_db_row_id", "state_db_row_id")
-        if (value := message.get(key)) not in (None, "")
-    }
+    values = set()
+    for key in ("_state_db_row_id", "_db_row_id", "state_db_row_id"):
+        if key not in message or message.get(key) in (None, ""):
+            continue
+        value = message.get(key)
+        if isinstance(value, bool):
+            return None, False
+        if isinstance(value, int):
+            normalized = str(value) if value >= 0 else None
+        elif isinstance(value, float):
+            normalized = str(int(value)) if math.isfinite(value) and value >= 0 and value.is_integer() else None
+        elif isinstance(value, str):
+            text = value.strip()
+            normalized = text if text.isdigit() else None
+            if normalized is not None:
+                normalized = str(int(normalized))
+        else:
+            normalized = None
+        if normalized is None:
+            return None, False
+        values.add(normalized)
     if len(values) > 1:
         return None, False
     return (next(iter(values)) if values else None), True
@@ -8408,16 +8455,25 @@ def _message_exact_timestamp(message: dict | None):
     """Return a numeric transcript timestamp, preserving ``0`` as valid."""
     if not isinstance(message, dict):
         return None
-    value = message.get("timestamp")
-    if value in (None, ""):
-        value = message.get("_ts")
-    if value in (None, ""):
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed == parsed else None  # reject NaN
+    parsed, valid = _message_exact_timestamp_details(message)
+    return parsed if valid else None
+
+
+def _message_exact_timestamp_details(message: dict | None) -> tuple[float | None, bool]:
+    """Return ``(timestamp, valid)`` while distinguishing absent metadata."""
+    if not isinstance(message, dict):
+        return None, True
+    for key in ("timestamp", "_ts"):
+        if key not in message or message.get(key) in (None, ""):
+            continue
+        try:
+            parsed = float(message.get(key))
+        except (TypeError, ValueError):
+            return None, False
+        if not math.isfinite(parsed):
+            return None, False
+        return parsed, True
+    return None, True
 
 
 def _message_sidecar_role(message: dict | None):
@@ -8495,7 +8551,9 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
     absent on both sides, rows are paired by per-role sequence only when the
     available durable metadata does not contradict that pairing.  We never use
     role + normalized visible text alone, because repeated user text is valid
-    and must not inherit another turn's provider-facing bytes.
+    and must not inherit another turn's provider-facing bytes.  If both sides
+    already carry different non-empty provider sidecars, neither is attached;
+    the append-only merge preserves those rows as distinct.
     """
     sidecar = [message for message in sidecar_messages or () if isinstance(message, dict)]
     state = [
@@ -8512,10 +8570,26 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
     used_targets: set[int] = set()
     used_sources: set[int] = set()
 
+    # Invalid provenance is never treated as absent metadata.  Consume those
+    # rows up front so neither the timestamp tier nor the metadata-free role
+    # sequence tier can attach an arbitrary provider sidecar.
+    for index, message in enumerate(sidecar):
+        _, row_id_valid = _state_db_row_identity_details(message)
+        _, timestamp_valid = _message_exact_timestamp_details(message)
+        if not row_id_valid or not timestamp_valid:
+            used_targets.add(index)
+    for source_index, message in enumerate(state):
+        _, row_id_valid = _state_db_row_identity_details(message)
+        _, timestamp_valid = _message_exact_timestamp_details(message)
+        if not row_id_valid or not timestamp_valid:
+            used_sources.add(source_index)
+
     # 1. Durable row identity.  This path is unambiguous only when every
     # alias agrees, each row id occurs once on each side, and visible content
     # is compatible.  Any duplicate/conflicting id is consumed and rejected;
-    # it must not fall through to a weaker tier.
+    # it must not fall through to a weaker tier.  A unique row id with
+    # conflicting non-empty sidecars is left for the append-only merge, which
+    # can preserve both authoritative payloads without guessing.
     targets_by_row_id = {}
     for index, message in enumerate(sidecar):
         row_id, valid = _state_db_row_identity_details(message)
@@ -8547,6 +8621,18 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
             continue
         target_index = target_indexes[0]
         source_index = source_indexes[0]
+        target_api_content = _session_message_api_content_key(sidecar[target_index])
+        source_api_content = _session_message_api_content_key(state[source_index])
+        if (
+            target_api_content is not None
+            and source_api_content is not None
+            and target_api_content != source_api_content
+        ):
+            # A durable row id is not sufficient to reconcile two already
+            # authoritative provider payloads.  Leave both rows available to
+            # the append-only merge, where their distinct sidecar identities
+            # keep them separate.
+            continue
         used_targets.add(target_index)
         used_sources.add(source_index)
         _copy_api_content_sidecar(sidecar[target_index], state[source_index])
@@ -8628,13 +8714,15 @@ def _session_message_dedup_key(msg: dict):
         return ("non_dict", repr(msg))
     message_identity = msg.get("id") or msg.get("message_id")
     if message_identity:
-        return ("message_id", str(message_identity))
+        return _session_message_key_with_sidecar(
+            ("message_id", str(message_identity)), msg
+        )
     # Include tool_calls in the key so assistant messages that carry
     # different tool invocations (but identical empty content/timestamp)
     # are never collapsed into one.  (#3346 regression)
     _tc = msg.get("tool_calls")
     _tc_key = json.dumps(_tc, sort_keys=True, default=str) if _tc else ""
-    return (
+    return _session_message_key_with_sidecar((
         "legacy",
         str(msg.get("role") or ""),
         str(msg.get("content") or ""),
@@ -8642,7 +8730,7 @@ def _session_message_dedup_key(msg: dict):
         str(msg.get("tool_call_id") or ""),
         str(msg.get("tool_name") or msg.get("name") or ""),
         _tc_key,
-    )
+    ), msg)
 
 
 def _normalized_session_message_content(msg: dict) -> str:
@@ -8680,12 +8768,12 @@ def _session_message_content_key(msg: dict):
         content = " ".join(
             _strip_workspace_prefix(content, include_legacy=True).split()
         )
-    return (
+    return _session_message_key_with_sidecar((
         role,
         content,
         str(msg.get("tool_call_id") or ""),
         str(msg.get("tool_name") or msg.get("name") or ""),
-    )
+    ), msg)
 
 
 def _session_message_visible_key(msg: dict):
@@ -8697,11 +8785,11 @@ def _session_message_visible_key(msg: dict):
     # ("assistant", "") and the merge treats state.db rows as replays.
     _tc = msg.get("tool_calls")
     _tc_key = json.dumps(_tc, sort_keys=True, default=str) if _tc else ""
-    return (
+    return _session_message_key_with_sidecar((
         str(msg.get("role") or ""),
         _normalized_session_message_content(msg),
         _tc_key,
-    )
+    ), msg)
 
 
 def _build_visible_duplicate_lookup(visible_keys: set[tuple]) -> dict:
@@ -8726,6 +8814,7 @@ def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], lo
         return visible_key
     role = visible_key[0]
     content = visible_key[1] if len(visible_key) > 1 else ""
+    sidecar = visible_key[3] if len(visible_key) > 3 else None
     if not content:
         return None
     if lookup is None:
@@ -8735,7 +8824,8 @@ def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], lo
     for existing_key in lookup.get("by_role", {}).get(role, []):
         existing_role = existing_key[0]
         existing_content = existing_key[1] if len(existing_key) > 1 else ""
-        if role != existing_role or not existing_content:
+        existing_sidecar = existing_key[3] if len(existing_key) > 3 else None
+        if role != existing_role or sidecar != existing_sidecar or not existing_content:
             continue
         # Exact visible-key equality was checked above. For very large payloads
         # (tool logs / request dumps), Python-in substring and fuzzy-token
@@ -8811,6 +8901,12 @@ def state_db_delta_after_context(sidecar_context: list, state_messages: list) ->
     state_messages = list(state_messages or [])
     if not sidecar_context or not state_messages:
         return state_messages
+
+    # Attach trusted state.db sidecars before computing context keys.  A missing
+    # sidecar is not a wildcard: once attached, it participates in every
+    # duplicate/prefix decision below and distinct provider bytes remain
+    # distinct rows.
+    _reconcile_api_content_sidecars(sidecar_context, state_messages)
 
     # Recovered interrupted turns are special: the visible interruption marker
     # is synthetic, so the recovered user turn should still count as a mirrored
@@ -9208,6 +9304,8 @@ def merge_session_messages_append_only(
     merged_by_message_key = {}
     merged_by_dedup_key = {}
     merged_by_visible_key = {}
+    merged_by_row_id = {}
+    ambiguous_row_ids = set()
     max_sidecar_timestamp = None
 
     def _remember_merged_message(message):
@@ -9216,6 +9314,12 @@ def merge_session_messages_append_only(
         merged_by_message_key.setdefault(_cached_message_key(message, "merge"), message)
         merged_by_dedup_key.setdefault(_cached_message_key(message, "dedup"), message)
         merged_by_visible_key.setdefault(_cached_message_key(message, "visible"), message)
+        row_id, row_id_valid = _state_db_row_identity_details(message)
+        if row_id_valid and row_id is not None:
+            if row_id in merged_by_row_id:
+                ambiguous_row_ids.add(row_id)
+            else:
+                merged_by_row_id[row_id] = message
 
     for msg in sidecar_messages:
         timestamp = _message_timestamp_as_float(msg)
@@ -9282,6 +9386,27 @@ def merge_session_messages_append_only(
             # are caught by the dedup guard (#3346).
             seen_dedup_keys.add(dedup_key)
             continue
+        row_id, row_id_valid = _state_db_row_identity_details(msg)
+        row_id_sidecar_conflict = False
+        if (
+            row_id_valid
+            and row_id is not None
+            and row_id in merged_by_row_id
+            and row_id not in ambiguous_row_ids
+        ):
+            existing = merged_by_row_id[row_id]
+            existing_api_content = _session_message_api_content_key(existing)
+            incoming_api_content = _session_message_api_content_key(msg)
+            row_id_sidecar_conflict = (
+                existing_api_content is not None
+                and incoming_api_content is not None
+                and existing_api_content != incoming_api_content
+            )
+            if not row_id_sidecar_conflict:
+                if existing_api_content is None and incoming_api_content is not None:
+                    _copy_api_content_sidecar(existing, msg)
+                _merge_session_display_metadata(existing, msg)
+                continue
         # Skip rows ABOVE the watermark only while the sidecar has NOT advanced
         # past the watermark. Because Session.save() no longer auto-clears the
         # watermark, an unconditional `timestamp > watermark` skip would become
@@ -9416,6 +9541,7 @@ def merge_session_messages_append_only(
             and max_sidecar_timestamp is not None
             and timestamp is not None
             and timestamp <= max_sidecar_timestamp
+            and not row_id_sidecar_conflict
         ):
             # When a truncation watermark is active and the sidecar holds only
             # the edited user checkpoint, state.db may contain an assistant/tool

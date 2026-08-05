@@ -48,7 +48,11 @@ from api.config import (
     _main_model_request_overrides,
     PROCESS_SESSION_INDEX, PROCESS_SESSION_INDEX_LOCK,
 )
-from api.helpers import redact_session_data, _redact_text
+from api.helpers import (
+    redact_session_data,
+    scrub_internal_replay_fields,
+    _redact_text,
+)
 from api.compression_anchor import is_context_compression_marker, visible_messages_for_anchor
 from api.compression_recovery import stamp_compression_exhausted_recovery
 from api.metering import meter
@@ -4863,6 +4867,11 @@ def _sanitize_messages_for_api(
                 # Orphaned tool result — skip to avoid 400 from strict providers.
                 continue
         sanitized = {k: v for k, v in msg.items() if k in allowed_keys}
+        sanitized = scrub_internal_replay_fields(
+            [sanitized],
+            preserve_message_api_content=preserve_api_content,
+            message_records=True,
+        )[0]
         if sanitized.get("role") not in {"user", "assistant"}:
             sanitized.pop("api_content", None)
         elif not isinstance(sanitized.get("api_content"), str) or not sanitized.get("api_content"):
@@ -5007,6 +5016,10 @@ def _api_safe_message_positions(messages):
             if not tid or tid not in valid_tool_call_ids:
                 continue
         sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        sanitized = scrub_internal_replay_fields(
+            [sanitized],
+            message_records=True,
+        )[0]
         if 'tool_calls' in sanitized and not sanitized['tool_calls']:
             del sanitized['tool_calls']
         if is_recovered:
@@ -5542,6 +5555,20 @@ def _looks_like_replayed_session_arc_summary(previous_msg, candidate_msg):
     if not isinstance(previous_msg, dict) or not isinstance(candidate_msg, dict):
         return False
     if previous_msg.get('role') != candidate_msg.get('role'):
+        return False
+    previous_api_content = previous_msg.get("api_content")
+    candidate_api_content = candidate_msg.get("api_content")
+    normalized_previous_api_content = (
+        " ".join(previous_api_content.split())
+        if isinstance(previous_api_content, str) and previous_api_content
+        else None
+    )
+    normalized_candidate_api_content = (
+        " ".join(candidate_api_content.split())
+        if isinstance(candidate_api_content, str) and candidate_api_content
+        else None
+    )
+    if normalized_previous_api_content != normalized_candidate_api_content:
         return False
     previous_text = " ".join(_message_text(previous_msg.get('content', '')).split())
     candidate_text = " ".join(_message_text(candidate_msg.get('content', '')).split())

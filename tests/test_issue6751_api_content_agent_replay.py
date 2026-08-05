@@ -122,6 +122,7 @@ def test_issue6751_reconciliation_prioritizes_row_id_and_preserves_existing_side
     assert [message["api_content"] for message in merged] == [
         "already-authoritative",
         "[Workspace::v1: /one]\\nsame visible text",
+        "[Workspace::v1: /two]\\nsame visible text",
     ]
 
 
@@ -267,7 +268,13 @@ def test_issue6751_ambiguous_metadata_free_sequence_fails_closed():
 
     merged = merge_session_messages_append_only(sidecar, state)
 
-    assert [message.get("api_content") for message in merged] == [None, None]
+    assert merged[:2] == sidecar
+    assert [message.get("api_content") for message in merged] == [
+        None,
+        None,
+        "wire-one",
+        "wire-two",
+    ]
 
 
 def test_issue6751_partial_metadata_bucket_fails_closed_instead_of_zipping():
@@ -284,7 +291,13 @@ def test_issue6751_partial_metadata_bucket_fails_closed_instead_of_zipping():
 
     merged = merge_session_messages_append_only(sidecar, state)
 
-    assert [message.get("api_content") for message in merged] == [None, None]
+    assert merged[:2] == sidecar
+    assert [message.get("api_content") for message in merged] == [
+        None,
+        None,
+        "wire-first",
+        "wire-second",
+    ]
 
 
 def test_issue6751_state_db_reader_preserves_shape_without_api_content(monkeypatch, tmp_path):
@@ -390,8 +403,8 @@ def test_issue6751_public_projection_preserves_non_message_alias_keys(monkeypatc
         "api_content": "user-json-field",
         "_db_row_id": 41,
     }
-    assert safe["tool_calls"][0]["api_content"] == "tool-payload-field"
-    assert safe["tool_calls"][0]["_db_row_id"] == 42
+    assert "api_content" not in safe["tool_calls"][0]
+    assert "_db_row_id" not in safe["tool_calls"][0]
 
 
 def test_issue6751_provider_projection_still_strips_api_content_by_default():
@@ -651,6 +664,11 @@ def test_issue6751_json_import_nested_tool_calls_are_removed_at_agent_boundary(
                             "id": "call-1",
                             "api_content": "nested provider bytes",
                             "_db_row_id": 2,
+                            "args": {
+                                "messages": [
+                                    {"api_content": "import-business-payload"}
+                                ]
+                            },
                             "function": {
                                 "name": "lookup",
                                 "arguments": '{"api_content":"ordinary argument field"}',
@@ -684,10 +702,13 @@ def test_issue6751_json_import_nested_tool_calls_are_removed_at_agent_boundary(
     aliases = ("api_content", "_state_db_row_id", "_db_row_id", "state_db_row_id")
     assert all(alias not in nested for alias in aliases)
     assert all(alias not in nested["tool_calls"][0] for alias in aliases)
-    assert nested["content"][0]["api_content"] == "ordinary content field"
+    assert "api_content" not in nested["content"][0]
     assert nested["tool_calls"][0]["function"]["arguments"] == (
         '{"api_content":"ordinary argument field"}'
     )
+    assert nested["tool_calls"][0]["args"]["messages"] == [
+        {"api_content": "import-business-payload"}
+    ]
     assert reloaded.tool_calls == [{"id": "call-1", "arguments": {"_db_row_id": 4}}]
 
     # Restore the real response writer for the production sync route below.
@@ -863,3 +884,223 @@ def test_issue6751_ephemeral_terminal_sse_projects_agent_messages(monkeypatch):
         "session_id": "ephemeral-sid",
         "messages": [{"role": "assistant", "content": "visible"}],
     }
+
+
+def test_issue6751_schema_scrubber_preserves_tool_argument_business_payload(monkeypatch):
+    """Only authoritative message/tool schemas are scrubbed; args are opaque."""
+    import api.config as config
+    from api.helpers import public_session_projection
+
+    monkeypatch.setattr(config, "load_settings", lambda: {"api_redact_enabled": False})
+    payload = public_session_projection(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "visible",
+                            "api_content": "content-part-internal",
+                        }
+                    ],
+                    "api_content": "message-wire",
+                    "_state_db_row_id": 7,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "api_content": "tool-call-internal",
+                            "function": {
+                                "name": "lookup",
+                                "api_content": "function-internal",
+                                "arguments": '{"api_content":"opaque-argument"}',
+                            },
+                            "args": {
+                                "messages": [
+                                    {
+                                        "api_content": "business-payload",
+                                        "_db_row_id": 41,
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ],
+            "runtime_journal_snapshot": {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "snapshot-visible",
+                        "api_content": "snapshot-wire",
+                    }
+                ],
+                "tool_calls": [
+                    {
+                        "name": "lookup",
+                        "args": {
+                            "messages": [
+                                {
+                                    "api_content": "snapshot-business-payload",
+                                }
+                            ]
+                        },
+                    }
+                ],
+            },
+        }
+    )
+
+    message = payload["messages"][0]
+    assert "api_content" not in message
+    assert "_state_db_row_id" not in message
+    assert "api_content" not in message["content"][0]
+    tool_call = message["tool_calls"][0]
+    assert "api_content" not in tool_call
+    assert "api_content" not in tool_call["function"]
+    assert tool_call["function"]["arguments"] == '{"api_content":"opaque-argument"}'
+    assert tool_call["args"]["messages"][0] == {
+        "api_content": "business-payload",
+        "_db_row_id": 41,
+    }
+    assert payload["runtime_journal_snapshot"]["messages"] == [
+        {"role": "assistant", "content": "snapshot-visible"}
+    ]
+    assert payload["runtime_journal_snapshot"]["tool_calls"][0]["args"]["messages"][0] == {
+        "api_content": "snapshot-business-payload"
+    }
+
+
+def test_issue6751_agent_schema_scrubber_keeps_message_sidecar_only():
+    from api.streaming import _sanitize_messages_for_agent
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "visible", "api_content": "part-internal"}
+            ],
+            "api_content": "message-wire",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "api_content": "tool-call-internal",
+                    "function": {
+                        "name": "lookup",
+                        "api_content": "function-internal",
+                        "arguments": '{"api_content":"opaque-argument"}',
+                    },
+                    "args": {"messages": [{"api_content": "business-payload"}]},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+    ]
+
+    sanitized = _sanitize_messages_for_agent(messages)
+
+    assistant = sanitized[0]
+    assert assistant["api_content"] == "message-wire"
+    assert "api_content" not in assistant["content"][0]
+    tool_call = assistant["tool_calls"][0]
+    assert "api_content" not in tool_call
+    assert "api_content" not in tool_call["function"]
+    assert tool_call["function"]["arguments"] == '{"api_content":"opaque-argument"}'
+    assert tool_call["args"]["messages"] == [{"api_content": "business-payload"}]
+
+
+def test_issue6751_session_arc_fuzzy_replay_requires_equal_api_content():
+    from api.streaming import _looks_like_replayed_session_arc_summary
+
+    summary_a = {
+        "role": "user",
+        "content": "[Session Arc Summary]\n" + "same recovered context\n" * 260,
+        "api_content": "wire-one",
+    }
+    summary_b = dict(summary_a, api_content="wire-two")
+
+    assert not _looks_like_replayed_session_arc_summary(summary_a, summary_b)
+    assert _looks_like_replayed_session_arc_summary(summary_a, dict(summary_a))
+
+
+@pytest.mark.parametrize("bad_row_id", ["invalid-row-id", "nan", "inf", float("nan"), float("inf")])
+def test_issue6751_invalid_row_id_rejects_metadata_free_fallback(bad_row_id):
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [{"role": "user", "content": "same"}]
+    state = [
+        {
+            "role": "user",
+            "content": "same",
+            "_state_db_row_id": bad_row_id,
+            "api_content": "wire",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert merged[0].get("api_content") is None
+
+
+@pytest.mark.parametrize("bad_timestamp", ["invalid-time", "nan", "inf", float("nan"), float("inf")])
+def test_issue6751_invalid_timestamp_rejects_metadata_free_fallback(bad_timestamp):
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [{"role": "user", "content": "same"}]
+    state = [
+        {
+            "role": "user",
+            "content": "same",
+            "timestamp": bad_timestamp,
+            "api_content": "wire",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert merged[0].get("api_content") is None
+
+
+def test_issue6751_distinct_state_sidecars_are_not_deduplicated():
+    from api.models import merge_session_messages_append_only
+
+    merged = merge_session_messages_append_only(
+        [],
+        [
+            {"role": "user", "content": "same", "api_content": "wire-one"},
+            {"role": "user", "content": "same", "api_content": "wire-two"},
+        ],
+    )
+
+    assert [message["api_content"] for message in merged] == ["wire-one", "wire-two"]
+
+
+def test_issue6751_same_row_id_different_sidecars_remain_distinct():
+    """A durable row id cannot override distinct provider payload identity."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {
+            "role": "user",
+            "content": "same visible",
+            "timestamp": 100.0,
+            "_state_db_row_id": 7,
+            "api_content": "wire-one",
+        }
+    ]
+    state = [
+        {
+            "role": "user",
+            "content": "same visible",
+            "timestamp": 100.0,
+            "_state_db_row_id": 7,
+            "api_content": "wire-two",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert [message.get("api_content") for message in merged] == [
+        "wire-one",
+        "wire-two",
+    ]
