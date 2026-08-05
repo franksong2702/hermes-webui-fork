@@ -116,6 +116,11 @@ class _FaithfulCompletedAgent:
         self.context_compressor = None
         self._last_error = None
         self._current_turn_id = "turn-6749-wakeup"
+        self._current_run_id = getattr(
+            self,
+            "trace_run_id",
+            "run:stream-6749-wakeup",
+        )
         # Deliberately leave this unset/None: recovery has not materialized the
         # pending process-wakeup user row when the final assistant is persisted.
         self._persist_user_message_idx = None
@@ -154,6 +159,8 @@ class _FaithfulCompletedAgent:
         assert len(final_rows) == 1, "faithful trace must carry one persisted final row"
         final_rows[0]["_recovered_from_run_journal"] = True
         final_rows[0]["_recovered_stream_id"] = self.result_owner_stream_id
+        final_rows[0]["turn_id"] = self._current_turn_id
+        final_rows[0]["_run_id"] = self._current_run_id
         # This is the reported late display snapshot: it repeats the completed
         # answer and carries WebUI-only tool activity.  The canonical Agent
         # assistant/tool rows above, not these display flags, prove closure.
@@ -191,6 +198,7 @@ class _FaithfulCompletedAgent:
             "finish_reason": "stop",
             "final_response": "Final wakeup answer",
             "turn_id": self._current_turn_id,
+            "run_id": self._current_run_id,
             "session_id": self.session_id,
             "error": None,
         }
@@ -286,6 +294,7 @@ def _prepare_persisted_wakeup_final(
             "_recovered_from_run_journal": True,
             "_recovered_stream_id": stream_id,
             "turn_id": "turn-6749-wakeup",
+            "_run_id": f"run:{stream_id}",
         }
     )
     # The final row is already durable, while the pending wakeup user row has
@@ -365,6 +374,7 @@ def _run_stream(session, stream_id: str, agent_cls, workspace: str):
     config.STREAM_PARTIAL_TEXT[stream_id] = ""
     class BoundAgent(agent_cls):
         trace_stream_id = stream_id
+        trace_run_id = f"run:{stream_id}"
         trace_user_message = session.pending_user_message
         trace_pending_started_at = session.pending_started_at
         result_owner_stream_id = getattr(agent_cls, "result_owner_stream_id", stream_id)
@@ -697,6 +707,8 @@ def test_process_wakeup_replay_strip_is_scoped_to_process_wakeup_source():
         "source": "webui",
         "stream_id": stream_id,
         "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
     }
     assert streaming._strip_replayed_process_wakeup_arc(previous, candidates, identity) == previous
 
@@ -718,6 +730,7 @@ def test_process_wakeup_replay_strip_rejects_mismatched_turn_identity():
         "stream_id": stream_id,
         "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
         "turn_id": "different-turn",
+        "run_id": f"run:{stream_id}",
     }
     assert streaming._strip_replayed_process_wakeup_arc(previous, candidates, identity) == previous
 
@@ -744,6 +757,7 @@ def test_process_wakeup_replay_strip_preserves_older_identical_answer():
         "stream_id": stream_id,
         "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
         "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
     }
     settled = streaming._strip_replayed_process_wakeup_arc(
         previous,
@@ -783,6 +797,8 @@ def test_process_wakeup_replay_strip_rejects_tool_before_call():
         "source": "process_wakeup",
         "stream_id": stream_id,
         "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
     }
     assert streaming._strip_replayed_process_wakeup_arc(
         previous, candidates, identity
@@ -814,6 +830,8 @@ def test_process_wakeup_replay_strip_rejects_intermediary_plain_assistant():
         "source": "process_wakeup",
         "stream_id": stream_id,
         "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
     }
     assert streaming._strip_replayed_process_wakeup_arc(
         previous, candidates, identity
@@ -838,6 +856,8 @@ def test_process_wakeup_replay_strip_rejects_lossy_content_match():
         "source": "process_wakeup",
         "stream_id": stream_id,
         "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
     }
     assert streaming._strip_replayed_process_wakeup_arc(
         previous, candidates, identity
@@ -861,6 +881,8 @@ def test_process_wakeup_replay_strip_is_idempotent_with_ambiguous_matches():
         "source": "process_wakeup",
         "stream_id": stream_id,
         "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
     }
     settled = streaming._strip_replayed_process_wakeup_arc(
         previous, candidates, identity
@@ -897,3 +919,288 @@ def test_process_wakeup_replay_strip_rejects_any_turn_identity_disagreement():
     assert streaming._strip_replayed_process_wakeup_arc(
         previous, candidates, identity
     ) == previous
+
+
+def test_process_wakeup_replay_strip_requires_turn_and_run_identity_agreement():
+    """A missing old turn plus conflicting run ids must keep the old arc."""
+    stream_id = "stream-6749-turn-run-conflict"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-turn-run-conflict-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        "issue6749-turn-run-conflict-candidates",
+        stream_id,
+    ).messages
+    old_final = next(
+        row for row in previous
+        if row.get("role") == "assistant"
+        and row.get("content") == "Final wakeup answer"
+    )
+    candidate_final = next(
+        row for row in candidates
+        if row.get("role") == "assistant"
+        and row.get("content") == "Final wakeup answer"
+    )
+    old_final.pop("turn_id")
+    old_final["_run_id"] = "run-old"
+    candidate_final["turn_id"] = "turn-6749-wakeup"
+    candidate_final["_run_id"] = "run-new"
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
+    }
+    assert streaming._strip_replayed_process_wakeup_arc(
+        previous, candidates, identity
+    ) == previous
+
+
+def test_process_wakeup_replay_strip_transfers_reasoning_metadata_before_delete():
+    """Matched old reasoning must have one exact canonical destination."""
+    stream_id = "stream-6749-reasoning-transfer"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-reasoning-transfer-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        "issue6749-reasoning-transfer-candidates",
+        stream_id,
+    ).messages
+    old_final = next(
+        row for row in previous
+        if row.get("role") == "assistant"
+        and row.get("content") == "Final wakeup answer"
+    )
+    candidate_final = next(
+        row for row in candidates
+        if row.get("role") == "assistant"
+        and row.get("content") == "Final wakeup answer"
+    )
+    old_final["reasoning_content"] = "reasoning-content-6749"
+    old_final["reasoning"] = "reasoning-display-6749"
+    candidate_final.pop("reasoning_content", None)
+    candidate_final.pop("reasoning", None)
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
+    }
+    settled = streaming._strip_replayed_process_wakeup_arc(
+        previous, candidates, identity
+    )
+    assert settled != previous
+    assert candidate_final["reasoning_content"] == "reasoning-content-6749"
+    assert candidate_final["reasoning"] == "reasoning-display-6749"
+
+
+def test_process_wakeup_replay_strip_distinguishes_missing_content_from_none():
+    """Presence-aware content comparison must not equate missing with None."""
+    stream_id = "stream-6749-content-presence"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-content-presence-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        "issue6749-content-presence-candidates",
+        stream_id,
+    ).messages
+    old_tool = next(
+        row for row in previous
+        if row.get("role") == "tool" and row.get("tool_call_id") == "call-6749-1"
+    )
+    candidate_tool = next(
+        row for row in candidates
+        if row.get("role") == "tool" and row.get("tool_call_id") == "call-6749-1"
+    )
+    old_tool.pop("content")
+    candidate_tool["content"] = None
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
+    }
+    assert streaming._strip_replayed_process_wakeup_arc(
+        previous, candidates, identity
+    ) == previous
+
+
+def test_process_wakeup_replay_key_rejects_cyclic_content():
+    """Cyclic content must fail closed without reaching session serialization."""
+    cyclic_content = []
+    cyclic_content.append(cyclic_content)
+    assert streaming._process_wakeup_replay_key(
+        {"role": "tool", "content": cyclic_content}
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("old_content", "candidate_content", "should_strip"),
+    [
+        (
+            [
+                {"type": "text", "text": "tool result"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+            [
+                {"text": "tool result", "type": "text"},
+                {"image_url": {"url": "data:image/png;base64,AA=="}, "type": "image_url"},
+            ],
+            True,
+        ),
+        (
+            [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}],
+            [{"type": "text", "text": "second"}, {"type": "text", "text": "first"}],
+            False,
+        ),
+        ({"text": "tool result", "part": {"a": 1, "b": 2}}, {"part": {"b": 2, "a": 1}, "text": "tool result"}, True),
+        (None, "", False),
+        (float("nan"), float("nan"), False),
+        (object(), object(), False),
+    ],
+)
+def test_process_wakeup_replay_strip_content_comparison_is_canonical_and_fail_closed(
+    old_content,
+    candidate_content,
+    should_strip,
+):
+    stream_id = "stream-6749-content-canonical"
+    previous_session = _prepare_persisted_wakeup_final(
+        f"issue6749-content-canonical-{should_strip}",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        f"issue6749-content-canonical-candidate-{should_strip}",
+        stream_id,
+    ).messages
+    old_tool = next(
+        row for row in previous
+        if row.get("role") == "tool" and row.get("tool_call_id") == "call-6749-1"
+    )
+    candidate_tool = next(
+        row for row in candidates
+        if row.get("role") == "tool" and row.get("tool_call_id") == "call-6749-1"
+    )
+    old_tool["content"] = old_content
+    candidate_tool["content"] = candidate_content
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
+    }
+    settled = streaming._strip_replayed_process_wakeup_arc(
+        previous, candidates, identity
+    )
+    if should_strip:
+        assert settled != previous
+        assert not any(
+            row.get("tool_call_id") == "call-6749-1"
+            for row in settled
+            if isinstance(row, dict)
+        )
+    else:
+        assert settled == previous
+
+
+@pytest.mark.parametrize("missing_identity", ["active", "candidate", "old", "all"])
+def test_process_wakeup_replay_strip_requires_run_id_on_all_three_owners(missing_identity):
+    stream_id = "stream-6749-run-required"
+    previous_session = _prepare_persisted_wakeup_final(
+        f"issue6749-run-required-{missing_identity}",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        f"issue6749-run-required-candidate-{missing_identity}",
+        stream_id,
+    ).messages
+    old_final = next(
+        row for row in previous
+        if row.get("role") == "assistant" and row.get("content") == "Final wakeup answer"
+    )
+    candidate_final = next(
+        row for row in candidates
+        if row.get("role") == "assistant" and row.get("content") == "Final wakeup answer"
+    )
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
+    }
+    if missing_identity in {"old", "all"}:
+        old_final.pop("_run_id", None)
+    if missing_identity in {"candidate", "all"}:
+        candidate_final.pop("_run_id", None)
+    if missing_identity in {"active", "all"}:
+        identity.pop("run_id", None)
+    assert streaming._strip_replayed_process_wakeup_arc(
+        previous, candidates, identity
+    ) == previous
+
+
+def test_process_wakeup_replay_strip_transfers_reasoning_transactionally():
+    """A later checkpoint failure must not leave candidate metadata mutated."""
+    stream_id = "stream-6749-reasoning-transaction"
+    previous_session = _prepare_persisted_wakeup_final(
+        "issue6749-reasoning-transaction-previous",
+        stream_id,
+        "[IMPORTANT: Background process completed]",
+    )
+    previous = copy.deepcopy(previous_session.messages)
+    candidates = _closed_wakeup_session(
+        "issue6749-reasoning-transaction-candidates",
+        stream_id,
+    ).messages
+    active_user = {
+        "role": "user",
+        "content": "[IMPORTANT: Background process completed]",
+        "_source": "process_wakeup",
+        "_active_turn_token": streaming.build_active_turn_token(
+            stream_id,
+            1234567890.0,
+        ),
+    }
+    previous.insert(0, active_user)
+    old_final = next(
+        row for row in previous
+        if row.get("role") == "assistant" and row.get("content") == "Final wakeup answer"
+    )
+    candidate_final = next(
+        row for row in candidates
+        if row.get("role") == "assistant" and row.get("content") == "Final wakeup answer"
+    )
+    old_final["reasoning_content"] = "reasoning-content-transaction"
+    old_final["reasoning"] = "reasoning-display-transaction"
+    candidate_final.pop("reasoning_content", None)
+    candidate_final.pop("reasoning", None)
+    before_candidates = copy.deepcopy(candidates)
+    identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
+    }
+    assert streaming._strip_replayed_process_wakeup_arc(
+        previous, candidates, identity
+    ) == previous
+    assert candidates == before_candidates
