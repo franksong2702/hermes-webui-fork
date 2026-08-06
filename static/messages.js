@@ -2070,6 +2070,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return;
   }
+  // Registry ownership follows the EventSource closure. If reconnecting
+  // reaches this path, no same-stream OPEN transport owns the old registry,
+  // so discard it before the fresh closure creates its replacement. The OPEN
+  // reuse branch above must return first or its handler-owned registry would
+  // be orphaned.
+  if(reconnecting && typeof window!=='undefined' && window._liveAnchorRegistries && typeof window._liveAnchorRegistries.delete==='function'){
+    window._liveAnchorRegistries.delete(streamId);
+  }
   closeOtherLiveStreams(activeSid);
   closeLiveStream(activeSid);
   if(!reconnecting&&typeof resetTurnWorkspaceMutations==='function') resetTurnWorkspaceMutations();
