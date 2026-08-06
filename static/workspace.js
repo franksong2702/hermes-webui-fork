@@ -810,7 +810,8 @@ function renderSessionArtifacts(){
 async function _workspacePathExists(path, opts={}){
   const owner = _artifactOwnerFromOptions(opts);
   if(!owner||!path) return false;
-  const parts=String(path).split('/').filter(Boolean);
+  const normalizedPath=String(path).replace(/\\/g,'/');
+  const parts=normalizedPath.split('/').filter(Boolean);
   const name=parts.pop();
   if(!name) return false;
   const dir=parts.length?parts.join('/'):'.';
@@ -820,7 +821,7 @@ async function _workspacePathExists(path, opts={}){
   });
   if(!route) return false;
   const data=await api(route);
-  return (data.entries||[]).some(entry=>entry&&((entry.path===path)||entry.name===name));
+  return (data.entries||[]).some(entry=>entry&&((entry.path===normalizedPath)||entry.name===name));
 }
 
 function _artifactOwnerFromArtifactValue(value){
@@ -838,24 +839,31 @@ function _artifactOwnerFromArtifactValue(value){
 
 async function openArtifactPath(path){
   const artifact = path && typeof path === 'object' && !Array.isArray(path) ? path : null;
+  const legacyString = !artifact;
   let pathValue = typeof path === 'string'
     ? path
     : artifact && typeof artifact.path === 'string'
       ? artifact.path
       : '';
-  // Artifacts-panel rows predate typed descriptors and may carry the absolute
+  // Artifacts-panel rows predate typed descriptors and may carry an absolute
   // workspace path returned by the legacy list route. Keep that route usable;
   // strict descriptor validation below remains reserved for typed artifacts.
-  if(!artifact && pathValue.startsWith('/')){
-    const workspaceRoot = String(S&&S.session&&S.session.workspace||'').replace(/\/+$/,'');
+  // The legacy path is also where Windows backslash separators are accepted;
+  // typed Final Answer descriptors stay fail-closed on malformed separators.
+  if(legacyString){
+    pathValue = String(pathValue).replace(/\\/g,'/').replace(/^~\//,'').replace(/^(?:\.\/)+/,'');
+    const workspaceRoot = String(S&&S.session&&S.session.workspace||'')
+      .replace(/\\/g,'/').replace(/\/+$/,'');
     if(workspaceRoot && (pathValue===workspaceRoot || pathValue.startsWith(`${workspaceRoot}/`))){
-      pathValue = pathValue.slice(workspaceRoot.length).replace(/^\/+/, '');
+      pathValue = pathValue.slice(workspaceRoot.length).replace(/^\/+/, '') || '.';
     }
   }
   const owner = artifact
     ? _artifactOwnerFromArtifactValue(artifact)
     : _artifactOwnerFromCurrentSession();
-  const rel = _normalizeTypedArtifactPath(pathValue);
+  const rel = legacyString && pathValue === '.'
+    ? '.'
+    : _normalizeTypedArtifactPath(pathValue);
   if(!rel || !owner) return;
   if(typeof _artifactOwnerMatchesSession === 'function' && !_artifactOwnerMatchesSession(owner)) return;
   const generation = _nextWorkspaceOpenGeneration();

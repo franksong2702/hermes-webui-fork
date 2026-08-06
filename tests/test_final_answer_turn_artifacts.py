@@ -218,7 +218,7 @@ def test_public_artifact_existence_flow_uses_root_sentinel_and_rejects_invalid_e
         + path_exists
         + artifact_owner
         + open_artifact
-        + "async function run(){ await openArtifactPath('report.md'); await openArtifactPath('./malformed.md'); console.log(JSON.stringify(requests)); } run().catch((error)=>{console.error(error);process.exit(1)});"
+        + "async function run(){ await openArtifactPath('report.md'); await openArtifactPath({path:'./malformed.md',owner:{session_id:'sid-1',workspace_root:'/workspace'}}); await openArtifactPath({path:'dir\\\\report.md',owner:{session_id:'sid-1',workspace_root:'/workspace'}}); console.log(JSON.stringify(requests)); } run().catch((error)=>{console.error(error);process.exit(1)});"
     )
     assert len(output) == 1
     params = __import__("urllib.parse").parse.parse_qs(output[0].split("?", 1)[1])
