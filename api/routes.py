@@ -26616,7 +26616,35 @@ def _mcp_tools_from_runtime_status(
     return tools
 
 
-def _mcp_registry_tool_owner_key(registry, tool_name: str) -> str:
+def _mcp_registry_call_for_profile(
+    registry,
+    method_name: str,
+    *args,
+    active_home_key: str,
+):
+    """Call a registry query with an explicit owner when the Agent supports it."""
+    method = getattr(registry, method_name, None)
+    if not callable(method):
+        raise AttributeError(method_name)
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    supports_profile_home = any(
+        parameter.name == "profile_home"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if supports_profile_home:
+        return method(*args, profile_home=active_home_key)
+    return method(*args)
+
+
+def _mcp_registry_tool_owner_key(
+    registry,
+    tool_name: str,
+    active_home_key: str,
+) -> str:
     """Return a registered MCP tool's owning profile home, if known."""
     for method_name in (
         "get_profile_home_for_tool",
@@ -26624,22 +26652,28 @@ def _mcp_registry_tool_owner_key(registry, tool_name: str) -> str:
         "get_hermes_home_for_tool",
         "get_tool_hermes_home",
     ):
-        method = getattr(registry, method_name, None)
-        if not callable(method):
-            continue
         try:
-            owner_key = _mcp_profile_home_key(method(tool_name))
+            owner_key = _mcp_profile_home_key(
+                _mcp_registry_call_for_profile(
+                    registry,
+                    method_name,
+                    tool_name,
+                    active_home_key=active_home_key,
+                )
+            )
         except Exception:
             owner_key = ""
         if owner_key:
             return owner_key
 
     for method_name in ("get_tool_metadata", "get_metadata", "get_tool_info"):
-        method = getattr(registry, method_name, None)
-        if not callable(method):
-            continue
         try:
-            metadata = method(tool_name)
+            metadata = _mcp_registry_call_for_profile(
+                registry,
+                method_name,
+                tool_name,
+                active_home_key=active_home_key,
+            )
         except Exception:
             continue
         if not isinstance(metadata, dict):
@@ -26673,7 +26707,11 @@ def _mcp_tools_from_registry(
     except Exception:
         return []
     try:
-        names = registry.get_all_tool_names()
+        names = _mcp_registry_call_for_profile(
+            registry,
+            "get_all_tool_names",
+            active_home_key=active_home_key,
+        )
     except Exception:
         return []
     candidates = []
@@ -26681,7 +26719,12 @@ def _mcp_tools_from_registry(
     active_home_key = _mcp_profile_home_key(active_home_key)
     for tool_name in names:
         try:
-            toolset = registry.get_toolset_for_tool(tool_name)
+            toolset = _mcp_registry_call_for_profile(
+                registry,
+                "get_toolset_for_tool",
+                tool_name,
+                active_home_key=active_home_key,
+            )
         except Exception:
             continue
         if not isinstance(toolset, str) or not toolset.startswith("mcp-"):
@@ -26689,10 +26732,19 @@ def _mcp_tools_from_registry(
         server_name = toolset[len("mcp-"):]
         if server_name not in server_summaries:
             continue
-        owner_key = _mcp_registry_tool_owner_key(registry, tool_name)
+        owner_key = _mcp_registry_tool_owner_key(
+            registry,
+            tool_name,
+            active_home_key,
+        )
         if owner_key:
             has_owner_metadata = True
-        schema = registry.get_schema(tool_name) or {}
+        schema = _mcp_registry_call_for_profile(
+            registry,
+            "get_schema",
+            tool_name,
+            active_home_key=active_home_key,
+        ) or {}
         server_summary = server_summaries[server_name]
         candidates.append((owner_key, _mcp_tool_summary(tool_name, schema, server_summary)))
     if not has_owner_metadata and not allow_ownerless:

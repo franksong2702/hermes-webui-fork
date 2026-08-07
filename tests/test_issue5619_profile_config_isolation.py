@@ -9,6 +9,7 @@ import sys
 import threading
 import types
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
 from unittest.mock import MagicMock
@@ -853,6 +854,90 @@ def test_mcp_tools_inventory_filters_runtime_and_registry_to_active_profile(
     tools = _payload(handler)["tools"]
 
     assert [tool["name"] for tool in tools] == ["work_registry_tool"]
+
+
+def test_mcp_inventory_consumes_profile_scoped_agent_registry_across_switches(
+    profile_config_harness, monkeypatch
+):
+    harness = profile_config_harness
+    routes = harness.routes
+    _write_config(
+        harness.default_home,
+        provider="default-provider",
+        mcp_server="shared-mcp",
+    )
+    _write_config(
+        harness.work_home,
+        provider="work-provider",
+        mcp_server="shared-mcp",
+    )
+    homes = {
+        "default": str(harness.default_home.resolve()),
+        "work": str(harness.work_home.resolve()),
+    }
+    tool_name = "mcp__shared_mcp__echo"
+
+    fake_registry_mod = types.ModuleType("tools.registry")
+
+    class _Registry:
+        def __init__(self):
+            self.calls = []
+
+        def _entry(self, profile_home):
+            owner = str(Path(profile_home).resolve())
+            self.calls.append(owner)
+            assert owner in homes.values()
+            label = "work" if owner == homes["work"] else "default"
+            return owner, label
+
+        def get_all_tool_names(self, *, profile_home):
+            self._entry(profile_home)
+            return [tool_name]
+
+        def get_toolset_for_tool(self, name, *, profile_home):
+            assert name == tool_name
+            self._entry(profile_home)
+            return "mcp-shared-mcp"
+
+        def get_profile_home_for_tool(self, name, *, profile_home):
+            assert name == tool_name
+            owner, _label = self._entry(profile_home)
+            return owner
+
+        def get_schema(self, name, *, profile_home):
+            assert name == tool_name
+            _owner, label = self._entry(profile_home)
+            return {"name": name, "description": f"{label} schema"}
+
+    registry = _Registry()
+    fake_registry_mod.registry = registry
+    monkeypatch.setitem(sys.modules, "tools.registry", fake_registry_mod)
+    monkeypatch.setattr(
+        routes,
+        "_mcp_runtime_status_by_name",
+        lambda: {
+            (owner, "shared-mcp"): {
+                "name": "shared-mcp",
+                "profile_home": owner,
+                "connected": True,
+                "tools": 1,
+            }
+            for owner in homes.values()
+        },
+    )
+
+    observed = []
+    for profile in ("work", "default", "work"):
+        harness.request_scope.profile = profile
+        handler = _handler()
+        routes._handle_mcp_tools_list(handler)
+        payload = _payload(handler)
+        assert payload["source"] == "tool_registry"
+        assert [tool["name"] for tool in payload["tools"]] == [tool_name]
+        observed.append(payload["tools"][0]["description"])
+
+    assert observed == ["work schema", "default schema", "work schema"]
+    assert set(registry.calls) == set(homes.values())
 
 
 def test_strict_profile_cookie_rejects_invalid_and_unknown_profiles(
