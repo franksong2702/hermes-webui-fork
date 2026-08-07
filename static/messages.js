@@ -2160,11 +2160,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _isActiveSession(){
     return !!(S.session&&S.session.session_id===activeSid);
   }
-  function _ownsActiveStreamOrBackground(){
+  function _ownsActiveStreamOrBackground(source){
+    const live=LIVE_STREAMS[activeSid];
+    if(!live||live.streamId!==streamId||live.source!==source) return false;
     return !_isActiveSession() || S.activeStreamId===streamId;
   }
+  let _staleSourceCleanupScheduled=false;
   function _bailOutOfTerminalEventsFromStaleStream(source){
-    if(_ownsActiveStreamOrBackground()) return false;
+    if(_ownsActiveStreamOrBackground(source)) return false;
+    if(_staleSourceCleanupScheduled) return true;
+    _staleSourceCleanupScheduled=true;
     // This stale stream no longer owns the session — schedule cleanup of ITS own
     // anchor registry (identity-guarded, so it can't clobber the newer stream's
     // registry for the same session) before closing. (Codex leak catch.)
@@ -5469,6 +5474,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     LIVE_STREAMS[activeSid]={streamId,source};
 
+    // EventSource.close() prevents future network delivery but callbacks that
+    // were already queued can still run. Session + stream identity is not
+    // sufficient when a reconnect replaces the transport for the same stream;
+    // every listener must prove it still owns the exact registered source.
     // Note on #631 Bug B: the original PR description stated the server
     // "replays buffered token events" on reconnect, and proposed resetting
     // the accumulators here so the re-sent tokens wouldn't double the prefix.
@@ -5485,6 +5494,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // terminal handlers) address it without needing a reset here.
 
     source.addEventListener('token',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       if(_terminalStateReached||_streamFinalized) return;
       const d=JSON.parse(e.data);
       assistantText+=d.text;
@@ -5509,6 +5519,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('interim_assistant',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       if(_terminalStateReached||_streamFinalized) return;
       const d=JSON.parse(e.data);
       const visible=String(d&&d.text?d.text:'').trim();
@@ -5592,8 +5603,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('reasoning',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       if(_terminalStateReached||_streamFinalized) return;
-      if(!_ownsActiveStreamOrBackground()) return;
+      if(!_ownsActiveStreamOrBackground(source)) return;
       const d=JSON.parse(e.data);
       const text=d.text||'';
       reasoningText += text;
@@ -5615,6 +5627,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('tool',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       if(_terminalStateReached||_streamFinalized) return;
       if(!S.session||S.session.session_id!==activeSid||S.activeStreamId!==streamId) return;
       const d=JSON.parse(e.data);
@@ -5651,6 +5664,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('tool_complete',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       if(_terminalStateReached||_streamFinalized) return;
       if(!S.session||S.session.session_id!==activeSid||S.activeStreamId!==streamId) return;
       const d=JSON.parse(e.data);
@@ -5697,6 +5711,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // Cross-session protection mirrors every other live listener:
     // payload.session_id must match activeSid or the event is dropped.
     source.addEventListener('todo_state',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       let d;
       try{ d=JSON.parse(e.data||'{}'); }catch(_){ return; }
       if(!d||typeof d!=='object') return;
@@ -5730,6 +5745,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('approval',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       const d=JSON.parse(e.data);
       _applyToAnchor('approval',d,e);
       showApprovalForSession(activeSid, d, d.pending_count || 1);
@@ -5738,6 +5754,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('clarify',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       const d=JSON.parse(e.data);
       _applyToAnchor('clarify',d,e);
       showClarifyForSession(activeSid, d);
@@ -5746,6 +5763,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('state_saved',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       let d={};
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
       if((d.session_id||activeSid)!==activeSid) return;
@@ -5755,6 +5773,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('title',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       let d={};
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
       if((d.session_id||activeSid)!==activeSid) return;
@@ -5762,6 +5781,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('title_status',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       let d={};
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
       if((d.session_id||activeSid)!==activeSid) return;
@@ -5777,6 +5797,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('context_status',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       let d={};
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
       if((d.session_id||activeSid)!==activeSid) return;
@@ -5805,6 +5826,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
 
     source.addEventListener('goal',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       try{
         const d=JSON.parse(e.data||'{}');
         if((d.session_id||activeSid)!==activeSid) return;
@@ -5823,6 +5845,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('goal_continue',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       try{
         const d=JSON.parse(e.data||'{}');
         const sid=d.session_id||activeSid;
@@ -5861,6 +5884,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // `_handleBgTaskCompleteEvent` function below is shared between both
     // paths (dedupe only; the wakeup itself is server-side).
     source.addEventListener('bg_task_complete',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       if(typeof _handleBgTaskCompleteEvent==='function'){
         _handleBgTaskCompleteEvent(e, activeSid, {source:'stream'});
       }
@@ -5868,8 +5892,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('done',e=>{
       if(_streamFinalized) return;
-      _clearStreamEndRecovery();
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      _clearStreamEndRecovery();
       // Set _streamFinalized IMMEDIATELY — before any fade delay. Without this,
       // a stream_end event arriving during the fade window sees
       // _streamFinalized=false, calls _restoreSettledSession(), and overwrites
@@ -6163,8 +6187,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _closeSource(source);
         return;
       }
-      _clearStreamEndRecovery();
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      _clearStreamEndRecovery();
       try{
         const d=JSON.parse(e.data||'{}');
         if((d.session_id||activeSid)!==activeSid) return;
@@ -6190,6 +6214,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('pending_steer_leftover',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       // The agent finished its turn with steer text still stashed (no
       // tool-result boundary fired). Match the CLI's leftover-delivery
       // behaviour: queue the leftover text as a next-turn user message
@@ -6215,6 +6240,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('compressing',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       // Context auto-compression is starting. Surface the same calm running
       // compression card as manual /compress while the summarizer LLM call runs.
       if(!S.session||S.session.session_id!==activeSid) return;
@@ -6245,6 +6271,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('compressed',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       // Context was auto-compressed during this turn. Keep the live timeline
       // honest by transitioning the running divider into a completed divider;
       // final settlement removes live-only compression rows from the Worklog.
@@ -6280,6 +6307,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('metering',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       try{
         const d=JSON.parse(e.data||'{}');
         if((d.session_id||activeSid)!==activeSid) return;
@@ -6421,6 +6449,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('warning',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       // Non-fatal warning from server (e.g. fallback activated, retrying)
       if(!S.session||S.session.session_id!==activeSid) return;
       try{
@@ -6441,9 +6470,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('error',async e=>{
-      if(_bailOutOfTerminalEventsFromStaleStream(source) && !_streamFinalized){
-        return;
-      }
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       if(_terminalStateReached || _streamFinalized){
         _closeSource(source);
         return;
@@ -6652,7 +6679,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','todo_state','approval','clarify','state_saved','title','title_status','context_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
-      source.addEventListener(_runJournalEventName,_rememberRunJournalCursor);
+      source.addEventListener(_runJournalEventName,e=>{
+        if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+        _rememberRunJournalCursor(e);
+      });
     }
   }
 

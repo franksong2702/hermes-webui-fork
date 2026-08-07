@@ -125,6 +125,7 @@ var S = { session: null, activeStreamId: null, messages: [], toolCalls: [], busy
 var _STREAM_WAS_HIDDEN = {};
 var _STREAM_NOTIFICATION_BACKGROUND = {};
 var _desktopBackgroundedForNotifications = false;
+var _thinkPairs = [];
 
 // Module-scope state loadSession() touches.
 var _loadingSessionId = null;
@@ -195,14 +196,22 @@ async function api(url) { return __apiResponse; }
 function _bindStreamHiddenTracker() {}
 function ensureLiveWorklogShell() {}
 function showLiveRunStatus() {}
-function closeOtherLiveStreams() {}
-function closeLiveStream() {}
 function resetTurnWorkspaceMutations() {}
 function _resetStreamScrollFollow() {}
 function _suspendSessionStreamForLiveChat() {}
 function clearInflight() {}
 function clearInflightState() {}
-function _closeSource() {}
+function _resumeSessionStreamAfterLiveChat() {}
+function _clearStreamHidden() {}
+function _clearStreamNotificationBackground() {}
+function clearLiveToolCards() {}
+function removeThinking() {}
+function renderSessionList() {}
+function playNotificationSound() {}
+function sendBrowserNotification() {}
+function _markSessionViewed() {}
+function _isSessionCurrentPane(sid) { return !!(S.session && S.session.session_id === sid); }
+function _isSessionActivelyViewed(sid) { return _isSessionCurrentPane(sid); }
 function _approvalBelongsToOwner() { return true; }
 function _clarifyBelongsToOwner() { return true; }
 function _clearApprovalPendingForSession() {}
@@ -294,6 +303,8 @@ def _run_harness(setup_code: str, include_loadsession: bool = False) -> dict:
         _MOCK_GLOBALS,
         _read(ANCHORS_JS),
         _function_source(_read(MESSAGES_JS), "_extractInlineThinkingFromContent"),
+        _function_source(_read(MESSAGES_JS), "closeLiveStream"),
+        _function_source(_read(MESSAGES_JS), "closeOtherLiveStreams"),
         _function_source(_read(MESSAGES_JS), "attachLiveStream"),
         _function_source(_read(UI_JS), "_projectLiveAnchorActivitySceneForStream"),
         _function_source(_read(UI_JS), "_renderLiveAnchorActivitySceneForStream"),
@@ -661,3 +672,111 @@ def test_fresh_connection_replaces_stale_registry_when_no_open_transport():
     assert result["freshRegistryIdentity"] is True, (
         "the fresh registry must be seeded for the active stream"
     )
+
+
+# ---------------------------------------------------------------------------
+# Generation ownership: queued callbacks retained by a replaced same-stream
+# EventSource must not mutate the fresh transport's state.
+# ---------------------------------------------------------------------------
+
+
+def test_replaced_same_stream_source_cannot_mutate_fresh_transport_state():
+    """A replaced EventSource is stale even when its session and stream IDs match.
+
+    This uses the real attach/wire/teardown path twice, retains the old source's
+    production listeners, and dispatches stale token, reasoning, and terminal
+    events after the fresh source has applied one token and one reasoning event.
+    """
+    setup = textwrap.dedent("""\
+    const __results = {};
+    const SID = 'test-sid';
+    const STREAM_ID = 'test-stream';
+
+    window._liveAnchorRegistries = new Map();
+    window._renderLiveAnchorActivitySceneForStream = _renderLiveAnchorActivitySceneForStream;
+    window._projectLiveAnchorActivitySceneForStream = _projectLiveAnchorActivitySceneForStream;
+
+    (async () => {
+    S.session = { session_id: SID };
+    S.activeStreamId = STREAM_ID;
+    S.messages = [];
+    INFLIGHT[SID] = {
+      messages: [], uploaded: [], toolCalls: [],
+      streamId: STREAM_ID,
+      activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+    };
+
+    // Install the first transport and retain its production callbacks.
+    attachLiveStream(SID, STREAM_ID, [], {});
+    const staleSource = __esCreated[0];
+    const staleRegistry = window._liveAnchorRegistries.get(STREAM_ID);
+
+    // Force the production reconnect path to reject the non-OPEN transport,
+    // close it through closeLiveStream(), and wire a fresh same-stream source.
+    staleSource.readyState = EventSource.CONNECTING;
+    __apiResponse = { active: true, replay_available: false };
+    attachLiveStream(SID, STREAM_ID, [], { reconnecting: true });
+    await Promise.resolve();
+    const freshSource = __esCreated[1];
+    const freshRegistry = window._liveAnchorRegistries.get(STREAM_ID);
+
+    // Prove the fresh source remains functional exactly once. Token handling is
+    // exercised in background mode to avoid presentation-only DOM work.
+    S.session = { session_id: 'other-session' };
+    freshSource.dispatch('token', { text: 'fresh token', event_id: 'fresh-token' });
+    S.session = { session_id: SID };
+    freshSource.dispatch('reasoning', { text: 'fresh reasoning', event_id: 'fresh-reasoning' });
+
+    S.messages = [{ role: 'user', content: 'baseline transcript' }];
+    const before = {
+      inflight: JSON.stringify(INFLIGHT[SID]),
+      transcript: JSON.stringify(S.messages),
+      activeStreamId: S.activeStreamId,
+      freshEvents: freshRegistry.anchor.activity_events.length,
+      staleEvents: staleRegistry.anchor.activity_events.length,
+    };
+
+    // Browser event queues may still invoke these retained callbacks after
+    // close(). Same session + same stream ID is insufficient ownership proof.
+    S.session = { session_id: 'other-session' };
+    staleSource.dispatch('token', { text: 'STALE TOKEN', event_id: 'stale-token' });
+    S.session = { session_id: SID };
+    staleSource.dispatch('reasoning', { text: 'STALE REASONING', event_id: 'stale-reasoning' });
+    staleSource.dispatch('cancel', {
+      status: 'cancelled',
+      event_id: 'stale-cancel',
+      session: {
+        session_id: SID,
+        message_count: 1,
+        messages: [{ role: 'assistant', content: 'stale terminal transcript' }],
+      },
+    });
+
+    __results.twoSources = __esCreated.length;
+    __results.staleWasClosed = staleSource.readyState === EventSource.CLOSED;
+    __results.freshOwnsLiveEntry = !!(LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === freshSource);
+    __results.freshAppliedOnce = before.freshEvents === 1;
+    __results.staleRegistryUnchanged = staleRegistry.anchor.activity_events.length === before.staleEvents;
+    __results.freshRegistryUnchanged = freshRegistry.anchor.activity_events.length === before.freshEvents;
+    __results.inflightUnchanged = JSON.stringify(INFLIGHT[SID]) === before.inflight;
+    __results.transcriptUnchanged = JSON.stringify(S.messages) === before.transcript;
+    __results.activeStreamUnchanged = S.activeStreamId === before.activeStreamId;
+
+    process.stdout.write(JSON.stringify(__results) + '\\n', () => { process.exit(0); });
+    })().catch(err => {
+      console.error(err && err.stack ? err.stack : String(err));
+      process.exit(2);
+    });
+    """)
+
+    result = _run_harness(setup)
+
+    assert result["twoSources"] == 2
+    assert result["staleWasClosed"] is True
+    assert result["freshOwnsLiveEntry"] is True
+    assert result["freshAppliedOnce"] is True
+    assert result["staleRegistryUnchanged"] is True
+    assert result["freshRegistryUnchanged"] is True
+    assert result["inflightUnchanged"] is True
+    assert result["transcriptUnchanged"] is True
+    assert result["activeStreamUnchanged"] is True
