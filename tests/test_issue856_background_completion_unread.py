@@ -103,10 +103,9 @@ def test_done_event_updates_sidebar_cache_immediately_after_completion_marker():
     assert cleanup_idx != -1, "done handler must clear local INFLIGHT before rendering idle state"
     assert cache_idx != -1, "done handler must update the sidebar cache immediately"
     assert refresh_idx != -1 and sound_idx != -1
-    assert marker_idx < cache_idx < cleanup_idx < refresh_idx < sound_idx, (
-        "the sidebar should update from the done payload immediately after the "
-        "completion marker, while owner cleanup still precedes idle rendering "
-        "and the completion cue"
+    assert marker_idx < cleanup_idx < cache_idx < refresh_idx < sound_idx, (
+        "the completion marker must be written before owner cleanup and the "
+        "sidebar cache update, while idle rendering and the completion cue follow"
     )
 
 
