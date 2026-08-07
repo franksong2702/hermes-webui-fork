@@ -121,6 +121,7 @@ _MOCK_GLOBALS = textwrap.dedent("""\
 var window = globalThis;
 var INFLIGHT = {};
 var LIVE_STREAMS = {};
+var _LIVE_STREAM_ATTACHMENT_GENERATIONS = {};
 var S = { session: null, activeStreamId: null, messages: [], toolCalls: [], busy: false };
 var _STREAM_WAS_HIDDEN = {};
 var _STREAM_NOTIFICATION_BACKGROUND = {};
@@ -188,7 +189,8 @@ EventSource.CLOSED = 2;
 
 // The mocked API fetch used by loadSession(); the driver sets __apiResponse.
 var __apiResponse = null;
-async function api(url) { return __apiResponse; }
+var __apiHandler = null;
+async function api(url) { return __apiHandler ? __apiHandler(url) : __apiResponse; }
 
 // Stubbed module-scope helpers the production functions call. The code paths
 // under test (registry ownership, reattach, journal-snapshot projection) are
@@ -246,6 +248,7 @@ function updateThinking() {}
 function appendThinking() {}
 function _hideHandoffHint() {}
 function _checkAndShowHandoffHint() {}
+function _deferStreamErrorIfOffline() { return false; }
 
 // ui.js renderer hooks: chatActivityMode() is the production mode source;
 // renderLiveAnchorActivityScene() is the DOM paint step — recorded here so
@@ -780,3 +783,347 @@ def test_replaced_same_stream_source_cannot_mutate_fresh_transport_state():
     assert result["inflightUnchanged"] is True
     assert result["transcriptUnchanged"] is True
     assert result["activeStreamUnchanged"] is True
+
+
+def test_settled_restore_from_replaced_generation_cannot_settle_new_owner():
+    """A restore that started while source A owned the stream must become a
+    no-op when its session response resolves after source B replaces A.
+    """
+    setup = textwrap.dedent("""\
+    const __results = {};
+    const SID = 'test-sid';
+    const STREAM_ID = 'test-stream';
+    let resolveRestore;
+
+    window._liveAnchorRegistries = new Map();
+    S.session = { session_id: SID };
+    S.activeStreamId = STREAM_ID;
+    S.messages = [{ role: 'user', content: 'before restore' }];
+    INFLIGHT[SID] = {
+      messages: [], uploaded: [], toolCalls: [], streamId: STREAM_ID,
+      activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+    };
+
+    (async () => {
+      attachLiveStream(SID, STREAM_ID, [], {});
+      const staleSource = __esCreated[0];
+      __apiHandler = url => url.includes('/api/session?')
+        ? new Promise(resolve => { resolveRestore = resolve; })
+        : Promise.resolve({ active: true });
+
+      staleSource.dispatch('stream_end', { session_id: SID });
+      await Promise.resolve();
+
+      staleSource.readyState = EventSource.CLOSED;
+      __apiHandler = null;
+      attachLiveStream(SID, STREAM_ID, [], {});
+      const freshSource = __esCreated[1];
+      INFLIGHT[SID] = {
+        marker: 'fresh-owner', messages: [], uploaded: [], toolCalls: [], streamId: STREAM_ID,
+        activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+      };
+      S.messages = [{ role: 'user', content: 'fresh transcript' }];
+      S.activeStreamId = STREAM_ID;
+
+      resolveRestore({
+        session: {
+          session_id: SID, active_stream_id: null, pending_user_message: null,
+          message_count: 1, messages: [{ role: 'assistant', content: 'STALE RESTORE' }],
+          tool_calls: [],
+        },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      __results.freshOwnsLiveEntry = !!(LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === freshSource);
+      __results.inflightKept = !!(INFLIGHT[SID] && INFLIGHT[SID].marker === 'fresh-owner');
+      __results.transcriptKept = S.messages.length === 1 && S.messages[0].content === 'fresh transcript';
+      __results.activeStreamKept = S.activeStreamId === STREAM_ID;
+      process.stdout.write(JSON.stringify(__results) + '\\n', () => { process.exit(0); });
+    })().catch(err => {
+      console.error(err && err.stack ? err.stack : String(err));
+      process.exit(2);
+    });
+    """)
+
+    result = _run_harness(setup)
+
+    assert result["freshOwnsLiveEntry"] is True
+    assert result["inflightKept"] is True
+    assert result["transcriptKept"] is True
+    assert result["activeStreamKept"] is True
+
+
+def test_newer_reconnect_preflight_wins_when_status_resolves_out_of_order():
+    """Generation B must remain authoritative when B's reconnect status probe
+    resolves before the older generation A probe.
+    """
+    setup = textwrap.dedent("""\
+    const __results = {};
+    const SID = 'test-sid';
+    const STREAM_ID = 'test-stream';
+    const pendingStatus = [];
+
+    window._liveAnchorRegistries = new Map();
+    S.session = { session_id: SID };
+    S.activeStreamId = STREAM_ID;
+    INFLIGHT[SID] = {
+      messages: [], uploaded: [], toolCalls: [], streamId: STREAM_ID,
+      activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+    };
+    __apiHandler = url => url.includes('/api/chat/stream/status?')
+      ? new Promise(resolve => pendingStatus.push(resolve))
+      : Promise.resolve(null);
+
+    (async () => {
+      attachLiveStream(SID, STREAM_ID, [], { reconnecting: true });
+      attachLiveStream(SID, STREAM_ID, [], { reconnecting: true });
+      await Promise.resolve();
+
+      pendingStatus[1]({ active: true, replay_available: false });
+      await Promise.resolve();
+      await Promise.resolve();
+      const newerSource = __esCreated[0];
+
+      pendingStatus[0]({ active: true, replay_available: false });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      __results.onlyNewerConstructed = __esCreated.length === 1;
+      __results.newerStillOwnsLiveEntry = !!(LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === newerSource);
+      process.stdout.write(JSON.stringify(__results) + '\\n', () => { process.exit(0); });
+    })().catch(err => {
+      console.error(err && err.stack ? err.stack : String(err));
+      process.exit(2);
+    });
+    """)
+
+    result = _run_harness(setup)
+
+    assert result["onlyNewerConstructed"] is True
+    assert result["newerStillOwnsLiveEntry"] is True
+
+
+def test_stale_same_generation_source_cannot_delete_reconnected_registry():
+    """A stale source callback from the same attachment closure must not queue
+    cleanup capable of deleting the registry now used by its replacement source.
+    """
+    setup = textwrap.dedent("""\
+    const __results = {};
+    const SID = 'test-sid';
+    const STREAM_ID = 'test-stream';
+    const timers = [];
+    setTimeout = (fn, delay) => {
+      const timer = { fn, delay: Number(delay) || 0, cancelled: false };
+      timers.push(timer);
+      return timer;
+    };
+    clearTimeout = timer => { if (timer) timer.cancelled = true; };
+
+    window._liveAnchorRegistries = new Map();
+    S.session = { session_id: SID };
+    S.activeStreamId = STREAM_ID;
+    INFLIGHT[SID] = {
+      messages: [], uploaded: [], toolCalls: [], streamId: STREAM_ID,
+      activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+    };
+    __apiHandler = url => url.includes('/api/chat/stream/status?')
+      ? Promise.resolve({ active: true, replay_available: false })
+      : Promise.resolve(null);
+
+    (async () => {
+      attachLiveStream(SID, STREAM_ID, [], {});
+      const staleSource = __esCreated[0];
+      const sharedRegistry = window._liveAnchorRegistries.get(STREAM_ID);
+
+      staleSource.dispatch('error', {});
+      const reconnectTimer = timers.find(timer => timer.delay === 1500 && !timer.cancelled);
+      reconnectTimer.fn();
+      await new Promise(resolve => setImmediate(resolve));
+      const freshSource = __esCreated[1];
+
+      staleSource.dispatch('reasoning', { text: 'stale reasoning' });
+      for (const timer of timers.filter(timer => timer.delay === 120000 && !timer.cancelled)) {
+        timer.fn();
+      }
+
+      __results.freshSourceInstalled = !!(freshSource && LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === freshSource);
+      __results.registryStillOwned = window._liveAnchorRegistries.get(STREAM_ID) === sharedRegistry;
+      process.stdout.write(JSON.stringify(__results) + '\\n', () => { process.exit(0); });
+    })().catch(err => {
+      console.error(err && err.stack ? err.stack : String(err));
+      process.exit(2);
+    });
+    """)
+
+    result = _run_harness(setup)
+
+    assert result["freshSourceInstalled"] is True
+    assert result["registryStillOwned"] is True
+
+
+def test_queued_render_from_replaced_generation_cannot_paint():
+    """A render rAF queued by source A must not perform its first DOM write after
+    a fresh attachment generation B owns the same session and stream.
+    """
+    setup = textwrap.dedent("""\
+    const __results = {};
+    const SID = 'test-sid';
+    const STREAM_ID = 'test-stream';
+    const rafs = [];
+    let paintCalls = 0;
+    performance = { now: () => 1000 };
+    requestAnimationFrame = fn => { rafs.push({ fn, cancelled: false }); return rafs.length - 1; };
+    cancelAnimationFrame = id => { if (rafs[id]) rafs[id].cancelled = true; };
+    window._fixMobileScrollJank = () => { paintCalls += 1; };
+
+    window._liveAnchorRegistries = new Map();
+    S.session = { session_id: SID };
+    S.activeStreamId = STREAM_ID;
+    INFLIGHT[SID] = {
+      messages: [], uploaded: [], toolCalls: [], streamId: STREAM_ID,
+      activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+    };
+
+    (async () => {
+      attachLiveStream(SID, STREAM_ID, [], {});
+      const staleSource = __esCreated[0];
+      staleSource.dispatch('token', { text: 'queued paint' });
+      const staleRafs = rafs.slice();
+
+      staleSource.readyState = EventSource.CLOSED;
+      attachLiveStream(SID, STREAM_ID, [], {});
+      const freshSource = __esCreated[1];
+
+      for (const frame of staleRafs) {
+        if (frame.cancelled) continue;
+        try { frame.fn(); } catch (_) {}
+      }
+
+      __results.freshOwnsLiveEntry = !!(LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === freshSource);
+      __results.stalePaintSuppressed = paintCalls === 0;
+      process.stdout.write(JSON.stringify(__results) + '\\n', () => { process.exit(0); });
+    })().catch(err => {
+      console.error(err && err.stack ? err.stack : String(err));
+      process.exit(2);
+    });
+    """)
+
+    result = _run_harness(setup)
+
+    assert result["freshOwnsLiveEntry"] is True
+    assert result["stalePaintSuppressed"] is True
+
+
+def test_queued_done_fade_from_replaced_source_cannot_finish():
+    """The real fade-drain continuation must recheck source ownership before
+    invoking terminal finalization after its delayed animation wait.
+    """
+    drain_source = _function_source(_read(MESSAGES_JS), "_drainStreamFadeBeforeDone")
+    script = textwrap.dedent(
+        f"""\
+        let owned = true;
+        let finishCalls = 0;
+        const source = {{ id: 'source-a' }};
+        const timers = [];
+        const assistantBody = {{}};
+        const performance = {{ now: () => 100 }};
+        const _STREAM_FADE_MS = 620;
+        const _STREAM_FADE_DONE_MAX_MS = 1000;
+        const _STREAM_FADE_DONE_DRAIN_MAX_MS = 1400;
+        let _streamFadeLatestAnimationEndAt = 720;
+        let _streamFadeDomText = 'settled text';
+        let _smdParser = null;
+        function _ownsAttachmentSource(candidate) {{ return owned && candidate === source; }}
+        function _streamFadeCurrentDisplayText() {{ return 'settled text'; }}
+        function _renderStreamingFadeMarkdown() {{ return true; }}
+        function _upsertAnchorProcessProse() {{}}
+        function scrollIfPinned() {{}}
+        function _smdEndParser() {{}}
+        function setTimeout(fn) {{ timers.push(fn); return timers.length; }}
+        function requestAnimationFrame(fn) {{ fn(); return 1; }}
+        {drain_source}
+        _drainStreamFadeBeforeDone(source, () => {{ finishCalls += 1; }});
+        owned = false;
+        for (const timer of timers.slice()) timer();
+        process.stdout.write(JSON.stringify({{ finishCalls, timerCount: timers.length }}));
+        """
+    )
+    result = subprocess.run(
+        [NODE, "-e", script],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout)
+    assert outcome["timerCount"] == 1
+    assert outcome["finishCalls"] == 0
+
+
+def test_done_postprocess_allows_clean_release_but_rejects_successor_owner():
+    """A terminal rAF may run after its own live entry is released, but it
+    must not run once another generation or source owns the session.
+    """
+    helper_source = _function_source(
+        _read(MESSAGES_JS), "_ownsAttachmentSourceOrReleasedGeneration"
+    )
+    script = textwrap.dedent(
+        f"""\
+        const activeSid = 'test-sid';
+        const streamId = 'test-stream';
+        const _attachmentGeneration = {{ id: 'generation-a' }};
+        const source = {{ id: 'source-a' }};
+        const replacementSource = {{ id: 'source-b' }};
+        const successorGeneration = {{ id: 'generation-b' }};
+        const LIVE_STREAMS = {{}};
+        const _LIVE_STREAM_ATTACHMENT_GENERATIONS = {{}};
+        {helper_source}
+
+        _LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid] = _attachmentGeneration;
+        LIVE_STREAMS[activeSid] = {{
+          streamId, generation: _attachmentGeneration, source,
+        }};
+        const currentOwnerAllowed = _ownsAttachmentSourceOrReleasedGeneration(source);
+
+        delete LIVE_STREAMS[activeSid];
+        delete _LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid];
+        const cleanReleaseAllowed = _ownsAttachmentSourceOrReleasedGeneration(source);
+
+        _LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid] = _attachmentGeneration;
+        LIVE_STREAMS[activeSid] = {{
+          streamId, generation: _attachmentGeneration, source: replacementSource,
+        }};
+        const replacementRejected = !_ownsAttachmentSourceOrReleasedGeneration(source);
+
+        _LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid] = successorGeneration;
+        LIVE_STREAMS[activeSid] = {{
+          streamId, generation: successorGeneration, source: replacementSource,
+        }};
+        const successorRejected = !_ownsAttachmentSourceOrReleasedGeneration(source);
+
+        process.stdout.write(JSON.stringify({{
+          currentOwnerAllowed,
+          cleanReleaseAllowed,
+          replacementRejected,
+          successorRejected,
+        }}));
+        """
+    )
+    result = subprocess.run(
+        [NODE, "-e", script],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "currentOwnerAllowed": True,
+        "cleanReleaseAllowed": True,
+        "replacementRejected": True,
+        "successorRejected": True,
+    }
