@@ -1,6 +1,9 @@
 import base64
 import json
 import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1390,7 +1393,10 @@ def test_run_journal_generation_failure_cannot_leave_a_reported_failed_event(
     assert not path.exists() or path.read_bytes() == b""
 
 
-def test_run_journal_reader_binds_generation_to_open_file_identity(tmp_path, monkeypatch):
+def test_run_journal_reader_fails_closed_when_open_file_identity_diverges(
+    tmp_path,
+    monkeypatch,
+):
     session_id = "session_open_file_generation"
     run_id = "run_open_file_generation"
     path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
@@ -1409,24 +1415,108 @@ def test_run_journal_reader_binds_generation_to_open_file_identity(tmp_path, mon
         lambda _path: (real_identity[0], real_identity[1] + 1),
     )
 
-    first_page = read_run_events(
+    page = read_run_events(
         session_id,
         run_id,
-        session_dir=tmp_path,
-        max_rows=1,
-    )
-    monkeypatch.undo()
-    resumed = read_run_events(
-        session_id,
-        run_id,
-        after_seq=first_page["next_after_seq"],
-        resume_token=first_page["resume_token"],
         session_dir=tmp_path,
         max_rows=1,
     )
 
-    assert [event["seq"] for event in resumed["events"]] == [2]
-    assert resumed["complete"] is True
+    assert page["events"] == []
+    assert page["complete"] is False
+    assert page["limit_reason"] == "replay_cursor_invalid"
+    assert page["resume_token"] is None
+
+
+def test_run_journal_generation_is_stable_across_concurrent_processes(tmp_path):
+    session_id = "session_process_generation"
+    run_id = "run_process_generation"
+    coordination = tmp_path / "coordination"
+    coordination.mkdir()
+    worker = r'''
+import sys
+import time
+from pathlib import Path
+
+import api.run_journal as journal
+
+root = Path(sys.argv[1])
+coordination = Path(sys.argv[2])
+role = sys.argv[3]
+session_id = sys.argv[4]
+run_id = sys.argv[5]
+original_write = journal._write_run_generation_record
+
+def wait_for(name):
+    deadline = time.monotonic() + 15
+    marker = coordination / name
+    while not marker.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(name)
+        time.sleep(0.01)
+
+if role == "a":
+    def gated_write(*args, **kwargs):
+        (coordination / "a_writer_ready").touch()
+        wait_for("allow_a_write")
+        return original_write(*args, **kwargs)
+    journal._write_run_generation_record = gated_write
+    journal.append_run_event(
+        session_id, run_id, "token", {"text": "x" * 2048},
+        session_dir=root, seq=1, created_at=1.0,
+    )
+    generation, _identity = journal._read_run_generation_record(
+        journal._run_path(session_id, run_id, session_dir=root)
+    )
+    (coordination / "a_generation").write_text(generation, encoding="ascii")
+    (coordination / "a_generation_ready").touch()
+else:
+    (coordination / "b_process_started").touch()
+    def gated_write(*args, **kwargs):
+        (coordination / "b_writer_ready").touch()
+        wait_for("a_generation_ready")
+        return original_write(*args, **kwargs)
+    journal._write_run_generation_record = gated_write
+    journal.append_run_event(
+        session_id, run_id, "token", {"text": "suffix"},
+        session_dir=root, seq=2, created_at=2.0,
+    )
+'''
+
+    def wait_for(name, timeout=15):
+        deadline = time.monotonic() + timeout
+        marker = coordination / name
+        while not marker.exists():
+            if time.monotonic() >= deadline:
+                pytest.fail(f"timed out waiting for {name}")
+            time.sleep(0.01)
+
+    common = [str(tmp_path), str(coordination), session_id, run_id]
+    process_a = subprocess.Popen(
+        [sys.executable, "-c", worker, common[0], common[1], "a", common[2], common[3]],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    wait_for("a_writer_ready")
+    process_b = subprocess.Popen(
+        [sys.executable, "-c", worker, common[0], common[1], "b", common[2], common[3]],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    wait_for("b_process_started")
+    time.sleep(0.25)
+    (coordination / "allow_a_write").touch()
+    wait_for("a_generation_ready")
+    output_a, error_a = process_a.communicate(timeout=20)
+    output_b, error_b = process_b.communicate(timeout=20)
+    assert process_a.returncode == 0, (output_a, error_a)
+    assert process_b.returncode == 0, (output_b, error_b)
+
+    path = run_journal._run_path(session_id, run_id, session_dir=tmp_path)
+    final_generation, _identity = run_journal._read_run_generation_record(path)
+    assert final_generation == (coordination / "a_generation").read_text(encoding="ascii")
 
 
 @pytest.mark.parametrize("nonfinite", [b"NaN", b"Infinity", b"-Infinity"])

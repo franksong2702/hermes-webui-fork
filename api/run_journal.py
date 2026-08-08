@@ -16,8 +16,19 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
+
+try:  # pragma: no cover - platform-specific imports.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover
+    _fcntl = None
+
+try:  # pragma: no cover - platform-specific imports.
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover
+    _msvcrt = None
 
 _REAL_FSYNC = os.fsync
 
@@ -98,6 +109,42 @@ def _run_path(session_id: str, run_id: str, session_dir: Path | None = None) -> 
 def _run_generation_path(path: Path) -> Path:
     """Return the durable generation sidecar for one JSONL journal."""
     return path.with_name(f"{path.name}.generation")
+
+
+def _run_generation_lock_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.generation.lock")
+
+
+@contextmanager
+def _run_generation_process_lock(path: Path):
+    """Serialize generation initialization across WebUI worker processes."""
+    lock_path = _run_generation_lock_path(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "r+b", buffering=0) as lock_file:
+        if _fcntl is not None:
+            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+            return
+        if _msvcrt is not None:
+            if os.fstat(lock_file.fileno()).st_size == 0:
+                lock_file.write(b"\0")
+            lock_file.seek(0)
+            _msvcrt.locking(  # type: ignore[attr-defined]
+                lock_file.fileno(), _msvcrt.LK_LOCK, 1  # type: ignore[attr-defined]
+            )
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                _msvcrt.locking(  # type: ignore[attr-defined]
+                    lock_file.fileno(), _msvcrt.LK_UNLCK, 1  # type: ignore[attr-defined]
+                )
+            return
+        raise RuntimeError("cross-process run-journal generation locking is unavailable")
 
 
 def _run_file_identity(path: Path) -> tuple[int, int] | None:
@@ -210,12 +257,15 @@ def _ensure_run_generation_for_read(
     # lock scope only covers sidecar read/replace; journal bytes remain readable
     # concurrently with ordinary appends.
     with _lock_for(path):
-        record = _read_run_generation_record(path)
-        if record is not None and record[1] == identity:
-            return record[0]
-        generation = secrets.token_hex(16)
-        _write_run_generation_record(path, generation, identity=identity)
-        return generation
+        with _run_generation_process_lock(path):
+            if _run_file_identity(path) != identity:
+                return None
+            record = _read_run_generation_record(path)
+            if record is not None and record[1] == identity:
+                return record[0]
+            generation = secrets.token_hex(16)
+            _write_run_generation_record(path, generation, identity=identity)
+            return generation
 
 
 def _lock_for(path: Path) -> threading.Lock:
@@ -543,18 +593,29 @@ def append_run_event(
         raise ValueError("event_name is required")
     with _lock_for(path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        created_file = not path.exists()
-        fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         try:
-            stat = os.fstat(fd)
-            identity = int(stat.st_dev), int(stat.st_ino)
-            generation, generation_needs_write = _prepare_run_generation_for_append(
+            fd = os.open(
                 path,
-                identity=identity,
-                force_rotate=created_file,
+                os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_WRONLY,
+                0o600,
             )
-            if generation_needs_write:
-                _write_run_generation_record(path, generation, identity=identity)
+            created_file = True
+        except FileExistsError:
+            fd = os.open(path, os.O_APPEND | os.O_WRONLY)
+            created_file = False
+        try:
+            with _run_generation_process_lock(path):
+                stat = os.fstat(fd)
+                identity = int(stat.st_dev), int(stat.st_ino)
+                if _run_file_identity(path) != identity:
+                    raise OSError("run journal replaced during append")
+                generation, generation_needs_write = _prepare_run_generation_for_append(
+                    path,
+                    identity=identity,
+                    force_rotate=created_file,
+                )
+                if generation_needs_write:
+                    _write_run_generation_record(path, generation, identity=identity)
             if seq is not None:
                 assigned_seq = int(seq)
                 _note_assigned_seq(path, assigned_seq)
