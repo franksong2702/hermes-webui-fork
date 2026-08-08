@@ -1519,6 +1519,92 @@ else:
     assert final_generation == (coordination / "a_generation").read_text(encoding="ascii")
 
 
+def test_run_journal_generation_lock_inode_survives_session_delete(tmp_path):
+    session_id = "session_stable_generation_lock"
+    run_id = "run_stable_generation_lock"
+    append_run_event(
+        session_id,
+        run_id,
+        "token",
+        {"text": "before-delete"},
+        session_dir=tmp_path,
+        seq=1,
+    )
+    path = run_journal._run_path(session_id, run_id, session_dir=tmp_path)
+    lock_path = run_journal._run_generation_lock_path(path)
+    lock_identity = (lock_path.stat().st_dev, lock_path.stat().st_ino)
+
+    coordination = tmp_path / "delete_coordination"
+    coordination.mkdir()
+    holder = r'''
+import sys
+import time
+from pathlib import Path
+import api.run_journal as journal
+root, coordination = Path(sys.argv[1]), Path(sys.argv[2])
+path = journal._run_path(sys.argv[3], sys.argv[4], session_dir=root)
+with journal._run_generation_process_lock(path):
+    (coordination / "held").touch()
+    deadline = time.monotonic() + 15
+    while not (coordination / "release").exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("release")
+        time.sleep(0.01)
+'''
+    deleter = r'''
+import sys
+from pathlib import Path
+import api.run_journal as journal
+root, coordination = Path(sys.argv[1]), Path(sys.argv[2])
+journal.delete_run_journal(sys.argv[3], session_dir=root)
+(coordination / "deleted").touch()
+'''
+
+    def wait_for(name, timeout=15):
+        deadline = time.monotonic() + timeout
+        marker = coordination / name
+        while not marker.exists():
+            if time.monotonic() >= deadline:
+                pytest.fail(f"timed out waiting for {name}")
+            time.sleep(0.01)
+
+    holder_process = subprocess.Popen(
+        [sys.executable, "-c", holder, str(tmp_path), str(coordination), session_id, run_id],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    wait_for("held")
+    deleter_process = subprocess.Popen(
+        [sys.executable, "-c", deleter, str(tmp_path), str(coordination), session_id],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    time.sleep(0.25)
+    assert not (coordination / "deleted").exists()
+    (coordination / "release").touch()
+    holder_output, holder_error = holder_process.communicate(timeout=20)
+    deleter_output, deleter_error = deleter_process.communicate(timeout=20)
+    assert holder_process.returncode == 0, (holder_output, holder_error)
+    assert deleter_process.returncode == 0, (deleter_output, deleter_error)
+    wait_for("deleted")
+
+    assert lock_path.exists()
+    assert (lock_path.stat().st_dev, lock_path.stat().st_ino) == lock_identity
+
+    append_run_event(
+        session_id,
+        run_id,
+        "token",
+        {"text": "after-delete"},
+        session_dir=tmp_path,
+        seq=1,
+    )
+    assert run_journal._run_generation_lock_path(path) == lock_path
+    assert (lock_path.stat().st_dev, lock_path.stat().st_ino) == lock_identity
+
+
 @pytest.mark.parametrize("nonfinite", [b"NaN", b"Infinity", b"-Infinity"])
 def test_run_journal_bounded_reader_rejects_nonfinite_json_before_seq_authority(
     tmp_path,

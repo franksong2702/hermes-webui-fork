@@ -79,6 +79,7 @@ _REPLAY_RESUME_TOKEN_HMAC_DOMAIN = b"hermes-webui:run-journal-replay:v3\0"
 _REPLAY_RESUME_STATE_MAX_BYTES = 8 * 1024
 _RUN_JOURNAL_GENERATION_VERSION = 1
 _RUN_JOURNAL_GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
+_RUN_JOURNAL_GENERATION_LOCK_STRIPES = 64
 _SNAPSHOT_ARGS_MAX_ITEMS = 64
 _SNAPSHOT_ARGS_MAX_DEPTH = 8
 _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
@@ -112,7 +113,12 @@ def _run_generation_path(path: Path) -> Path:
 
 
 def _run_generation_lock_path(path: Path) -> Path:
-    return path.with_name(f"{path.name}.generation.lock")
+    session_id = path.parent.name
+    stripe = int.from_bytes(
+        hashlib.sha256(session_id.encode("utf-8")).digest()[:2],
+        "big",
+    ) % _RUN_JOURNAL_GENERATION_LOCK_STRIPES
+    return path.parent.parent / ".generation-locks" / f"{stripe:02d}.lock"
 
 
 @contextmanager
@@ -2501,8 +2507,16 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
     session_journal_dir = root / RUN_JOURNAL_DIR_NAME / sid
     if not session_journal_dir.exists():
         return False
-    shutil.rmtree(session_journal_dir, ignore_errors=True)
-    removed = not session_journal_dir.exists()
+    # Generation locks live in a stable striped directory outside each session
+    # subtree. Take the same session stripe before removal so a held lock cannot
+    # be unlinked and recreated on a different inode while another process is
+    # initializing or validating a generation sidecar.
+    deletion_lock_path = session_journal_dir / ".delete.jsonl"
+    with _run_generation_process_lock(deletion_lock_path):
+        if not session_journal_dir.exists():
+            return False
+        shutil.rmtree(session_journal_dir, ignore_errors=True)
+        removed = not session_journal_dir.exists()
     # Evict any writer locks the removed runs left behind. `_lock_for` keys are
     # ``(str(path.parent), path.name, pid)`` and every run file for this session
     # lives directly under ``session_journal_dir``, so drop all keys whose parent
