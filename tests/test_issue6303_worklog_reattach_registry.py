@@ -36,6 +36,10 @@ Path 2 — loadSession() with a winning server journal snapshot
 A third sentinel keeps the other side of the ownership decision locked: a fresh
 connection (no existing OPEN transport) must delete the stale registry and let the
 new closure create its own registry via the real anchor API.
+
+Delayed-callback rows drive real `done` listeners and fake browser queues through
+successor generations, proving completion grace and post-done rAF/TTS callbacks
+keep their attachment owner after A is released and B takes or releases the session.
 """
 from __future__ import annotations
 
@@ -127,6 +131,8 @@ var _STREAM_WAS_HIDDEN = {};
 var _STREAM_NOTIFICATION_BACKGROUND = {};
 var _desktopBackgroundedForNotifications = false;
 var _thinkPairs = [];
+var _approvalSessionId = null;
+var _clarifySessionId = null;
 
 // Module-scope state loadSession() touches.
 var _loadingSessionId = null;
@@ -230,6 +236,7 @@ function stopSessionStream() {}
 function _updateYoloPill() {}
 function syncTopbar() {}
 function renderMessages() {}
+function loadDir() {}
 function setBusy() {}
 function setComposerStatus() {}
 function startApprovalPolling() {}
@@ -249,6 +256,13 @@ function appendThinking() {}
 function _hideHandoffHint() {}
 function _checkAndShowHandoffHint() {}
 function _deferStreamErrorIfOffline() { return false; }
+function _completionNotificationPreviewText() { return ''; }
+function _shouldForceCompletionNotification() { return false; }
+function enhanceMarkdownTables() {}
+var __autoReadCalls = 0;
+function autoReadLastAssistant() { __autoReadCalls += 1; }
+var __highlightCalls = 0;
+function highlightCode() { __highlightCalls += 1; }
 
 // ui.js renderer hooks: chatActivityMode() is the production mode source;
 // renderLiveAnchorActivityScene() is the DOM paint step — recorded here so
@@ -1063,67 +1077,148 @@ def test_queued_done_fade_from_replaced_source_cannot_finish():
     assert outcome["finishCalls"] == 0
 
 
-def test_done_postprocess_allows_clean_release_but_rejects_successor_owner():
-    """A terminal rAF may run after its own live entry is released, but it
-    must not run once another generation or source owns the session.
+def _done_callback_setup(sequence: str) -> str:
+    """Build a driver that reaches terminal callbacks through real SSE listeners.
+
+    The driver deliberately keeps the production EventSource callbacks and
+    completion timers intact. Only browser scheduling is faked so a test can
+    invoke one owner generation's delayed callback at a time.
     """
-    helper_source = _function_source(
-        _read(MESSAGES_JS), "_ownsAttachmentSourceOrReleasedGeneration"
-    )
-    script = textwrap.dedent(
+    return textwrap.dedent(
         f"""\
-        const activeSid = 'test-sid';
-        const streamId = 'test-stream';
-        const _attachmentGeneration = {{ id: 'generation-a' }};
-        const source = {{ id: 'source-a' }};
-        const replacementSource = {{ id: 'source-b' }};
-        const successorGeneration = {{ id: 'generation-b' }};
-        const LIVE_STREAMS = {{}};
-        const _LIVE_STREAM_ATTACHMENT_GENERATIONS = {{}};
-        {helper_source}
-
-        _LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid] = _attachmentGeneration;
-        LIVE_STREAMS[activeSid] = {{
-          streamId, generation: _attachmentGeneration, source,
+        const __results = {{}};
+        const SID = 'test-sid';
+        const timers = [];
+        const rafs = [];
+        setTimeout = (fn, delay) => {{
+          const timer = {{ fn, delay: Number(delay) || 0, cancelled: false }};
+          timers.push(timer);
+          return timer;
         }};
-        const currentOwnerAllowed = _ownsAttachmentSourceOrReleasedGeneration(source);
-
-        delete LIVE_STREAMS[activeSid];
-        delete _LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid];
-        const cleanReleaseAllowed = _ownsAttachmentSourceOrReleasedGeneration(source);
-
-        _LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid] = _attachmentGeneration;
-        LIVE_STREAMS[activeSid] = {{
-          streamId, generation: _attachmentGeneration, source: replacementSource,
+        clearTimeout = timer => {{ if (timer && typeof timer === 'object') timer.cancelled = true; }};
+        requestAnimationFrame = fn => {{
+          const frame = {{ fn, cancelled: false }};
+          rafs.push(frame);
+          return rafs.length - 1;
         }};
-        const replacementRejected = !_ownsAttachmentSourceOrReleasedGeneration(source);
+        cancelAnimationFrame = id => {{ if (rafs[id]) rafs[id].cancelled = true; }};
+        performance = {{ now: () => 1000 }};
+        const testBlocks = {{ querySelectorAll: () => [], appendChild: () => {{}} }};
+        const testTurn = {{ _blocks: testBlocks }};
+        const testEmptyState = {{ style: {{}} }};
+        $ = id => id === 'liveAssistantTurn' ? testTurn : (id === 'emptyState' ? testEmptyState : null);
+        _assistantTurnBlocks = turn => turn && turn._blocks;
 
-        _LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid] = successorGeneration;
-        LIVE_STREAMS[activeSid] = {{
-          streamId, generation: successorGeneration, source: replacementSource,
-        }};
-        const successorRejected = !_ownsAttachmentSourceOrReleasedGeneration(source);
+        function install(streamId) {{
+          S.session = {{ session_id: SID, message_count: 0 }};
+          S.activeStreamId = streamId;
+          S.messages = [];
+          S.toolCalls = [];
+          INFLIGHT[SID] = {{
+            messages: [], uploaded: [], toolCalls: [], streamId,
+            activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+          }};
+          attachLiveStream(SID, streamId, [], {{}});
+          return __esCreated[__esCreated.length - 1];
+        }}
+        function complete(source, streamId, text) {{
+          source.dispatch('done', {{
+            stream_id: streamId,
+            status: 'completed',
+            session: {{
+              session_id: SID,
+              message_count: 1,
+              messages: [{{ role: 'assistant', content: text }}],
+              tool_calls: [],
+            }},
+          }});
+        }}
 
-        process.stdout.write(JSON.stringify({{
-          currentOwnerAllowed,
-          cleanReleaseAllowed,
-          replacementRejected,
-          successorRejected,
-        }}));
+        {sequence}
+
+        process.stdout.write(JSON.stringify(__results) + '\\n', () => {{ process.exit(0); }});
         """
     )
-    result = subprocess.run(
-        [NODE, "-e", script],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        timeout=20,
-        check=False,
+
+
+def test_done_a_attach_b_without_done_timer_a_releases_only_a_grace():
+    """A's completion grace expires even while B is merely active."""
+    setup = _done_callback_setup(
+        """\
+        const sourceA = install('stream-a');
+        complete(sourceA, 'stream-a', 'answer A');
+        const sourceB = install('stream-b');
+        const graceA = timers.filter(t => t.delay === 5000 && !t.cancelled);
+        __results.realListenerUsed = sourceA._handlers.done.length > 0 && sourceB._handlers.done.length > 0;
+        __results.bIsActiveBeforeTimer = !!(LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === sourceB);
+        __results.graceTimerCount = graceA.length;
+        graceA[0].fn();
+        __results.streamJustFinishedAfterATimer = window._streamJustFinished;
+        __results.bStillOwnsLiveEntry = !!(LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === sourceB);
+        """
     )
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {
-        "currentOwnerAllowed": True,
-        "cleanReleaseAllowed": True,
-        "replacementRejected": True,
-        "successorRejected": True,
+    result = _run_harness(setup)
+    assert result == {
+        "realListenerUsed": True,
+        "bIsActiveBeforeTimer": True,
+        "graceTimerCount": 1,
+        "streamJustFinishedAfterATimer": False,
+        "bStillOwnsLiveEntry": True,
+    }
+
+
+def test_done_a_done_b_timer_a_cannot_clear_b_grace():
+    """A and B completion grace timers are independently owned."""
+    setup = _done_callback_setup(
+        """\
+        const sourceA = install('stream-a');
+        complete(sourceA, 'stream-a', 'answer A');
+        const sourceB = install('stream-b');
+        complete(sourceB, 'stream-b', 'answer B');
+        const graceTimers = timers.filter(t => t.delay === 5000 && !t.cancelled);
+        __results.graceTimerCount = graceTimers.length;
+        graceTimers[0].fn();
+        __results.afterTimerA = window._streamJustFinished;
+        graceTimers[1].fn();
+        __results.afterTimerB = window._streamJustFinished;
+        """
+    )
+    result = _run_harness(setup)
+    assert result == {
+        "graceTimerCount": 2,
+        "afterTimerA": True,
+        "afterTimerB": False,
+    }
+
+
+def test_done_a_attach_done_release_b_blocks_a_delayed_tts_callback():
+    """After B settles and releases, A's delayed rAF/TTS callbacks stay stale."""
+    setup = _done_callback_setup(
+        """\
+        const sourceA = install('stream-a');
+        sourceA.dispatch('token', { text: 'live A' });
+        complete(sourceA, 'stream-a', 'answer A');
+        const sourceB = install('stream-b');
+        sourceB.dispatch('token', { text: 'live B' });
+        complete(sourceB, 'stream-b', 'answer B');
+        const terminalRafs = rafs.filter(frame => !frame.cancelled);
+        const ttsTimers = timers.filter(t => t.delay === 300 && !t.cancelled);
+        __results.terminalRafCount = terminalRafs.length;
+        terminalRafs[0].fn();
+        __results.highlightCallsAfterA = __highlightCalls;
+        __results.ttsTimerCount = ttsTimers.length;
+        ttsTimers[0].fn();
+        __results.autoReadCallsAfterA = __autoReadCalls;
+        __results.latestBIsReleased = !LIVE_STREAMS[SID] && __esCreated[1].readyState === EventSource.CLOSED;
+        __results.bGraceStillPresent = window._streamJustFinished;
+        """
+    )
+    result = _run_harness(setup)
+    assert result == {
+        "terminalRafCount": 2,
+        "highlightCallsAfterA": 0,
+        "ttsTimerCount": 2,
+        "autoReadCallsAfterA": 0,
+        "latestBIsReleased": True,
+        "bGraceStillPresent": True,
     }

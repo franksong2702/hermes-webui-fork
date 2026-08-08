@@ -1908,6 +1908,9 @@ const LIVE_STREAMS={};
 // same (session, stream), so every async continuation must also prove that its
 // attachment generation is still current.
 const _LIVE_STREAM_ATTACHMENT_GENERATIONS={};
+// Monotonic per-session attachment epoch. The latest value is a tombstone: a
+// released generation remains identifiable until a newer attachment claims the
+// session, so a delayed callback can never regain authority after replacement.
 const _STREAM_NOTIFICATION_BACKGROUND={};
 
 // #4416: track whether the tab was hidden at ANY point during a live stream, so
@@ -1976,9 +1979,6 @@ function closeLiveStream(sessionId, streamId, source, generation){
   if(typeof hideLiveRunStatus==='function') hideLiveRunStatus(sessionId);
   try{if(live.source&&live.source.readyState!==2)live.source.close();}catch(_){ }
   delete LIVE_STREAMS[sessionId];
-  if(!live.generation||_LIVE_STREAM_ATTACHMENT_GENERATIONS[sessionId]===live.generation){
-    delete _LIVE_STREAM_ATTACHMENT_GENERATIONS[sessionId];
-  }
   _resumeSessionStreamAfterLiveChat(sessionId);
   // closeLiveStream() is called during session-switch teardown for any session
   // the user is no longer viewing. The stream is still active on the server,
@@ -2027,6 +2027,27 @@ function closeOtherLiveStreams(activeSid){
 function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(!activeSid||!streamId) return;
   const reconnecting=!!options.reconnecting;
+  // Completion cooldowns are owned by the attachment that armed them. Keep
+  // the store on window so independently extracted/replayed attach closures
+  // share the same owner set; sessions.js still receives the legacy boolean
+  // projection while each timer removes only its own key.
+  const _completionGraceStore=(typeof window!=='undefined'&&window.__hermesStreamCompletionGraces instanceof Map)
+    ? window.__hermesStreamCompletionGraces
+    : (typeof window!=='undefined'
+      ? (window.__hermesStreamCompletionGraces=new Map())
+      : new Map());
+  const _syncCompletionGraceFlag=()=>{
+    if(typeof window!=='undefined') window._streamJustFinished=_completionGraceStore.size>0;
+  };
+  const _armCompletionGrace=(ownerKey)=>{
+    if(!ownerKey) return;
+    _completionGraceStore.set(ownerKey,true);
+    _syncCompletionGraceFlag();
+    setTimeout(()=>{
+      if(!_completionGraceStore.delete(ownerKey)) return;
+      _syncCompletionGraceFlag();
+    },5000);
+  };
   // #4416: start (or, on reconnect for the SAME stream, keep) tracking whether
   // the tab was hidden during this stream so the done-notification fires for a
   // backgrounded tab. A reconnect with a different streamId re-seeds (the old
@@ -2089,7 +2110,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   closeOtherLiveStreams(activeSid);
   closeLiveStream(activeSid);
-  const _attachmentGeneration={};
+  const _previousAttachmentGeneration=_LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid];
+  const _previousAttachmentEpoch=Number(_previousAttachmentGeneration&&_previousAttachmentGeneration.epoch);
+  const _attachmentEpoch=Number.isFinite(_previousAttachmentEpoch)?_previousAttachmentEpoch+1:1;
+  const _attachmentGeneration={epoch:_attachmentEpoch};
   _LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid]=_attachmentGeneration;
   // Claim the generation before any reconnect status preflight can suspend.
   // source:null is an intentional pending-transport state; only this exact
@@ -2195,9 +2219,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _ownsAttachmentSourceOrReleasedGeneration(source){
     const latestGeneration=_LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid];
     const live=LIVE_STREAMS[activeSid];
-    if(!latestGeneration&&!live) return true;
-    return latestGeneration===_attachmentGeneration&&
-      !!live&&live.streamId===streamId&&live.generation===_attachmentGeneration&&live.source===source;
+    if(latestGeneration!==_attachmentGeneration||Number(latestGeneration&&latestGeneration.epoch)!==_attachmentEpoch) return false;
+    if(!live) return true;
+    return live.streamId===streamId&&live.generation===_attachmentGeneration&&live.source===source;
   }
   let _staleSourceCleanupScheduled=false;
   function _bailOutOfTerminalEventsFromStaleStream(source){
@@ -2720,9 +2744,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(!_ownsAttachmentGeneration()) return;
     if(source&&!_ownsAttachmentSource(source)) return;
     const scheduledGeneration=_attachmentGeneration;
+    const scheduledEpoch=_attachmentEpoch;
     setTimeout(()=>{
       const latestGeneration=_LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid];
-      if(latestGeneration&&latestGeneration!==scheduledGeneration) return;
+      if(Number(latestGeneration&&latestGeneration.epoch)!==scheduledEpoch||latestGeneration!==scheduledGeneration) return;
       const live=LIVE_STREAMS[activeSid];
       if(live&&(
         live.streamId!==streamId||
@@ -6220,11 +6245,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           // Cooldown: prevent refreshActiveSessionIfExternallyUpdated from
           // force-reloading immediately after "done" — the event already
           // delivered the final messages and tool calls.
-          if(typeof window!=='undefined') window._streamJustFinished=true;
-          setTimeout(()=>{
-            const latest=_LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid];
-            if((!latest||latest===_attachmentGeneration)&&typeof window!=='undefined') window._streamJustFinished=false;
-          }, 5000);
+          _armCompletionGrace(_attachmentGeneration);
           // Expand render window to cover all messages so the done render
           // doesn't hide Activity behind a tiny window (winSize=50).
           if(typeof _messageRenderableMessageCount==='function'&&typeof _messageRenderWindowSize!=='undefined'){
