@@ -490,10 +490,12 @@ function _artifactToolName(value){
 }
 
 function _artifactOwnerFromCurrentSession(){
-  if(!S.session || !S.session.session_id) return null;
+  if(!S.session || typeof S.session.session_id !== 'string') return null;
+  const sessionId = S.session.session_id.trim();
+  if(!sessionId) return null;
   const workspaceRoot = _artifactScalarString(S.session.workspace);
   return {
-    session_id: String(S.session.session_id),
+    session_id: sessionId,
     workspace_root: workspaceRoot ? workspaceRoot.replace(/\/+$/,'') : '',
   };
 }
@@ -527,6 +529,81 @@ let _workspaceOpenGeneration = 0;
 function _nextWorkspaceOpenGeneration(){
   _workspaceOpenGeneration += 1;
   return _workspaceOpenGeneration;
+}
+
+// Native preview elements keep loading after JavaScript returns from openFile().
+// Clear every browser-owned sink synchronously when an owner is replaced or a
+// preview is closed, so a previous session cannot finish into the shared pane.
+function _clearNativePreviewSinks(opts={}){
+  if(!opts || opts.bumpGeneration !== false) _workspaceOpenGeneration += 1;
+  const lookup=(id)=>typeof $ === 'function' ? $(id) : null;
+  const clearElement = (node, isMedia=false) => {
+    if(!node) return;
+    if(isMedia && typeof node.pause === 'function'){
+      try{ node.pause(); }catch(_){ }
+    }
+    for(const prop of ['onload','onerror','onloadeddata','oncanplay','onabort','onstalled']){
+      try{ node[prop]=null; }catch(_){ }
+    }
+    try{
+      if(typeof node.removeAttribute === 'function') node.removeAttribute('src');
+    }catch(_){ }
+    try{ node.src=''; }catch(_){ }
+    if(isMedia && typeof node.load === 'function'){
+      try{ node.load(); }catch(_){ }
+    }
+  };
+  clearElement(lookup('previewImg'));
+  clearElement(lookup('previewPdfFrame'));
+  clearElement(lookup('previewHtmlIframe'));
+  const mediaWrap=lookup('previewMediaWrap');
+  if(mediaWrap){
+    let mediaNodes=[];
+    try{
+      mediaNodes=typeof mediaWrap.querySelectorAll === 'function'
+        ? [...mediaWrap.querySelectorAll('audio,video')]
+        : [];
+    }catch(_){ }
+    for(const node of mediaNodes) clearElement(node,true);
+    try{ mediaWrap.innerHTML=''; }catch(_){ }
+  }
+}
+
+// Session replacement normally happens before the deferred workspace refresh.
+// Observe that shared state transition so native sinks are invalidated in the
+// same synchronous turn, even before clearPreview()/openFile() gets a chance to
+// run. The data contract stays unchanged; this only fences browser resources.
+let _workspaceSessionOwnerKey = null;
+function _workspaceSessionOwnerKeyFor(session){
+  if(!session || typeof session !== 'object') return '';
+  const sessionId = _artifactScalarString(session.session_id);
+  if(!sessionId) return '';
+  const workspaceRoot = _artifactScalarString(session.workspace).replace(/\/+$/,'');
+  return `${sessionId}\u0000${workspaceRoot}`;
+}
+function _installWorkspaceSessionOwnerFence(){
+  if(typeof S === 'undefined' || !S || typeof S !== 'object') return;
+  const descriptor=Object.getOwnPropertyDescriptor(S,'session');
+  if(!descriptor || descriptor.configurable===false || descriptor.get || descriptor.set) return;
+  let current=descriptor.value;
+  _workspaceSessionOwnerKey=_workspaceSessionOwnerKeyFor(current);
+  try{
+    Object.defineProperty(S,'session',{
+      configurable:true,
+      enumerable:descriptor.enumerable,
+      get(){ return current; },
+      set(next){
+        const nextKey=_workspaceSessionOwnerKeyFor(next);
+        if(_workspaceSessionOwnerKey && _workspaceSessionOwnerKey!==nextKey){
+          _clearNativePreviewSinks();
+        }
+        current=next;
+        _workspaceSessionOwnerKey=nextKey;
+      },
+    });
+  }catch(_){
+    _workspaceSessionOwnerKey=null;
+  }
 }
 
 function _normalizeTypedArtifactPath(path){
@@ -871,6 +948,12 @@ async function openArtifactPath(path){
     ? generation===_workspaceOpenGeneration && _artifactOwnerMatchesSession(owner)
     : generation===_workspaceOpenGeneration;
   if(!ownerStillActive()) return;
+  // Invalidate any native sink from the previous preview before an async
+  // existence check. The open generation above is the authoritative token for
+  // this request, so clearing the sinks must not advance it a second time.
+  if(typeof _clearNativePreviewSinks === 'function'){
+    _clearNativePreviewSinks({bumpGeneration:false});
+  }
   // Artifact links are an explicit request to inspect a file. A closed
   // workspace panel must expand before openFile paints the preview, otherwise
   // the file is selected behind an invisible right-hand column.
@@ -1411,6 +1494,13 @@ async function openFile(path, opts={}){
   const routeOpts={...opts, owner};
   delete routeOpts._openGeneration;
 
+  // A direct file open is another owner transition point (the artifact path
+  // path already invalidates its sinks before the existence request). Clear all
+  // native sinks without advancing this call's captured generation.
+  if(typeof _clearNativePreviewSinks === 'function'){
+    _clearNativePreviewSinks({bumpGeneration:false});
+  }
+
   // Binary/download-only formats: trigger browser download, don't preview
   if(DOWNLOAD_EXTS.has(ext)){
     if(!ownerStillActive()) return;
@@ -1434,52 +1524,64 @@ async function openFile(path, opts={}){
     session_id: openFileOwner.session_id,
     workspace_root: openFileOwner.workspace_root || '',
   };
+  const nativePreviewToken=Object.freeze({
+    generation,
+    session_id:openFileOwner.session_id,
+    workspace_root:openFileOwner.workspace_root || '',
+    path,
+  });
+  const nativePreviewStillActive=()=>ownerStillActive()
+    && nativePreviewToken.generation===currentGeneration()
+    && _previewCurrentPath===nativePreviewToken.path
+    && !!_previewOwner
+    && _previewOwner.session_id===nativePreviewToken.session_id
+    && (_previewOwner.workspace_root||'')===nativePreviewToken.workspace_root;
   _previewPreserveArtifactPath = !!(opts && opts._preserveArtifactPath);
   if(!ownerStillActive()) return;
   renderFileBreadcrumb(path);
   if(IMAGE_EXTS.has(ext)){
     // Image: load via raw endpoint, show as <img>
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     showPreview('image');
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     const url=_workspaceRouteForPath(path, 'raw', routeOpts) + cacheBust;
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     $('previewImg').alt=path;
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     $('previewImg').src=url;
-    if(!ownerStillActive()) return;
-    $('previewImg').onerror=()=>{ if(!ownerStillActive()) return; setStatus(t('image_load_failed')); };
+    if(!nativePreviewStillActive()) return;
+    $('previewImg').onerror=()=>{ if(!nativePreviewStillActive()) return; setStatus(t('image_load_failed')); };
   } else if(AUDIO_EXTS.has(ext)||VIDEO_EXTS.has(ext)){
     const mode=VIDEO_EXTS.has(ext)?'video':'audio';
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     showPreview(mode);
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     const url=_workspaceRouteForPath(path, 'raw', {...routeOpts, inline:true}) + cacheBust;
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     const wrap=$('previewMediaWrap');
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     if(wrap){
       wrap.innerHTML=(typeof _mediaPlayerHtml==='function')
         ? _mediaPlayerHtml(mode,url,path.split('/').pop()||path)
         : `<${mode} src="${url.replace(/"/g,'%22')}" controls preload="metadata"></${mode}>`;
-      if(!ownerStillActive()) return;
+      if(!nativePreviewStillActive()) return;
       if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(wrap);
     }
   } else if(PDF_EXTS.has(ext)){
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     showPreview('pdf');
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     const legacyRawUrl = _workspaceRouteForPath(path, 'raw', {inline:true});
     const url=(routeOpts.owner
       ? _workspaceRouteForPath(path, 'raw', {...routeOpts, inline:true})
       : legacyRawUrl) + cacheBust;
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     const frame=$('previewPdfFrame');
     if(frame){
       frame.src=''; // clear first to avoid stale content
-      if(!ownerStillActive()) return;
+      if(!nativePreviewStillActive()) return;
       frame.src=url;
-      if(!ownerStillActive()) return;
+      if(!nativePreviewStillActive()) return;
       frame.title=`PDF preview: ${path.split('/').pop()||path}`;
     }
   } else if(MD_EXTS.has(ext)){
@@ -1520,15 +1622,15 @@ async function openFile(path, opts={}){
     // still prevents the preview from navigating the parent, accessing cookies,
     // or reading other origin data. If a stricter mode is needed, remove
     // allow-scripts (or add sandbox="") to disable all JS execution.
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     showPreview('html');
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     const url=_workspaceRouteForPath(path, 'raw', {...routeOpts, inline:true}) + cacheBust;
-    if(!ownerStillActive()) return;
+    if(!nativePreviewStillActive()) return;
     const iframe=$('previewHtmlIframe');
     if(iframe){
       iframe.src=''; // clear first to avoid stale content
-      if(!ownerStillActive()) return;
+      if(!nativePreviewStillActive()) return;
       iframe.src=url;
     }
   } else if(ext==='.csv'){
@@ -1873,6 +1975,8 @@ function _bindWorkspaceOsUploadDropTarget(el, destDir) {
     await uploadOsDropToWorkspace(e.dataTransfer, destDir);
   });
 }
+
+_installWorkspaceSessionOwnerFence();
 
 // Drag-and-drop files onto workspace file tree
 if (typeof document !== 'undefined') {

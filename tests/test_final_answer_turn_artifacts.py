@@ -371,6 +371,111 @@ def test_artifact_owner_match_requires_root_when_captured():
     assert output == [False, True, True, False]
 
 
+def test_current_session_artifact_owner_requires_non_empty_string_id_and_trims_once():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    start = workspace.index("function _artifactScalarString(value){")
+    end = workspace.index("function _artifactCandidatesFromText", start)
+    output = _run_node(
+        workspace[start:end]
+        + "\nconst cases = ["
+        + "{session_id:'  sid-current  ',workspace:'/workspace'},"
+        + "{session_id:'   ',workspace:'/workspace'},"
+        + "{session_id:'',workspace:'/workspace'},"
+        + "{session_id:42,workspace:'/workspace'},"
+        + "{session_id:{value:'sid-object'},workspace:'/workspace'},"
+        + "null"
+        + "];\n"
+        + "console.log(JSON.stringify(cases.map((session)=>{ global.S={session}; return _artifactOwnerFromCurrentSession(); })));"
+    )
+    assert output == [
+        {"session_id": "sid-current", "workspace_root": "/workspace"},
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+
+
+def test_native_preview_owner_switch_fences_old_loads_and_clears_all_sinks():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    helpers = workspace[workspace.index("const ARTIFACT_IGNORE_RE") : workspace.index("async function _workspacePathExists")]
+    open_file = workspace[
+        workspace.index("async function openFile") : workspace.index("function downloadFile")
+    ]
+    clear_preview = _function_source(
+        "static/boot.js", "function clearPreview", "function _applySessionContextMetadataUpdate"
+    )
+    output = _run_node(
+        "const status=[]; const dom=[];\n"
+        "class Node{constructor(id){this.id=id;this.style={display:''};this.classList={add(){},remove(){}};this.src='';this.onerror=null;this.onload=null;this.innerHTML='';this.children=[];this.paused=false;this.title='';this.alt='';}\n"
+        "set innerHTML(value){this._innerHTML=String(value);this.children=[];if(this._innerHTML){const child=new Node('media');child.src=(this._innerHTML.match(/src=\\\"([^\\\"]*)/)||[])[1]||'';this.children.push(child);}}\n"
+        "get innerHTML(){return this._innerHTML||'';} pause(){this.paused=true;dom.push(this.id+':pause');} load(){dom.push(this.id+':load');} querySelectorAll(){return this.children;} setAttribute(){} appendChild(){} }\n"
+        "const nodes={}; const $=(id)=>nodes[id]||(nodes[id]=new Node(id));\n"
+        "const document={createElement:()=>new Node('created'),body:{appendChild(){},removeChild(){}}}; const window={};\n"
+        "const S={session:{session_id:'sid-a',workspace:'/workspace-a'}};\n"
+        "const IMAGE_EXTS=new Set(['.png']); const AUDIO_EXTS=new Set(['.mp3']); const VIDEO_EXTS=new Set(['.mp4']); const PDF_EXTS=new Set(['.pdf']); const MD_EXTS=new Set(['.md']); const HTML_EXTS=new Set(['.html']); const DOWNLOAD_EXTS=new Set();\n"
+        "const fileExt=(path)=>path.slice(path.lastIndexOf('.')).toLowerCase(); const t=(value)=>value; const setStatus=(value)=>status.push(value);\n"
+        "const showPreview=(mode)=>{ $('previewArea').classList.add('visible'); $('previewBadge').textContent=mode; }; const renderFileBreadcrumb=()=>{}; const renderMarkdownPreviewContent=()=>{}; const renderCodePreviewContent=()=>{}; const renderCsvPreviewContent=()=>false; const shouldRenderMarkdownPreviewAsPlainText=()=>false; const setLargeMarkdownForceRenderVisible=()=>{}; const largeMarkdownPlainTextStatus=()=>'';\n"
+        "const _workspaceRouteForPath=()=>'/raw'; const _workspaceRouteForPathRel=(path,kind,opts={})=>typeof _artifactOwnerFromOptions==='function'&&_artifactOwnerFromOptions(opts)?'/raw':''; const _workspaceEscapeGrantForPath=()=>null; const _clearWorkspaceEscapeGrant=()=>{}; const _mediaPlayerHtml=(mode,url)=>`<${mode} src=\\\"${url}\\\" controls></${mode}>`; const _applyMediaPlaybackPreferences=()=>{}; const showToast=()=>{};\n"
+        "const api=()=>Promise.resolve({content:'# loaded'}); let _workspacePanelMode='preview'; const closeWorkspacePanel=()=>{}; const openWorkspacePanel=()=>{}; const syncWorkspacePanelUI=()=>{}; const renderBreadcrumb=()=>{};\n"
+        "const handleWorkspaceClose=()=>{};\n"
+        "let _previewCurrentPath=''; let _previewOwner=null; let _previewPreserveArtifactPath=false; let _previewCurrentMode=''; let _previewDirty=false; let _previewServerEditable=null; let _previewSaveRoute=''; let _previewOfficeFormat=''; let _previewPreviewKind=''; let _previewRawContent=''; let _previewRawContentPath='';\n"
+        + helpers
+        + open_file
+        + clear_preview
+        + "_installWorkspaceSessionOwnerFence();\n"
+        + "async function run(){\n"
+        + "  const ownerA={session_id:'sid-a',workspace_root:'/workspace-a'}; const ownerB={session_id:'sid-b',workspace_root:'/workspace-b'};\n"
+        + "  await openFile('output/a.png',{owner:ownerA}); const staleImageError=$('previewImg').onerror;\n"
+        + "  S.session={session_id:'sid-b',workspace:'/workspace-b'}; await openFile('output/b.png',{owner:ownerB}); const bImage={path:_previewCurrentPath,src:$('previewImg').src,status:status.length}; staleImageError(); const imageControl={path:_previewCurrentPath,src:$('previewImg').src,status:status.length,bOwner:_previewOwner&&_previewOwner.session_id};\n"
+        + "  S.session={session_id:'sid-a',workspace:'/workspace-a'}; await openFile('output/a.html',{owner:ownerA}); const html=$('previewHtmlIframe'); const staleHtmlSrc=html.src; html.onload=()=>{status.push('stale-html-load');html.src=staleHtmlSrc+'#settled';}; html.onerror=()=>status.push('stale-html-error');\n"
+        + "  S.session={session_id:'sid-b',workspace:'/workspace-b'}; const switchedIframe={src:html.src,status:status.length,onload:html.onload,onerror:html.onerror}; if(typeof html.onload==='function')html.onload(); if(typeof html.onerror==='function')html.onerror(); await openFile('output/b.html',{owner:ownerB}); const bHtmlSrc=html.src; const iframeControl={path:_previewCurrentPath,src:html.src,expected:bHtmlSrc,status:status.length,switched:switchedIframe};\n"
+        + "  S.session={session_id:'sid-a',workspace:'/workspace-a'}; await openFile('output/a.mp3',{owner:ownerA}); const media=$('previewMediaWrap'); const staleMedia=media.children[0]; if(staleMedia)staleMedia.onerror=()=>status.push('stale-media-error'); const staleMediaHtml=media.innerHTML;\n"
+        + "  S.session={session_id:'sid-b',workspace:'/workspace-b'}; clearPreview(); const mediaCleared={html:media.innerHTML,children:media.children.length,paused:!!(staleMedia&&staleMedia.paused),dom:dom.slice(),status:status.length};\n"
+        + "  await openFile('output/b.png',{owner:ownerB}); const bError=$('previewImg').onerror; bError(); const currentOwnerControl={path:_previewCurrentPath,owner:_previewOwner&&_previewOwner.session_id,status:status.slice()};\n"
+        + "  S.session={session_id:42,workspace:'/workspace-b'}; const numericBefore={generation:_workspaceOpenGeneration,path:_previewCurrentPath,src:$('previewImg').src,status:status.length}; const numericRoute=_workspaceRouteForPathRel('output/numeric.png','raw'); await openFile('output/numeric.png'); const numericAfter={generation:_workspaceOpenGeneration,path:_previewCurrentPath,src:$('previewImg').src,status:status.length,owner:_artifactOwnerFromCurrentSession()};\n"
+        + "  S.session={session_id:{value:'sid-object'},workspace:'/workspace-b'}; const objectBefore={generation:_workspaceOpenGeneration,path:_previewCurrentPath,src:$('previewImg').src,status:status.length}; const objectRoute=_workspaceRouteForPathRel('output/object.png','raw'); await openFile('output/object.png'); const objectAfter={generation:_workspaceOpenGeneration,path:_previewCurrentPath,src:$('previewImg').src,status:status.length,owner:_artifactOwnerFromCurrentSession()};\n"
+        + "  console.log(JSON.stringify({bImage, imageControl, iframeControl, mediaCleared, currentOwnerControl, numeric:{before:numericBefore,after:numericAfter,route:numericRoute}, object:{before:objectBefore,after:objectAfter,route:objectRoute}}));\n"
+        + "} run().catch(error=>{console.error(error);process.exit(1)});"
+    )
+    assert output["bImage"] == {"path": "output/b.png", "src": "/raw", "status": 0}
+    assert output["imageControl"] == {
+        "path": "output/b.png",
+        "src": "/raw",
+        "status": 0,
+        "bOwner": "sid-b",
+    }
+    assert output["iframeControl"]["path"] == "output/b.html"
+    assert output["iframeControl"]["src"] == output["iframeControl"]["expected"] == "/raw"
+    assert output["iframeControl"]["status"] == 0
+    assert output["iframeControl"]["switched"] == {
+        "src": "",
+        "status": 0,
+        "onload": None,
+        "onerror": None,
+    }
+    assert output["mediaCleared"]["html"] == ""
+    assert output["mediaCleared"]["children"] == 0
+    assert output["mediaCleared"]["paused"] is True
+    assert output["mediaCleared"]["status"] == 0
+    assert output["currentOwnerControl"] == {
+        "path": "output/b.png",
+        "owner": "sid-b",
+        "status": ["image_load_failed"],
+    }
+    assert output["numeric"]["route"] == ""
+    assert output["numeric"]["after"] == {
+        **output["numeric"]["before"],
+        "owner": None,
+    }
+    assert output["object"]["route"] == ""
+    assert output["object"]["after"] == {
+        **output["object"]["before"],
+        "owner": None,
+    }
+
+
 def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():
     workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
     helpers = workspace[workspace.index("const ARTIFACT_IGNORE_RE") : workspace.index("async function _workspacePathExists")]
