@@ -1102,6 +1102,372 @@ def test_run_journal_bounded_reader_invalid_json_cannot_advance_seq_authority(tm
     assert journal["complete"] is True
 
 
+def test_run_journal_bounded_reader_resumes_inside_oversized_row_and_reaches_suffix(
+    tmp_path,
+    monkeypatch,
+):
+    scan_cap = 384
+    monkeypatch.setattr(run_journal, "_BOUNDED_REPLAY_MAX_SCAN_BYTES", scan_cap)
+    monkeypatch.setattr(run_journal, "_LEGACY_TERMINAL_RECOVERY_MAX_BYTES", 128)
+    session_id = "session_mid_row_resume"
+    run_id = "run_mid_row_resume"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    _write_bounded_events(
+        path,
+        [
+            _bounded_event(session_id, run_id, 1, "x" * 2048),
+            _bounded_event(session_id, run_id, 2, "reachable"),
+        ],
+    )
+
+    token = None
+    after_seq = None
+    seen = []
+    incomplete_prefix_pages = 0
+    for _page_number in range(12):
+        page = read_run_events(
+            session_id,
+            run_id,
+            after_seq=after_seq,
+            resume_token=token,
+            session_dir=tmp_path,
+            max_bytes=4096,
+            max_rows=2,
+        )
+        assert page["scanned_bytes"] <= scan_cap
+        seen.extend(page["events"])
+        if page["complete"]:
+            break
+        assert page["resume_token"]
+        if page["next_after_seq"] == 0:
+            incomplete_prefix_pages += 1
+        token = page["resume_token"]
+        after_seq = page["next_after_seq"]
+    else:
+        pytest.fail("bounded replay never reached the row after the oversized prefix")
+
+    assert incomplete_prefix_pages >= 2
+    assert [event["seq"] for event in seen] == [2]
+    assert page["next_after_seq"] == 2
+
+
+def test_run_journal_mid_row_token_restores_late_authority_and_partial_unicode_escape(
+    tmp_path,
+    monkeypatch,
+):
+    session_id = "session_late_mid_row_authority"
+    run_id = "run_late_mid_row_authority"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True)
+    nested_depth = 40
+    payload_prefix = (
+        b'{"payload":'
+        + (b"[" * nested_depth)
+        + b'{"text":"'
+        + (b"x" * 120)
+    )
+    scan_cap = len(payload_prefix) + len(b"\\u2")
+    late_authority_row = (
+        payload_prefix
+        + b"\\u2603"  # first scan ends inside this JSON unicode escape
+        + b'"}'
+        + (b"]" * nested_depth)
+        + b',"version":1,"event_id":"'
+        + f"{run_id}:1".encode("utf-8")
+        + b'","seq":1,"run_id":"'
+        + run_id.encode("utf-8")
+        + b'","session_id":"'
+        + session_id.encode("utf-8")
+        + b'","event":"token","type":"token","terminal":false,'
+        + b'"terminal_state":null}\n'
+    )
+    suffix = _bounded_event(session_id, run_id, 2, "reachable-after-late-authority")
+    path.write_bytes(
+        late_authority_row
+        + json.dumps(suffix, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+    monkeypatch.setattr(run_journal, "_LEGACY_TERMINAL_RECOVERY_MAX_BYTES", 64)
+    monkeypatch.setattr(run_journal, "_BOUNDED_REPLAY_MAX_SCAN_BYTES", scan_cap)
+
+    token = None
+    after_seq = None
+    seen = []
+    prefix_pages = 0
+    for _page_number in range(12):
+        page = read_run_events(
+            session_id,
+            run_id,
+            after_seq=after_seq,
+            resume_token=token,
+            session_dir=tmp_path,
+            max_bytes=4096,
+            max_rows=2,
+        )
+        seen.extend(page["events"])
+        if page["complete"]:
+            break
+        assert page["resume_token"]
+        assert len(page["resume_token"]) <= run_journal._REPLAY_RESUME_TOKEN_MAX_CHARS
+        token = page["resume_token"]
+        after_seq = page["next_after_seq"]
+        if after_seq == 0:
+            prefix_pages += 1
+        else:
+            monkeypatch.setattr(run_journal, "_BOUNDED_REPLAY_MAX_SCAN_BYTES", 4096)
+    else:
+        pytest.fail("late-authority oversized row never reached its suffix")
+
+    assert prefix_pages >= 2
+    assert [event["seq"] for event in seen] == [2]
+    assert page["next_after_seq"] == 2
+
+
+def test_run_journal_bounded_resume_accepts_logical_cursor_ahead_of_physical_seq(
+    tmp_path,
+    monkeypatch,
+):
+    session_id = "session_logical_physical_cursor"
+    run_id = "run_logical_physical_cursor"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    first = _bounded_event(session_id, run_id, 4, "before-floor")
+    later = _bounded_event(session_id, run_id, 6, "after-floor")
+    _write_bounded_events(path, [first, later])
+    first_size = len(json.dumps(first, separators=(",", ":")).encode("utf-8")) + 1
+    monkeypatch.setattr(run_journal, "_BOUNDED_REPLAY_MAX_SCAN_BYTES", first_size)
+
+    first_page = read_run_events(
+        session_id,
+        run_id,
+        after_seq=5,
+        session_dir=tmp_path,
+        max_bytes=4096,
+        max_rows=1,
+    )
+    assert first_page["events"] == []
+    assert first_page["next_after_seq"] == 5
+    assert first_page["resume_token"]
+
+    monkeypatch.setattr(run_journal, "_BOUNDED_REPLAY_MAX_SCAN_BYTES", 4096)
+    resumed = read_run_events(
+        session_id,
+        run_id,
+        after_seq=5,
+        resume_token=first_page["resume_token"],
+        session_dir=tmp_path,
+        max_bytes=4096,
+        max_rows=1,
+    )
+
+    assert [event["seq"] for event in resumed["events"]] == [6]
+    assert resumed["complete"] is True
+    assert resumed["next_after_seq"] == 6
+
+
+def test_run_journal_bounded_reader_continues_after_over_digit_limit_integer(tmp_path):
+    session_id = "session_over_digit_integer"
+    run_id = "run_over_digit_integer"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True)
+    oversized_integer = (
+        b'{"version":1,"event_id":"'
+        + f"{run_id}:999".encode("utf-8")
+        + b'","seq":999,"run_id":"'
+        + run_id.encode("utf-8")
+        + b'","session_id":"'
+        + session_id.encode("utf-8")
+        + b'","event":"token","type":"token","payload":{"number":'
+        + (b"9" * 5000)
+        + b"}}\n"
+    )
+    valid = _bounded_event(session_id, run_id, 1, "valid")
+    path.write_bytes(
+        oversized_integer
+        + json.dumps(valid, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+
+    journal = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=8192, max_rows=2,
+    )
+
+    assert [event["seq"] for event in journal["events"]] == [1]
+    assert journal["malformed"] == [
+        {"line": 1, "reason": "replay_invalid_json_value"},
+    ]
+    assert journal["next_after_seq"] == 1
+    assert journal["complete"] is True
+
+
+def test_run_journal_bounded_resume_rejects_recreated_generation_with_same_inode(
+    tmp_path,
+    monkeypatch,
+):
+    session_id = "session_recreated_generation"
+    run_id = "run_recreated_generation"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    append_run_event(
+        session_id, run_id, "token", {"text": "old-one"},
+        session_dir=tmp_path, seq=1, created_at=1.0,
+    )
+    append_run_event(
+        session_id, run_id, "token", {"text": "old-two"},
+        session_dir=tmp_path, seq=2, created_at=2.0,
+    )
+    original_stat = path.stat()
+    first_page = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_rows=1,
+    )
+
+    path.unlink()
+    append_run_event(
+        session_id, run_id, "token", {"text": "new-one"},
+        session_dir=tmp_path, seq=1, created_at=1.0,
+    )
+    append_run_event(
+        session_id, run_id, "token", {"text": "new-two"},
+        session_dir=tmp_path, seq=2, created_at=2.0,
+    )
+
+    real_fstat = os.fstat
+
+    class SameInodeStat:
+        def __init__(self, current):
+            self._current = current
+            self.st_dev = original_stat.st_dev
+            self.st_ino = original_stat.st_ino
+
+        def __getattr__(self, name):
+            return getattr(self._current, name)
+
+    monkeypatch.setattr(
+        run_journal.os,
+        "fstat",
+        lambda fd: SameInodeStat(real_fstat(fd)),
+    )
+    resumed = read_run_events(
+        session_id,
+        run_id,
+        after_seq=first_page["next_after_seq"],
+        resume_token=first_page["resume_token"],
+        session_dir=tmp_path,
+        max_rows=1,
+    )
+
+    assert resumed["events"] == []
+    assert resumed["complete"] is False
+    assert resumed["limit_reason"] == "replay_cursor_invalid"
+
+
+def test_run_journal_generation_failure_cannot_leave_a_reported_failed_event(
+    tmp_path,
+    monkeypatch,
+):
+    session_id = "session_generation_write_failure"
+    run_id = "run_generation_write_failure"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+
+    def fail_generation_write(*_args, **_kwargs):
+        raise OSError("generation-sidecar-write-failed")
+
+    monkeypatch.setattr(
+        run_journal,
+        "_write_run_generation_record",
+        fail_generation_write,
+    )
+
+    with pytest.raises(OSError, match="generation-sidecar-write-failed"):
+        append_run_event(
+            session_id,
+            run_id,
+            "token",
+            {"text": "must-not-be-reported-failed-after-append"},
+            session_dir=tmp_path,
+            seq=1,
+            created_at=1.0,
+        )
+
+    assert not path.exists() or path.read_bytes() == b""
+
+
+def test_run_journal_reader_binds_generation_to_open_file_identity(tmp_path, monkeypatch):
+    session_id = "session_open_file_generation"
+    run_id = "run_open_file_generation"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    _write_bounded_events(
+        path,
+        [
+            _bounded_event(session_id, run_id, 1, "one"),
+            _bounded_event(session_id, run_id, 2, "two"),
+        ],
+    )
+    real_identity = run_journal._run_file_identity(path)
+    assert real_identity is not None
+    monkeypatch.setattr(
+        run_journal,
+        "_run_file_identity",
+        lambda _path: (real_identity[0], real_identity[1] + 1),
+    )
+
+    first_page = read_run_events(
+        session_id,
+        run_id,
+        session_dir=tmp_path,
+        max_rows=1,
+    )
+    monkeypatch.undo()
+    resumed = read_run_events(
+        session_id,
+        run_id,
+        after_seq=first_page["next_after_seq"],
+        resume_token=first_page["resume_token"],
+        session_dir=tmp_path,
+        max_rows=1,
+    )
+
+    assert [event["seq"] for event in resumed["events"]] == [2]
+    assert resumed["complete"] is True
+
+
+@pytest.mark.parametrize("nonfinite", [b"NaN", b"Infinity", b"-Infinity"])
+def test_run_journal_bounded_reader_rejects_nonfinite_json_before_seq_authority(
+    tmp_path,
+    nonfinite,
+):
+    session_id = "session_nonfinite_json"
+    run_id = "run_nonfinite_json"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True)
+    malformed = (
+        b'{"version":1,"event_id":"'
+        + f"{run_id}:999".encode("utf-8")
+        + b'","seq":999,"run_id":"'
+        + run_id.encode("utf-8")
+        + b'","session_id":"'
+        + session_id.encode("utf-8")
+        + b'","event":"token","type":"token","payload":{"number":'
+        + nonfinite
+        + b"}}\n"
+    )
+    valid = _bounded_event(session_id, run_id, 1, "valid")
+    path.write_bytes(
+        malformed
+        + json.dumps(valid, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+
+    journal = read_run_events(
+        session_id, run_id, session_dir=tmp_path, max_bytes=4096, max_rows=2,
+    )
+
+    assert [event["seq"] for event in journal["events"]] == [1]
+    assert journal["malformed"] == [
+        {"line": 1, "reason": "replay_invalid_envelope"},
+    ]
+    assert journal["next_after_seq"] == 1
+    assert journal["complete"] is True
+
+
 @pytest.mark.parametrize("max_rows", [0, -1])
 def test_run_journal_bounded_reader_rejects_nonpositive_row_cap(tmp_path, max_rows):
     session_id = "session_zero_row_cap"

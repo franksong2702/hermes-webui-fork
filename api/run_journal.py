@@ -12,11 +12,14 @@ import hmac
 import json
 import os
 import re
+import secrets
 import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterable
+
+_REAL_FSYNC = os.fsync
 
 RUN_JOURNAL_DIR_NAME = "_run_journal"
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -59,9 +62,12 @@ _LEGACY_TERMINAL_RECOVERY_MAX_BYTES = 16 * 1024 * 1024
 _BOUNDED_REPLAY_MAX_SCAN_BYTES = 32 * 1024 * 1024
 _BOUNDED_REPLAY_MAX_SCAN_ROWS = 4096
 _BOUNDED_REPLAY_MAX_MALFORMED = 64
-_REPLAY_RESUME_TOKEN_MAX_CHARS = 512
-_REPLAY_RESUME_TOKEN_VERSION = 2
-_REPLAY_RESUME_TOKEN_HMAC_DOMAIN = b"hermes-webui:run-journal-replay:v2\0"
+_REPLAY_RESUME_TOKEN_MAX_CHARS = 16 * 1024
+_REPLAY_RESUME_TOKEN_VERSION = 3
+_REPLAY_RESUME_TOKEN_HMAC_DOMAIN = b"hermes-webui:run-journal-replay:v3\0"
+_REPLAY_RESUME_STATE_MAX_BYTES = 8 * 1024
+_RUN_JOURNAL_GENERATION_VERSION = 1
+_RUN_JOURNAL_GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
 _SNAPSHOT_ARGS_MAX_ITEMS = 64
 _SNAPSHOT_ARGS_MAX_DEPTH = 8
 _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
@@ -87,6 +93,129 @@ def _run_path(session_id: str, run_id: str, session_dir: Path | None = None) -> 
     rid = _validate_id(run_id, "run_id")
     root = Path(session_dir) if session_dir is not None else _default_session_dir()
     return root / RUN_JOURNAL_DIR_NAME / sid / f"{rid}.jsonl"
+
+
+def _run_generation_path(path: Path) -> Path:
+    """Return the durable generation sidecar for one JSONL journal."""
+    return path.with_name(f"{path.name}.generation")
+
+
+def _run_file_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return int(stat.st_dev), int(stat.st_ino)
+
+
+def _read_run_generation_record(path: Path) -> tuple[str, tuple[int, int] | None] | None:
+    generation_path = _run_generation_path(path)
+    try:
+        raw = generation_path.read_text(encoding="ascii")
+        record = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    generation = record.get("generation")
+    if (
+        record.get("version") != _RUN_JOURNAL_GENERATION_VERSION
+        or not isinstance(generation, str)
+        or _RUN_JOURNAL_GENERATION_RE.fullmatch(generation) is None
+    ):
+        return None
+    device = record.get("device")
+    inode = record.get("inode")
+    if device is None and inode is None:
+        identity = None
+    elif (
+        isinstance(device, bool)
+        or not isinstance(device, int)
+        or device < 0
+        or isinstance(inode, bool)
+        or not isinstance(inode, int)
+        or inode < 0
+    ):
+        return None
+    else:
+        identity = (device, inode)
+    return generation, identity
+
+
+def _write_run_generation_record(
+    path: Path,
+    generation: str,
+    *,
+    identity: tuple[int, int] | None = None,
+) -> None:
+    """Persist one generation nonce and the current file identity atomically."""
+    if _RUN_JOURNAL_GENERATION_RE.fullmatch(generation) is None:
+        raise ValueError("invalid run-journal generation")
+    if identity is None:
+        identity = _run_file_identity(path)
+    record = {
+        "version": _RUN_JOURNAL_GENERATION_VERSION,
+        "generation": generation,
+        "device": identity[0] if identity is not None else None,
+        "inode": identity[1] if identity is not None else None,
+    }
+    generation_path = _run_generation_path(path)
+    generation_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = generation_path.with_name(
+        f".{generation_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    raw = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii")
+    fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+            fh.flush()
+            _REAL_FSYNC(fh.fileno())
+        os.replace(temporary, generation_path)
+        _fsync_parent_dir(generation_path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _prepare_run_generation_for_append(
+    path: Path,
+    *,
+    identity: tuple[int, int] | None = None,
+    force_rotate: bool = False,
+) -> tuple[str, bool]:
+    """Return the nonce to use for an append and whether its sidecar needs writing."""
+    if identity is None:
+        identity = _run_file_identity(path)
+    record = _read_run_generation_record(path)
+    if force_rotate or identity is None or record is None or record[1] != identity:
+        return secrets.token_hex(16), True
+    return record[0], False
+
+
+def _ensure_run_generation_for_read(
+    path: Path,
+    *,
+    identity: tuple[int, int] | None = None,
+) -> str | None:
+    """Load/create the nonce used by replay tokens for the currently-open JSONL."""
+    if identity is None:
+        identity = _run_file_identity(path)
+    if identity is None:
+        return None
+    # Readers and appenders must agree on the first-created nonce. The short
+    # lock scope only covers sidecar read/replace; journal bytes remain readable
+    # concurrently with ordinary appends.
+    with _lock_for(path):
+        record = _read_run_generation_record(path)
+        if record is not None and record[1] == identity:
+            return record[0]
+        generation = secrets.token_hex(16)
+        _write_run_generation_record(path, generation, identity=identity)
+        return generation
 
 
 def _lock_for(path: Path) -> threading.Lock:
@@ -346,7 +475,7 @@ def _fsync_parent_dir(path: Path) -> None:
     try:
         dir_fd = os.open(path.parent, getattr(os, "O_DIRECTORY", 0))
         try:
-            os.fsync(dir_fd)
+            _REAL_FSYNC(dir_fd)
         finally:
             os.close(dir_fd)
     except OSError:
@@ -413,34 +542,49 @@ def append_run_event(
     if not event_name:
         raise ValueError("event_name is required")
     with _lock_for(path):
-        if seq is not None:
-            assigned_seq = int(seq)
-            _note_assigned_seq(path, assigned_seq)
-        else:
-            assigned_seq = _reserve_next_seq(path)
-        terminal_state = _terminal_state_for_event(event_name, payload)
-        event = {
-            "version": 1,
-            "event_id": f"{run_id}:{assigned_seq}",
-            "seq": assigned_seq,
-            "run_id": str(run_id),
-            "session_id": str(session_id),
-            "event": event_name,
-            "type": event_name,
-            "created_at": float(created_at if created_at is not None else time.time()),
-            "terminal": bool(terminal_state),
-            "terminal_state": terminal_state,
-            "payload": payload,
-        }
         path.parent.mkdir(parents=True, exist_ok=True)
         created_file = not path.exists()
-        line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
         fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as fh:
-            fh.write(line)
-            fh.flush()
-            if _should_fsync_event(terminal_state):
-                os.fsync(fh.fileno())
+        try:
+            stat = os.fstat(fd)
+            identity = int(stat.st_dev), int(stat.st_ino)
+            generation, generation_needs_write = _prepare_run_generation_for_append(
+                path,
+                identity=identity,
+                force_rotate=created_file,
+            )
+            if generation_needs_write:
+                _write_run_generation_record(path, generation, identity=identity)
+            if seq is not None:
+                assigned_seq = int(seq)
+                _note_assigned_seq(path, assigned_seq)
+            else:
+                assigned_seq = _reserve_next_seq(path)
+            terminal_state = _terminal_state_for_event(event_name, payload)
+            event = {
+                "version": 1,
+                "event_id": f"{run_id}:{assigned_seq}",
+                "seq": assigned_seq,
+                "run_id": str(run_id),
+                "session_id": str(session_id),
+                "event": event_name,
+                "type": event_name,
+                "created_at": float(created_at if created_at is not None else time.time()),
+                "terminal": bool(terminal_state),
+                "terminal_state": terminal_state,
+                "payload": payload,
+            }
+            line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+            fh = os.fdopen(fd, "a", encoding="utf-8")
+            fd = None
+            with fh:
+                fh.write(line)
+                fh.flush()
+                if _should_fsync_event(terminal_state):
+                    os.fsync(fh.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
         _discard_cached_summary(path)
         if created_file:
             _fsync_parent_dir(path)
@@ -531,6 +675,14 @@ def _serialized_event_size(event: dict) -> int:
     return len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
 
 
+class _ReplayInvalidJsonEnvelope(ValueError):
+    """Raised when a retained JSON row uses a non-standard numeric constant."""
+
+
+def _reject_nonfinite_json_value(value: str):
+    raise _ReplayInvalidJsonEnvelope(value)
+
+
 def _replay_resume_signing_key() -> bytes:
     # Reuse the installation-persistent key so valid cursors survive restarts
     # without introducing a second secret lifecycle.
@@ -560,6 +712,30 @@ def _decode_urlsafe_unpadded(value: str) -> bytes:
     return base64.b64decode(value + padding, altchars=b"-_", validate=True)
 
 
+def _encode_replay_resume_state(scanner: "_TopLevelEnvelopeScanner") -> str:
+    raw = json.dumps(
+        scanner.snapshot(), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    if len(raw) > _REPLAY_RESUME_STATE_MAX_BYTES:
+        raise ValueError("replay_resume_state_too_large")
+    return _encode_urlsafe_unpadded(raw)
+
+
+def _decode_replay_resume_state(encoded: Any) -> "_TopLevelEnvelopeScanner | None":
+    if encoded is None:
+        return None
+    if not isinstance(encoded, str) or not encoded:
+        raise ValueError("invalid replay resume state")
+    raw = _decode_urlsafe_unpadded(encoded)
+    if len(raw) > _REPLAY_RESUME_STATE_MAX_BYTES:
+        raise ValueError("invalid replay resume state")
+    try:
+        state = json.loads(raw.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("invalid replay resume state") from None
+    return _TopLevelEnvelopeScanner.from_snapshot(state)
+
+
 def _encode_replay_resume_token(
     fh,
     *,
@@ -570,8 +746,12 @@ def _encode_replay_resume_token(
     next_after_seq: int,
     last_physical_seq: int,
     line_no: int,
+    generation: str,
+    scanner: "_TopLevelEnvelopeScanner | None" = None,
 ) -> str:
     stat = os.fstat(fh.fileno())
+    if _RUN_JOURNAL_GENERATION_RE.fullmatch(generation) is None:
+        raise ValueError("invalid run-journal generation")
     payload = {
         "v": _REPLAY_RESUME_TOKEN_VERSION,
         "d": int(stat.st_dev),
@@ -583,12 +763,17 @@ def _encode_replay_resume_token(
         "c": max_seq,
         "x": str(session_id),
         "r": str(run_id),
+        "g": generation,
+        "q": None if scanner is None else _encode_replay_resume_state(scanner),
     }
     payload_bytes = _replay_resume_payload_bytes(payload)
-    return ".".join((
+    token = ".".join((
         _encode_urlsafe_unpadded(payload_bytes),
         _encode_urlsafe_unpadded(_replay_resume_signature(payload_bytes)),
     ))
+    if len(token) > _REPLAY_RESUME_TOKEN_MAX_CHARS:
+        raise ValueError("replay_resume_token_too_large")
+    return token
 
 
 def _decode_replay_resume_token(
@@ -599,7 +784,8 @@ def _decode_replay_resume_token(
     run_id: str,
     expected_after_seq: int | None,
     expected_max_seq: int | None,
-) -> tuple[int, int, int, int, int] | None:
+    expected_generation: str | None,
+) -> tuple[int, int, int, int, int, "_TopLevelEnvelopeScanner | None"] | None:
     raw_token = str(token or "").strip()
     if (
         not raw_token
@@ -611,16 +797,16 @@ def _decode_replay_resume_token(
         payload_token, signature_token = raw_token.split(".")
         payload_bytes = _decode_urlsafe_unpadded(payload_token)
         signature = _decode_urlsafe_unpadded(signature_token)
-    except ValueError:
+    except (TypeError, ValueError):
         return None
     if not hmac.compare_digest(signature, _replay_resume_signature(payload_bytes)):
         return None
     try:
         payload = json.loads(payload_bytes.decode("ascii"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
     if not isinstance(payload, dict) or set(payload) != {
-        "v", "d", "i", "o", "s", "p", "l", "c", "x", "r",
+        "v", "d", "i", "o", "s", "p", "l", "c", "x", "r", "g", "q",
     }:
         return None
     canonical_payload = _replay_resume_payload_bytes(payload)
@@ -636,21 +822,32 @@ def _decode_replay_resume_token(
         or offset < 0
         or token_seq < 0
         or (expected_after_seq is not None and token_seq != expected_after_seq)
-        or physical_seq < token_seq
+        or physical_seq < 0
         or line_no < 0
         or isinstance(token_max_seq, bool)
         or (token_max_seq is not None and not isinstance(token_max_seq, int))
         or token_max_seq != expected_max_seq
         or payload["x"] != str(session_id)
         or payload["r"] != str(run_id)
+        or not isinstance(payload["g"], str)
+        or _RUN_JOURNAL_GENERATION_RE.fullmatch(payload["g"]) is None
+        or expected_generation is None
+        or payload["g"] != expected_generation
     ):
+        return None
+    try:
+        scanner = _decode_replay_resume_state(payload["q"])
+    except (TypeError, ValueError):
+        return None
+    partial = scanner is not None
+    if partial and offset <= 0:
         return None
     boundary_scan_bytes = 0
     try:
         stat = os.fstat(fh.fileno())
         if device != int(stat.st_dev) or inode != int(stat.st_ino) or offset > int(stat.st_size):
             return None
-        if offset > 0 and offset != int(stat.st_size):
+        if not partial and offset > 0 and offset != int(stat.st_size):
             fh.seek(offset - 1)
             boundary = fh.read(1)
             boundary_scan_bytes = len(boundary)
@@ -659,7 +856,7 @@ def _decode_replay_resume_token(
         fh.seek(offset)
     except (OSError, ValueError):
         return None
-    return offset, token_seq, physical_seq, line_no, boundary_scan_bytes
+    return offset, token_seq, physical_seq, line_no, boundary_scan_bytes, scanner
 
 
 class _StreamingJsonValidator:
@@ -962,6 +1159,116 @@ class _StreamingJsonValidator:
             if self._invalid:
                 return
 
+    def snapshot(self) -> dict[str, Any]:
+        """Return only bounded parser state needed to continue one partial row."""
+        pending, decoder_flag = self._decoder.getstate()
+        return {
+            "d": pending.hex(),
+            "df": int(decoder_flag),
+            "f": [[frame["kind"], frame["state"]] for frame in self._frames],
+            "a": self._started,
+            "n": self._done,
+            "i": self._invalid,
+            "z": self._finalized,
+            "m": self._mode,
+            "r": self._string_role,
+            "e": self._escape_state,
+            "u": self._unicode_digits,
+            "l": self._literal,
+            "li": self._literal_index,
+            "q": self._number_state,
+        }
+
+    @classmethod
+    def from_snapshot(cls, state: Any) -> "_StreamingJsonValidator":
+        if not isinstance(state, dict):
+            raise ValueError("invalid replay validator state")
+        validator = cls()
+        try:
+            pending_hex = state["d"]
+            decoder_flag = state["df"]
+            frames = state["f"]
+            if (
+                not isinstance(pending_hex, str)
+                or len(pending_hex) > 8
+                or not isinstance(decoder_flag, int)
+                or isinstance(decoder_flag, bool)
+                or not isinstance(frames, list)
+                or len(frames) > cls._MAX_NESTING
+            ):
+                raise ValueError("invalid replay validator state")
+            pending = bytes.fromhex(pending_hex)
+            restored_frames: list[dict[str, str]] = []
+            allowed_states = {
+                "key_or_end", "key", "colon", "value", "comma_or_end",
+                "value_or_end",
+            }
+            for frame in frames:
+                if (
+                    not isinstance(frame, list)
+                    or len(frame) != 2
+                    or frame[0] not in {"object", "array"}
+                    or frame[1] not in allowed_states
+                ):
+                    raise ValueError("invalid replay validator state")
+                restored_frames.append({"kind": frame[0], "state": frame[1]})
+            bool_fields = ("a", "n", "i", "z")
+            if any(not isinstance(state[name], bool) for name in bool_fields):
+                raise ValueError("invalid replay validator state")
+            mode = state["m"]
+            if mode not in {None, "string", "literal", "number"}:
+                raise ValueError("invalid replay validator state")
+            role = state["r"]
+            if role not in {"", "key", "value"}:
+                raise ValueError("invalid replay validator state")
+            escape_state = state["e"]
+            if escape_state not in {"", "escape", "unicode"}:
+                raise ValueError("invalid replay validator state")
+            unicode_digits = state["u"]
+            if (
+                isinstance(unicode_digits, bool)
+                or not isinstance(unicode_digits, int)
+                or unicode_digits < 0
+                or unicode_digits > 4
+            ):
+                raise ValueError("invalid replay validator state")
+            literal = state["l"]
+            literal_index = state["li"]
+            number_state = state["q"]
+            if (
+                not isinstance(literal, str)
+                or len(literal) > 5
+                or literal not in {"", "true", "false", "null"}
+                or isinstance(literal_index, bool)
+                or not isinstance(literal_index, int)
+                or literal_index < 0
+                or literal_index > len(literal)
+                or not isinstance(number_state, str)
+                or number_state not in {
+                    "", "sign", "zero", "integer", "decimal", "fraction",
+                    "exponent_marker", "exponent_sign", "exponent",
+                }
+            ):
+                raise ValueError("invalid replay validator state")
+            validator._decoder.setstate((pending, decoder_flag))
+            validator._frames = restored_frames
+            validator._started = state["a"]
+            validator._done = state["n"]
+            validator._invalid = state["i"]
+            validator._finalized = state["z"]
+            validator._mode = mode
+            validator._string_role = role
+            validator._escape_state = escape_state
+            validator._unicode_digits = unicode_digits
+            validator._literal = literal
+            validator._literal_index = literal_index
+            validator._number_state = number_state
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+            raise ValueError("invalid replay validator state") from None
+        if validator._finalized:
+            raise ValueError("invalid replay validator state")
+        return validator
+
     def valid(self) -> bool:
         if not self._finalized:
             self._finalized = True
@@ -1081,7 +1388,10 @@ class _TopLevelEnvelopeScanner:
                 not self._primitive_overflow
                 and re.fullmatch(rb"-?(?:0|[1-9]\d*)", token)
             ):
-                value = int(token)
+                try:
+                    value = int(token)
+                except ValueError:
+                    value = None
             else:
                 value = None
             self._record_field("seq", value)
@@ -1218,6 +1528,124 @@ class _TopLevelEnvelopeScanner:
                 self._invalid = True
                 return
 
+    def snapshot(self) -> dict[str, Any]:
+        """Serialize bounded envelope/parser state, never row payload bytes."""
+        stack = bytes(self._stack)
+        string_buf = bytes(self._string_buf)
+        primitive_buf = (
+            None if self._primitive_buf is None else bytes(self._primitive_buf)
+        )
+        return {
+            "v": 1,
+            "s": self._state,
+            "k": _encode_urlsafe_unpadded(stack),
+            "i": self._invalid,
+            "w": self._in_string,
+            "e": self._escape,
+            "r": self._string_role,
+            "b": _encode_urlsafe_unpadded(string_buf),
+            "bo": self._string_overflow,
+            "a": self._active_key,
+            "p": (
+                None
+                if primitive_buf is None
+                else _encode_urlsafe_unpadded(primitive_buf)
+            ),
+            "po": self._primitive_overflow,
+            "f": dict(self._fields),
+            "q": self._seq_seen,
+            "j": self._validator.snapshot(),
+        }
+
+    @classmethod
+    def from_snapshot(cls, state: Any) -> "_TopLevelEnvelopeScanner":
+        if not isinstance(state, dict):
+            raise ValueError("invalid replay envelope state")
+        scanner = cls()
+        try:
+            if state.get("v") != 1:
+                raise ValueError("invalid replay envelope state")
+            parser_state = state["s"]
+            if parser_state not in {
+                "start", "key_or_end", "colon", "value", "value_nested",
+                "comma_or_end", "closed",
+            }:
+                raise ValueError("invalid replay envelope state")
+            stack_token = state["k"]
+            if not isinstance(stack_token, str) or len(stack_token) > 256:
+                raise ValueError("invalid replay envelope state")
+            stack = _decode_urlsafe_unpadded(stack_token)
+            if len(stack) > cls._MAX_NESTING or any(value not in {91, 123} for value in stack):
+                raise ValueError("invalid replay envelope state")
+            bool_fields = ("i", "w", "e", "bo", "po")
+            if any(not isinstance(state[name], bool) for name in bool_fields):
+                raise ValueError("invalid replay envelope state")
+            role = state["r"]
+            if role not in {"", "key", "value", "nested"}:
+                raise ValueError("invalid replay envelope state")
+            string_token = state["b"]
+            if not isinstance(string_token, str) or len(string_token) > 2048:
+                raise ValueError("invalid replay envelope state")
+            string_buf = _decode_urlsafe_unpadded(string_token)
+            if len(string_buf) > cls._CAPTURE_LIMIT:
+                raise ValueError("invalid replay envelope state")
+            active_key = state["a"]
+            if active_key is not None and (
+                not isinstance(active_key, str) or len(active_key) > cls._CAPTURE_LIMIT
+            ):
+                raise ValueError("invalid replay envelope state")
+            primitive_token = state["p"]
+            if primitive_token is None:
+                primitive_buf = None
+            else:
+                if not isinstance(primitive_token, str) or len(primitive_token) > 2048:
+                    raise ValueError("invalid replay envelope state")
+                primitive_buf = _decode_urlsafe_unpadded(primitive_token)
+                if len(primitive_buf) > cls._CAPTURE_LIMIT:
+                    raise ValueError("invalid replay envelope state")
+            fields = state["f"]
+            if not isinstance(fields, dict) or set(fields) - {
+                "seq", "event_id", "run_id", "session_id", "event", "terminal_state",
+                "terminal",
+            }:
+                raise ValueError("invalid replay envelope state")
+            for key, value in fields.items():
+                if key == "seq":
+                    if value is not None and (
+                        isinstance(value, bool) or not isinstance(value, int) or value < 0
+                    ):
+                        raise ValueError("invalid replay envelope state")
+                elif key == "terminal":
+                    if value is not None and not isinstance(value, bool):
+                        raise ValueError("invalid replay envelope state")
+                elif value is not None and (
+                    not isinstance(value, str) or len(value) > cls._CAPTURE_LIMIT
+                ):
+                    raise ValueError("invalid replay envelope state")
+            seq_seen = state["q"]
+            if isinstance(seq_seen, bool) or not isinstance(seq_seen, int) or not 0 <= seq_seen <= 2:
+                raise ValueError("invalid replay envelope state")
+            validator = _StreamingJsonValidator.from_snapshot(state["j"])
+            scanner._validator = validator
+            scanner._stack = list(stack)
+            scanner._state = parser_state
+            scanner._invalid = state["i"]
+            scanner._in_string = state["w"]
+            scanner._escape = state["e"]
+            scanner._string_role = role
+            scanner._string_buf = bytearray(string_buf)
+            scanner._string_overflow = state["bo"]
+            scanner._active_key = active_key
+            scanner._primitive_buf = (
+                None if primitive_buf is None else bytearray(primitive_buf)
+            )
+            scanner._primitive_overflow = state["po"]
+            scanner._fields = dict(fields)
+            scanner._seq_seen = seq_seen
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("invalid replay envelope state") from None
+        return scanner
+
     def authoritative_seq(
         self,
         session_id: str,
@@ -1263,9 +1691,17 @@ def _read_bounded_physical_row(
     fh,
     *,
     max_scan_bytes: int,
+    scanner: _TopLevelEnvelopeScanner | None = None,
+    max_retained_bytes: int | None = None,
 ) -> tuple[bytes | None, _TopLevelEnvelopeScanner, int, bool] | None:
     """Read one JSONL row within the remaining aggregate physical-read budget."""
-    scanner = _TopLevelEnvelopeScanner()
+    resumed = scanner is not None
+    scanner = scanner or _TopLevelEnvelopeScanner()
+    retention_limit = (
+        _LEGACY_TERMINAL_RECOVERY_MAX_BYTES
+        if max_retained_bytes is None
+        else max(0, int(max_retained_bytes))
+    )
     retained = bytearray()
     total_bytes = 0
     while total_bytes < max_scan_bytes:
@@ -1275,12 +1711,17 @@ def _read_bounded_physical_row(
             break
         total_bytes += len(chunk)
         scanner.feed(chunk)
-        remaining = _LEGACY_TERMINAL_RECOVERY_MAX_BYTES + 1 - len(retained)
-        if remaining > 0:
-            retained.extend(chunk[:remaining])
+        if not resumed:
+            remaining = retention_limit + 1 - len(retained)
+            if remaining > 0:
+                retained.extend(chunk[:remaining])
         if chunk.endswith(b"\n"):
             return (
-                None if total_bytes > _LEGACY_TERMINAL_RECOVERY_MAX_BYTES else bytes(retained),
+                (
+                    None
+                    if resumed or total_bytes > retention_limit
+                    else bytes(retained)
+                ),
                 scanner,
                 total_bytes,
                 True,
@@ -1292,7 +1733,11 @@ def _read_bounded_physical_row(
     except (OSError, ValueError):
         complete = False
     return (
-        None if total_bytes > _LEGACY_TERMINAL_RECOVERY_MAX_BYTES else bytes(retained),
+        (
+            None
+            if resumed or total_bytes > retention_limit
+            else bytes(retained)
+        ),
         scanner,
         total_bytes,
         complete,
@@ -1380,7 +1825,21 @@ def read_run_events(
             "malformed_count": 0,
         }
     with fh:
+        stat = os.fstat(fh.fileno())
+        generation = _ensure_run_generation_for_read(
+            path,
+            identity=(int(stat.st_dev), int(stat.st_ino)),
+        )
+        if generation is None:
+            return _replay_limit_result(
+                str(session_id), str(run_id), events, malformed,
+                line_no=0, reason="replay_cursor_invalid",
+                next_after_seq=next_after_seq, resume_token=None,
+                scanned_bytes=0, scanned_rows=0, malformed_count=0,
+                record_limit_diagnostic=False,
+            )
         line_no = 0
+        resumed_scanner: _TopLevelEnvelopeScanner | None = None
 
         def continuation_token(
             *,
@@ -1388,17 +1847,23 @@ def read_run_events(
             logical_seq: int,
             physical_seq: int,
             completed_lines: int,
-        ) -> str:
-            return _encode_replay_resume_token(
-                fh,
-                session_id=str(session_id),
-                run_id=str(run_id),
-                max_seq=ceiling,
-                offset=offset,
-                next_after_seq=logical_seq,
-                last_physical_seq=physical_seq,
-                line_no=completed_lines,
-            )
+            scanner: _TopLevelEnvelopeScanner | None = None,
+        ) -> str | None:
+            try:
+                return _encode_replay_resume_token(
+                    fh,
+                    session_id=str(session_id),
+                    run_id=str(run_id),
+                    max_seq=ceiling,
+                    offset=offset,
+                    next_after_seq=logical_seq,
+                    last_physical_seq=physical_seq,
+                    line_no=completed_lines,
+                    generation=generation,
+                    scanner=scanner,
+                )
+            except (OSError, TypeError, ValueError):
+                return None
 
         if resume_token is not None:
             resumed = _decode_replay_resume_token(
@@ -1408,6 +1873,7 @@ def read_run_events(
                 run_id=str(run_id),
                 expected_after_seq=floor,
                 expected_max_seq=ceiling,
+                expected_generation=generation,
             )
             if resumed is None:
                 return _replay_limit_result(
@@ -1423,6 +1889,7 @@ def read_run_events(
                 last_physical_seq,
                 line_no,
                 boundary_scan_bytes,
+                resumed_scanner,
             ) = resumed
             scanned_bytes += boundary_scan_bytes
             floor = next_after_seq
@@ -1440,6 +1907,7 @@ def read_run_events(
                     logical_seq=next_after_seq,
                     physical_seq=last_physical_seq,
                     completed_lines=line_no,
+                    scanner=resumed_scanner,
                 )
                 return _replay_limit_result(
                     str(session_id), str(run_id), events, malformed,
@@ -1455,6 +1923,7 @@ def read_run_events(
                     logical_seq=next_after_seq,
                     physical_seq=last_physical_seq,
                     completed_lines=line_no,
+                    scanner=resumed_scanner,
                 )
                 return _replay_limit_result(
                     str(session_id), str(run_id), events, malformed,
@@ -1467,18 +1936,27 @@ def read_run_events(
             row_start_seq = next_after_seq
             row_start_physical_seq = last_physical_seq
             row_start_line_no = line_no
+            row_scanner = resumed_scanner
+            resumed_scanner = None
             row = _read_bounded_physical_row(
                 fh,
                 max_scan_bytes=remaining_scan_bytes,
+                scanner=row_scanner,
+                max_retained_bytes=(
+                    max(
+                        _LEGACY_TERMINAL_RECOVERY_MAX_BYTES,
+                        byte_cap or 0,
+                    )
+                    if floor is not None
+                    else _LEGACY_TERMINAL_RECOVERY_MAX_BYTES
+                ),
             )
             if row is None:
                 break
-            line_no += 1
             scanned_rows += 1
             raw_bytes, envelope, row_bytes, row_complete = row
             scanned_bytes += row_bytes
             if not row_complete:
-                continuation = None
                 if row_start_offset > page_start_offset:
                     continuation = continuation_token(
                         offset=row_start_offset,
@@ -1486,39 +1964,63 @@ def read_run_events(
                         physical_seq=row_start_physical_seq,
                         completed_lines=row_start_line_no,
                     )
+                else:
+                    continuation = continuation_token(
+                        offset=fh.tell(),
+                        logical_seq=row_start_seq,
+                        physical_seq=row_start_physical_seq,
+                        completed_lines=row_start_line_no,
+                        scanner=envelope,
+                    )
                 return _replay_limit_result(
                     str(session_id), str(run_id), events, malformed,
-                    line_no=line_no, reason="replay_scan_limit_bytes",
+                    line_no=row_start_line_no + 1, reason="replay_scan_limit_bytes",
                     next_after_seq=row_start_seq, resume_token=continuation,
                     scanned_bytes=scanned_bytes, scanned_rows=scanned_rows,
                     malformed_count=malformed_count, record_limit_diagnostic=False,
                 )
+            line_no += 1
             if raw_bytes is not None and not raw_bytes.strip():
-                continue
-            seq, identity_error = envelope.authoritative_seq(
-                str(session_id),
-                str(run_id),
-                require_complete_json=raw_bytes is None,
-            )
-            if seq is None:
-                malformed_count += 1
-                if len(malformed) < _BOUNDED_REPLAY_MAX_MALFORMED:
-                    malformed.append({"line": line_no, "reason": identity_error})
                 continue
             event = None
             if raw_bytes is not None:
                 try:
-                    event = json.loads(raw_bytes.decode("utf-8"))
+                    event = json.loads(
+                        raw_bytes.decode("utf-8"),
+                        parse_constant=_reject_nonfinite_json_value,
+                    )
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     malformed_count += 1
                     if len(malformed) < _BOUNDED_REPLAY_MAX_MALFORMED:
                         malformed.append({"line": line_no, "raw": ""})
+                    continue
+                except _ReplayInvalidJsonEnvelope:
+                    malformed_count += 1
+                    if len(malformed) < _BOUNDED_REPLAY_MAX_MALFORMED:
+                        malformed.append({"line": line_no, "reason": "replay_invalid_envelope"})
+                    continue
+                except ValueError:
+                    malformed_count += 1
+                    if len(malformed) < _BOUNDED_REPLAY_MAX_MALFORMED:
+                        malformed.append({"line": line_no, "reason": "replay_invalid_json_value"})
                     continue
                 if not isinstance(event, dict):
                     malformed_count += 1
                     if len(malformed) < _BOUNDED_REPLAY_MAX_MALFORMED:
                         malformed.append({"line": line_no, "raw": ""})
                     continue
+                seq, identity_error = envelope.authoritative_seq(
+                    str(session_id), str(run_id), require_complete_json=True,
+                )
+            else:
+                seq, identity_error = envelope.authoritative_seq(
+                    str(session_id), str(run_id), require_complete_json=True,
+                )
+            if seq is None:
+                malformed_count += 1
+                if len(malformed) < _BOUNDED_REPLAY_MAX_MALFORMED:
+                    malformed.append({"line": line_no, "reason": identity_error})
+                continue
             if seq <= last_physical_seq:
                 malformed_count += 1
                 if len(malformed) < _BOUNDED_REPLAY_MAX_MALFORMED:
