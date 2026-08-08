@@ -37,14 +37,16 @@ _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _WRITER_LOCKS: dict[tuple[str, str, str], threading.Lock] = {}
 _WRITER_LOCKS_GUARD = threading.Lock()
 # Next-seq to assign per run-journal file path, kept in memory so repeat appends
-# to the same run do not re-parse the whole file on every call. The per-path
-# ``_lock_for(path)`` serializes same-path reserve→append so seqs stay monotonic
-# and file order matches; ``_SEQ_CACHE_LOCK`` (below) additionally guards every
-# *structural* access to the dict (reserve/note/evict) so ``delete_run_journal``
-# can iterate + drop keys while a concurrent append on ANOTHER path inserts one,
-# without a ``dictionary changed size during iteration`` crash. See
-# ``_reserve_next_seq`` and ``delete_run_journal`` (which evicts stale entries).
-_SEQ_CACHE: dict[str, int] = {}
+# to the same run do not re-parse the whole file on every call. Every entry is
+# ``(generation, file_size_before_append, next_seq)`` so a cache from another
+# process's append or a delete/recreate cannot be reused against a different
+# durable file state. The per-path ``_lock_for(path)`` serializes same-path
+# reserve→append so seqs stay monotonic and file order matches; ``_SEQ_CACHE_LOCK``
+# (below) additionally guards every *structural* access to the dict (peek/publish/
+# evict) so ``delete_run_journal`` can iterate + drop keys while a concurrent
+# append on ANOTHER path inserts one, without a ``dictionary changed size during
+# iteration`` crash. See ``_peek_next_seq`` and ``delete_run_journal``.
+_SEQ_CACHE: dict[str, tuple[str, int, int]] = {}
 _SEQ_CACHE_LOCK = threading.Lock()
 # Summary callers only need terminal state and the latest cursor. Re-parsing a
 # completed journal's full payload (which can include multi-megabyte tool or
@@ -80,6 +82,8 @@ _REPLAY_RESUME_STATE_MAX_BYTES = 8 * 1024
 _RUN_JOURNAL_GENERATION_VERSION = 1
 _RUN_JOURNAL_GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
 _RUN_JOURNAL_GENERATION_LOCK_STRIPES = 64
+_RUN_JOURNAL_LIFECYCLE_LOCKS: dict[tuple[str, int], threading.Lock] = {}
+_RUN_JOURNAL_LIFECYCLE_LOCKS_GUARD = threading.Lock()
 _SNAPSHOT_ARGS_MAX_ITEMS = 64
 _SNAPSHOT_ARGS_MAX_DEPTH = 8
 _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
@@ -114,11 +118,43 @@ def _run_generation_path(path: Path) -> Path:
 
 def _run_generation_lock_path(path: Path) -> Path:
     session_id = path.parent.name
-    stripe = int.from_bytes(
-        hashlib.sha256(session_id.encode("utf-8")).digest()[:2],
+    stripe = _run_journal_lifecycle_stripe(session_id)
+    return path.parent.parent / ".generation-locks" / f"{stripe:02d}.lock"
+
+
+def _run_journal_lifecycle_stripe(session_id: str) -> int:
+    return int.from_bytes(
+        hashlib.sha256(str(session_id).encode("utf-8")).digest()[:2],
         "big",
     ) % _RUN_JOURNAL_GENERATION_LOCK_STRIPES
-    return path.parent.parent / ".generation-locks" / f"{stripe:02d}.lock"
+
+
+def _run_journal_lifecycle_lock_for(path: Path) -> threading.Lock:
+    key = (
+        os.path.abspath(str(path.parent.parent)),
+        _run_journal_lifecycle_stripe(path.parent.name),
+    )
+    with _RUN_JOURNAL_LIFECYCLE_LOCKS_GUARD:
+        lock = _RUN_JOURNAL_LIFECYCLE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _RUN_JOURNAL_LIFECYCLE_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def _run_journal_lifecycle_authority(path: Path):
+    """Hold the per-session lifecycle authority in the fixed lock order.
+
+    The thread stripe is deliberately keyed by the same session hash as the
+    stable cross-process generation stripe.  Every path operation that can
+    create, replace, or remove a session journal must enter this context before
+    opening a journal descriptor; the per-run lock is acquired by the caller
+    only after this context is held.
+    """
+    with _run_journal_lifecycle_lock_for(path):
+        with _run_generation_process_lock(path):
+            yield
 
 
 @contextmanager
@@ -249,7 +285,7 @@ def _prepare_run_generation_for_append(
     return record[0], False
 
 
-def _ensure_run_generation_for_read(
+def _ensure_run_generation_for_read_locked(
     path: Path,
     *,
     identity: tuple[int, int] | None = None,
@@ -259,19 +295,24 @@ def _ensure_run_generation_for_read(
         identity = _run_file_identity(path)
     if identity is None:
         return None
-    # Readers and appenders must agree on the first-created nonce. The short
-    # lock scope only covers sidecar read/replace; journal bytes remain readable
-    # concurrently with ordinary appends.
-    with _lock_for(path):
-        with _run_generation_process_lock(path):
-            if _run_file_identity(path) != identity:
-                return None
-            record = _read_run_generation_record(path)
-            if record is not None and record[1] == identity:
-                return record[0]
-            generation = secrets.token_hex(16)
-            _write_run_generation_record(path, generation, identity=identity)
-            return generation
+    if _run_file_identity(path) != identity:
+        return None
+    record = _read_run_generation_record(path)
+    if record is not None and record[1] == identity:
+        return record[0]
+    generation = secrets.token_hex(16)
+    _write_run_generation_record(path, generation, identity=identity)
+    return generation
+
+
+def _ensure_run_generation_for_read(
+    path: Path,
+    *,
+    identity: tuple[int, int] | None = None,
+) -> str | None:
+    """Load/create the replay nonce while holding the lifecycle authority."""
+    with _run_journal_lifecycle_authority(path):
+        return _ensure_run_generation_for_read_locked(path, identity=identity)
 
 
 def _lock_for(path: Path) -> threading.Lock:
@@ -448,47 +489,60 @@ def _next_seq(path: Path) -> int:
     return (max(seqs) + 1) if seqs else 1
 
 
-def _reserve_next_seq(path: Path) -> int:
-    """Reserve and return the next seq for ``path``, advancing the in-memory cache.
+def _peek_next_seq(
+    path: Path,
+    *,
+    generation: str,
+    pre_write_size: int,
+) -> int:
+    """Return the next seq candidate without publishing it to the cache.
 
-    Callers MUST hold ``_lock_for(path)``. The first append per path in this
-    process seeds the cache from ``_next_seq(path)`` (one file read); every later
-    append is a pure in-memory increment, avoiding the O(n) re-parse that
-    re-reading the whole journal on every append caused (O(n^2) over a run).
-    Because ``RunJournalWriter`` and the free ``append_run_event`` share this one
-    cache under the same per-path lock, their seqs stay monotonic and gapless
-    even when both write the same path. ``_SEQ_CACHE_LOCK`` additionally makes the
-    dict get+set atomic against a concurrent cross-path eviction.
+    Callers MUST hold the lifecycle authority and ``_lock_for(path)``. A cache
+    entry is reusable only when both its durable generation and its file size
+    match the descriptor's pre-write state. Otherwise the candidate is rebuilt
+    from the physical journal, which catches appends made by another process
+    and delete/recreate cycles that this process did not observe.
     """
     key = str(path)
     with _SEQ_CACHE_LOCK:
-        nxt = _SEQ_CACHE.get(key)
-        if nxt is not None:
-            _SEQ_CACHE[key] = nxt + 1
-            return nxt
+        cached = _SEQ_CACHE.get(key)
+        if (
+            cached is not None
+            and cached[0] == generation
+            and cached[1] == int(pre_write_size)
+        ):
+            return cached[2]
     # Cache miss: seed from disk WITHOUT holding the module-global lock, so a
     # slow first-access file read for one path can't block every other path's
     # cache ops. The caller holds the per-path lock, so only one thread per path
     # can reach this branch — no double-seed, and no same-path writer can race
     # the value in between.
     seeded = _next_seq(path)
+    return seeded
+
+
+def _reserve_next_seq(path: Path) -> int:
+    """Back-compat physical-seed helper for callers outside append transactions."""
+    return _next_seq(path)
+
+
+def _discard_seq_cache(path: Path) -> None:
     with _SEQ_CACHE_LOCK:
-        _SEQ_CACHE[key] = seeded + 1
-        return seeded
+        _SEQ_CACHE.pop(str(path), None)
 
 
-def _note_assigned_seq(path: Path, seq: int) -> None:
-    """Keep the cache at least one past an explicitly-supplied ``seq``.
-
-    Callers MUST hold ``_lock_for(path)``. When an append carries a caller-chosen
-    ``seq`` rather than drawing from the cache, advance the cache so a later
-    cache-based append on the same path cannot re-issue an already-used seq.
-    """
+def _publish_seq_cache(
+    path: Path,
+    *,
+    generation: str,
+    file_size: int,
+    seq: int,
+) -> None:
+    """Publish an automatic candidate after its physical append is validated."""
     key = str(path)
-    nxt = int(seq) + 1
+    entry = (str(generation), int(file_size), int(seq) + 1)
     with _SEQ_CACHE_LOCK:
-        if _SEQ_CACHE.get(key, 0) < nxt:
-            _SEQ_CACHE[key] = nxt
+        _SEQ_CACHE[key] = entry
 
 
 def _terminal_state_for_event(event_name: str, payload) -> str | None:
@@ -597,22 +651,29 @@ def append_run_event(
     event_name = str(event_name or "").strip()
     if not event_name:
         raise ValueError("event_name is required")
-    with _lock_for(path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd = os.open(
-                path,
-                os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_WRONLY,
-                0o600,
-            )
-            created_file = True
-        except FileExistsError:
-            fd = os.open(path, os.O_APPEND | os.O_WRONLY)
+    with _run_journal_lifecycle_authority(path):
+        with _lock_for(path):
+            fd = None
             created_file = False
-        try:
-            with _run_generation_process_lock(path):
+            physical_write_attempted = False
+            try:
+                # Directory creation and descriptor opening stay inside the
+                # lifecycle authority. A concurrent delete therefore cannot
+                # unlink the directory between setup and the physical append.
+                path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    fd = os.open(
+                        path,
+                        os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_WRONLY,
+                        0o600,
+                    )
+                    created_file = True
+                except FileExistsError:
+                    fd = os.open(path, os.O_APPEND | os.O_WRONLY)
+
                 stat = os.fstat(fd)
                 identity = int(stat.st_dev), int(stat.st_ino)
+                pre_write_size = int(stat.st_size)
                 if _run_file_identity(path) != identity:
                     raise OSError("run journal replaced during append")
                 generation, generation_needs_write = _prepare_run_generation_for_append(
@@ -622,40 +683,84 @@ def append_run_event(
                 )
                 if generation_needs_write:
                     _write_run_generation_record(path, generation, identity=identity)
-            if seq is not None:
-                assigned_seq = int(seq)
-                _note_assigned_seq(path, assigned_seq)
-            else:
-                assigned_seq = _reserve_next_seq(path)
-            terminal_state = _terminal_state_for_event(event_name, payload)
-            event = {
-                "version": 1,
-                "event_id": f"{run_id}:{assigned_seq}",
-                "seq": assigned_seq,
-                "run_id": str(run_id),
-                "session_id": str(session_id),
-                "event": event_name,
-                "type": event_name,
-                "created_at": float(created_at if created_at is not None else time.time()),
-                "terminal": bool(terminal_state),
-                "terminal_state": terminal_state,
-                "payload": payload,
-            }
-            line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
-            fh = os.fdopen(fd, "a", encoding="utf-8")
-            fd = None
-            with fh:
-                fh.write(line)
-                fh.flush()
-                if _should_fsync_event(terminal_state):
-                    os.fsync(fh.fileno())
-        finally:
-            if fd is not None:
-                os.close(fd)
-        _discard_cached_summary(path)
-        if created_file:
-            _fsync_parent_dir(path)
-        return event
+
+                if created_file:
+                    # A deleted/recreated path must never inherit this process's
+                    # old next-seq candidate.
+                    _discard_seq_cache(path)
+                assigned_seq = (
+                    int(seq)
+                    if seq is not None
+                    else _peek_next_seq(
+                        path,
+                        generation=generation,
+                        pre_write_size=pre_write_size,
+                    )
+                )
+                terminal_state = _terminal_state_for_event(event_name, payload)
+                event = {
+                    "version": 1,
+                    "event_id": f"{run_id}:{assigned_seq}",
+                    "seq": assigned_seq,
+                    "run_id": str(run_id),
+                    "session_id": str(session_id),
+                    "event": event_name,
+                    "type": event_name,
+                    "created_at": float(created_at if created_at is not None else time.time()),
+                    "terminal": bool(terminal_state),
+                    "terminal_state": terminal_state,
+                    "payload": payload,
+                }
+                line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+                fh = os.fdopen(fd, "a", encoding="utf-8")
+                fd = None
+                with fh:
+                    physical_write_attempted = True
+                    fh.write(line)
+                    fh.flush()
+                    if _should_fsync_event(terminal_state):
+                        os.fsync(fh.fileno())
+                    final_stat = os.fstat(fh.fileno())
+                    final_identity = int(final_stat.st_dev), int(final_stat.st_ino)
+                    final_size = int(final_stat.st_size)
+                    if final_identity != _run_file_identity(path):
+                        raise OSError("run journal replaced during append")
+                    if _read_run_generation_record(path) != (generation, identity):
+                        raise OSError("run journal generation changed during append")
+                if created_file:
+                    # Parent durability is part of the same lifecycle
+                    # transaction, but only runs after descriptor/path and
+                    # generation validation has succeeded.
+                    _fsync_parent_dir(path)
+                # Publish process caches only after the descriptor/path and
+                # generation identities have been validated successfully.
+                if seq is None:
+                    _publish_seq_cache(
+                        path,
+                        generation=generation,
+                        file_size=final_size,
+                        seq=assigned_seq,
+                    )
+                else:
+                    # An explicit sequence may not reflect the highest value
+                    # another writer placed on disk. Force the next automatic
+                    # append to rebuild from the physical journal.
+                    _discard_seq_cache(path)
+                _discard_cached_summary(path)
+                return event
+            except BaseException:
+                # A write may have reached the journal before a final
+                # identity/generation or parent-durability check failed. Do
+                # not let a pre-write seq/summary cache describe that stale
+                # state on the next append or recovery lookup; reseed from
+                # the physical file instead.
+                if physical_write_attempted:
+                    _discard_seq_cache(path)
+                    _discard_cached_summary(path)
+                raise
+            finally:
+                if fd is not None:
+                    os.close(fd)
 
 
 class RunJournalWriter:
@@ -669,18 +774,15 @@ class RunJournalWriter:
         self._lock = _lock_for(self._path)
 
     def append_sse_event(self, event_name: str, payload=None) -> dict:
-        # Draw from the shared module-level seq cache under the per-path lock so
-        # this writer and any direct append_run_event() call on the same path
-        # agree on one monotonic, gapless sequence.
-        with self._lock:
-            seq = _reserve_next_seq(self._path)
+        # Sequence allocation belongs to append_run_event's lifecycle
+        # transaction. Reserving here would publish a candidate before the
+        # physical write could prove its descriptor/path identity.
         return append_run_event(
             self.session_id,
             self.run_id,
             event_name,
             payload or {},
             session_dir=self.session_dir,
-            seq=seq,
         )
 
 
@@ -1881,9 +1983,33 @@ def read_run_events(
     scanned_rows = 0
     next_after_seq = floor or 0
     last_physical_seq = 0
-    try:
-        fh = path.open("rb")
-    except FileNotFoundError:
+    fh = None
+    generation = None
+    missing = False
+    with _run_journal_lifecycle_authority(path):
+        try:
+            fh = path.open("rb")
+        except FileNotFoundError:
+            missing = True
+        else:
+            try:
+                stat = os.fstat(fh.fileno())
+                generation = _ensure_run_generation_for_read_locked(
+                    path,
+                    identity=(int(stat.st_dev), int(stat.st_ino)),
+                )
+            except BaseException:
+                fh.close()
+                raise
+    if missing:
+        if resume_token is not None:
+            return _replay_limit_result(
+                str(session_id), str(run_id), events, malformed,
+                line_no=0, reason="replay_cursor_invalid",
+                next_after_seq=next_after_seq, resume_token=None,
+                scanned_bytes=0, scanned_rows=0, malformed_count=0,
+                record_limit_diagnostic=False,
+            )
         return {
             "session_id": str(session_id), "run_id": str(run_id), "events": events,
             "malformed": malformed, "complete": True, "limit_reason": None,
@@ -1891,12 +2017,8 @@ def read_run_events(
             "resume_token": None, "scanned_bytes": 0, "scanned_rows": 0,
             "malformed_count": 0,
         }
+    assert fh is not None
     with fh:
-        stat = os.fstat(fh.fileno())
-        generation = _ensure_run_generation_for_read(
-            path,
-            identity=(int(stat.st_dev), int(stat.st_ino)),
-        )
         if generation is None:
             return _replay_limit_result(
                 str(session_id), str(run_id), events, malformed,
@@ -2505,28 +2627,22 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
         return False
     root = Path(session_dir) if session_dir is not None else _default_session_dir()
     session_journal_dir = root / RUN_JOURNAL_DIR_NAME / sid
-    if not session_journal_dir.exists():
-        return False
-    # Generation locks live in a stable striped directory outside each session
-    # subtree. Take the same session stripe before removal so a held lock cannot
-    # be unlinked and recreated on a different inode while another process is
-    # initializing or validating a generation sidecar.
     deletion_lock_path = session_journal_dir / ".delete.jsonl"
-    with _run_generation_process_lock(deletion_lock_path):
+    # The lifecycle authority covers the existence check, rmtree, residual
+    # validation, and cache eviction. Writers cannot publish a late append or
+    # recreate the per-run lock/cache while this block owns the session stripe.
+    with _run_journal_lifecycle_authority(deletion_lock_path):
         if not session_journal_dir.exists():
             return False
-        shutil.rmtree(session_journal_dir, ignore_errors=True)
-        removed = not session_journal_dir.exists()
-    # Evict any writer locks the removed runs left behind. `_lock_for` keys are
-    # ``(str(path.parent), path.name, pid)`` and every run file for this session
-    # lives directly under ``session_journal_dir``, so drop all keys whose parent
-    # dir matches — pid-independent — to keep `_WRITER_LOCKS` from growing forever.
-    # Guard on confirmed removal: `rmtree(ignore_errors=True)` can silently leave
-    # the directory (locked files on Windows, permission transients). If the files
-    # still exist their locks are still live — evicting them would hand a later
-    # `_lock_for` caller a brand-new Lock, breaking mutual exclusion with a writer
-    # still holding the old one.
-    if removed:
+        shutil.rmtree(session_journal_dir)
+        if session_journal_dir.exists():
+            raise OSError("run journal cleanup left residual files")
+        # Evict any writer locks the removed runs left behind. `_lock_for` keys
+        # are ``(str(path.parent), path.name, pid)`` and every run file for this
+        # session lives directly under ``session_journal_dir``, so drop all keys
+        # whose parent dir matches — pid-independent — to keep `_WRITER_LOCKS`
+        # from growing forever. This stays inside the lifecycle authority so a
+        # new writer cannot split from an old lock during deletion.
         dir_key = str(session_journal_dir)
         with _WRITER_LOCKS_GUARD:
             for key in [k for k in _WRITER_LOCKS if k[0] == dir_key]:
@@ -2535,8 +2651,8 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
         # for this session lives directly under ``session_journal_dir``, so its
         # cache key's parent dir matches. Without this, a run re-created at the
         # same path would resume the stale cached seq instead of restarting at 1.
-        # Hold ``_SEQ_CACHE_LOCK`` — the SAME mutex ``_reserve_next_seq``/
-        # ``_note_assigned_seq`` take — so a concurrent append on another path
+        # Hold ``_SEQ_CACHE_LOCK`` — the SAME mutex ``_peek_next_seq``/
+        # ``_publish_seq_cache`` take — so a concurrent append on another path
         # cannot mutate the dict mid-iteration (``dictionary changed size``).
         with _SEQ_CACHE_LOCK:
             for cache_key in [entry for entry in _SEQ_CACHE if str(Path(entry).parent) == dir_key]:
@@ -2544,7 +2660,7 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
         with _SUMMARY_CACHE_LOCK:
             for cache_key in [entry for entry in _SUMMARY_CACHE if str(Path(entry).parent) == dir_key]:
                 del _SUMMARY_CACHE[cache_key]
-    return removed
+        return True
 
 
 def stale_interrupted_event(session_id: str, run_id: str, *, after_seq: int | None = None) -> dict | None:

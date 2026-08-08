@@ -3,7 +3,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -731,6 +733,297 @@ def test_run_journal_bounded_reader_resume_token_survives_append(tmp_path):
 
     assert [event["seq"] for event in second_page["events"]] == [2, 3]
     assert second_page["complete"] is True
+
+
+def test_run_journal_resume_token_missing_journal_fails_closed(tmp_path):
+    session_id = "session_resume_missing_journal"
+    run_id = "run_resume_missing_journal"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    _write_bounded_events(
+        path,
+        [
+            _bounded_event(session_id, run_id, 1, "one"),
+            _bounded_event(session_id, run_id, 2, "two"),
+        ],
+    )
+    first_page = read_run_events(session_id, run_id, session_dir=tmp_path, max_rows=1)
+    path.unlink()
+
+    resumed = read_run_events(
+        session_id,
+        run_id,
+        after_seq=first_page["next_after_seq"],
+        resume_token=first_page["resume_token"],
+        session_dir=tmp_path,
+        max_rows=1,
+    )
+
+    assert resumed["events"] == []
+    assert resumed["complete"] is False
+    assert resumed["limit_reason"] == "replay_cursor_invalid"
+    assert resumed["resume_token"] is None
+
+
+def test_run_journal_resume_token_missing_generation_fails_closed(tmp_path):
+    session_id = "session_resume_missing_generation"
+    run_id = "run_resume_missing_generation"
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    _write_bounded_events(
+        path,
+        [
+            _bounded_event(session_id, run_id, 1, "one"),
+            _bounded_event(session_id, run_id, 2, "two"),
+        ],
+    )
+    first_page = read_run_events(session_id, run_id, session_dir=tmp_path, max_rows=1)
+    run_journal._run_generation_path(path).unlink()
+
+    resumed = read_run_events(
+        session_id,
+        run_id,
+        after_seq=first_page["next_after_seq"],
+        resume_token=first_page["resume_token"],
+        session_dir=tmp_path,
+        max_rows=1,
+    )
+
+    assert resumed["events"] == []
+    assert resumed["complete"] is False
+    assert resumed["limit_reason"] == "replay_cursor_invalid"
+    assert resumed["resume_token"] is None
+
+
+def test_run_journal_append_quiesces_before_concurrent_delete(tmp_path, monkeypatch):
+    session_id = "session_append_delete_barrier"
+    run_id = "run_append_delete_barrier"
+    append_ready = threading.Event()
+    allow_seq = threading.Event()
+    delete_started = threading.Event()
+    delete_attempted = threading.Event()
+    delete_done = threading.Event()
+    writes_after_delete: list[bool] = []
+    append_result: list[dict] = []
+    append_errors: list[BaseException] = []
+
+    real_next_seq = run_journal._next_seq
+
+    def blocked_next_seq(path):
+        append_ready.set()
+        assert allow_seq.wait(timeout=10)
+        return real_next_seq(path)
+
+    monkeypatch.setattr(run_journal, "_next_seq", blocked_next_seq)
+    real_fdopen = run_journal.os.fdopen
+
+    def tracked_fdopen(fd, mode="r", *args, **kwargs):
+        fh = real_fdopen(fd, mode, *args, **kwargs)
+        if mode != "a":
+            return fh
+
+        class TrackedFile:
+            def __enter__(self):
+                fh.__enter__()
+                return self
+
+            def __exit__(self, *exc_info):
+                return fh.__exit__(*exc_info)
+
+            def write(self, data):
+                if delete_done.is_set():
+                    writes_after_delete.append(True)
+                return fh.write(data)
+
+            def __getattr__(self, name):
+                return getattr(fh, name)
+
+        return TrackedFile()
+
+    monkeypatch.setattr(run_journal.os, "fdopen", tracked_fdopen)
+    real_authority = run_journal._run_journal_lifecycle_authority
+
+    @contextmanager
+    def tracked_authority(path):
+        if path.name == ".delete.jsonl":
+            delete_attempted.set()
+        with real_authority(path):
+            yield
+
+    monkeypatch.setattr(run_journal, "_run_journal_lifecycle_authority", tracked_authority)
+
+    def append():
+        try:
+            append_result.append(
+                append_run_event(
+                    session_id,
+                    run_id,
+                    "token",
+                    {"text": "append"},
+                    session_dir=tmp_path,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - test records worker failure
+            append_errors.append(exc)
+
+    def delete():
+        delete_started.set()
+        run_journal.delete_run_journal(session_id, session_dir=tmp_path)
+        delete_done.set()
+
+    append_thread = threading.Thread(target=append)
+    append_thread.start()
+    assert append_ready.wait(timeout=10)
+    delete_thread = threading.Thread(target=delete)
+    delete_thread.start()
+    assert delete_started.wait(timeout=10)
+    assert delete_attempted.wait(timeout=10)
+    assert not delete_done.is_set(), "delete must wait for the append transaction"
+    allow_seq.set()
+    append_thread.join(timeout=10)
+    delete_thread.join(timeout=10)
+
+    assert not append_thread.is_alive()
+    assert not delete_thread.is_alive()
+    assert not append_errors
+    assert append_result and append_result[0]["seq"] == 1
+    assert not writes_after_delete
+
+
+def test_run_journal_delete_waits_old_writer_before_recreated_writer(
+    tmp_path, monkeypatch
+):
+    session_id = "session_writer_recreate_barrier"
+    run_id = "run_writer_recreate_barrier"
+    append_run_event(
+        session_id,
+        run_id,
+        "token",
+        {"text": "seed"},
+        session_dir=tmp_path,
+        seq=1,
+    )
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    with run_journal._SEQ_CACHE_LOCK:
+        run_journal._SEQ_CACHE.pop(str(path), None)
+
+    old_ready = threading.Event()
+    allow_old = threading.Event()
+    delete_started = threading.Event()
+    delete_attempted = threading.Event()
+    delete_acquired = threading.Event()
+    old_validated = threading.Event()
+    old_result: list[dict] = []
+    errors: list[BaseException] = []
+    real_next_seq = run_journal._next_seq
+    real_authority = run_journal._run_journal_lifecycle_authority
+    real_discard_summary = run_journal._discard_cached_summary
+
+    def blocked_next_seq(candidate_path):
+        old_ready.set()
+        assert allow_old.wait(timeout=10)
+        return real_next_seq(candidate_path)
+
+    monkeypatch.setattr(run_journal, "_next_seq", blocked_next_seq)
+
+    @contextmanager
+    def tracked_authority(candidate_path):
+        is_delete = candidate_path.name == ".delete.jsonl"
+        if is_delete:
+            delete_attempted.set()
+        with real_authority(candidate_path):
+            if is_delete:
+                delete_acquired.set()
+            yield
+
+    monkeypatch.setattr(run_journal, "_run_journal_lifecycle_authority", tracked_authority)
+
+    def tracked_discard_summary(candidate_path):
+        if candidate_path == path:
+            old_validated.set()
+        real_discard_summary(candidate_path)
+
+    monkeypatch.setattr(run_journal, "_discard_cached_summary", tracked_discard_summary)
+    old_writer_obj = RunJournalWriter(session_id, run_id, session_dir=tmp_path)
+    recreated_writer = RunJournalWriter(session_id, run_id, session_dir=tmp_path)
+
+    def old_writer():
+        try:
+            old_result.append(
+                old_writer_obj.append_sse_event("token", {"text": "old"})
+            )
+        except BaseException as exc:  # noqa: BLE001 - test records worker failure
+            errors.append(exc)
+
+    def delete():
+        delete_started.set()
+        run_journal.delete_run_journal(session_id, session_dir=tmp_path)
+
+    old_thread = threading.Thread(target=old_writer)
+    old_thread.start()
+    assert old_ready.wait(timeout=10)
+    delete_thread = threading.Thread(target=delete)
+    delete_thread.start()
+    assert delete_started.wait(timeout=10)
+    assert delete_attempted.wait(timeout=10)
+    assert not delete_acquired.is_set()
+    allow_old.set()
+    old_thread.join(timeout=10)
+    delete_thread.join(timeout=10)
+
+    assert not old_thread.is_alive()
+    assert not delete_thread.is_alive()
+    assert not errors
+    assert delete_acquired.is_set()
+    assert old_validated.is_set()
+    assert old_result and old_result[0]["seq"] == 2
+    new_event = recreated_writer.append_sse_event("token", {"text": "new"})
+    assert new_event["seq"] == 1
+    final_events = read_run_events(session_id, run_id, session_dir=tmp_path)["events"]
+    assert [event["seq"] for event in final_events] == [1]
+    assert final_events[0]["payload"]["text"] == "new"
+
+
+def test_run_journal_failed_final_validation_discards_post_write_caches(
+    tmp_path, monkeypatch
+):
+    session_id = "session_failed_final_validation"
+    run_id = "run_failed_final_validation"
+    writer = RunJournalWriter(session_id, run_id, session_dir=tmp_path)
+    writer.append_sse_event("token", {"text": "seed"})
+    path = tmp_path / "_run_journal" / session_id / f"{run_id}.jsonl"
+    latest_run_summary(session_id, run_id, session_dir=tmp_path)
+    with run_journal._SEQ_CACHE_LOCK:
+        assert run_journal._SEQ_CACHE[str(path)][2] == 2
+
+    real_read_generation = run_journal._read_run_generation_record
+    generation_reads = 0
+
+    def return_mismatched_generation(candidate_path):
+        nonlocal generation_reads
+        record = real_read_generation(candidate_path)
+        if candidate_path == path:
+            generation_reads += 1
+            if generation_reads == 2:
+                assert record is not None
+                wrong_generation = "0" * 32
+                if record[0] == wrong_generation:
+                    wrong_generation = "1" * 32
+                return wrong_generation, record[1]
+        return record
+
+    monkeypatch.setattr(
+        run_journal, "_read_run_generation_record", return_mismatched_generation
+    )
+    with pytest.raises(OSError, match="generation changed"):
+        writer.append_sse_event("token", {"text": "written-before-failure"})
+
+    with run_journal._SEQ_CACHE_LOCK:
+        assert str(path) not in run_journal._SEQ_CACHE
+    assert latest_run_summary(session_id, run_id, session_dir=tmp_path)["event_count"] == 2
+
+    retry = writer.append_sse_event("token", {"text": "retry"})
+    assert retry["seq"] == 3
+    events = read_run_events(session_id, run_id, session_dir=tmp_path)["events"]
+    assert [event["seq"] for event in events] == [1, 2, 3]
 
 
 def test_run_journal_bounded_reader_rejects_tampered_resume_authority(tmp_path):
