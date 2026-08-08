@@ -595,6 +595,8 @@ def _activity_snapshot(page) -> dict:
               source: row.getAttribute('data-anchor-source-event-type'),
               status: row.getAttribute('data-anchor-row-status'),
               tool: row.getAttribute('data-tool-name'),
+              label: ((row.querySelector('.agent-activity-status-label') || {}).textContent || '').trim(),
+              detail: ((row.querySelector('.agent-activity-status-detail') || {}).textContent || '').trim(),
               text: row.innerText.trim(),
               classes: row.className,
             })),
@@ -646,6 +648,24 @@ def _expand_settled_worklog(
 
 def _terminal_rows(snapshot: dict) -> list[dict]:
     return [row for row in snapshot["rows"] if row["role"] == "terminal"]
+
+
+def _terminal_row_semantics(row: dict) -> dict:
+    """Exclude only the renderer-owned clock from terminal-row parity."""
+    return {
+        key: row.get(key)
+        for key in (
+            "role",
+            "rowId",
+            "toolCallId",
+            "source",
+            "status",
+            "tool",
+            "label",
+            "detail",
+            "classes",
+        )
+    }
 
 
 def _process_rows(snapshot: dict) -> list[dict]:
@@ -1405,7 +1425,9 @@ def main() -> int:
                 "settled_terminal": settled_terminal,
                 "reloaded_terminal": reloaded_terminal,
             }
-            assert settled_terminal[0]["text"] == reloaded_terminal[0]["text"], {
+            assert _terminal_row_semantics(settled_terminal[0]) == _terminal_row_semantics(
+                reloaded_terminal[0]
+            ), {
                 "settled_terminal": settled_terminal[0],
                 "reloaded_terminal": reloaded_terminal[0],
             }
