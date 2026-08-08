@@ -2820,6 +2820,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         ),
         tool_name: typeof artifactObj.tool_name === 'string' ? artifactObj.tool_name.trim() : String(tc.name||'tool'),
         tool_call_id:artifactCallId,
+        source:'live_tool_complete',
       },null,null,{render:false});
     }
   }
@@ -3698,6 +3699,45 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return scene;
   }
   let _persistAnchorSceneWarned=false;
+  function _settleTurnArtifactSceneForSession(scene, session){
+    if(!scene||typeof scene!=='object'||!Array.isArray(scene.artifacts)||!scene.artifacts.length) return scene;
+    const completedSessionId=typeof (session&&session.session_id)==='string'?session.session_id.trim():'';
+    const completedWorkspace=typeof (session&&session.workspace)==='string'?session.workspace.replace(/\/+$/,'').trim():'';
+    const artifacts=[];
+    for(const artifact of scene.artifacts){
+      const payload=artifact&&artifact.payload&&typeof artifact.payload==='object'?artifact.payload:null;
+      if(!payload||payload.source!=='live_tool_complete'){
+        artifacts.push(artifact);
+        continue;
+      }
+      const artifactWorkspace=typeof payload.workspace_root==='string'?payload.workspace_root.replace(/\/+$/,'').trim():'';
+      const artifactSessionId=(
+        typeof payload.session_id==='string'
+          ? payload.session_id
+          : typeof artifact.session_id==='string'
+            ? artifact.session_id
+            : ''
+      ).trim();
+      if(
+        !completedSessionId
+        || !completedWorkspace
+        || !artifactWorkspace
+        || artifactWorkspace!==completedWorkspace
+        || !artifactSessionId
+        || artifactSessionId!==activeSid
+      ) continue;
+      artifacts.push({
+        ...artifact,
+        session_id:completedSessionId,
+        payload:{
+          ...payload,
+          session_id:completedSessionId,
+          owner:{session_id:completedSessionId,workspace_root:artifactWorkspace},
+        },
+      });
+    }
+    return {...scene,artifacts};
+  }
   function _anchorSceneMessageOffsetForPersist(){
     const raw=(typeof _oldestIdx!=='undefined')?_oldestIdx:0;
     const offset=Number(raw);
@@ -3709,8 +3749,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(!Number.isFinite(idx)||idx<0) return messageIndex;
     return idx+(Number.isFinite(off)&&off>0?Math.floor(off):0);
   }
-  function _persistSettledAnchorScene(message, scene, messageIndex){
-    if(!activeSid||!message||!scene||typeof api!=='function') return;
+  function _persistSettledAnchorScene(message, scene, messageIndex, session){
+    const ownerSessionId=typeof (session&&session.session_id)==='string'
+      ? session.session_id.trim()
+      : activeSid;
+    if(!ownerSessionId||!message||!scene||typeof api!=='function') return;
     try{
       const messageOffset=_anchorSceneMessageOffsetForPersist();
       api('/api/session/anchor-scene',{
@@ -3718,7 +3761,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         timeoutMs:8000,
         timeoutToast:false,
         body:JSON.stringify({
-          session_id:activeSid,
+          session_id:ownerSessionId,
           stream_id:streamId,
           message_index:_anchorSceneAbsoluteMessageIndexForPersist(messageIndex,messageOffset),
           message_window_index:messageIndex,
@@ -3770,7 +3813,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       || (Array.isArray(scene&&scene.side_effects)&&scene.side_effects.length)
     );
   }
-  function _attachProjectedAnchorSceneToLastAssistant(messages, targetMessage=null, targetIndex=null){
+  function _attachProjectedAnchorSceneToLastAssistant(messages, targetMessage=null, targetIndex=null, settlementSession=null){
     if(!_anchorRegistry||!Array.isArray(messages)) return false;
     let lastAsst=targetMessage;
     let lastAsstIndex=Number.isInteger(targetIndex)?targetIndex:-1;
@@ -3788,7 +3831,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     if(!lastAsst) return false;
     const projectedScene=_projectLiveAnchorActivityScene();
-    const scene=_completeSettledAnchorSceneForTurn(messages,lastAsstIndex,projectedScene);
+    let scene=_completeSettledAnchorSceneForTurn(messages,lastAsstIndex,projectedScene);
+    const settlementOwner=settlementSession&&typeof settlementSession==='object'
+      ? settlementSession
+      : ((typeof S!=='undefined'&&S&&S.session)?S.session:null);
+    if(typeof _settleTurnArtifactSceneForSession==='function'){
+      scene=_settleTurnArtifactSceneForSession(scene,settlementOwner);
+    }
     const hasOwnedOutcomes=_anchorSceneHasOwnedOutcomes(scene);
     if(scene&&Array.isArray(scene.activity_rows)&&(scene.activity_rows.length||hasOwnedOutcomes)){
       const hasWorklogRows=_anchorSceneHasWorklogWorthyRows(scene);
@@ -3804,7 +3853,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       lastAsst._anchor_stream_id=streamId;
       lastAsst._anchor_activity_scene=scene;
       lastAsst._anchor_scene_persist_key=sceneKey;
-      _persistSettledAnchorScene(lastAsst, scene, lastAsstIndex);
+      if(settlementOwner) _persistSettledAnchorScene(lastAsst, scene, lastAsstIndex, settlementOwner);
+      else _persistSettledAnchorScene(lastAsst, scene, lastAsstIndex);
       return hasWorklogRows;
     }
     return false;
@@ -6067,7 +6117,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
               }
             }
           }
-          _attachProjectedAnchorSceneToLastAssistant(S.messages);
+          _attachProjectedAnchorSceneToLastAssistant(S.messages, null, null, completedSession);
           const hasMessageToolMetadata=S.messages.some(m=>{
             if(!m||m.role!=='assistant') return false;
             const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;

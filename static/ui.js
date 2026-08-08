@@ -13814,7 +13814,6 @@ function _renderTurnArtifactListForMessage(message, segment, rawIdx){
   const list=document.createElement('div');
   list.className='turn-artifact-list';
   list.setAttribute('data-turn-artifact-list','1');
-  list.setAttribute('role','group');
   const items=document.createElement('div');
   items.className='turn-artifact-items';
   items.setAttribute('role','list');
@@ -14786,6 +14785,16 @@ function renderCompressionUi(){
 // to a session whose rendered transcript inputs are unchanged.
 // Keyed by session_id. Only used on cross-session navigation, never for
 // in-session updates (new messages, edits, stream events).
+function _messagesHaveTurnArtifacts(messages){
+  return Array.isArray(messages)&&messages.some(message=>{
+    const scene=message&&message._anchor_activity_scene;
+    return !!(scene&&Array.isArray(scene.artifacts)&&scene.artifacts.length);
+  });
+}
+function _sessionHtmlCacheEligible(sid, hasTransientTranscriptUi, messages){
+  // Artifact controls own event handlers that cannot survive innerHTML restore.
+  return !!sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!_messagesHaveTurnArtifacts(messages);
+}
 const _sessionHtmlCache=new Map();
 let _sessionHtmlCacheSid=null; // session_id currently rendered in the DOM
 // #5966 (Codex F3): persist which capped Transparent-Stream turns the user has
@@ -16029,7 +16038,7 @@ function renderMessages(options){
   // Also skip cache for transient transcript cards such as /compress and
   // cross-channel handoff summaries; otherwise the cached transcript returns
   // before those cards can be inserted.
-  if(sid&&sid!==_sessionHtmlCacheSid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi){
+  if(sid&&sid!==_sessionHtmlCacheSid&&_sessionHtmlCacheEligible(sid,hasTransientTranscriptUi,S.messages)){
     const renderSignature=_messageRenderCacheSignature();
     cachedRenderSignature=renderSignature;
     const cached=_sessionHtmlCache.get(sid);
@@ -17590,7 +17599,7 @@ function renderMessages(options){
   // guard keeps standalone renderMessages() test harnesses (which don't define
   // the helper) working — absent helper == not armed == cache normally.
   const _keepOpenArmed=(typeof _isKeepSettledWorklogOpenArmed==='function')&&_isKeepSettledWorklogOpenArmed();
-  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!_keepOpenArmed){
+  if(_sessionHtmlCacheEligible(sid,hasTransientTranscriptUi,S.messages)&&!_keepOpenArmed){
     const _html=inner.innerHTML;
     // Only cache sessions with <300KB rendered HTML; evict oldest beyond 8 sessions.
     if(_html.length<300_000){

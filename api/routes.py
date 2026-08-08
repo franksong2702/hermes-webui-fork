@@ -8727,6 +8727,106 @@ def _messages_for_limited_payload(messages) -> list:
     return [_tool_message_for_limited_payload(msg) for msg in list(messages or [])]
 
 
+def _turn_artifact_result_candidates(value) -> list:
+    """Flatten provider result wrappers without inventing result content."""
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        return [value]
+    candidates = []
+    for part in value:
+        if not isinstance(part, dict):
+            if part not in (None, ""):
+                candidates.append(part)
+            continue
+        part_type = str(part.get("type") or "").lower()
+        if part_type in {"text", "input_text", "output_text"}:
+            text = part.get("text") or part.get("input_text") or part.get("output_text")
+            if text not in (None, ""):
+                candidates.append(text)
+            continue
+        if part_type == "tool_result":
+            for key in ("content", "result", "output"):
+                candidates.extend(_turn_artifact_result_candidates(part.get(key)))
+            continue
+        candidates.append(part)
+    return candidates
+
+
+def _turn_artifact_declarations_from_message(message) -> list[tuple[str, str]]:
+    """Normalize OpenAI tool_calls and Anthropic tool_use declarations."""
+    if not isinstance(message, dict) or str(message.get("role") or "").lower() != "assistant":
+        return []
+    declarations = []
+    raw_calls = message.get("tool_calls")
+    if isinstance(raw_calls, list):
+        declarations.extend(call for call in raw_calls if isinstance(call, dict))
+    content = message.get("content")
+    if isinstance(content, list):
+        declarations.extend(
+            part
+            for part in content
+            if isinstance(part, dict) and str(part.get("type") or "").lower() == "tool_use"
+        )
+    normalized = []
+    for call in declarations:
+        call_id = _anchor_scene_tool_id(call)
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        raw_name = call.get("name") or call.get("tool_name") or function.get("name")
+        normalized.append((call_id, normalize_tool_name(raw_name)))
+    return normalized
+
+
+def _turn_artifact_result_messages(message) -> list[dict]:
+    """Normalize OpenAI/Anthropic result rows to role:tool-shaped records."""
+    if not isinstance(message, dict):
+        return []
+    role = str(message.get("role") or "").lower()
+    if role == "tool":
+        normalized = dict(message)
+        normalized["tool_call_id"] = str(
+            message.get("tool_call_id") or message.get("tool_use_id") or ""
+        ).strip()
+        return [normalized]
+    if role != "user":
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    results = []
+    for part in content:
+        if not isinstance(part, dict) or str(part.get("type") or "").lower() != "tool_result":
+            continue
+        result = {
+            "role": "tool",
+            "tool_call_id": str(
+                part.get("tool_use_id")
+                or part.get("tool_call_id")
+                or part.get("call_id")
+                or ""
+            ).strip(),
+            "name": part.get("name") or part.get("tool_name"),
+            "is_error": part.get("is_error") is True,
+        }
+        for key in ("content", "result", "output"):
+            if key in part:
+                result[key] = part.get(key)
+        results.append(result)
+    return results
+
+
+def _turn_artifact_user_message_is_tool_result(message) -> bool:
+    if not isinstance(message, dict) or str(message.get("role") or "").lower() != "user":
+        return False
+    content = message.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    return all(
+        isinstance(part, dict) and str(part.get("type") or "").lower() == "tool_result"
+        for part in content
+    )
+
+
 def _turn_artifact_descriptors_from_tool_result(
     message,
     *,
@@ -8739,14 +8839,12 @@ def _turn_artifact_descriptors_from_tool_result(
     if message.get("is_error") is True:
         return []
     name = normalize_tool_name(message.get("name") or message.get("tool_name"))
-    tool_call_id = str(message.get("tool_call_id") or "").strip()
+    tool_call_id = str(message.get("tool_call_id") or message.get("tool_use_id") or "").strip()
     if not tool_call_id:
         return []
-    result_candidates = [
-        candidate
-        for candidate in (message.get("content"), message.get("result"), message.get("output"))
-        if candidate
-    ]
+    result_candidates = []
+    for value in (message.get("content"), message.get("result"), message.get("output")):
+        result_candidates.extend(_turn_artifact_result_candidates(value))
     if any(tool_result_is_error(candidate) for candidate in result_candidates):
         return []
     for candidate in result_candidates:
@@ -8768,22 +8866,7 @@ def _declared_turn_tool_calls(messages) -> dict[str, str]:
     for message in messages:
         if not isinstance(message, dict) or str(message.get("role") or "").lower() != "assistant":
             continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        for call in tool_calls:
-            if not isinstance(call, dict):
-                continue
-            raw_call_id = call.get("id") or call.get("tool_call_id")
-            if not isinstance(raw_call_id, str):
-                continue
-            call_id = raw_call_id.strip()
-            raw_name = call.get("name")
-            if not raw_name and isinstance(call.get("function"), dict):
-                raw_name = call["function"].get("name")
-            if not isinstance(raw_name, str):
-                continue
-            name = normalize_tool_name(raw_name)
+        for call_id, name in _turn_artifact_declarations_from_message(message):
             if not call_id or not name:
                 continue
             if call_id in declarations or call_id in invalid:
@@ -8821,7 +8904,13 @@ def _final_turn_artifact_paths(
         if call_id in result_order:
             result_order.remove(call_id)
 
-    user_indexes = [idx for idx, message in enumerate(source) if isinstance(message, dict) and message.get("role") == "user"]
+    user_indexes = [
+        idx
+        for idx, message in enumerate(source)
+        if isinstance(message, dict)
+        and message.get("role") == "user"
+        and not _turn_artifact_user_message_is_tool_result(message)
+    ]
     for position, turn_start in enumerate(user_indexes):
         turn_end = user_indexes[position + 1] if position + 1 < len(user_indexes) else len(source)
         final_idx = next(
@@ -8848,16 +8937,7 @@ def _final_turn_artifact_paths(
             if not isinstance(message, dict):
                 continue
             if str(message.get("role") or "").lower() == "assistant":
-                tool_calls = message.get("tool_calls")
-                if not isinstance(tool_calls, list):
-                    continue
-                for call in tool_calls:
-                    if not isinstance(call, dict):
-                        continue
-                    raw_call_id = call.get("id") or call.get("tool_call_id")
-                    if not isinstance(raw_call_id, str):
-                        continue
-                    call_id = raw_call_id.strip()
+                for call_id, name in _turn_artifact_declarations_from_message(message):
                     if not call_id:
                         continue
                     if call_id in observed_declarations:
@@ -8872,19 +8952,6 @@ def _final_turn_artifact_paths(
                     observed_declarations.add(call_id)
                     if call_id in invalid_calls:
                         continue
-                    raw_name = call.get("name")
-                    if not raw_name and isinstance(call.get("function"), dict):
-                        raw_name = call["function"].get("name")
-                    if not isinstance(raw_name, str):
-                        _invalidate_call(
-                            call_id,
-                            invalid_calls=invalid_calls,
-                            declared_calls=declared_calls,
-                            descriptors_by_id=descriptors_by_id,
-                            result_order=result_order,
-                        )
-                        continue
-                    name = normalize_tool_name(raw_name)
                     if not name:
                         _invalidate_call(
                             call_id,
@@ -8896,56 +8963,61 @@ def _final_turn_artifact_paths(
                         continue
                     declared_calls[call_id] = name
                 continue
-            if message.get("role") != "tool":
-                continue
-            raw_tool_call_id = message.get("tool_call_id")
-            if not isinstance(raw_tool_call_id, str):
-                continue
-            tool_call_id = raw_tool_call_id.strip()
-            if not tool_call_id or tool_call_id in invalid_calls:
-                invalid_calls.add(tool_call_id)
-                continue
-            if tool_call_id not in declared_calls:
-                invalid_calls.add(tool_call_id)
-                continue
-            tool_name = normalize_tool_name(message.get("name") or message.get("tool_name"))
-            if not tool_name or tool_name != declared_calls[tool_call_id]:
-                _invalidate_call(
-                    tool_call_id,
-                    invalid_calls=invalid_calls,
-                    declared_calls=declared_calls,
-                    descriptors_by_id=descriptors_by_id,
-                    result_order=result_order,
+            for result_message in _turn_artifact_result_messages(message):
+                tool_call_id = str(result_message.get("tool_call_id") or "").strip()
+                if not tool_call_id or tool_call_id in invalid_calls:
+                    if tool_call_id:
+                        invalid_calls.add(tool_call_id)
+                    continue
+                if tool_call_id not in declared_calls:
+                    invalid_calls.add(tool_call_id)
+                    continue
+                declared_name = declared_calls[tool_call_id]
+                result_name = normalize_tool_name(
+                    result_message.get("name") or result_message.get("tool_name")
                 )
-                continue
-            if tool_call_id in consumed_calls:
-                _invalidate_call(
-                    tool_call_id,
-                    invalid_calls=invalid_calls,
-                    declared_calls=declared_calls,
-                    descriptors_by_id=descriptors_by_id,
-                    result_order=result_order,
+                if result_name and result_name != declared_name:
+                    _invalidate_call(
+                        tool_call_id,
+                        invalid_calls=invalid_calls,
+                        declared_calls=declared_calls,
+                        descriptors_by_id=descriptors_by_id,
+                        result_order=result_order,
+                    )
+                    continue
+                if tool_call_id in consumed_calls:
+                    _invalidate_call(
+                        tool_call_id,
+                        invalid_calls=invalid_calls,
+                        declared_calls=declared_calls,
+                        descriptors_by_id=descriptors_by_id,
+                        result_order=result_order,
+                    )
+                    continue
+                consumed_calls.add(tool_call_id)
+                normalized_result = {
+                    **result_message,
+                    "name": declared_name,
+                    "tool_call_id": tool_call_id,
+                }
+                descriptors_for_call = _turn_artifact_descriptors_from_tool_result(
+                    normalized_result,
+                    workspace_root=workspace_root,
+                    session_id=replay_session_id,
                 )
-                continue
-            consumed_calls.add(tool_call_id)
-            descriptors_for_call = _turn_artifact_descriptors_from_tool_result(
-                message,
-                workspace_root=workspace_root,
-                session_id=replay_session_id,
-            )
-            if not descriptors_for_call:
-                _invalidate_call(
-                    tool_call_id,
-                    invalid_calls=invalid_calls,
-                    declared_calls=declared_calls,
-                    descriptors_by_id=descriptors_by_id,
-                    result_order=result_order,
-                )
-                continue
-            if tool_call_id in invalid_calls:
-                continue
-            descriptors_by_id[tool_call_id] = descriptors_for_call
-            result_order.append(tool_call_id)
+                if not descriptors_for_call:
+                    _invalidate_call(
+                        tool_call_id,
+                        invalid_calls=invalid_calls,
+                        declared_calls=declared_calls,
+                        descriptors_by_id=descriptors_by_id,
+                        result_order=result_order,
+                    )
+                    continue
+                if tool_call_id in invalid_calls:
+                    continue
+                descriptors_by_id[tool_call_id] = descriptors_for_call
+                result_order.append(tool_call_id)
         descriptors = []
         seen = set()
         for result_id in result_order:

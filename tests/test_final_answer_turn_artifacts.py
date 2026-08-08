@@ -601,10 +601,10 @@ def test_turn_artifact_renderer_collapses_large_lists_with_accessible_toggle():
         + "const message={_anchor_activity_scene:{artifacts:"
         + json.dumps(artifacts)
         + "}}; _renderTurnArtifactListForMessage(message,segment,0);\n"
-        + "const list=segment.children[0]; const items=list.children[0]; const toggle=list.children[1]; const stableToggle=toggle; toggle.focus(); const collapsed={items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],type:toggle.type,controls:toggle.attributes['aria-controls'],target:items.id,focused:document.activeElement===toggle}; toggle.onclick(); const expanded={items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],stable:toggle===stableToggle,focused:document.activeElement===toggle}; const rerenderSegment=new Node(); rerenderSegment.querySelectorAll=()=>[]; _renderTurnArtifactListForMessage(message,rerenderSegment,0); const rerenderToggle=rerenderSegment.children[0].children[1]; const rerender={items:rerenderSegment.children[0].children[0].children.length,expanded:rerenderToggle.attributes['aria-expanded']}; toggle.onclick(); console.log(JSON.stringify({collapsed,expanded,rerender,collapsedAgain:{items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],stable:toggle===stableToggle,focused:document.activeElement===toggle}}));"
+        + "const list=segment.children[0]; const items=list.children[0]; const toggle=list.children[1]; const stableToggle=toggle; toggle.focus(); const collapsed={items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],type:toggle.type,controls:toggle.attributes['aria-controls'],target:items.id,focused:document.activeElement===toggle,listRole:list.attributes.role||null,itemsRole:items.attributes.role}; toggle.onclick(); const expanded={items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],stable:toggle===stableToggle,focused:document.activeElement===toggle}; const rerenderSegment=new Node(); rerenderSegment.querySelectorAll=()=>[]; _renderTurnArtifactListForMessage(message,rerenderSegment,0); const rerenderToggle=rerenderSegment.children[0].children[1]; const rerender={items:rerenderSegment.children[0].children[0].children.length,expanded:rerenderToggle.attributes['aria-expanded']}; toggle.onclick(); console.log(JSON.stringify({collapsed,expanded,rerender,collapsedAgain:{items:items.children.length,toggle:toggle.textContent,expanded:toggle.attributes['aria-expanded'],stable:toggle===stableToggle,focused:document.activeElement===toggle}}));"
     )
     assert output == {
-        "collapsed": {"items": 5, "toggle": "+7 more", "expanded": "false", "type": "button", "controls": output["collapsed"]["target"], "target": output["collapsed"]["target"], "focused": True},
+        "collapsed": {"items": 5, "toggle": "+7 more", "expanded": "false", "type": "button", "controls": output["collapsed"]["target"], "target": output["collapsed"]["target"], "focused": True, "listRole": None, "itemsRole": "list"},
         "expanded": {"items": 12, "toggle": "Show fewer artifacts", "expanded": "true", "stable": True, "focused": True},
         "rerender": {"items": 12, "expanded": "true"},
         "collapsedAgain": {"items": 5, "toggle": "+7 more", "expanded": "false", "stable": True, "focused": True},
@@ -613,6 +613,51 @@ def test_turn_artifact_renderer_collapses_large_lists_with_accessible_toggle():
     assert "min-height:44px" in styles
     assert "touch-action:manipulation" in styles
     assert "overflow-wrap:anywhere" in styles
+
+
+def test_artifact_sessions_bypass_html_cache_and_keep_controls_live_after_switch():
+    ui = (ROOT / "static/ui.js").read_text(encoding="utf-8")
+    cache_helpers = _function_source(
+        "static/ui.js", "function _messagesHaveTurnArtifacts", "const _sessionHtmlCache"
+    )
+    artifact_helpers = _function_source(
+        "static/ui.js", "function _turnArtifactWorkspacePath", "function _syncLiveWorklogReasonsForAnchor"
+    )
+    artifacts = [
+        {
+            "type": "artifact_reference",
+            "payload": {
+                "path": f"output/report-{index}.md",
+                "workspace_root": "/workspace",
+                "session_id": "sid-a",
+                "tool_name": "patch",
+                "tool_call_id": f"call-{index}",
+            },
+        }
+        for index in range(6)
+    ]
+    output = _run_node(
+        "const INFLIGHT={}; const cache=new Map(); const clicked=[];\n"
+        "const S={session:null,messages:[]}; const t=(key,count)=>key==='turn_artifact_more'?`+${count} more`:key==='turn_artifact_show_fewer'?'Show fewer artifacts':key;\n"
+        "class Node{constructor(){this.children=[];this.attributes={};this.onclick=null;this.id='';this.textContent='';} append(...x){this.children.push(...x)} appendChild(x){this.children.push(x)} replaceChildren(...x){this.children=[...x]} setAttribute(k,v){this.attributes[k]=v} addEventListener(_n,fn){this.onclick=fn}}\n"
+        "const document={createElement:()=>new Node()}; const openArtifactPath=(entry)=>clicked.push(entry.path);\n"
+        + cache_helpers
+        + artifact_helpers
+        + "const artifactMessage={role:'assistant',content:'final',_anchor_activity_scene:{artifacts:"
+        + json.dumps(artifacts)
+        + "}}; const plainMessage={role:'assistant',content:'plain'};\n"
+        "function renderSession(sid,message){S.session={session_id:sid,workspace:'/workspace'};S.messages=[message];if(_sessionHtmlCacheEligible(sid,false,S.messages)){if(cache.has(sid))return cache.get(sid);const inert={cached:true};cache.set(sid,inert);return inert;}const segment=new Node();segment.querySelectorAll=()=>[];_renderTurnArtifactListForMessage(message,segment,0);return segment;}\n"
+        "const first=renderSession('sid-a',artifactMessage);renderSession('sid-b',plainMessage);const restored=renderSession('sid-a',artifactMessage);const list=restored.children[0];const items=list.children[0];const toggle=list.children[1];items.children[0].children[0].onclick();toggle.onclick();console.log(JSON.stringify({artifactCached:cache.has('sid-a'),plainCached:cache.has('sid-b'),rerendered:first!==restored,clicked,expanded:toggle.attributes['aria-expanded'],itemCount:items.children.length}));"
+    )
+    assert output == {
+        "artifactCached": False,
+        "plainCached": True,
+        "rerendered": True,
+        "clicked": ["output/report-0.md"],
+        "expanded": "true",
+        "itemCount": 6,
+    }
+    assert ui.count("_sessionHtmlCacheEligible(sid,hasTransientTranscriptUi,S.messages)") == 2
 
 
 def test_mobile_turn_artifact_items_meet_computed_touch_target_floor():
@@ -1108,6 +1153,160 @@ def test_paginated_session_response_keeps_paired_landed_turn_artifacts():
     ]
 
 
+def test_anthropic_tool_use_results_replay_as_turn_artifacts_without_splitting_turn():
+    from api import routes
+
+    messages = [
+        {"role": "user", "content": "write both files"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "working"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu-write",
+                    "name": "write_file",
+                    "input": {"path": "output/report.md"},
+                },
+                {
+                    "type": "tool_use",
+                    "tool_use_id": "toolu-patch",
+                    "tool_name": "patch",
+                    "input": {"patch": "..."},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu-write",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "bytes_written": 8,
+                                    "resolved_path": "/workspace/output/report.md",
+                                }
+                            ),
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_use_id": "toolu-patch",
+            "content": json.dumps(
+                {
+                    "success": True,
+                    "files_modified": ["/workspace/output/notes.md"],
+                }
+            ),
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "final answer"}]},
+    ]
+
+    assert routes._final_turn_artifact_paths(
+        messages,
+        workspace_root="/workspace",
+        session_id="sid-anthropic",
+    ) == {
+        4: [
+            {
+                "path": "output/report.md",
+                "workspace_root": "/workspace",
+                "tool_call_id": "toolu-write",
+                "tool_name": "write_file",
+                "session_id": "sid-anthropic",
+            },
+            {
+                "path": "output/notes.md",
+                "workspace_root": "/workspace",
+                "tool_call_id": "toolu-patch",
+                "tool_name": "patch",
+                "session_id": "sid-anthropic",
+            },
+        ]
+    }
+
+
+def test_anthropic_artifact_replay_still_rejects_unpaired_and_ambiguous_evidence():
+    from api import routes
+
+    success_result = json.dumps(
+        {"bytes_written": 8, "resolved_path": "/workspace/output/report.md"}
+    )
+    cases = [
+        [
+            {"role": "user", "content": "write"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu-dup", "name": "write_file"},
+                    {"type": "tool_use", "id": "toolu-dup", "name": "write_file"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu-dup", "content": success_result}
+                ],
+            },
+            {"role": "assistant", "content": "final"},
+        ],
+        [
+            {"role": "user", "content": "write"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu-orphan", "content": success_result}
+                ],
+            },
+            {"role": "assistant", "content": "final"},
+        ],
+        [
+            {"role": "user", "content": "write"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu-twice", "name": "write_file"}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu-twice", "content": success_result},
+                    {"type": "tool_result", "tool_use_id": "toolu-twice", "content": success_result},
+                ],
+            },
+            {"role": "assistant", "content": "final"},
+        ],
+        [
+            {"role": "user", "content": "write"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu-mixed", "name": "write_file"}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu-mixed", "content": success_result},
+                    {"type": "text", "text": "Now answer a different question"},
+                ],
+            },
+            {"role": "assistant", "content": "new answer"},
+        ],
+    ]
+
+    for messages in cases:
+        assert routes._final_turn_artifact_paths(
+            messages,
+            workspace_root="/workspace",
+            session_id="sid-anthropic",
+        ) == {}
+
+
 def test_replay_rejects_failed_unpaired_duplicate_and_mismatched_writes():
     from api import routes
 
@@ -1371,6 +1570,41 @@ def test_live_stream_completion_uses_landed_artifact_descriptors():
     assert "'artifacts': landed_artifacts" in body
     assert "'is_error': tool_result_is_error(function_result)" in body
     assert "'is_error': False" not in body
+
+
+def test_compression_settlement_rebinds_artifacts_only_for_the_completed_workspace():
+    messages = (ROOT / "static/messages.js").read_text(encoding="utf-8")
+    settle = _function_source(
+        "static/messages.js",
+        "function _settleTurnArtifactSceneForSession",
+        "function _anchorSceneMessageOffsetForPersist",
+    )
+    persistence = _function_source(
+        "static/messages.js",
+        "function _anchorSceneMessageOffsetForPersist",
+        "function _anchorSceneHasWorklogWorthyRows",
+    )
+    output = _run_node(
+        "const activeSid='sid-parent';const streamId='stream-1';let _oldestIdx=0;const calls=[];const _anchorSceneMessageRef=()=>({id:'message-1'});const api=(_path,options)=>{calls.push(JSON.parse(options.body));return Promise.resolve({});};\n"
+        + settle
+        + persistence
+        + "const scene={version:'activity_scene_v1',artifacts:[{type:'artifact_reference',source_event_type:'artifact_reference',session_id:'sid-parent',payload:{path:'output/report.md',workspace_root:'/workspace',session_id:'sid-parent',tool_name:'patch',tool_call_id:'call-1',source:'live_tool_complete'}}]};\n"
+        "const same=_settleTurnArtifactSceneForSession(scene,{session_id:'sid-child',workspace:'/workspace'});const changed=_settleTurnArtifactSceneForSession(scene,{session_id:'sid-other',workspace:'/other'});_persistSettledAnchorScene({role:'assistant'},same,0,{session_id:'sid-child',workspace:'/workspace'});console.log(JSON.stringify({same,changed,persisted:calls[0]}));"
+    )
+    artifact = output["same"]["artifacts"][0]
+    assert artifact["session_id"] == "sid-child"
+    assert artifact["payload"]["session_id"] == "sid-child"
+    assert artifact["payload"]["workspace_root"] == "/workspace"
+    assert artifact["payload"]["owner"] == {
+        "session_id": "sid-child",
+        "workspace_root": "/workspace",
+    }
+    assert output["changed"]["artifacts"] == []
+    assert output["persisted"]["session_id"] == "sid-child"
+    assert (
+        "_attachProjectedAnchorSceneToLastAssistant(S.messages, null, null, completedSession);"
+        in messages
+    )
 
 
 def test_artifact_open_expands_a_closed_workspace_preview_before_loading_file():

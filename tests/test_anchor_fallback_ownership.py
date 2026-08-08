@@ -412,6 +412,8 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
     """Drive the real renderMessages() gate, not only source-order assertions."""
 
     render_source = _function_source(_ui_js(), "renderMessages")
+    artifact_cache_source = _function_source(_ui_js(), "_messagesHaveTurnArtifacts")
+    cache_eligibility_source = _function_source(_ui_js(), "_sessionHtmlCacheEligible")
     transparent_source = _function_source(_ui_js(), "_transparentStreamOrderedParts")
     legacy_metadata_source = _function_source(
         _ui_js(), "_legacySettledFallbackHasToolMetadata"
@@ -700,6 +702,8 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
           return true;
         }}
 
+        eval({json.dumps(artifact_cache_source)});
+        eval({json.dumps(cache_eligibility_source)});
         eval({json.dumps(transparent_source)});
         eval({json.dumps(legacy_metadata_source)});
         eval({json.dumps(render_source)});
