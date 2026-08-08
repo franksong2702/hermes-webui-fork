@@ -3807,7 +3807,7 @@ def test_gateway_runs_api_journal_snapshot_late_binds_remote_run_authority(
     tmp_path,
     monkeypatch,
 ):
-    from api import run_journal
+    from api import routes, run_journal
     from api.config import STREAMS, STREAMS_LOCK
     from api.gateway_chat import _run_gateway_chat_streaming
 
@@ -3822,6 +3822,8 @@ def test_gateway_runs_api_journal_snapshot_late_binds_remote_run_authority(
     )
     requests = []
     events = []
+    post_entered = threading.Event()
+    release_post = threading.Event()
     q = SimpleNamespace(put_nowait=events.append)
     with STREAMS_LOCK:
         STREAMS[stream_id] = q
@@ -3829,6 +3831,8 @@ def test_gateway_runs_api_journal_snapshot_late_binds_remote_run_authority(
     def fake_urlopen(req, *, timeout=None):
         requests.append(req.full_url)
         if req.full_url.endswith("/v1/runs"):
+            post_entered.set()
+            assert release_post.wait(timeout=5), "runs POST was not released"
             return _GatewayJsonResponse({"run_id": remote_run_id})
         assert req.full_url.endswith(f"/v1/runs/{remote_run_id}/events")
         return _GatewaySseResponse([
@@ -3838,6 +3842,16 @@ def test_gateway_runs_api_journal_snapshot_late_binds_remote_run_authority(
             b"\n",
         ])
 
+    worker = threading.Thread(
+        target=_run_gateway_chat_streaming,
+        kwargs={
+            "session_id": session_id,
+            "msg_text": "hi",
+            "model": "test",
+            "workspace": "/tmp",
+            "stream_id": stream_id,
+        },
+    )
     try:
         with patch.dict("os.environ", {
             "HERMES_WEBUI_CHAT_BACKEND": "gateway",
@@ -3850,14 +3864,23 @@ def test_gateway_runs_api_journal_snapshot_late_binds_remote_run_authority(
              patch("api.gateway_chat._gateway_use_runs_api_enabled", return_value=True), \
              patch("api.gateway_chat.gateway_supports_approval", return_value=True), \
              patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            _run_gateway_chat_streaming(
-                session_id=session_id,
-                msg_text="hi",
-                model="test",
-                workspace="/tmp",
-                stream_id=stream_id,
-            )
+            worker.start()
+            try:
+                assert post_entered.wait(timeout=5), "runs POST was not reached"
+                before_bind = run_journal.find_run_summary(
+                    stream_id,
+                    session_dir=session_dir,
+                )
+                assert before_bind is not None
+                assert before_bind["stable_run_id_status"] == "absent"
+                assert routes._run_journal_live_snapshot(stream_id) is None
+            finally:
+                release_post.set()
+                worker.join(timeout=5)
+        assert not worker.is_alive(), "Gateway worker did not finish after runs POST release"
     finally:
+        release_post.set()
+        worker.join(timeout=5)
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
 

@@ -3664,15 +3664,9 @@ def _run_journal_summary_stable_run_id(summary: dict, stream_id: str) -> str | N
         return None
     if stable_run_id and summary_run_id and stable_run_id != summary_run_id:
         return None
-    if status == "ok":
-        return stable_run_id or summary_run_id
-    if status != "absent":
+    if status != "ok":
         return None
-    if stable_run_id or (summary_run_id and summary_run_id != stream_id):
-        return None
-    if not transport_ids and summary_run_id != stream_id:
-        return None
-    return stream_id
+    return stable_run_id or summary_run_id
 
 
 def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict | None:

@@ -558,7 +558,7 @@ def test_snapshot_fails_closed_on_malformed_or_conflicting_stable_authority(
     assert routes._run_journal_live_snapshot("stream_bad_stable") is None
 
 
-def test_snapshot_accepts_legacy_journal_without_persisted_stable_authority(
+def test_snapshot_rejects_legacy_journal_without_persisted_stable_authority(
     monkeypatch,
     tmp_path,
 ):
@@ -576,14 +576,7 @@ def test_snapshot_accepts_legacy_journal_without_persisted_stable_authority(
 
     assert summary is not None
     assert summary["stable_run_id_status"] == "absent"
-    snapshot = routes._run_journal_live_snapshot("stream_no_authority")
-
-    assert snapshot is not None
-    assert snapshot["stream_id"] == "stream_no_authority"
-    assert snapshot["messages"][0]["content"] == "legacy only"
-    scene_identity = snapshot["anchor_activity_scene"]["identity"]
-    assert scene_identity["run_id"] == "stream_no_authority"
-    assert scene_identity["stream_id"] == "stream_no_authority"
+    assert routes._run_journal_live_snapshot("stream_no_authority") is None
 
 
 def test_snapshot_rejects_missing_stable_run_id_status(monkeypatch):
