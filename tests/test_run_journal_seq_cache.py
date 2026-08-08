@@ -9,7 +9,6 @@ the same per-path lock).
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 
 import pytest  # noqa: F401  # top-level import keeps pytest collection unambiguous
