@@ -143,7 +143,7 @@ class TestMcpToolInventoryApi:
     @patch("api.routes._mcp_runtime_status_by_name")
     @patch("api.routes._active_profile_mcp_config_data")
     @patch("api.routes.get_active_hermes_home")
-    def test_legacy_registry_without_owner_metadata_still_lists_tools(
+    def test_legacy_registry_without_profile_queries_fails_closed(
         self, mock_home, mock_cfg, mock_runtime, mock_allow_ownerless, monkeypatch, tmp_path
     ):
         mock_home.return_value = tmp_path / "profiles" / "work"
@@ -171,8 +171,8 @@ class TestMcpToolInventoryApi:
         _handle_mcp_tools_list(h)
         payload = _json_payload(h)
 
-        assert payload["source"] == "tool_registry"
-        assert [tool["name"] for tool in payload["tools"]] == ["legacy_tool"]
+        assert payload["source"] == "none"
+        assert payload["tools"] == []
         mock_allow_ownerless.assert_called_once_with()
 
     def test_ownerless_runtime_status_adapter_keeps_empty_owner_and_named_profiles_drop_it(

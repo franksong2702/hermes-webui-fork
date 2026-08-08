@@ -781,7 +781,7 @@ def test_mcp_write_ignores_hermes_config_path_and_preserves_raw_placeholders(
     assert "raw-work-mcp" not in default_config["mcp_servers"]
 
 
-def test_mcp_tools_inventory_filters_runtime_and_registry_to_active_profile(
+def test_mcp_inventory_filters_runtime_and_fails_closed_for_unscoped_registry(
     profile_config_harness, monkeypatch
 ):
     harness = profile_config_harness
@@ -853,7 +853,11 @@ def test_mcp_tools_inventory_filters_runtime_and_registry_to_active_profile(
     routes._handle_mcp_tools_list(handler)
     tools = _payload(handler)["tools"]
 
-    assert [tool["name"] for tool in tools] == ["work_registry_tool"]
+    # A registry without profile-scoped query parameters cannot prove which
+    # same-named MCP entry belongs to this request, even when it exposes owner
+    # metadata after an unscoped lookup. Fail closed instead of reading the
+    # process-global/bare-name registry view.
+    assert tools == []
 
 
 def test_mcp_inventory_consumes_profile_scoped_agent_registry_across_switches(

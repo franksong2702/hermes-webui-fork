@@ -26622,7 +26622,7 @@ def _mcp_registry_call_for_profile(
     *args,
     active_home_key: str,
 ):
-    """Call a registry query with an explicit owner when the Agent supports it."""
+    """Call a registry query with an explicit owner or fail closed."""
     method = getattr(registry, method_name, None)
     if not callable(method):
         raise AttributeError(method_name)
@@ -26637,7 +26637,9 @@ def _mcp_registry_call_for_profile(
     )
     if supports_profile_home:
         return method(*args, profile_home=active_home_key)
-    return method(*args)
+    raise TypeError(
+        f"Agent registry method {method_name!r} does not support profile_home"
+    )
 
 
 def _mcp_registry_tool_owner_key(
