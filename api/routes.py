@@ -21092,7 +21092,9 @@ def _handle_btw(handler, body):
     # Copy conversation history for context (agent reads from messages)
     ephemeral.messages = list(s.messages or [])
     ephemeral.title = f"btw: {question[:60]}"
+    auxiliary_persistence_before = _snapshot_auxiliary_session_persistence(ephemeral)
     ephemeral.save()
+    auxiliary_persistence_after = _snapshot_auxiliary_session_persistence(ephemeral)
     from api.run_journal import (
         RunJournalRetiredAuthorityError,
         activate_run_journal_session,
@@ -21100,6 +21102,20 @@ def _handle_btw(handler, body):
     try:
         run_journal_incarnation = activate_run_journal_session(ephemeral.session_id)
     except RunJournalRetiredAuthorityError as exc:
+        if not _rollback_auxiliary_session_after_authority_failure(
+            ephemeral,
+            before=auxiliary_persistence_before,
+            prepared=auxiliary_persistence_after,
+        ):
+            return j(
+                handler,
+                {
+                    "error": "run journal authority failure left auxiliary session state uncertain",
+                    "type": "run_journal_authority_rollback_failed",
+                    "retryable": False,
+                },
+                status=500,
+            )
         return j(
             handler,
             {
@@ -21169,7 +21185,9 @@ def _handle_background(handler, body):
         profile=getattr(s, 'profile', None),
     )
     bg.title = f"bg: {prompt[:60]}"
+    auxiliary_persistence_before = _snapshot_auxiliary_session_persistence(bg)
     bg.save()
+    auxiliary_persistence_after = _snapshot_auxiliary_session_persistence(bg)
     from api.run_journal import (
         RunJournalRetiredAuthorityError,
         activate_run_journal_session,
@@ -21177,6 +21195,20 @@ def _handle_background(handler, body):
     try:
         run_journal_incarnation = activate_run_journal_session(bg.session_id)
     except RunJournalRetiredAuthorityError as exc:
+        if not _rollback_auxiliary_session_after_authority_failure(
+            bg,
+            before=auxiliary_persistence_before,
+            prepared=auxiliary_persistence_after,
+        ):
+            return j(
+                handler,
+                {
+                    "error": "run journal authority failure left auxiliary session state uncertain",
+                    "type": "run_journal_authority_rollback_failed",
+                    "retryable": False,
+                },
+                status=500,
+            )
         return j(
             handler,
             {
@@ -21412,6 +21444,15 @@ def _snapshot_chat_start_file(path: Path) -> dict:
     return {"path": path, "exists": True, "bytes": payload, "mode": mode}
 
 
+def _chat_start_file_snapshots_equal(expected: dict, actual: dict) -> bool:
+    """Compare two exact file images without treating missing as empty."""
+    if expected.get("error") or actual.get("error"):
+        return False
+    if expected.get("exists") != actual.get("exists"):
+        return False
+    return not expected.get("exists") or expected.get("bytes") == actual.get("bytes")
+
+
 def _snapshot_chat_start_persistence(session) -> dict | None:
     """Capture the sidecar and backup images around chat-start preparation."""
     path = getattr(session, "path", None)
@@ -21445,12 +21486,173 @@ def _chat_start_persistence_matches(snapshot: dict | None) -> bool:
     for key in ("sidecar", "backup"):
         expected = snapshot.get(key) or {}
         actual = current[key]
-        if expected.get("error") or actual.get("error"):
+        if not _chat_start_file_snapshots_equal(expected, actual):
             return False
-        if expected.get("exists") != actual.get("exists"):
+    return True
+
+
+def _snapshot_auxiliary_session_persistence(session) -> dict:
+    """Capture child sidecar, backup, and index images around the first save.
+
+    Auxiliary sessions use a real ``Session`` in production, but route-level
+    tests also use in-memory doubles without a ``path``.  The latter have no
+    durable child state to clean, so record that explicit boundary instead of
+    guessing a path under the process's real session directory.
+    """
+    snapshot = _snapshot_chat_start_persistence(session)
+    if snapshot is None:
+        return {"unpersisted": True}
+    snapshot["index"] = _snapshot_chat_start_file(Path(SESSION_INDEX_FILE))
+    return snapshot
+
+
+def _auxiliary_session_persistence_matches(snapshot: dict | None) -> bool:
+    """Return whether a child still owns its sidecar and backup images."""
+    if not isinstance(snapshot, dict):
+        return False
+    if snapshot.get("unpersisted"):
+        return True
+    return _chat_start_persistence_matches(snapshot)
+
+
+def _session_index_rows_from_snapshot(snapshot: dict | None) -> list[dict] | None:
+    """Decode one captured index image, rejecting malformed rows."""
+    if not isinstance(snapshot, dict) or snapshot.get("error"):
+        return None
+    if not snapshot.get("exists"):
+        return []
+    try:
+        rows = json.loads(bytes(snapshot.get("bytes") or b"").decode("utf-8"))
+    except (UnicodeDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        return None
+    return rows
+
+
+def _prune_auxiliary_session_index(
+    session_id: str,
+    *,
+    before: dict | None,
+    prepared: dict | None,
+    restore_files: tuple[dict, dict] | None = None,
+) -> bool:
+    """Compare-and-prune only this child's index row under the index lock."""
+    before_index = before.get("index") if isinstance(before, dict) else None
+    prepared_index = prepared.get("index") if isinstance(prepared, dict) else None
+    before_rows = _session_index_rows_from_snapshot(before_index)
+    prepared_rows = _session_index_rows_from_snapshot(prepared_index)
+    if before_rows is None or prepared_rows is None:
+        return False
+    before_matches = [row for row in before_rows if row.get("session_id") == session_id]
+    prepared_matches = [row for row in prepared_rows if row.get("session_id") == session_id]
+    if before_matches or len(prepared_matches) != 1:
+        return False
+    post_row = prepared_matches[0]
+    index_path = Path(SESSION_INDEX_FILE)
+    from api.models import _INDEX_WRITE_LOCK, _safe_replace
+
+    with _INDEX_WRITE_LOCK:
+        current_snapshot = _snapshot_chat_start_file(index_path)
+        current_rows = _session_index_rows_from_snapshot(current_snapshot)
+        if current_rows is None:
             return False
-        if expected.get("exists") and expected.get("bytes") != actual.get("bytes"):
+        current_matches = [row for row in current_rows if row.get("session_id") == session_id]
+        if len(current_matches) != 1 or current_matches[0] != post_row:
             return False
+        survivors = [row for row in current_rows if row.get("session_id") != session_id]
+        if restore_files is not None:
+            try:
+                _restore_chat_start_file(restore_files[0])
+                _restore_chat_start_file(restore_files[1])
+            except Exception:
+                logger.exception("Failed to restore rejected auxiliary child persistence")
+                return False
+        temporary = index_path.with_suffix(
+            f".tmp.{os.getpid()}.{threading.current_thread().ident}"
+        )
+        try:
+            with open(temporary, "w", encoding="utf-8") as fh:
+                json.dump(survivors, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            _safe_replace(temporary, index_path)
+        except BaseException:
+            try:
+                temporary.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+    return True
+
+
+def _restore_auxiliary_session_persistence(
+    *,
+    session_id: str,
+    before: dict | None,
+    prepared: dict | None,
+) -> bool:
+    """Restore a rejected auxiliary child only while every image is exact."""
+    if not isinstance(before, dict) or not isinstance(prepared, dict):
+        return False
+    if before.get("unpersisted"):
+        return bool(prepared.get("unpersisted"))
+    if (
+        before.get("error")
+        or any((before.get(key) or {}).get("error") for key in ("sidecar", "backup"))
+        or not _auxiliary_session_persistence_matches(prepared)
+    ):
+        logger.warning("Refusing auxiliary run-journal rollback: child persistence rotated")
+        return False
+    return _prune_auxiliary_session_index(
+        session_id,
+        before=before,
+        prepared=prepared,
+        restore_files=(before["sidecar"], before["backup"]),
+    )
+
+
+def _rollback_auxiliary_session_after_authority_failure(
+    session,
+    *,
+    before: dict,
+    prepared: dict,
+) -> bool:
+    """Remove one rejected child without touching a successor or its parent."""
+    session_id = str(getattr(session, "session_id", "") or "")
+    if not isinstance(prepared, dict):
+        return False
+    from api.models import _INDEX_WRITE_LOCK
+
+    # Match models.py's writer order (_INDEX_WRITE_LOCK -> LOCK) so the exact
+    # owner check remains held while the targeted index prune and child file
+    # cleanup run.  This closes the in-process successor-rotation window
+    # without introducing the inverse LOCK -> _INDEX_WRITE_LOCK order.
+    with _INDEX_WRITE_LOCK:
+        with LOCK:
+            current = SESSIONS.get(session_id)
+        if current is not session:
+            logger.warning(
+                "Refusing auxiliary run-journal rollback for %s: in-memory child owner rotated",
+                session_id,
+            )
+            return False
+        if not _restore_auxiliary_session_persistence(
+            session_id=session_id,
+            before=before,
+            prepared=prepared,
+        ):
+            return False
+        with LOCK:
+            current = SESSIONS.get(session_id)
+            if current is session:
+                SESSIONS.pop(session_id, None)
+            else:
+                logger.warning(
+                    "Refusing auxiliary run-journal rollback for %s: in-memory child owner rotated during cleanup",
+                    session_id,
+                )
+                return False
     return True
 
 

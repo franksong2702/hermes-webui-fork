@@ -550,6 +550,7 @@ def test_auxiliary_route_valid_retired_authority_still_blocks(
     child = _Session(f"{endpoint}-child-retired")
     monkeypatch.setattr(routes, "get_session", lambda _sid: parent)
     monkeypatch.setattr(models, "new_session", lambda **_kwargs: child)
+    models.SESSIONS[child.session_id] = child
     _install_authority_failure(monkeypatch, route_harness, child.session_id, "retired")
 
     if endpoint == "btw":
@@ -564,6 +565,252 @@ def test_auxiliary_route_valid_retired_authority_still_blocks(
     assert response["_status"] == 409
     assert response["type"] == "run_journal_authority_unavailable"
     assert not _Thread.created
+
+
+def _invoke_auxiliary_route(monkeypatch, endpoint, parent, *, trackers):
+    from api import background
+
+    if endpoint == "btw":
+        monkeypatch.setattr(
+            background,
+            "track_btw",
+            lambda *args: trackers.append(("btw", args)),
+        )
+        return routes._handle_btw(
+            object(), {"session_id": parent.session_id, "question": "side question"}
+        )
+    monkeypatch.setattr(
+        background,
+        "track_background",
+        lambda *args: trackers.append(("background", args)),
+    )
+    monkeypatch.setattr(background, "complete_background", lambda *_args: None)
+    return routes._handle_background(
+        object(), {"session_id": parent.session_id, "prompt": "background task"}
+    )
+
+
+def _install_retired_authority_for_child(root, child):
+    path = _authority_path(root, child.session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "session_id": child.session_id,
+                "state": "retired",
+                "incarnation": "0" * 32,
+            }
+        ),
+        encoding="ascii",
+    )
+    return path, path.read_bytes()
+
+
+@pytest.mark.parametrize("endpoint", ["btw", "background"])
+def test_auxiliary_retired_authority_removes_fresh_child_exactly(
+    real_session_store, monkeypatch, endpoint
+):
+    parent = _Session(f"{endpoint}-parent-fresh-cleanup")
+    parent_before = copy.deepcopy(parent.__dict__)
+    created = []
+    authority = {}
+    real_new_session = models.new_session
+
+    def new_child(**kwargs):
+        child = real_new_session(**kwargs)
+        created.append(child)
+        authority["path"], authority["before"] = _install_retired_authority_for_child(
+            real_session_store[0].parent,
+            child,
+        )
+        return child
+
+    monkeypatch.setattr(routes, "get_session", lambda _sid: parent)
+    monkeypatch.setattr(models, "new_session", new_child)
+    trackers = []
+
+    response = _invoke_auxiliary_route(
+        monkeypatch,
+        endpoint,
+        parent,
+        trackers=trackers,
+    )
+
+    child = created[0]
+    backup_path = child.path.with_suffix(".json.bak")
+    assert response["_status"] == 409
+    assert response["type"] == "run_journal_authority_unavailable"
+    assert not child.path.exists()
+    assert not backup_path.exists()
+    if real_session_store[1].exists():
+        rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+        assert all(row.get("session_id") != child.session_id for row in rows)
+    assert child.session_id not in models.SESSIONS
+    assert authority["path"].read_bytes() == authority["before"]
+    assert not _Thread.created
+    assert trackers == []
+    assert parent.__dict__ == parent_before
+
+
+@pytest.mark.parametrize("endpoint", ["btw", "background"])
+@pytest.mark.parametrize(
+    "rotation",
+    ["sidecar", "backup", "owner", "index_missing", "index_duplicate", "index_rotated"],
+)
+def test_auxiliary_retired_authority_rotation_fails_closed_without_clobbering(
+    real_session_store, monkeypatch, endpoint, rotation
+):
+    parent = _Session(f"{endpoint}-parent-rotation-{rotation}")
+    created = []
+    authority = {}
+    real_new_session = models.new_session
+    successor = object()
+
+    def new_child(**kwargs):
+        child = real_new_session(**kwargs)
+        created.append(child)
+        authority["path"], authority["before"] = _install_retired_authority_for_child(
+            real_session_store[0].parent,
+            child,
+        )
+        return child
+
+    def rotate_then_retire(session_id):
+        child = created[0]
+        authority["post_sidecar"] = child.path.read_bytes()
+        authority["post_index"] = real_session_store[1].read_bytes()
+        if rotation == "sidecar":
+            child.path.write_bytes(b"external-sidecar-successor")
+        elif rotation == "backup":
+            child.path.with_suffix(".json.bak").write_bytes(b"external-backup-successor")
+        elif rotation == "owner":
+            models.SESSIONS[session_id] = successor
+        else:
+            rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+            if rotation == "index_missing":
+                real_session_store[1].unlink()
+            elif rotation == "index_duplicate":
+                rows.append(next(row for row in rows if row.get("session_id") == child.session_id))
+                real_session_store[1].write_text(
+                    json.dumps(rows, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            else:
+                next(row for row in rows if row.get("session_id") == child.session_id)["title"] = "rotated child row"
+                real_session_store[1].write_text(
+                    json.dumps(rows, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        raise run_journal.RunJournalRetiredAuthorityError("retired")
+
+    monkeypatch.setattr(routes, "get_session", lambda _sid: parent)
+    monkeypatch.setattr(models, "new_session", new_child)
+    monkeypatch.setattr(run_journal, "activate_run_journal_session", rotate_then_retire)
+    trackers = []
+
+    response = _invoke_auxiliary_route(
+        monkeypatch,
+        endpoint,
+        parent,
+        trackers=trackers,
+    )
+
+    child = created[0]
+    assert response["_status"] == 500
+    assert response["type"] == "run_journal_authority_rollback_failed"
+    assert response["retryable"] is False
+    if rotation == "sidecar":
+        assert child.path.read_bytes() == b"external-sidecar-successor"
+    elif rotation == "backup":
+        assert child.path.with_suffix(".json.bak").read_bytes() == b"external-backup-successor"
+    elif rotation == "owner":
+        assert models.SESSIONS[child.session_id] is successor
+        assert child.path.read_bytes() == authority["post_sidecar"]
+    elif rotation == "index_missing":
+        assert not real_session_store[1].exists()
+        assert child.path.read_bytes() == authority["post_sidecar"]
+    elif rotation == "index_duplicate":
+        rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+        assert sum(row.get("session_id") == child.session_id for row in rows) == 2
+        assert child.path.read_bytes() == authority["post_sidecar"]
+    elif rotation == "index_rotated":
+        rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+        child_rows = [row for row in rows if row.get("session_id") == child.session_id]
+        assert len(child_rows) == 1
+        assert child_rows[0]["title"] == "rotated child row"
+        assert child.path.read_bytes() == authority["post_sidecar"]
+    else:
+        assert real_session_store[1].read_bytes() == authority["post_index"]
+    if rotation != "owner":
+        assert models.SESSIONS[child.session_id] is child
+    assert authority["path"].read_bytes() == authority["before"]
+    assert not _Thread.created
+    assert trackers == []
+
+
+@pytest.mark.parametrize("endpoint", ["btw", "background"])
+def test_auxiliary_rollback_prunes_only_child_index_row(
+    real_session_store, monkeypatch, endpoint
+):
+    parent = _Session(f"{endpoint}-parent-index-successor")
+    sibling = models.Session(
+        session_id="sibling-index-row",
+        title="Sibling before",
+        messages=[{"role": "assistant", "content": "existing"}],
+    )
+    sibling.save(touch_updated_at=False)
+    created = []
+    real_new_session = models.new_session
+
+    def new_child(**kwargs):
+        child = real_new_session(**kwargs)
+        created.append(child)
+        _install_retired_authority_for_child(real_session_store[0].parent, child)
+        return child
+
+    def update_index_then_retire(_sid):
+        rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+        for row in rows:
+            if row.get("session_id") == sibling.session_id:
+                row["title"] = "Sibling updated concurrently"
+        rows.append(
+            {
+                "session_id": "new-concurrent-row",
+                "title": "Concurrent new row",
+                "message_count": 0,
+            }
+        )
+        real_session_store[1].write_text(
+            json.dumps(rows, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        raise run_journal.RunJournalRetiredAuthorityError("retired")
+
+    monkeypatch.setattr(routes, "get_session", lambda _sid: parent)
+    monkeypatch.setattr(models, "new_session", new_child)
+    monkeypatch.setattr(run_journal, "activate_run_journal_session", update_index_then_retire)
+    trackers = []
+
+    response = _invoke_auxiliary_route(
+        monkeypatch,
+        endpoint,
+        parent,
+        trackers=trackers,
+    )
+
+    child = created[0]
+    rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+    rows_by_id = {row["session_id"]: row for row in rows}
+    assert response["_status"] == 409
+    assert response["type"] == "run_journal_authority_unavailable"
+    assert child.session_id not in rows_by_id
+    assert rows_by_id[sibling.session_id]["title"] == "Sibling updated concurrently"
+    assert rows_by_id["new-concurrent-row"]["title"] == "Concurrent new row"
+    assert not child.path.exists()
+    assert child.session_id not in models.SESSIONS
+    assert not _Thread.created
+    assert trackers == []
 
 
 @pytest.mark.parametrize("endpoint", ["send", "btw", "background"])
