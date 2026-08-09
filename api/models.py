@@ -52,6 +52,10 @@ CLI_VISIBLE_SESSION_LIMIT = 20
 # sidebar window (#3172).
 CRON_PROJECT_CHIP_LIMIT = 200
 WEBHOOK_PROJECT_CHIP_LIMIT = 200
+# Kanban worker runs are internal/background like cron+webhook; keep the same
+# higher project-chip cap so project-assigned kanban rows stay addressable when
+# the toggle is on, without letting them dominate the default sidebar window.
+KANBAN_PROJECT_CHIP_LIMIT = 200
 _CLI_SESSIONS_CACHE_TTL_SECONDS = 5.0
 # While a turn is actively streaming, hold the CLI/cron projection longer than
 # one poll interval (mirrors the route-level #4808 hold-down). The frontend
@@ -1187,7 +1191,8 @@ def model_explicit_pick_signature(model, model_provider) -> str:
 
 class Session:
     def __init__(self, session_id: str=None, title: str='Untitled',
-                 workspace=str(DEFAULT_WORKSPACE), model=DEFAULT_MODEL,
+                 workspace=str(DEFAULT_WORKSPACE), created_workspace=None,
+                 model=DEFAULT_MODEL,
                  model_provider=None,
                  messages=None, created_at=None, updated_at=None,
                  tool_calls=None, pinned: bool=False, archived: bool=False,
@@ -1238,6 +1243,21 @@ class Session:
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.title = title
         self.workspace = str(Path(workspace).expanduser().resolve())
+        # #6672: immutable snapshot of the workspace at session creation time.
+        # s.workspace is updated on every turn when the user switches workspaces
+        # mid-session via the WebUI header dropdown; interpolating the live
+        # value into the system prompt would mutate msg[0] and invalidate LLM
+        # prefix caches (APC/Radix Tree) for the whole transcript. Freeze the
+        # original workspace here and keep the active workspace out of the
+        # system prompt (mid-session switches ride on the [Workspace::v1: ...]
+        # tag appended to the active user turn instead). Legacy sessions
+        # without a persisted created_workspace fall back to the workspace
+        # recorded on disk, which is the best available approximation.
+        self.created_workspace = (
+            str(Path(created_workspace).expanduser().resolve())
+            if created_workspace
+            else self.workspace
+        )
         self.model = model
         self.model_provider = str(model_provider).strip().lower() if model_provider else None
         # #5979: signature of the model the user DELIBERATELY picked this session
@@ -1369,7 +1389,7 @@ class Session:
         # without parsing the full messages array (which may be 400KB+).
         # Fields are listed in the order they should appear in the JSON file.
         METADATA_FIELDS = [
-            'session_id', 'title', 'workspace', 'model', 'model_provider', 'model_explicit_pick_signature', 'created_at', 'updated_at',
+            'session_id', 'title', 'workspace', 'created_workspace', 'model', 'model_provider', 'model_explicit_pick_signature', 'created_at', 'updated_at',
             'pinned', 'archived', 'project_id', 'profile',
             'input_tokens', 'output_tokens', 'estimated_cost',
             'cache_read_tokens', 'cache_write_tokens',
@@ -1751,6 +1771,10 @@ class Session:
             # Only emit 'parent_session_id' when set (the /branch fork link, #1342).
             # Sessions without a fork must not leak None — see test_session_lineage_metadata_api.
             **({'parent_session_id': self.parent_session_id} if self.parent_session_id else {}),
+            # #6672: immutable workspace captured at session creation, exposed so
+            # the UI can distinguish it from the live `workspace` field (which
+            # updates on mid-session switches without touching the system prompt).
+            'created_workspace': getattr(self, 'created_workspace', None) or self.workspace,
             **({
                 'compression_recovery_source_session_id': self.compression_recovery_source_session_id,
                 'compression_recovery_action': self.compression_recovery_action,
@@ -4956,7 +4980,7 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         s.save()
     return s
 
-def _hide_from_default_sidebar(session: dict, *, show_cron: bool = False, show_webhook: bool = False) -> bool:
+def _hide_from_default_sidebar(session: dict, *, show_cron: bool = False, show_webhook: bool = False, show_kanban: bool = False) -> bool:
     """Return True for internal/background sessions hidden from the default list."""
     sid = str(session.get('session_id') or '')
     source = (
@@ -4968,6 +4992,8 @@ def _hide_from_default_sidebar(session: dict, *, show_cron: bool = False, show_w
     if not show_cron and (source == 'cron' or sid.startswith('cron_')):
         return True
     if not show_webhook and source == 'webhook':
+        return True
+    if not show_kanban and source == 'kanban':
         return True
     if bool(session.get('pre_compression_snapshot')):
         return not bool(session.get('_show_pre_compression_snapshot'))
@@ -5022,7 +5048,7 @@ def _is_intentionally_background_sidebar_session(session: dict) -> bool:
         or session.get('raw_source')
         or session.get('session_source')
     )
-    return source in {'cron', 'webhook'} or sid.startswith('cron_')
+    return source in {'cron', 'webhook', 'kanban'} or sid.startswith('cron_')
 
 
 def _include_project_hidden_background_sidebar_sessions(
@@ -7523,6 +7549,7 @@ def _load_cli_sessions_uncached(
         limit=visible_session_limit if visible_session_limit is not None else (
             CRON_PROJECT_CHIP_LIMIT if source_filter == 'cron'
             else WEBHOOK_PROJECT_CHIP_LIMIT if source_filter == 'webhook'
+            else KANBAN_PROJECT_CHIP_LIMIT if source_filter == 'kanban'
             else CLI_VISIBLE_SESSION_LIMIT
         ),
         log=logger,
@@ -8451,6 +8478,48 @@ def _state_db_row_identity(message: dict | None):
     return identity if valid else None
 
 
+def _stable_message_identity_details(message: dict | None) -> tuple[str | None, bool]:
+    """Return a canonical stable message id and whether its aliases are valid."""
+    if not isinstance(message, dict):
+        return None, True
+    values = set()
+    for key in ("id", "message_id"):
+        if key not in message or message.get(key) in (None, ""):
+            continue
+        value = message.get(key)
+        if isinstance(value, bool):
+            return None, False
+        if isinstance(value, (int, str)):
+            normalized = str(value).strip()
+        elif isinstance(value, float):
+            normalized = str(value) if math.isfinite(value) else ""
+        else:
+            normalized = ""
+        if not normalized:
+            return None, False
+        values.add(normalized)
+    if len(values) > 1:
+        return None, False
+    return (next(iter(values)) if values else None), True
+
+
+def _message_identity_compatible(target: dict | None, source: dict | None) -> bool:
+    """Return whether private identities do not contradict one another."""
+    target_stable, target_stable_valid = _stable_message_identity_details(target)
+    source_stable, source_stable_valid = _stable_message_identity_details(source)
+    if not target_stable_valid or not source_stable_valid:
+        return False
+    if target_stable is not None and source_stable is not None and target_stable != source_stable:
+        return False
+    target_row_id, target_row_id_valid = _state_db_row_identity_details(target)
+    source_row_id, source_row_id_valid = _state_db_row_identity_details(source)
+    if not target_row_id_valid or not source_row_id_valid:
+        return False
+    if target_row_id is not None and source_row_id is not None and target_row_id != source_row_id:
+        return False
+    return _visible_content_compatible(target, source)
+
+
 def _message_exact_timestamp(message: dict | None):
     """Return a numeric transcript timestamp, preserving ``0`` as valid."""
     if not isinstance(message, dict):
@@ -8545,15 +8614,15 @@ def _copy_api_content_sidecar(target: dict | None, source: dict | None) -> bool:
 def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list) -> None:
     """Attach state.db ``api_content`` to the matching sidecar transcript rows.
 
-    Matching is intentionally stricter than the visible transcript dedupe.  A
-    durable row id wins when both sides carry the private state.db provenance;
-    otherwise an exact role + timestamp match is used.  When timestamps are
-    absent on both sides, rows are paired by per-role sequence only when the
-    available durable metadata does not contradict that pairing.  We never use
-    role + normalized visible text alone, because repeated user text is valid
-    and must not inherit another turn's provider-facing bytes.  If both sides
-    already carry different non-empty provider sidecars, neither is attached;
-    the append-only merge preserves those rows as distinct.
+    Matching is intentionally stricter than visible transcript dedupe. A
+    unique stable message id is preferred, followed by a unique durable
+    state.db row id, exact timestamps, same-second timestamp drift, and finally
+    a mutually-unique role/content pair that may have mixed timestamp metadata.
+    Duplicate, malformed, or contradictory provenance is consumed without a
+    fallback guess. Repeated visible rows without unique provenance remain
+    unattached. If both sides already carry different non-empty provider
+    sidecars, neither is attached; the append-only merge preserves those rows
+    as distinct.
     """
     sidecar = [message for message in sidecar_messages or () if isinstance(message, dict)]
     state = [
@@ -8570,21 +8639,63 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
     used_targets: set[int] = set()
     used_sources: set[int] = set()
 
-    # Invalid provenance is never treated as absent metadata.  Consume those
-    # rows up front so neither the timestamp tier nor the metadata-free role
-    # sequence tier can attach an arbitrary provider sidecar.
+    # Invalid provenance is never treated as absent metadata. Consume those
+    # rows up front so no weaker tier can attach an arbitrary provider sidecar.
     for index, message in enumerate(sidecar):
         _, row_id_valid = _state_db_row_identity_details(message)
         _, timestamp_valid = _message_exact_timestamp_details(message)
-        if not row_id_valid or not timestamp_valid:
+        _, stable_id_valid = _stable_message_identity_details(message)
+        if not row_id_valid or not timestamp_valid or not stable_id_valid:
             used_targets.add(index)
     for source_index, message in enumerate(state):
         _, row_id_valid = _state_db_row_identity_details(message)
         _, timestamp_valid = _message_exact_timestamp_details(message)
-        if not row_id_valid or not timestamp_valid:
+        _, stable_id_valid = _stable_message_identity_details(message)
+        if not row_id_valid or not timestamp_valid or not stable_id_valid:
             used_sources.add(source_index)
 
-    # 1. Durable row identity.  This path is unambiguous only when every
+    # 1. Stable message identity. This is the strongest WebUI-side identity
+    # and must run before timestamp/content fallbacks. Duplicate or conflicting
+    # aliases are consumed above and cannot fall through to a guess.
+    targets_by_stable_id = {}
+    state_by_stable_id = {}
+    for index, message in enumerate(sidecar):
+        if index in used_targets:
+            continue
+        stable_id, valid = _stable_message_identity_details(message)
+        if valid and stable_id is not None:
+            targets_by_stable_id.setdefault(stable_id, []).append(index)
+    for source_index, message in enumerate(state):
+        if source_index in used_sources:
+            continue
+        stable_id, valid = _stable_message_identity_details(message)
+        if valid and stable_id is not None:
+            state_by_stable_id.setdefault(stable_id, []).append(source_index)
+    for stable_id, target_indexes in targets_by_stable_id.items():
+        source_indexes = state_by_stable_id.get(stable_id, [])
+        if len(target_indexes) != 1 or len(source_indexes) != 1:
+            used_targets.update(target_indexes)
+            used_sources.update(source_indexes)
+            continue
+        target_index = target_indexes[0]
+        source_index = source_indexes[0]
+        if not _message_identity_compatible(sidecar[target_index], state[source_index]):
+            used_targets.add(target_index)
+            used_sources.add(source_index)
+            continue
+        target_api_content = _session_message_api_content_key(sidecar[target_index])
+        source_api_content = _session_message_api_content_key(state[source_index])
+        used_targets.add(target_index)
+        used_sources.add(source_index)
+        if (
+            target_api_content is not None
+            and source_api_content is not None
+            and target_api_content != source_api_content
+        ):
+            continue
+        _copy_api_content_sidecar(sidecar[target_index], state[source_index])
+
+    # 2. Durable row identity. This path is unambiguous only when every
     # alias agrees, each row id occurs once on each side, and visible content
     # is compatible.  Any duplicate/conflicting id is consumed and rejected;
     # it must not fall through to a weaker tier.  A unique row id with
@@ -8637,7 +8748,7 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
         used_sources.add(source_index)
         _copy_api_content_sidecar(sidecar[target_index], state[source_index])
 
-    # 2. Exact role + timestamp. A bucket is safe only when it has one
+    # 3. Exact role + timestamp. A bucket is safe only when it has one
     # remaining candidate on each side. Equal timestamps are not provenance;
     # never guess by list order when a bucket is ambiguous.
     sidecar_by_exact_timestamp = {}
@@ -8647,8 +8758,8 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
             continue
         role = _message_sidecar_role(message)
         timestamp = _message_exact_timestamp(message)
-        row_id, valid = _state_db_row_identity_details(message)
-        if valid and row_id is None and role is not None and timestamp is not None:
+        _, valid = _state_db_row_identity_details(message)
+        if valid and role is not None and timestamp is not None:
             sidecar_by_exact_timestamp.setdefault((role, timestamp), []).append(index)
     for source_index, message in enumerate(state):
         if source_index in used_sources:
@@ -8672,15 +8783,17 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
         source_index, message = state_rows[0]
         used_targets.add(index)
         used_sources.add(source_index)
+        if not _message_identity_compatible(sidecar[index], message):
+            continue
         _copy_api_content_sidecar(sidecar[index], message)
 
-    # 3. Same-second sub-second drift.  The sidecar JSON and state.db can
+    # 4. Same-second sub-second drift. The sidecar JSON and state.db can
     # record one logical turn with different fractional timestamps while still
-    # landing in the same wall-clock second.  Do not use the truncated second
-    # as identity by itself: build only role/timestamp buckets whose rows have
-    # no durable provenance, then require a unique *compatible* visible row on
-    # each side.  A candidate is compatible only when role + normalized visible
-    # content agree and neither side carries a conflicting provider sidecar.
+    # landing in the same wall-clock second. Do not use the truncated second
+    # as identity by itself: require a unique *compatible* visible row on each
+    # side. A candidate is compatible only when role + normalized visible
+    # content and all available provenance agree, and neither side carries a
+    # conflicting provider sidecar.
     # This keeps repeated text, contradictory provenance, and conflicting wire
     # payloads fail-closed instead of guessing by list order.
     sidecar_by_same_second = {}
@@ -8691,7 +8804,7 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
         role = _message_sidecar_role(message)
         timestamp = _message_exact_timestamp(message)
         row_id, valid = _state_db_row_identity_details(message)
-        if valid and row_id is None and role is not None and timestamp is not None:
+        if valid and role is not None and timestamp is not None:
             second = _normalized_message_timestamp_for_key(timestamp)
             sidecar_by_same_second.setdefault((role, second), []).append(index)
     for source_index, message in enumerate(state):
@@ -8700,7 +8813,7 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
         role = _message_sidecar_role(message)
         timestamp = _message_exact_timestamp(message)
         row_id, valid = _state_db_row_identity_details(message)
-        if valid and row_id is None and role is not None and timestamp is not None:
+        if valid and role is not None and timestamp is not None:
             second = _normalized_message_timestamp_for_key(timestamp)
             state_by_same_second.setdefault((role, second), []).append(source_index)
 
@@ -8722,7 +8835,7 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
                 target_index
                 for target_index in target_indexes
                 if target_index not in used_targets
-                and _visible_content_compatible(sidecar[target_index], source_message)
+                and _message_identity_compatible(sidecar[target_index], source_message)
                 and (
                     _session_message_api_content_key(sidecar[target_index]) is None
                     or _session_message_api_content_key(sidecar[target_index])
@@ -8750,36 +8863,60 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
             used_targets.add(target_index)
             _copy_api_content_sidecar(sidecar[target_index], state[source_index])
 
-    # 4. Metadata-free fallback is safe only for a unique role bucket. A
-    # repeated role with no durable identity has no principled ordering, so it
-    # must remain unattached rather than being paired by zip/list position.
-    sidecar_by_role_sequence = {}
-    state_by_role_sequence = {}
+    # 5. Role + visible-content fallback tolerates mixed timestamp metadata,
+    # but only when the candidate relationship is mutually unique. Repeated
+    # identical rows have no principled ordering and remain unattached.
+    sidecar_by_visible_content = {}
+    state_by_visible_content = {}
     for index, message in enumerate(sidecar):
         if index in used_targets:
             continue
         role = _message_sidecar_role(message)
-        row_id, valid = _state_db_row_identity_details(message)
-        if valid and row_id is None and role is not None and _message_exact_timestamp(message) is None:
-            sidecar_by_role_sequence.setdefault(role, []).append(index)
+        _, row_id_valid = _state_db_row_identity_details(message)
+        _, stable_id_valid = _stable_message_identity_details(message)
+        _, timestamp_valid = _message_exact_timestamp_details(message)
+        if (
+            row_id_valid
+            and stable_id_valid
+            and timestamp_valid
+            and role is not None
+            and _message_visible_content_key(message) is not None
+        ):
+            sidecar_by_visible_content.setdefault(_message_visible_content_key(message), []).append(index)
     for source_index, message in enumerate(state):
         if source_index in used_sources:
             continue
         role = _message_sidecar_role(message)
-        row_id, valid = _state_db_row_identity_details(message)
-        if valid and row_id is None and role is not None and _message_exact_timestamp(message) is None:
-            state_by_role_sequence.setdefault(role, []).append((source_index, message))
-    for role, state_rows in state_by_role_sequence.items():
-        candidates = [index for index in sidecar_by_role_sequence.get(role, ()) if index not in used_targets]
-        if len(candidates) != 1 or len(state_rows) != 1:
-            used_targets.update(candidates)
-            used_sources.update(source_index for source_index, _ in state_rows)
+        _, row_id_valid = _state_db_row_identity_details(message)
+        _, stable_id_valid = _stable_message_identity_details(message)
+        _, timestamp_valid = _message_exact_timestamp_details(message)
+        if (
+            row_id_valid
+            and stable_id_valid
+            and timestamp_valid
+            and role is not None
+            and _message_visible_content_key(message) is not None
+        ):
+            state_by_visible_content.setdefault(_message_visible_content_key(message), []).append(source_index)
+    for visible_key, target_indexes in sidecar_by_visible_content.items():
+        source_indexes = state_by_visible_content.get(visible_key, [])
+        if len(target_indexes) != 1 or len(source_indexes) != 1:
             continue
-        index = candidates[0]
-        source_index, message = state_rows[0]
-        used_targets.add(index)
+        target_index = target_indexes[0]
+        source_index = source_indexes[0]
+        if not _message_identity_compatible(sidecar[target_index], state[source_index]):
+            continue
+        target_api_content = _session_message_api_content_key(sidecar[target_index])
+        source_api_content = _session_message_api_content_key(state[source_index])
+        if (
+            target_api_content is not None
+            and source_api_content is not None
+            and target_api_content != source_api_content
+        ):
+            continue
+        used_targets.add(target_index)
         used_sources.add(source_index)
-        _copy_api_content_sidecar(sidecar[index], message)
+        _copy_api_content_sidecar(sidecar[target_index], state[source_index])
 
 
 def _session_message_dedup_key(msg: dict):

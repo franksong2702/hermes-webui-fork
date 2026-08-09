@@ -277,7 +277,7 @@ def test_issue6751_ambiguous_metadata_free_sequence_fails_closed():
     ]
 
 
-def test_issue6751_partial_metadata_bucket_fails_closed_instead_of_zipping():
+def test_issue6751_partial_metadata_bucket_uses_unique_role_content_pairs():
     from api.models import merge_session_messages_append_only
 
     sidecar = [
@@ -293,8 +293,6 @@ def test_issue6751_partial_metadata_bucket_fails_closed_instead_of_zipping():
 
     assert merged[:2] == sidecar
     assert [message.get("api_content") for message in merged] == [
-        None,
-        None,
         "wire-first",
         "wire-second",
     ]
@@ -1325,3 +1323,223 @@ def test_issue6751_branch_endpoint_reconciles_provider_sidecars_into_first_agent
         "[Workspace::v1: /original]\nvisible request",
         "provider answer bytes",
     ]
+
+
+def test_issue6751_real_state_reader_unique_row_id_reconciles_timestamp_drift(
+    monkeypatch, tmp_path
+):
+    """The real state.db reader's unique row identity must prevent a replay duplicate."""
+    import api.models as models
+
+    sid = "issue6751-reader-row-id"
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp REAL,
+            api_content TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)",
+        (7, sid, "user", "same visible", 100.8, "provider wire"),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db_path)
+
+    state_messages = models.get_state_db_session_messages(sid)
+    assert state_messages == [
+        {
+            "role": "user",
+            "content": "same visible",
+            "timestamp": 100.8,
+            "api_content": "provider wire",
+            "_state_db_row_id": 7,
+        }
+    ]
+
+    merged = models.merge_session_messages_append_only(
+        [{"role": "user", "content": "same visible", "timestamp": 100.1}],
+        state_messages,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["api_content"] == "provider wire"
+
+
+def test_issue6751_reconciliation_prefers_unique_stable_message_id_before_weaker_tiers():
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "timestamp": 10.0,
+            "id": "turn-a",
+        },
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "timestamp": 20.0,
+            "id": "turn-b",
+        },
+    ]
+    state = [
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "id": "turn-b",
+            "api_content": "wire-b",
+        },
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "id": "turn-a",
+            "api_content": "wire-a",
+        },
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert len(merged) == 2
+    assert [(message["id"], message.get("api_content")) for message in merged] == [
+        ("turn-a", "wire-a"),
+        ("turn-b", "wire-b"),
+    ]
+
+
+def test_issue6751_reconciliation_role_content_fallback_tolerates_mixed_timestamps():
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [{"role": "assistant", "content": "one answer", "timestamp": 30.0}]
+    state = [{"role": "assistant", "content": "one answer", "api_content": "wire"}]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert len(merged) == 1
+    assert merged[0]["api_content"] == "wire"
+
+
+def test_issue6751_repeated_identical_rows_without_provenance_stay_unmatched():
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {"role": "assistant", "content": "same answer", "timestamp": 30.0},
+        {"role": "assistant", "content": "same answer"},
+    ]
+    state = [
+        {"role": "assistant", "content": "same answer", "api_content": "wire-a"},
+        {"role": "assistant", "content": "same answer", "api_content": "wire-b"},
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert [message.get("api_content") for message in merged[:2]] == [None, None]
+    assert [message.get("api_content") for message in merged[2:]] == [
+        "wire-a",
+        "wire-b",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("keep_count", "expected_message_count", "expected_context_sidecars"),
+    [
+        (0, 0, []),
+        (1, 1, ["[Workspace::v1: /fork]\nrequest"]),
+        (2, 2, ["[Workspace::v1: /fork]\nrequest", "provider answer bytes"]),
+    ],
+)
+def test_issue6751_branch_keep_count_retains_final_assistant_sidecar(
+    monkeypatch, keep_count, expected_message_count, expected_context_sidecars
+):
+    """Fork prefixes keep the same reconciled provider payload as the display rows."""
+    from collections import OrderedDict
+
+    import api.routes as routes
+
+    source_messages = [
+        {
+            "role": "user",
+            "content": "request",
+            "timestamp": 1.0,
+            "id": "turn-user",
+            "api_content": "[Workspace::v1: /fork]\nrequest",
+        },
+        {
+            "role": "assistant",
+            "content": "answer",
+            "timestamp": 2.0,
+            "id": "turn-assistant",
+            "api_content": "provider answer bytes",
+        },
+    ]
+    source = SimpleNamespace(
+        _branch_source_readonly=True,
+        session_id="issue6751-keep-count-parent",
+        title="Parent",
+        workspace="/tmp/workspace",
+        model="test-model",
+        model_provider="test-provider",
+        profile="default",
+        messages=source_messages,
+        context_messages=[
+            {"role": "user", "content": "request", "id": "turn-user"},
+            {"role": "assistant", "content": "answer", "id": "turn-assistant"},
+        ],
+        project_id=None,
+        personality=None,
+        enabled_toolsets=None,
+        context_length=None,
+        threshold_tokens=None,
+        gateway_routing=None,
+        context_engine=None,
+        context_engine_state={},
+    )
+    captured = {}
+
+    class Branch:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.session_id = f"issue6751-keep-count-{keep_count}"
+            captured["branch"] = self
+
+        def save(self):
+            captured["saved"] = True
+
+    monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(
+        routes,
+        "read_body",
+        lambda _handler: {"session_id": source.session_id, "keep_count": keep_count},
+    )
+    monkeypatch.setattr(routes, "_guard_request_session_visibility", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(routes, "_load_branch_source_or_refuse", lambda *_args: source)
+    monkeypatch.setattr(routes, "_session_requires_cli_metadata_lookup", lambda _source: False)
+    monkeypatch.setattr(routes, "_is_messaging_session_record", lambda _record: False)
+    monkeypatch.setattr(routes, "Session", Branch)
+    monkeypatch.setattr(routes, "SESSIONS", OrderedDict())
+    monkeypatch.setattr(routes, "_evict_sessions_over_cap", lambda: None)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "j", lambda _handler, payload, **_kwargs: payload)
+    handler = SimpleNamespace(
+        client_address=("127.0.0.1", 12345),
+        headers={},
+        command="POST",
+        path="/api/session/branch",
+    )
+
+    routes.handle_post(
+        handler,
+        SimpleNamespace(path="/api/session/branch", query=""),
+    )
+
+    branch = captured["branch"]
+    assert len(branch.messages) == expected_message_count
+    assert [message.get("api_content") for message in branch.context_messages] == expected_context_sidecars
