@@ -15185,14 +15185,26 @@ def handle_post(handler, parsed) -> bool:
                 state_db_cleanup_failed = True
                 logger.warning("Failed to delete CLI session %s", sid, exc_info=True)
         _publish_session_list_changed("session_delete", profile=event_profile)
+        # A run-journal failure means plaintext conversation data may still be
+        # recoverable, so surface a non-success response and let the client
+        # retry.  Keep the historical state.db cleanup flag informational: its
+        # 200/ok:true behavior is relied on by existing deletion flows.
+        cleanup_status = 500 if run_journal_cleanup_failed else 200
+        cleanup_error = (
+            {"error": "Run journal cleanup failed; retry deletion"}
+            if run_journal_cleanup_failed
+            else {}
+        )
         return j(
             handler,
             {
-                "ok": True,
+                "ok": not run_journal_cleanup_failed,
                 "state_db_cleanup_failed": state_db_cleanup_failed,
                 "run_journal_cleanup_failed": run_journal_cleanup_failed,
                 **worktree_retained,
+                **cleanup_error,
             },
+            status=cleanup_status,
         )
 
     if parsed.path == "/api/session/clear":

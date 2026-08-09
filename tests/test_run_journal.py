@@ -888,7 +888,7 @@ def test_run_journal_append_quiesces_before_concurrent_delete(tmp_path, monkeypa
     assert not writes_after_delete
 
 
-def test_run_journal_delete_waits_old_writer_before_recreated_writer(
+def test_run_journal_delete_retires_writer_admitted_before_delete(
     tmp_path, monkeypatch
 ):
     session_id = "session_writer_recreate_barrier"
@@ -975,11 +975,95 @@ def test_run_journal_delete_waits_old_writer_before_recreated_writer(
     assert delete_acquired.is_set()
     assert old_validated.is_set()
     assert old_result and old_result[0]["seq"] == 2
-    new_event = recreated_writer.append_sse_event("token", {"text": "new"})
+    with pytest.raises(RuntimeError, match="run journal writer incarnation retired"):
+        recreated_writer.append_sse_event("token", {"text": "stale"})
+    assert not path.parent.exists()
+    with run_journal._WRITER_LOCKS_GUARD:
+        assert not any(key[0] == str(path.parent) for key in run_journal._WRITER_LOCKS)
+    with run_journal._SEQ_CACHE_LOCK:
+        assert str(path) not in run_journal._SEQ_CACHE
+    with run_journal._SUMMARY_CACHE_LOCK:
+        assert str(path) not in run_journal._SUMMARY_CACHE
+
+    fresh_writer = RunJournalWriter(session_id, run_id, session_dir=tmp_path)
+    new_event = fresh_writer.append_sse_event("token", {"text": "new"})
     assert new_event["seq"] == 1
     final_events = read_run_events(session_id, run_id, session_dir=tmp_path)["events"]
     assert [event["seq"] for event in final_events] == [1]
     assert final_events[0]["payload"]["text"] == "new"
+
+
+def test_run_journal_delete_retires_writer_admitted_in_another_process(tmp_path):
+    session_id = "session_cross_process_writer_retirement"
+    run_id = "run_cross_process_writer_retirement"
+    coordination = tmp_path / "writer_retirement_coordination"
+    coordination.mkdir()
+    writer_process = r'''
+import sys
+import time
+from pathlib import Path
+
+from api.run_journal import RunJournalWriter
+
+root = Path(sys.argv[1])
+coordination = Path(sys.argv[2])
+writer = RunJournalWriter(sys.argv[3], sys.argv[4], session_dir=root)
+(coordination / "writer_ready").touch()
+deadline = time.monotonic() + 15
+while not (coordination / "append_after_delete").exists():
+    if time.monotonic() >= deadline:
+        raise TimeoutError("append_after_delete")
+    time.sleep(0.01)
+try:
+    writer.append_sse_event("token", {"text": "stale"})
+except RuntimeError as exc:
+    if str(exc) != "run journal writer incarnation retired":
+        raise
+    (coordination / "writer_retired").touch()
+else:
+    raise AssertionError("pre-delete writer recreated a deleted journal")
+'''
+
+    def wait_for(name, timeout=15):
+        deadline = time.monotonic() + timeout
+        marker = coordination / name
+        while not marker.exists():
+            if time.monotonic() >= deadline:
+                pytest.fail(f"timed out waiting for {name}")
+            time.sleep(0.01)
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            writer_process,
+            str(tmp_path),
+            str(coordination),
+            session_id,
+            run_id,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    wait_for("writer_ready")
+    path = run_journal._run_path(session_id, run_id, session_dir=tmp_path)
+    RunJournalWriter(session_id, run_id, session_dir=tmp_path).append_sse_event(
+        "token", {"text": "seed"}
+    )
+    assert run_journal.delete_run_journal(session_id, session_dir=tmp_path) is True
+    assert not path.parent.exists()
+
+    (coordination / "append_after_delete").touch()
+    output, error = process.communicate(timeout=20)
+    assert process.returncode == 0, (output, error)
+    assert (coordination / "writer_retired").exists()
+    assert not path.parent.exists()
+
+    fresh_event = RunJournalWriter(
+        session_id, run_id, session_dir=tmp_path
+    ).append_sse_event("token", {"text": "fresh"})
+    assert fresh_event["seq"] == 1
 
 
 def test_run_journal_failed_final_validation_discards_post_write_caches(

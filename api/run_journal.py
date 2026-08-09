@@ -84,6 +84,15 @@ _RUN_JOURNAL_GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
 _RUN_JOURNAL_GENERATION_LOCK_STRIPES = 64
 _RUN_JOURNAL_LIFECYCLE_LOCKS: dict[tuple[str, int], threading.Lock] = {}
 _RUN_JOURNAL_LIFECYCLE_LOCKS_GUARD = threading.Lock()
+# The per-session journal directory is deliberately disposable.  Admission
+# state must therefore live beside it, not below it, so a writer that was
+# constructed before a delete cannot recreate the deleted plaintext journal.
+# The record is atomically replaced under the same lifecycle authority used by
+# append/delete, making the incarnation durable and visible across processes.
+_RUN_JOURNAL_INCARNATION_DIR_NAME = ".incarnations"
+_RUN_JOURNAL_INCARNATION_VERSION = 1
+_RUN_JOURNAL_INCARNATION_RE = re.compile(r"^[0-9a-f]{32}$")
+_RUN_JOURNAL_WRITER_RETIRED_ERROR = "run journal writer incarnation retired"
 _SNAPSHOT_ARGS_MAX_ITEMS = 64
 _SNAPSHOT_ARGS_MAX_DEPTH = 8
 _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
@@ -109,6 +118,104 @@ def _run_path(session_id: str, run_id: str, session_dir: Path | None = None) -> 
     rid = _validate_id(run_id, "run_id")
     root = Path(session_dir) if session_dir is not None else _default_session_dir()
     return root / RUN_JOURNAL_DIR_NAME / sid / f"{rid}.jsonl"
+
+
+def _run_journal_incarnation_path(path: Path) -> Path:
+    """Return the durable admission record for ``path``'s session.
+
+    ``path.parent`` is the disposable ``_run_journal/{session_id}`` subtree,
+    so the record is kept in a sibling directory under ``_run_journal``.  The
+    path itself is stable across delete/recreate cycles and across processes.
+    """
+    journal_root = path.parent.parent
+    return journal_root / _RUN_JOURNAL_INCARNATION_DIR_NAME / f"{path.parent.name}.json"
+
+
+def _read_run_journal_incarnation(path: Path) -> str | None:
+    """Read one valid session incarnation, returning ``None`` when absent."""
+    incarnation_path = _run_journal_incarnation_path(path)
+    try:
+        raw = incarnation_path.read_text(encoding="ascii")
+        record = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    incarnation = record.get("incarnation")
+    if (
+        record.get("version") != _RUN_JOURNAL_INCARNATION_VERSION
+        or record.get("session_id") != path.parent.name
+        or not isinstance(incarnation, str)
+        or _RUN_JOURNAL_INCARNATION_RE.fullmatch(incarnation) is None
+    ):
+        return None
+    return incarnation
+
+
+def _write_run_journal_incarnation(path: Path, incarnation: str) -> None:
+    """Atomically persist one session incarnation outside the deletable tree."""
+    if _RUN_JOURNAL_INCARNATION_RE.fullmatch(str(incarnation)) is None:
+        raise ValueError("invalid run-journal incarnation")
+    incarnation_path = _run_journal_incarnation_path(path)
+    incarnation_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = incarnation_path.with_name(
+        f".{incarnation_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    raw = json.dumps(
+        {
+            "version": _RUN_JOURNAL_INCARNATION_VERSION,
+            "session_id": path.parent.name,
+            "incarnation": str(incarnation),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+            fh.flush()
+            _REAL_FSYNC(fh.fileno())
+        os.replace(temporary, incarnation_path)
+        _fsync_parent_dir(incarnation_path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _admit_run_journal_incarnation_locked(path: Path) -> str:
+    """Admit a new writer or stateless append under lifecycle authority.
+
+    The caller must hold ``_run_journal_lifecycle_authority(path)``.  Existing
+    valid records are immutable for the lifetime of the current journal; only
+    ``delete_run_journal`` rotates them.
+    """
+    current = _read_run_journal_incarnation(path)
+    if current is not None:
+        return current
+    current = secrets.token_hex(16)
+    _write_run_journal_incarnation(path, current)
+    return current
+
+
+def _retire_run_journal_incarnation_locked(
+    path: Path,
+    *,
+    session_exists: bool,
+) -> bool:
+    """Durably rotate a session admission record before journal deletion.
+
+    Return whether a record existed (or a legacy session subtree required one)
+    so a missing directory with no admitted writer remains a true no-op.
+    """
+    current = _read_run_journal_incarnation(path)
+    if current is None and not session_exists:
+        return False
+    _write_run_journal_incarnation(path, secrets.token_hex(16))
+    return True
 
 
 def _run_generation_path(path: Path) -> Path:
@@ -545,6 +652,24 @@ def _publish_seq_cache(
         _SEQ_CACHE[key] = entry
 
 
+def _evict_run_journal_session_state(session_journal_dir: Path) -> None:
+    """Drop process-local writer/sequence/summary state for one session."""
+    dir_key = str(session_journal_dir)
+    with _WRITER_LOCKS_GUARD:
+        for key in [key for key in _WRITER_LOCKS if key[0] == dir_key]:
+            del _WRITER_LOCKS[key]
+    with _SEQ_CACHE_LOCK:
+        for cache_key in [
+            entry for entry in _SEQ_CACHE if str(Path(entry).parent) == dir_key
+        ]:
+            del _SEQ_CACHE[cache_key]
+    with _SUMMARY_CACHE_LOCK:
+        for cache_key in [
+            entry for entry in _SUMMARY_CACHE if str(Path(entry).parent) == dir_key
+        ]:
+            del _SUMMARY_CACHE[cache_key]
+
+
 def _terminal_state_for_event(event_name: str, payload) -> str | None:
     name = str(event_name or "")
     if name == "done" or name == "stream_end":
@@ -644,6 +769,7 @@ def append_run_event(
     session_dir: Path | None = None,
     seq: int | None = None,
     created_at: float | None = None,
+    _incarnation: str | None = None,
 ) -> dict:
     """Append one durable run event and fsync it according to the journal policy."""
     path = _run_path(session_id, run_id, session_dir=session_dir)
@@ -652,6 +778,12 @@ def append_run_event(
     if not event_name:
         raise ValueError("event_name is required")
     with _run_journal_lifecycle_authority(path):
+        admitted_incarnation = _admit_run_journal_incarnation_locked(path)
+        if _incarnation is not None and _incarnation != admitted_incarnation:
+            # Check before taking the per-run lock or touching the disposable
+            # session subtree.  A writer captured before delete must be unable
+            # to recreate any journal, generation sidecar, or process cache.
+            raise RuntimeError(_RUN_JOURNAL_WRITER_RETIRED_ERROR)
         with _lock_for(path):
             fd = None
             created_file = False
@@ -771,7 +903,15 @@ class RunJournalWriter:
         self.run_id = _validate_id(run_id, "run_id")
         self.session_dir = Path(session_dir) if session_dir is not None else None
         self._path = _run_path(self.session_id, self.run_id, session_dir=self.session_dir)
+        # Keep the historical lock attribute, but resolve it before admission
+        # so a concurrent delete can evict it and a retired append never adds a
+        # new per-run lock after the delete has committed.
         self._lock = _lock_for(self._path)
+        # Capture the session incarnation at construction time.  The durable
+        # admission record lives outside ``_run_journal/{sid}``, so deleting the
+        # journal can rotate it without touching this already-created object.
+        with _run_journal_lifecycle_authority(self._path):
+            self._incarnation = _admit_run_journal_incarnation_locked(self._path)
 
     def append_sse_event(self, event_name: str, payload=None) -> dict:
         # Sequence allocation belongs to append_run_event's lifecycle
@@ -783,6 +923,7 @@ class RunJournalWriter:
             event_name,
             payload or {},
             session_dir=self.session_dir,
+            _incarnation=self._incarnation,
         )
 
 
@@ -2632,34 +2773,27 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
     # validation, and cache eviction. Writers cannot publish a late append or
     # recreate the per-run lock/cache while this block owns the session stripe.
     with _run_journal_lifecycle_authority(deletion_lock_path):
-        if not session_journal_dir.exists():
+        session_exists = session_journal_dir.exists()
+        # Rotate the durable admission before removing bytes.  This retires
+        # every RunJournalWriter constructed before this delete, including one
+        # that has not appended yet, while leaving the authority record outside
+        # the subtree that rmtree removes.  A missing session with no admitted
+        # writer remains a no-op and does not create any state.
+        retired = _retire_run_journal_incarnation_locked(
+            deletion_lock_path,
+            session_exists=session_exists,
+        )
+        if not session_exists or not retired:
+            if retired:
+                _evict_run_journal_session_state(session_journal_dir)
             return False
         shutil.rmtree(session_journal_dir)
         if session_journal_dir.exists():
             raise OSError("run journal cleanup left residual files")
-        # Evict any writer locks the removed runs left behind. `_lock_for` keys
-        # are ``(str(path.parent), path.name, pid)`` and every run file for this
-        # session lives directly under ``session_journal_dir``, so drop all keys
-        # whose parent dir matches — pid-independent — to keep `_WRITER_LOCKS`
-        # from growing forever. This stays inside the lifecycle authority so a
-        # new writer cannot split from an old lock during deletion.
-        dir_key = str(session_journal_dir)
-        with _WRITER_LOCKS_GUARD:
-            for key in [k for k in _WRITER_LOCKS if k[0] == dir_key]:
-                del _WRITER_LOCKS[key]
-        # Drop cached next-seq entries for the removed runs too. Every run file
-        # for this session lives directly under ``session_journal_dir``, so its
-        # cache key's parent dir matches. Without this, a run re-created at the
-        # same path would resume the stale cached seq instead of restarting at 1.
-        # Hold ``_SEQ_CACHE_LOCK`` — the SAME mutex ``_peek_next_seq``/
-        # ``_publish_seq_cache`` take — so a concurrent append on another path
-        # cannot mutate the dict mid-iteration (``dictionary changed size``).
-        with _SEQ_CACHE_LOCK:
-            for cache_key in [entry for entry in _SEQ_CACHE if str(Path(entry).parent) == dir_key]:
-                del _SEQ_CACHE[cache_key]
-        with _SUMMARY_CACHE_LOCK:
-            for cache_key in [entry for entry in _SUMMARY_CACHE if str(Path(entry).parent) == dir_key]:
-                del _SUMMARY_CACHE[cache_key]
+        # Cache eviction stays inside the lifecycle authority so a new writer
+        # cannot split from an old lock during deletion.  It also resets the
+        # next-seq/summary caches, ensuring a recreated path starts at seq 1.
+        _evict_run_journal_session_state(session_journal_dir)
         return True
 
 

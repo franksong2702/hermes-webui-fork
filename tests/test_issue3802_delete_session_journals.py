@@ -164,6 +164,33 @@ def test_delete_run_journal_surfaces_rmtree_failure_without_evicting_caches(
         assert writer_locks_after[key] is lock
     assert seq_cache_after == seq_cache_before
     assert summary_cache_after == summary_cache_before
+    with pytest.raises(RuntimeError, match="run journal writer incarnation retired"):
+        writer.append_sse_event("token", {"text": "must-not-append-after-delete-intent"})
+
+
+def test_delete_run_journal_keeps_bytes_when_incarnation_retirement_fails(
+    tmp_path, monkeypatch
+):
+    writer = RunJournalWriter("sid-retire-failure", "run-1", session_dir=tmp_path)
+    writer.append_sse_event("token", {"text": "keep"})
+    run_path = tmp_path / "_run_journal" / "sid-retire-failure" / "run-1.jsonl"
+
+    def fail_retirement_write(*_args, **_kwargs):
+        raise OSError("forced-incarnation-write-failure")
+
+    monkeypatch.setattr(
+        run_journal,
+        "_write_run_journal_incarnation",
+        fail_retirement_write,
+    )
+    with pytest.raises(OSError, match="forced-incarnation-write-failure"):
+        delete_run_journal("sid-retire-failure", session_dir=tmp_path)
+
+    assert run_path.exists()
+    next_event = writer.append_sse_event(
+        "token", {"text": "writer-remains-admitted-after-retirement-failure"}
+    )
+    assert next_event["seq"] == 2
 
 
 def test_delete_journals_reject_dot_traversal_ids(tmp_path):
