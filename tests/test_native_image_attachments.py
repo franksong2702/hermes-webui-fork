@@ -383,6 +383,41 @@ class TestBuildNativeMultimodalMessage:
         assert sanitized[0]['api_content'] == original_user_wire
         assert sanitized[1]['api_content'] == original_assistant_wire
 
+    def test_agent_history_sanitizer_forwards_requested_provider(self, monkeypatch):
+        """The Agent wrapper must preserve master image-routing provenance."""
+        import api.streaming as streaming
+
+        captured = {}
+
+        def resolve_mode(cfg, active_provider, active_model, *, requested_provider):
+            captured.update({
+                'cfg': cfg,
+                'active_provider': active_provider,
+                'active_model': active_model,
+                'requested_provider': requested_provider,
+            })
+            return 'native'
+
+        monkeypatch.setattr(streaming, '_resolve_image_input_mode', resolve_mode)
+        history = [{'role': 'user', 'content': 'hello', 'api_content': 'wire'}]
+        cfg = {'agent': {'image_input_mode': 'auto'}}
+
+        sanitized = _sanitize_messages_for_agent(
+            history,
+            cfg=cfg,
+            effective_model='model-a',
+            effective_provider='custom',
+            requested_provider='custom:gateway-a',
+        )
+
+        assert captured == {
+            'cfg': cfg,
+            'active_provider': 'custom',
+            'active_model': 'model-a',
+            'requested_provider': 'custom:gateway-a',
+        }
+        assert sanitized == history
+
     def test_fake_png_rejected_by_magic_bytes(self):
         """A file named .png that is not actually an image must be rejected."""
         with TemporaryDirectory() as d:

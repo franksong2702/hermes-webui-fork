@@ -5164,6 +5164,7 @@ def _sanitize_messages_for_agent(
     effective_model: str | None = None,
     effective_provider: str | None = None,
     effective_base_url: str | None = None,
+    requested_provider: str = "",
 ):
     """Build the internal Agent replay projection with ``api_content`` intact.
 
@@ -5179,6 +5180,7 @@ def _sanitize_messages_for_agent(
         effective_provider=effective_provider,
         effective_base_url=effective_base_url,
         preserve_api_content=True,
+        requested_provider=requested_provider,
     )
 
 
