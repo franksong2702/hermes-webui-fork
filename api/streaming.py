@@ -7763,6 +7763,7 @@ def _run_agent_streaming(
     model_provider=None,
     goal_related=False,
     moa_config=None,
+    run_journal_incarnation=None,
 ):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
 
@@ -7796,7 +7797,11 @@ def _run_agent_streaming(
         ephemeral=bool(ephemeral),
     )
     try:
-        run_journal = RunJournalWriter(session_id, stream_id)
+        run_journal = RunJournalWriter(
+            session_id,
+            stream_id,
+            incarnation=run_journal_incarnation,
+        )
     except Exception:
         run_journal = None
         logger.debug("Failed to initialize run journal for stream %s", stream_id, exc_info=True)

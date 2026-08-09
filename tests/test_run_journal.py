@@ -12,13 +12,46 @@ import pytest
 
 import api.run_journal as run_journal
 from api.run_journal import (
-    RunJournalWriter,
-    append_run_event,
+    RunJournalWriter as _RunJournalWriter,
+    append_run_event as _append_run_event,
     find_run_summary,
     latest_run_summary,
     read_run_events,
     stale_interrupted_event,
 )
+
+
+def _activate(session_id, session_dir, *, reactivate_retired=False):
+    return run_journal.activate_run_journal_session(
+        session_id,
+        session_dir=session_dir,
+        reactivate_retired=reactivate_retired,
+    )
+
+
+def RunJournalWriter(session_id, run_id, *, session_dir=None, reactivate_retired=False):
+    return _RunJournalWriter(
+        session_id,
+        run_id,
+        session_dir=session_dir,
+        incarnation=_activate(
+            session_id,
+            session_dir,
+            reactivate_retired=reactivate_retired,
+        ),
+    )
+
+
+def append_run_event(session_id, run_id, event_name, payload=None, **kwargs):
+    session_dir = kwargs.get("session_dir")
+    return _append_run_event(
+        session_id,
+        run_id,
+        event_name,
+        payload,
+        **kwargs,
+        _incarnation=_activate(session_id, session_dir),
+    )
 
 
 def test_run_journal_appends_monotonic_seq_and_reads_after_cursor(tmp_path):
@@ -985,7 +1018,14 @@ def test_run_journal_delete_retires_writer_admitted_before_delete(
     with run_journal._SUMMARY_CACHE_LOCK:
         assert str(path) not in run_journal._SUMMARY_CACHE
 
-    fresh_writer = RunJournalWriter(session_id, run_id, session_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="run journal writer incarnation retired"):
+        RunJournalWriter(session_id, run_id, session_dir=tmp_path)
+    fresh_writer = RunJournalWriter(
+        session_id,
+        run_id,
+        session_dir=tmp_path,
+        reactivate_retired=True,
+    )
     new_event = fresh_writer.append_sse_event("token", {"text": "new"})
     assert new_event["seq"] == 1
     final_events = read_run_events(session_id, run_id, session_dir=tmp_path)["events"]
@@ -1003,11 +1043,14 @@ import sys
 import time
 from pathlib import Path
 
-from api.run_journal import RunJournalWriter
+from api.run_journal import RunJournalWriter, activate_run_journal_session
 
 root = Path(sys.argv[1])
 coordination = Path(sys.argv[2])
-writer = RunJournalWriter(sys.argv[3], sys.argv[4], session_dir=root)
+incarnation = activate_run_journal_session(sys.argv[3], session_dir=root)
+writer = RunJournalWriter(
+    sys.argv[3], sys.argv[4], session_dir=root, incarnation=incarnation
+)
 (coordination / "writer_ready").touch()
 deadline = time.monotonic() + 15
 while not (coordination / "append_after_delete").exists():
@@ -1060,8 +1103,13 @@ else:
     assert (coordination / "writer_retired").exists()
     assert not path.parent.exists()
 
+    with pytest.raises(RuntimeError, match="run journal writer incarnation retired"):
+        RunJournalWriter(session_id, run_id, session_dir=tmp_path)
     fresh_event = RunJournalWriter(
-        session_id, run_id, session_dir=tmp_path
+        session_id,
+        run_id,
+        session_dir=tmp_path,
+        reactivate_retired=True,
     ).append_sse_event("token", {"text": "fresh"})
     assert fresh_event["seq"] == 1
 
@@ -1823,6 +1871,7 @@ role = sys.argv[3]
 session_id = sys.argv[4]
 run_id = sys.argv[5]
 original_write = journal._write_run_generation_record
+incarnation = sys.argv[6]
 
 def wait_for(name):
     deadline = time.monotonic() + 15
@@ -1840,7 +1889,7 @@ if role == "a":
     journal._write_run_generation_record = gated_write
     journal.append_run_event(
         session_id, run_id, "token", {"text": "x" * 2048},
-        session_dir=root, seq=1, created_at=1.0,
+        session_dir=root, seq=1, created_at=1.0, _incarnation=incarnation,
     )
     generation, _identity = journal._read_run_generation_record(
         journal._run_path(session_id, run_id, session_dir=root)
@@ -1856,7 +1905,7 @@ else:
     journal._write_run_generation_record = gated_write
     journal.append_run_event(
         session_id, run_id, "token", {"text": "suffix"},
-        session_dir=root, seq=2, created_at=2.0,
+        session_dir=root, seq=2, created_at=2.0, _incarnation=incarnation,
     )
 '''
 
@@ -1868,16 +1917,17 @@ else:
                 pytest.fail(f"timed out waiting for {name}")
             time.sleep(0.01)
 
-    common = [str(tmp_path), str(coordination), session_id, run_id]
+    incarnation = _activate(session_id, tmp_path)
+    common = [str(tmp_path), str(coordination), session_id, run_id, incarnation]
     process_a = subprocess.Popen(
-        [sys.executable, "-c", worker, common[0], common[1], "a", common[2], common[3]],
+        [sys.executable, "-c", worker, common[0], common[1], "a", common[2], common[3], common[4]],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
     wait_for("a_writer_ready")
     process_b = subprocess.Popen(
-        [sys.executable, "-c", worker, common[0], common[1], "b", common[2], common[3]],
+        [sys.executable, "-c", worker, common[0], common[1], "b", common[2], common[3], common[4]],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -1970,13 +2020,15 @@ journal.delete_run_journal(sys.argv[3], session_dir=root)
     assert lock_path.exists()
     assert (lock_path.stat().st_dev, lock_path.stat().st_ino) == lock_identity
 
-    append_run_event(
+    incarnation = _activate(session_id, tmp_path, reactivate_retired=True)
+    _append_run_event(
         session_id,
         run_id,
         "token",
         {"text": "after-delete"},
         session_dir=tmp_path,
         seq=1,
+        _incarnation=incarnation,
     )
     assert run_journal._run_generation_lock_path(path) == lock_path
     assert (lock_path.stat().st_dev, lock_path.stat().st_ino) == lock_identity

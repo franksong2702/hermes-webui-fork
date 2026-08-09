@@ -90,9 +90,10 @@ _RUN_JOURNAL_LIFECYCLE_LOCKS_GUARD = threading.Lock()
 # The record is atomically replaced under the same lifecycle authority used by
 # append/delete, making the incarnation durable and visible across processes.
 _RUN_JOURNAL_INCARNATION_DIR_NAME = ".incarnations"
-_RUN_JOURNAL_INCARNATION_VERSION = 1
+_RUN_JOURNAL_INCARNATION_VERSION = 2
 _RUN_JOURNAL_INCARNATION_RE = re.compile(r"^[0-9a-f]{32}$")
 _RUN_JOURNAL_WRITER_RETIRED_ERROR = "run journal writer incarnation retired"
+_RUN_JOURNAL_WRITER_REQUIRED_ERROR = "run journal writer incarnation required"
 _SNAPSHOT_ARGS_MAX_ITEMS = 64
 _SNAPSHOT_ARGS_MAX_DEPTH = 8
 _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
@@ -131,31 +132,72 @@ def _run_journal_incarnation_path(path: Path) -> Path:
     return journal_root / _RUN_JOURNAL_INCARNATION_DIR_NAME / f"{path.parent.name}.json"
 
 
-def _read_run_journal_incarnation(path: Path) -> str | None:
-    """Read one valid session incarnation, returning ``None`` when absent."""
+def _read_run_journal_incarnation(path: Path) -> dict | None:
+    """Read one durable authority record, distinguishing absent from invalid."""
     incarnation_path = _run_journal_incarnation_path(path)
     try:
         raw = incarnation_path.read_text(encoding="ascii")
-        record = json.loads(raw)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    except FileNotFoundError:
         return None
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("invalid run journal authority") from exc
+    except OSError as exc:
+        raise RuntimeError("unreadable run journal authority") from exc
+    def _strict_object(pairs):
+        record = {}
+        for key, value in pairs:
+            if key in record:
+                raise ValueError("duplicate authority field")
+            record[key] = value
+        return record
+
+    try:
+        record = json.loads(raw, object_pairs_hook=_strict_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError("invalid run journal authority") from exc
     if not isinstance(record, dict):
-        return None
+        raise RuntimeError("invalid run journal authority")
     incarnation = record.get("incarnation")
+    version = record.get("version")
+    state = record.get("state")
+    if version == 1 and state is None and set(record) == {
+        "version",
+        "session_id",
+        "incarnation",
+    }:
+        # Version 1 records predate explicit lifecycle state. They can only be
+        # migrated by the canonical activation entrypoint; reads never replace
+        # malformed or unreadable authority.
+        state = "active"
+    elif version != _RUN_JOURNAL_INCARNATION_VERSION or set(record) != {
+        "version",
+        "session_id",
+        "state",
+        "incarnation",
+    }:
+        raise RuntimeError("invalid run journal authority")
     if (
-        record.get("version") != _RUN_JOURNAL_INCARNATION_VERSION
+        version not in (1, _RUN_JOURNAL_INCARNATION_VERSION)
         or record.get("session_id") != path.parent.name
+        or state not in ("active", "retired")
         or not isinstance(incarnation, str)
         or _RUN_JOURNAL_INCARNATION_RE.fullmatch(incarnation) is None
     ):
-        return None
-    return incarnation
+        raise RuntimeError("invalid run journal authority")
+    return {
+        "version": int(version),
+        "session_id": path.parent.name,
+        "state": state,
+        "incarnation": incarnation,
+    }
 
 
-def _write_run_journal_incarnation(path: Path, incarnation: str) -> None:
-    """Atomically persist one session incarnation outside the deletable tree."""
+def _write_run_journal_incarnation(path: Path, incarnation: str, *, state: str) -> None:
+    """Atomically persist one versioned authority record outside the journal."""
     if _RUN_JOURNAL_INCARNATION_RE.fullmatch(str(incarnation)) is None:
         raise ValueError("invalid run-journal incarnation")
+    if state not in ("active", "retired"):
+        raise ValueError("invalid run-journal authority state")
     incarnation_path = _run_journal_incarnation_path(path)
     incarnation_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = incarnation_path.with_name(
@@ -165,6 +207,7 @@ def _write_run_journal_incarnation(path: Path, incarnation: str) -> None:
         {
             "version": _RUN_JOURNAL_INCARNATION_VERSION,
             "session_id": path.parent.name,
+            "state": state,
             "incarnation": str(incarnation),
         },
         sort_keys=True,
@@ -186,19 +229,57 @@ def _write_run_journal_incarnation(path: Path, incarnation: str) -> None:
         raise
 
 
-def _admit_run_journal_incarnation_locked(path: Path) -> str:
-    """Admit a new writer or stateless append under lifecycle authority.
-
-    The caller must hold ``_run_journal_lifecycle_authority(path)``.  Existing
-    valid records are immutable for the lifetime of the current journal; only
-    ``delete_run_journal`` rotates them.
-    """
+def _activate_run_journal_incarnation_locked(
+    path: Path,
+    *,
+    reactivate_retired: bool,
+) -> str:
+    """Activate authority only for a caller at a canonical session boundary."""
     current = _read_run_journal_incarnation(path)
-    if current is not None:
-        return current
-    current = secrets.token_hex(16)
-    _write_run_journal_incarnation(path, current)
-    return current
+    if current is not None and current["state"] == "active":
+        incarnation = str(current["incarnation"])
+        if current["version"] != _RUN_JOURNAL_INCARNATION_VERSION:
+            _write_run_journal_incarnation(path, incarnation, state="active")
+        return incarnation
+    if current is not None and not reactivate_retired:
+        raise RuntimeError(_RUN_JOURNAL_WRITER_RETIRED_ERROR)
+    incarnation = secrets.token_hex(16)
+    _write_run_journal_incarnation(path, incarnation, state="active")
+    return incarnation
+
+
+def activate_run_journal_session(
+    session_id: str,
+    *,
+    session_dir: Path | None = None,
+    reactivate_retired: bool = False,
+) -> str:
+    """Return a capability for a canonical, live session lifecycle boundary.
+
+    Normal restore/run-start callers must leave ``reactivate_retired`` false so
+    a session whose deletion is awaiting retry cannot silently become writable.
+    Only a canonical create/import that intentionally reuses a retired id may
+    request a new incarnation.
+    """
+    path = _run_path(session_id, ".authority", session_dir=session_dir)
+    with _run_journal_lifecycle_authority(path):
+        return _activate_run_journal_incarnation_locked(
+            path,
+            reactivate_retired=bool(reactivate_retired),
+        )
+
+
+def validate_run_journal_session_activation(
+    session_id: str,
+    *,
+    session_dir: Path | None = None,
+) -> None:
+    """Fail closed on retired/invalid authority without creating new state."""
+    path = _run_path(session_id, ".authority", session_dir=session_dir)
+    with _run_journal_lifecycle_authority(path):
+        current = _read_run_journal_incarnation(path)
+        if current is not None and current["state"] != "active":
+            raise RuntimeError(_RUN_JOURNAL_WRITER_RETIRED_ERROR)
 
 
 def _retire_run_journal_incarnation_locked(
@@ -214,7 +295,16 @@ def _retire_run_journal_incarnation_locked(
     current = _read_run_journal_incarnation(path)
     if current is None and not session_exists:
         return False
-    _write_run_journal_incarnation(path, secrets.token_hex(16))
+    if current is None:
+        incarnation = secrets.token_hex(16)
+    else:
+        incarnation = str(current["incarnation"])
+    if (
+        current is None
+        or current["state"] != "retired"
+        or current["version"] != _RUN_JOURNAL_INCARNATION_VERSION
+    ):
+        _write_run_journal_incarnation(path, incarnation, state="retired")
     return True
 
 
@@ -773,13 +863,22 @@ def append_run_event(
 ) -> dict:
     """Append one durable run event and fsync it according to the journal policy."""
     path = _run_path(session_id, run_id, session_dir=session_dir)
+    if _incarnation is None:
+        raise RuntimeError(_RUN_JOURNAL_WRITER_REQUIRED_ERROR)
+    incarnation = str(_incarnation)
+    if _RUN_JOURNAL_INCARNATION_RE.fullmatch(incarnation) is None:
+        raise RuntimeError(_RUN_JOURNAL_WRITER_REQUIRED_ERROR)
     payload = payload if payload is not None else {}
     event_name = str(event_name or "").strip()
     if not event_name:
         raise ValueError("event_name is required")
     with _run_journal_lifecycle_authority(path):
-        admitted_incarnation = _admit_run_journal_incarnation_locked(path)
-        if _incarnation is not None and _incarnation != admitted_incarnation:
+        authority = _read_run_journal_incarnation(path)
+        if (
+            authority is None
+            or authority["state"] != "active"
+            or incarnation != authority["incarnation"]
+        ):
             # Check before taking the per-run lock or touching the disposable
             # session subtree.  A writer captured before delete must be unable
             # to recreate any journal, generation sidecar, or process cache.
@@ -898,20 +997,31 @@ def append_run_event(
 class RunJournalWriter:
     """Stateful writer for one WebUI stream/run."""
 
-    def __init__(self, session_id: str, run_id: str, *, session_dir: Path | None = None):
+    def __init__(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        session_dir: Path | None = None,
+        incarnation: str | None = None,
+    ):
         self.session_id = _validate_id(session_id, "session_id")
         self.run_id = _validate_id(run_id, "run_id")
         self.session_dir = Path(session_dir) if session_dir is not None else None
         self._path = _run_path(self.session_id, self.run_id, session_dir=self.session_dir)
-        # Keep the historical lock attribute, but resolve it before admission
-        # so a concurrent delete can evict it and a retired append never adds a
-        # new per-run lock after the delete has committed.
-        self._lock = _lock_for(self._path)
-        # Capture the session incarnation at construction time.  The durable
-        # admission record lives outside ``_run_journal/{sid}``, so deleting the
-        # journal can rotate it without touching this already-created object.
+        if incarnation is None or _RUN_JOURNAL_INCARNATION_RE.fullmatch(str(incarnation)) is None:
+            raise RuntimeError(_RUN_JOURNAL_WRITER_REQUIRED_ERROR)
+        self._incarnation = str(incarnation)
+        # Validate the capability before allocating any per-run process state.
         with _run_journal_lifecycle_authority(self._path):
-            self._incarnation = _admit_run_journal_incarnation_locked(self._path)
+            authority = _read_run_journal_incarnation(self._path)
+            if (
+                authority is None
+                or authority["state"] != "active"
+                or authority["incarnation"] != self._incarnation
+            ):
+                raise RuntimeError(_RUN_JOURNAL_WRITER_RETIRED_ERROR)
+        self._lock = _lock_for(self._path)
 
     def append_sse_event(self, event_name: str, payload=None) -> dict:
         # Sequence allocation belongs to append_run_event's lifecycle

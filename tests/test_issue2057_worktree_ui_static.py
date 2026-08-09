@@ -18,7 +18,20 @@ def _extract_js_function(source, name):
     start = source.index(marker)
     if source[max(0, start - 6) : start] == "async ":
         start -= 6
-    opening = source.index("{", start)
+    params_open = source.index("(", start)
+    params_depth = 0
+    params_close = None
+    for index in range(params_open, len(source)):
+        char = source[index]
+        if char == "(":
+            params_depth += 1
+        elif char == ")":
+            params_depth -= 1
+            if params_depth == 0:
+                params_close = index
+                break
+    assert params_close is not None
+    opening = source.index("{", params_close)
     depth = 0
     quote = None
     escaped = False
@@ -44,51 +57,68 @@ def _extract_js_function(source, name):
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
-def test_delete_cleanup_flags_are_observable_in_single_and_batch_flows():
+def test_real_http_500_preserves_single_and_batch_delete_retry_handles():
     src = read("static/sessions.js")
+    workspace_src = read("static/workspace.js")
+    api_start = workspace_src.index("async function api")
+    api_end = workspace_src.index("\n}\n\nfunction recordClientSSEError", api_start) + 2
+    api_source = workspace_src[api_start:api_end]
     delete_source = _extract_js_function(src, "deleteSession")
     batch_source = _extract_js_function(src, "_renderBatchActionBar")
     harness = (
+        "const api = eval('(' + " + json.dumps(api_source) + " + ')');\n"
         "const deleteSession = eval('(' + " + json.dumps(delete_source) + " + ')');\n"
         "const renderBatchActionBar = eval('(' + " + json.dumps(batch_source) + " + ')');\n"
         "const toasts = [];\n"
+        "const fetches = [];\n"
+        "let listRefreshes = 0;\n"
         "const bar = { children: [], style: {}, appendChild(node) { this.children.push(node); }, "
         "querySelectorAll() { return []; } };\n"
         "const localStorage = { removeItem() {} };\n"
         "const S = { session: null, messages: [], entries: [] };\n"
-        "const _allSessions = [];\n"
+        "let _allSessions = [{session_id:'single'},{session_id:'batch-ok'},{session_id:'batch-fail'}];\n"
         "const _optimisticallyRemovedSessionIds = new Set();\n"
         "let _pendingSessionReflowPositions = null;\n"
         "const _selectedSessions = new Set();\n"
         "const _sessionSelectMode = true;\n"
         "const _allProjects = [];\n"
+        "const location = { href: 'http://test.local/', pathname: '/', search: '' };\n"
         "const document = { createElement() { return { children: [], style: {}, "
-        "appendChild(node) { this.children.push(node); } }; } };\n"
+        "appendChild(node) { this.children.push(node); } }; }, baseURI: 'http://test.local/' };\n"
         "function $(id) { return id === 'batchActionBar' ? bar : { style: {}, innerHTML: '' }; }\n"
         "function t(key) { return key; }\n"
         "async function showConfirmDialog() { return true; }\n"
-        "function _sessionSnapshotById() { return null; }\n"
+        "function _sessionSnapshotById(sid) { return _allSessions.find(s=>s.session_id===sid)||null; }\n"
         "function _captureSessionReflowPositions() { return null; }\n"
         "function _clearHandoffStorageForSession() {}\n"
-        "function _optimisticallyRemoveSessionFromList() {}\n"
+        "function _optimisticallyRemoveSessionFromList(sid) { _allSessions=_allSessions.filter(s=>s.session_id!==sid); }\n"
         "function renderSessionListFromCache() {}\n"
-        "async function renderSessionList() {}\n"
+        "async function renderSessionList() { listRefreshes++; const result=await api('/api/sessions'); _allSessions=result.sessions; }\n"
         "function _clearPersistedSessionQueue() {}\n"
         "function _sessionResponseRetainsWorktree() { return false; }\n"
         "function _worktreeSessionCount() { return 0; }\n"
         "function _worktreeResponseCount() { return 0; }\n"
-        "function exitSessionSelectMode() {}\n"
+        "function exitSessionSelectMode() { _selectedSessions.clear(); }\n"
+        "function _updateBatchActionBar() {}\n"
         "function showToast(message) { toasts.push(message); }\n"
         "function setStatus() {}\n"
-        "function api(path) { return Promise.resolve({ state_db_cleanup_failed: false, "
-        "run_journal_cleanup_failed: true }); }\n"
+        "async function fetch(url, opts={}) {\n"
+        "  fetches.push({url,opts});\n"
+        "  if(url.endsWith('/api/sessions')) return new Response(JSON.stringify({sessions:_allSessions}),{status:200,headers:{'content-type':'application/json'}});\n"
+        "  const body=JSON.parse(opts.body||'{}');\n"
+        "  if(body.session_id==='single'||body.session_id==='batch-fail') return new Response(JSON.stringify({error:'Run journal cleanup failed; retry deletion'}),{status:500,headers:{'content-type':'application/json'}});\n"
+        "  return new Response(JSON.stringify({ok:true,state_db_cleanup_failed:false,run_journal_cleanup_failed:false}),{status:200,headers:{'content-type':'application/json'}});\n"
+        "}\n"
         "async function run() {\n"
-        "  const singleResult = await deleteSession('single');\n"
-        "  _selectedSessions.add('batch');\n"
+        "  const singleResult = await deleteSession('single',()=>Promise.resolve());\n"
+        "  const singleStillVisible=_allSessions.some(s=>s.session_id==='single');\n"
+        "  _selectedSessions.add('batch-ok');\n"
+        "  _selectedSessions.add('batch-fail');\n"
+        "  bar.children=[];\n"
         "  renderBatchActionBar();\n"
         "  const deleteButton = bar.children.find(node => node.textContent === 'session_batch_delete');\n"
         "  await deleteButton.onclick();\n"
-        "  process.stdout.write(JSON.stringify({ singleResult, toasts }));\n"
+        "  process.stdout.write(JSON.stringify({singleResult,singleStillVisible,toasts,selected:[..._selectedSessions],visible:_allSessions.map(s=>s.session_id),listRefreshes}));\n"
         "}\n"
         "run().catch(error => { console.error(error); process.exit(1); });\n"
     )
@@ -101,7 +131,12 @@ def test_delete_cleanup_flags_are_observable_in_single_and_batch_flows():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["singleResult"] is False
-    assert payload["toasts"] == ["delete_failed", "delete_failed (1/1)"]
+    assert payload["singleStillVisible"] is True
+    assert payload["selected"] == ["batch-fail"]
+    assert "batch-fail" in payload["visible"]
+    assert "batch-ok" not in payload["visible"]
+    assert payload["listRefreshes"] >= 2
+    assert payload["toasts"] == ["delete_failed", "delete_failed (1/2)"]
 
 
 def test_delete_confirmation_mentions_retained_worktree():
@@ -153,12 +188,15 @@ def test_archive_delete_success_copy_prefers_response_worktree_retained():
     assert "session.archived?_sessionArchiveToast(response,session):t('session_restored')" in src
     assert "_sessionResponseRetainsWorktree(response,session)?t('session_deleted_worktree')" in src
     assert "const retainedCount=_worktreeResponseCount(results)" in src
-    assert "const cleanupFailedCount=results.filter(result=>result.response&&(result.response.state_db_cleanup_failed||result.response.run_journal_cleanup_failed)).length;" in src
-    assert "if(cleanupFailedCount) showToast(t('delete_failed')+' ('+cleanupFailedCount+'/'+ids.length+')',0,'error');" in src
+    assert "const settled=await Promise.allSettled(ids.map(async sid=>{" in src
+    assert "failedIds.forEach(sid=>_selectedSessions.add(sid));" in src
+    assert "if(failedIds.length){" in src
+    assert "showToast(t('delete_failed')+' ('+failedIds.length+'/'+ids.length+')',0,'error');" in src
     assert "showToast(retainedCount?t('session_archived_worktree'):t('session_archived'))" in src
     assert "showToast((retainedCount?t('session_deleted_worktree'):t('session_delete'))" in src
     assert "const cleanupFailed=!!(response&&(response.state_db_cleanup_failed||response.run_journal_cleanup_failed));" in src
     assert "if(cleanupFailed) showToast(t('delete_failed'),0,'error');" in src
+    assert "await renderSessionList();\n    return false;" in src
     assert "return !cleanupFailed;" in src
 
 
@@ -168,7 +206,8 @@ def test_worktree_archive_delete_api_responses_are_explicit():
     assert "def _worktree_retained_payload_for_session_id(sid: str)" in src
     assert '"worktree_retained": True' in src
     assert '"state_db_cleanup_failed": state_db_cleanup_failed' in src
-    assert '"run_journal_cleanup_failed": run_journal_cleanup_failed' in src
+    assert '"run_journal_cleanup_failed": True' in src
+    assert '"run_journal_cleanup_failed": False' in src
     assert '"ok": True,' in src
     assert "**worktree_retained," in src
     assert '{"ok": True, "session": s.compact(), **_worktree_retained_payload(s)}' in src

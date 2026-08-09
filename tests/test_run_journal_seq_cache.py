@@ -19,6 +19,34 @@ from api import run_journal
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _capability(session_id, session_dir, *, reactivate_retired=False):
+    return run_journal.activate_run_journal_session(
+        session_id,
+        session_dir=session_dir,
+        reactivate_retired=reactivate_retired,
+    )
+
+
+def _append_run_event(session_id, run_id, event_name, payload=None, **kwargs):
+    return run_journal.append_run_event(
+        session_id,
+        run_id,
+        event_name,
+        payload,
+        **kwargs,
+        _incarnation=_capability(session_id, kwargs.get("session_dir")),
+    )
+
+
+def _writer(session_id, run_id, *, session_dir=None):
+    return run_journal.RunJournalWriter(
+        session_id,
+        run_id,
+        session_dir=session_dir,
+        incarnation=_capability(session_id, session_dir),
+    )
+
+
 def test_append_run_event_seeds_seq_once_and_stays_gapless(tmp_path, monkeypatch):
     calls = {"next_seq": 0, "read_jsonl": 0}
     real_next_seq = run_journal._next_seq
@@ -37,7 +65,7 @@ def test_append_run_event_seeds_seq_once_and_stays_gapless(tmp_path, monkeypatch
 
     n = 25
     seqs = [
-        run_journal.append_run_event(
+        _append_run_event(
             "sess_cache", "run_cache", "token", {"text": str(i)}, session_dir=tmp_path
         )["seq"]
         for i in range(n)
@@ -59,13 +87,13 @@ def test_append_run_event_seeds_seq_once_and_stays_gapless(tmp_path, monkeypatch
 
 
 def test_writer_and_free_function_share_one_gapless_sequence(tmp_path):
-    writer = run_journal.RunJournalWriter("sess_shared", "run_shared", session_dir=tmp_path)
+    writer = _writer("sess_shared", "run_shared", session_dir=tmp_path)
     a = writer.append_sse_event("token", {"text": "a"})
-    b = run_journal.append_run_event(
+    b = _append_run_event(
         "sess_shared", "run_shared", "token", {"text": "b"}, session_dir=tmp_path
     )
     c = writer.append_sse_event("token", {"text": "c"})
-    d = run_journal.append_run_event(
+    d = _append_run_event(
         "sess_shared", "run_shared", "done", {"session": {}}, session_dir=tmp_path
     )
 
@@ -80,30 +108,36 @@ def test_explicit_seq_discards_cache_and_rebuilds(tmp_path):
     # A caller-supplied seq conservatively discards the cache; a later automatic
     # append must rebuild from the physical journal rather than trusting a
     # possibly stale next-seq candidate.
-    run_journal.append_run_event(
+    _append_run_event(
         "sess_expl", "run_expl", "token", {"text": "x"}, session_dir=tmp_path, seq=5
     )
     path = tmp_path / "_run_journal" / "sess_expl" / "run_expl.jsonl"
     with run_journal._SEQ_CACHE_LOCK:
         assert str(path) not in run_journal._SEQ_CACHE
-    nxt = run_journal.append_run_event(
+    nxt = _append_run_event(
         "sess_expl", "run_expl", "token", {"text": "y"}, session_dir=tmp_path
     )
     assert nxt["seq"] == 6
 
 
 def test_delete_evicts_seq_cache_so_recreated_run_restarts(tmp_path):
-    run_journal.append_run_event(
+    _append_run_event(
         "sess_del", "run_del", "token", {"text": "one"}, session_dir=tmp_path
     )
-    run_journal.append_run_event(
+    _append_run_event(
         "sess_del", "run_del", "token", {"text": "two"}, session_dir=tmp_path
     )
 
     assert run_journal.delete_run_journal("sess_del", session_dir=tmp_path) is True
 
+    incarnation = _capability("sess_del", tmp_path, reactivate_retired=True)
     restarted = run_journal.append_run_event(
-        "sess_del", "run_del", "token", {"text": "fresh"}, session_dir=tmp_path
+        "sess_del",
+        "run_del",
+        "token",
+        {"text": "fresh"},
+        session_dir=tmp_path,
+        _incarnation=incarnation,
     )
     assert restarted["seq"] == 1
 
@@ -120,7 +154,7 @@ def test_delete_evicts_seq_cache_concurrently_without_crash(tmp_path):
     # Seed the cache with many keys so an eviction sweep iterates a wide dict,
     # widening the window for a concurrent insert to collide.
     for s in range(60):
-        run_journal.append_run_event(
+        _append_run_event(
             f"sess_seed{s}", "run", "token", {"text": "x"}, session_dir=tmp_path
         )
 
@@ -133,7 +167,7 @@ def test_delete_evicts_seq_cache_concurrently_without_crash(tmp_path):
         while not stop.is_set():
             sid = f"sess_del{i}"
             try:
-                run_journal.append_run_event(
+                _append_run_event(
                     sid, "run", "token", {"text": "d"}, session_dir=tmp_path
                 )
                 run_journal.delete_run_journal(sid, session_dir=tmp_path)
@@ -148,7 +182,7 @@ def test_delete_evicts_seq_cache_concurrently_without_crash(tmp_path):
             try:
                 # Each append to a brand-new session inserts a fresh cache key,
                 # racing the deleter's eviction comprehension.
-                run_journal.append_run_event(
+                _append_run_event(
                     f"sess_ins{base}_{i}", "run", "token", {"text": "i"},
                     session_dir=tmp_path,
                 )
@@ -176,7 +210,7 @@ def test_cross_process_delete_recreate_refreshes_parent_seq_cache(tmp_path):
     session_id = "sess_cross_process_recreate"
     run_id = "run_cross_process_recreate"
     for i in range(5):
-        event = run_journal.append_run_event(
+        event = _append_run_event(
             session_id,
             run_id,
             "token",
@@ -198,8 +232,12 @@ root = Path(sys.argv[1])
 sid = sys.argv[2]
 rid = sys.argv[3]
 run_journal.delete_run_journal(sid, session_dir=root)
+incarnation = run_journal.activate_run_journal_session(
+    sid, session_dir=root, reactivate_retired=True
+)
 event = run_journal.append_run_event(
-    sid, rid, "token", {"text": "child"}, session_dir=root
+    sid, rid, "token", {"text": "child"}, session_dir=root,
+    _incarnation=incarnation,
 )
 print(event["seq"], flush=True)
 """,
@@ -214,7 +252,7 @@ print(event["seq"], flush=True)
     )
     assert child.stdout.strip() == "1"
 
-    parent_event = run_journal.append_run_event(
+    parent_event = _append_run_event(
         session_id,
         run_id,
         "token",
@@ -247,6 +285,7 @@ rid = sys.argv[4]
 label = sys.argv[5]
 rounds = int(sys.argv[6])
 other = "b" if label == "a" else "a"
+incarnation = run_journal.activate_run_journal_session(sid, session_dir=root)
 
 def wait_for(path):
     deadline = time.monotonic() + 20
@@ -258,7 +297,8 @@ def wait_for(path):
 for index in range(rounds):
     wait_for(coordination / f"go-{label}-{index}")
     event = run_journal.append_run_event(
-        sid, rid, "token", {"worker": label, "index": index}, session_dir=root
+        sid, rid, "token", {"worker": label, "index": index}, session_dir=root,
+        _incarnation=incarnation,
     )
     (coordination / f"result-{label}-{index}").write_text(
         str(event["seq"]), encoding="ascii"
@@ -308,7 +348,7 @@ def test_concurrent_appends_produce_unique_gapless_seqs(tmp_path):
     results_lock = threading.Lock()
 
     def worker(i):
-        event = run_journal.append_run_event(
+        event = _append_run_event(
             "sess_conc", "run_conc", "token", {"text": str(i)}, session_dir=tmp_path
         )
         with results_lock:

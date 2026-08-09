@@ -15100,6 +15100,32 @@ def handle_post(handler, parsed) -> bool:
         if not session_lock.acquire(timeout=5):
             return bad(handler, "Session busy, try again", 503)
         try:
+            # The run journal contains the full plaintext request/response and
+            # its retired authority is the durable delete-retry marker. Do not
+            # remove the canonical session owner or publish session_delete
+            # until this cleanup has committed: the retained sidecar/sidebar
+            # row is the user's actionable retry handle after a truthful 500.
+            try:
+                from api.run_journal import delete_run_journal
+
+                delete_run_journal(sid)
+            except Exception:
+                logger.debug(
+                    "Failed to delete run journal for session %s; preserving session for retry",
+                    sid,
+                    exc_info=True,
+                )
+                return j(
+                    handler,
+                    {
+                        "ok": False,
+                        "state_db_cleanup_failed": False,
+                        "run_journal_cleanup_failed": True,
+                        **worktree_retained,
+                        "error": "Run journal cleanup failed; retry deletion",
+                    },
+                    status=500,
+                )
             with LOCK:
                 SESSIONS.pop(sid, None)
             try:
@@ -15149,14 +15175,6 @@ def handle_post(handler, parsed) -> bool:
             delete_turn_journal(sid)
         except Exception:
             logger.debug("Failed to delete turn journal for deleted session %s", sid)
-        run_journal_cleanup_failed = False
-        try:
-            from api.run_journal import delete_run_journal
-
-            delete_run_journal(sid)
-        except Exception:
-            run_journal_cleanup_failed = True
-            logger.debug("Failed to delete run journal for deleted session %s", sid)
         # The weak lock registry releases this entry automatically after all
         # holders and waiters drop their strong references.
         # Prune the completion-dedup entry too. The reaper sweeps it once the
@@ -15185,26 +15203,14 @@ def handle_post(handler, parsed) -> bool:
                 state_db_cleanup_failed = True
                 logger.warning("Failed to delete CLI session %s", sid, exc_info=True)
         _publish_session_list_changed("session_delete", profile=event_profile)
-        # A run-journal failure means plaintext conversation data may still be
-        # recoverable, so surface a non-success response and let the client
-        # retry.  Keep the historical state.db cleanup flag informational: its
-        # 200/ok:true behavior is relied on by existing deletion flows.
-        cleanup_status = 500 if run_journal_cleanup_failed else 200
-        cleanup_error = (
-            {"error": "Run journal cleanup failed; retry deletion"}
-            if run_journal_cleanup_failed
-            else {}
-        )
         return j(
             handler,
             {
-                "ok": not run_journal_cleanup_failed,
+                "ok": True,
                 "state_db_cleanup_failed": state_db_cleanup_failed,
-                "run_journal_cleanup_failed": run_journal_cleanup_failed,
+                "run_journal_cleanup_failed": False,
                 **worktree_retained,
-                **cleanup_error,
             },
-            status=cleanup_status,
         )
 
     if parsed.path == "/api/session/clear":
@@ -21056,6 +21062,8 @@ def _handle_btw(handler, body):
     ephemeral.messages = list(s.messages or [])
     ephemeral.title = f"btw: {question[:60]}"
     ephemeral.save()
+    from api.run_journal import activate_run_journal_session
+    run_journal_incarnation = activate_run_journal_session(ephemeral.session_id)
     stream_id = uuid.uuid4().hex
     ephemeral.active_stream_id = stream_id
     register_session_writeback_owner(ephemeral.session_id, stream_id)
@@ -21069,7 +21077,11 @@ def _handle_btw(handler, body):
     thr = threading.Thread(
         target=_run_agent_streaming,
         args=(ephemeral.session_id, question, s.model, s.workspace, stream_id, None),
-        kwargs={"ephemeral": True, "model_provider": model_provider},
+        kwargs={
+            "ephemeral": True,
+            "model_provider": model_provider,
+            "run_journal_incarnation": run_journal_incarnation,
+        },
         daemon=True,
     )
     thr.start()
@@ -21107,6 +21119,8 @@ def _handle_background(handler, body):
     )
     bg.title = f"bg: {prompt[:60]}"
     bg.save()
+    from api.run_journal import activate_run_journal_session
+    run_journal_incarnation = activate_run_journal_session(bg.session_id)
     stream_id = uuid.uuid4().hex
     bg.active_stream_id = stream_id
     register_session_writeback_owner(bg.session_id, stream_id)
@@ -21136,6 +21150,7 @@ def _handle_background(handler, body):
                 stream_id,
                 None,
                 model_provider=model_provider,
+                run_journal_incarnation=run_journal_incarnation,
             )
             # Reload the bg session from disk and extract the final assistant reply.
             try:
@@ -21517,6 +21532,18 @@ def _start_chat_stream_for_session(
                         "_status": 409,
                     }
                 needs_stale_cleanup = False
+                from api.run_journal import (
+                    activate_run_journal_session,
+                    validate_run_journal_session_activation,
+                )
+                try:
+                    validate_run_journal_session_activation(s.session_id)
+                except RuntimeError as exc:
+                    return {
+                        "error": str(exc),
+                        "type": "run_journal_authority_unavailable",
+                        "_status": 409,
+                    }
                 stream_id = uuid.uuid4().hex
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
@@ -21530,6 +21557,7 @@ def _start_chat_stream_for_session(
                     stream_id=stream_id,
                     source=source,
                 )
+                run_journal_incarnation = activate_run_journal_session(s.session_id)
                 break
         if needs_stale_cleanup:
             diag.stage("stale_stream_cleanup") if diag else None
@@ -21579,7 +21607,11 @@ def _start_chat_stream_for_session(
         STREAM_GOAL_RELATED[stream_id] = True
     diag.stage("worker_thread_start") if diag else None
     worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
-    worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
+    worker_kwargs = {
+        "model_provider": model_provider,
+        "goal_related": goal_related,
+        "run_journal_incarnation": run_journal_incarnation,
+    }
     if moa_config and not backend_is_gateway:
         worker_kwargs["moa_config"] = moa_config
     if backend_is_gateway:

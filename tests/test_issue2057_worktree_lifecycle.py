@@ -154,7 +154,18 @@ def test_delete_session_reports_run_journal_cleanup_failure(tmp_path, monkeypatc
     captured = _capture_post(monkeypatch, {"session_id": sid})
     monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda value: {})
     monkeypatch.setattr(routes, "_is_messaging_session_id", lambda value: False)
-    monkeypatch.setattr(models, "delete_cli_session", lambda value: True)
+    state_db_delete_calls = []
+    monkeypatch.setattr(
+        models,
+        "delete_cli_session",
+        lambda value: state_db_delete_calls.append(value) or True,
+    )
+    published = []
+    monkeypatch.setattr(
+        routes,
+        "_publish_session_list_changed",
+        lambda event, **kwargs: published.append((event, kwargs)),
+    )
 
     delete_calls = []
 
@@ -173,7 +184,10 @@ def test_delete_session_reports_run_journal_cleanup_failure(tmp_path, monkeypatc
     assert captured["payload"]["state_db_cleanup_failed"] is False
     assert captured["payload"]["run_journal_cleanup_failed"] is True
     assert captured["payload"]["error"] == "Run journal cleanup failed; retry deletion"
-    assert not (session_dir / f"{sid}.json").exists()
+    assert (session_dir / f"{sid}.json").exists()
+    assert sid in SESSIONS
+    assert state_db_delete_calls == []
+    assert published == []
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
 
@@ -183,6 +197,10 @@ def test_delete_session_reports_run_journal_cleanup_failure(tmp_path, monkeypatc
     assert captured["payload"]["state_db_cleanup_failed"] is False
     assert captured["payload"]["run_journal_cleanup_failed"] is False
     assert "error" not in captured["payload"]
+    assert not (session_dir / f"{sid}.json").exists()
+    assert sid not in SESSIONS
+    assert state_db_delete_calls == [sid]
+    assert [event for event, _kwargs in published] == ["session_delete"]
 
 
 def test_delete_messaging_session_reopens_read_only_without_deleted_webui_tombstone(
