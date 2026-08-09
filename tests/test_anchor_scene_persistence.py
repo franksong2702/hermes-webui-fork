@@ -1431,7 +1431,7 @@ def test_anchor_scene_persistence_merges_browser_post_after_worker_settlement(tm
 
 
 def test_anchor_scene_persistence_drops_browser_artifact_without_server_evidence(tmp_path, monkeypatch):
-    from api import models, routes, streaming
+    from api import config, models, routes, streaming
     from api.artifact_references import anchor_artifact_event_from_payload
     from api.models import Session
 
@@ -1445,12 +1445,17 @@ def test_anchor_scene_persistence_drops_browser_artifact_without_server_evidence
         workspace=workspace,
         messages=[{"role": "user", "content": "write then cancel", "timestamp": 1}],
     )
-    streaming._finalize_cancelled_turn(
-        session,
-        stream_id=stream_id,
-        run_id=stream_id,
-        artifact_events=[],
-    )
+    monkeypatch.setattr(streaming, "get_session", lambda _sid: session)
+    config.register_session_writeback_owner(sid, stream_id)
+    try:
+        streaming._finalize_cancelled_turn(
+            session,
+            stream_id=stream_id,
+            run_id=stream_id,
+            artifact_events=[],
+        )
+    finally:
+        config.clear_session_writeback_owner_if_owned(sid, stream_id)
 
     invented = anchor_artifact_event_from_payload(
         {

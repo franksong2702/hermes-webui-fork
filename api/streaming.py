@@ -37,6 +37,9 @@ from api.config import (
     _set_thread_env, _clear_thread_env,
     register_active_run, update_active_run, unregister_active_run,
     unregister_stream_owner,
+    stream_owner_session_id,
+    session_writeback_owner,
+    clear_session_writeback_owner_if_owned,
     SESSION_AGENT_LOCKS, SESSION_AGENT_LOCKS_LOCK,
     resolve_model_provider,
     resolve_custom_provider_connection,
@@ -2294,6 +2297,80 @@ def _reconcile_stream_artifacts_into_terminal_anchor_scene(
         records = dict(ordered[-256:])
     session.anchor_activity_scenes = records
     return True
+def _resolve_current_session_for_write(session):
+    """Resolve the CURRENT session object for a delayed-cancel write.
+
+    The worker thread holds a snapshot ``Session`` object captured when the
+    turn started. ``cancel_stream()`` clears ``active_stream_id`` on the
+    object it resolves and saves it, after which the session is eligible for
+    LRU eviction; a successor turn may then be admitted through a DISTINCT
+    object lazily reloaded by ``get_session()``. Writing to the worker's
+    snapshot after that point serializes stale state over the successor
+    (#6623 re-gate), so delayed-cancel writes MUST target the object that
+    ``get_session()`` currently resolves under the canonical per-session
+    lock.
+
+    Returns ``None`` (fail closed) when the current object cannot be
+    resolved — missing/deleted session, transient error, or no session id.
+    Callers MUST no-op on ``None`` and must NEVER fall back to the
+    worker-held snapshot: that object may be a detached LRU-evicted
+    generation whose save would overwrite the current session state.
+    """
+    sid = getattr(session, "session_id", None)
+    if not sid:
+        return None
+    try:
+        return get_session(sid)
+    except Exception:
+        logger.debug(
+            "Failed to resolve current session %s for delayed-cancel write; "
+            "failing closed (no write)",
+            sid,
+            exc_info=True,
+        )
+        return None
+
+
+def _merge_process_wakeup_pause_into_current_session(
+    session,
+    *,
+    classification: str,
+    model=None,
+    provider=None,
+) -> dict | None:
+    """Record a process-wakeup provider-unavailable pause on the CURRENT session.
+
+    The worker-held ``session`` may be a detached snapshot (LRU-evicted and
+    replaced by a distinct object through which a successor was admitted and
+    saved). The pause is session-wide suppression metadata that must survive
+    regardless of stream ownership, so it is merged into the current object —
+    resolved under the canonical per-session lock — and saved there. Saving
+    the worker's snapshot instead would serialize stale state over the
+    successor even when the generation-guarded finalizer later no-ops
+    (#6623 re-gate). If the current object cannot be resolved the pause is
+    skipped (fail closed) — it is never written through the worker-held
+    snapshot.
+    """
+    current = _resolve_current_session_for_write(session)
+    if current is None:
+        logger.info(
+            "Skipping process-wakeup pause for unresolvable session %s "
+            "(fail closed — no detached-snapshot save)",
+            getattr(session, "session_id", None),
+        )
+        return None
+    recorded = record_process_wakeup_provider_unavailable_pause(
+        current,
+        classification=classification,
+        model=model,
+        provider=provider,
+    )
+    if recorded:
+        try:
+            current.save(touch_updated_at=False)
+        except Exception:
+            logger.debug("Failed to save process-wakeup pause", exc_info=True)
+    return recorded
 
 
 def _finalize_cancelled_turn(
@@ -2305,7 +2382,66 @@ def _finalize_cancelled_turn(
     run_id: str | None = None,
     artifact_events=None,
 ) -> None:
-    """Finalize a cancelled turn for persistent or ephemeral sessions."""
+    """Finalize a cancelled turn for persistent or ephemeral sessions.
+
+    Generation-guarded (#6623 re-gate): when ``stream_id`` is provided, the
+    finalizer only acts while the session has not advanced past that stream.
+    The worker-held ``session`` object is only a snapshot: cancel_stream()
+    clears ``active_stream_id`` eagerly, and the session may have been
+    LRU-evicted and lazily reloaded as a DISTINCT object through which a
+    successor turn was admitted and saved. Finalization authority is therefore
+    bound to the per-session writeback-ownership record
+    (``SESSION_WRITEBACK_OWNERS``), which survives cancel cleanup, AND to the
+    CURRENT session object resolved by canonical session id under the
+    per-session agent lock (callers hold it). A successor owns the session now
+    and a delayed finalizer from the old worker MUST no-op against it instead
+    of clearing pending fields, materializing the pending user turn, appending
+    markers, unlinking the session, or saving. ``active_stream_id is None`` on
+    a worker-held snapshot is NOT proof that no successor exists — cancel
+    cleanup clears that field eagerly. And a MISSING ownership record is NOT
+    proof that the session is idle: the successor's own teardown clears the
+    record when it completes, so ``owner is None`` must fail closed too.
+    """
+    if stream_id:
+        session_id = getattr(session, "session_id", None)
+        current = _resolve_current_session_for_write(session) if session_id else None
+        if current is None:
+            logger.info(
+                "Skipping stale cancelled-turn finalize for session %s stream %s; "
+                "current session cannot be resolved (fail closed)",
+                session_id,
+                stream_id,
+            )
+            return
+        # Immutable stream/generation authority: the writeback-ownership record
+        # survives cancel cleanup and is replaced only by a successor admission,
+        # so authority must EQUAL this worker's exact stream_id. ``None`` —
+        # successor completed and its teardown cleared the entry, record never
+        # registered, or already reaped/deleted — must FAIL CLOSED: it is not
+        # proof that no successor exists, and the old worker would otherwise
+        # append/save its obsolete cancellation over the completed successor.
+        owner = session_writeback_owner(session_id) if session_id else None
+        if owner != stream_id:
+            logger.info(
+                "Skipping stale cancelled-turn finalize for session %s stream %s; "
+                "writeback owner=%r (missing, replaced, or unresolvable — fail closed)",
+                session_id,
+                stream_id,
+                owner,
+            )
+            return
+        _current = getattr(current, "active_stream_id", None)
+        if _current is not None and _current != stream_id:
+            logger.info(
+                "Skipping stale cancelled-turn finalize for session %s stream %s; "
+                "active_stream_id=%s (successor owns the writeback)",
+                session_id,
+                stream_id,
+                _current,
+            )
+            return
+        # Finalize against the CURRENT object — never the worker's snapshot.
+        session = current
     if ephemeral:
         _cleanup_ephemeral_cancelled_turn(session)
         return
@@ -4029,6 +4165,31 @@ def _get_aux_title_config() -> dict:
         return {}
 
 
+def _aux_title_generation_enabled() -> bool:
+    """Return whether automatic title generation is enabled (default: enabled).
+
+    Mirrors Hermes Agent's ``auxiliary.title_generation.enabled`` contract
+    byte-for-byte via its canonical ``is_truthy_value(value, default=True)``
+    semantics (agent/title_generator.py -> utils.is_truthy_value):
+
+      * ``None`` / missing -> default (True)
+      * ``bool`` -> unchanged
+      * ``str`` -> True ONLY when normalized into {"1", "true", "yes", "on"}
+        (an empty or unrecognized string is False, matching the agent — an
+        allowlist, NOT a "disable on false/0/no/off" blocklist)
+      * any other type -> ``bool(value)``
+    """
+    tg = _get_aux_title_config()
+    val = tg.get('enabled', True)
+    if val is None:
+        return True
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(val)
+
+
 def _aux_title_configured() -> bool:
     """Return True when any auxiliary title_generation config field is meaningfully set."""
     tg = _get_aux_title_config()
@@ -4554,6 +4715,9 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
         from api import profiles as profiles_api
 
         with profiles_api.profile_env_for_background_worker(s, "background title", logger_override=logger):
+            if not _aux_title_generation_enabled():
+                _put_title_status(put_event, session_id, 'skipped', 'title_generation_disabled', current)
+                return
             aux_title_configured = _aux_title_configured()
             if agent and not aux_title_configured:
                 next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
@@ -4643,6 +4807,9 @@ def _run_background_title_refresh(session_id: str, user_text: str, assistant_tex
         from api import profiles as profiles_api
 
         with profiles_api.profile_env_for_background_worker(s, "background title", logger_override=logger):
+            if not _aux_title_generation_enabled():
+                _put_title_status(put_event, session_id, 'refresh_skipped', 'title_generation_disabled', effective)
+                return
             aux_title_configured = _aux_title_configured()
             if agent and not aux_title_configured:
                 next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
@@ -4704,6 +4871,8 @@ def generate_session_title_for_session(session, *, prefer_latest: bool = False, 
     from api import profiles as profiles_api
 
     with profiles_api.profile_env_for_background_worker(session, "manual title regeneration", logger_override=logger):
+        if not _aux_title_generation_enabled():
+            return None, 'title_generation_disabled', ''
         next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent)
     if next_title:
         return next_title, llm_status, raw_preview
@@ -7975,6 +8144,13 @@ def _run_agent_streaming(
         # already registered the stream owner, so release it here to avoid
         # leaking a STREAM_SESSION_OWNERS entry that the teardown finally never sees.
         unregister_stream_owner(stream_id)
+        try:
+            clear_session_writeback_owner_if_owned(session_id, stream_id)
+        except Exception:
+            logger.debug(
+                "Failed to clear session writeback owner for stream %s", stream_id,
+                exc_info=True,
+            )
         return
     register_active_run(
         stream_id,
@@ -9876,8 +10052,16 @@ def _run_agent_streaming(
             # Prepend workspace context so the agent always knows which directory
             # to use for file operations, regardless of session age or AGENTS.md defaults.
             workspace_ctx = _workspace_context_prefix(str(s.workspace))
+            # #6672: interpolate the session-CREATION workspace (immutable), never
+            # the live s.workspace, into the system prompt. s.workspace changes on
+            # every mid-session workspace switch in the WebUI header; mutating the
+            # system prompt would rewrite msg[0] and invalidate the LLM prefix
+            # cache (APC/Radix Tree) for the whole 50k+ token transcript. Active
+            # switches still reach the model via the [Workspace::v1: ...] tag on
+            # the current user turn (workspace_ctx above), which lives in msg[-1].
+            _session_workspace_frozen = getattr(s, 'created_workspace', None) or str(s.workspace)
             workspace_system_msg = (
-                f"Active workspace at session start: {s.workspace}\n"
+                f"Active workspace at session start: {_session_workspace_frozen}\n"
                 "Every user message is prefixed with [Workspace::v1: /absolute/path] indicating the "
                 "workspace the user has selected in the web UI at the time they sent that message. "
                 "This tag is the single authoritative source of the active workspace and updates "
@@ -9915,7 +10099,10 @@ def _run_agent_streaming(
                     'source': 'webui',
                     'session_id': session_id,
                     'profile': getattr(s, 'profile', None),
-                    'workspace': s.workspace,
+                    # #6672: frozen session-creation workspace — see
+                    # workspace_system_msg above. Live workspace switches stay out
+                    # of msg[0] so LLM prefix caches are not invalidated.
+                    'workspace': _session_workspace_frozen,
                 },
                 config_data=_cfg,
             )
@@ -10069,7 +10256,8 @@ def _run_agent_streaming(
                 if _ckpt_thread is not None:
                     _ckpt_thread.join(timeout=15)
                 if ephemeral:
-                    _cleanup_ephemeral_cancelled_turn(s)
+                    with _agent_lock:
+                        _finalize_cancelled_turn(s, ephemeral=True, stream_id=stream_id)
                 else:
                     with _agent_lock:
                         _finalize_cancelled_turn(
@@ -11699,7 +11887,16 @@ def _run_agent_streaming(
                         and _turn_pending_source == 'process_wakeup'
                         and _exc_is_credential_pool_empty
                     ):
-                        record_process_wakeup_provider_unavailable_pause(
+                        # Merge the pause into the CURRENT session object under
+                        # the canonical lock. The worker-held ``s`` may be a
+                        # detached snapshot (LRU-evicted + replaced by a
+                        # distinct object through which a successor was
+                        # admitted); saving it would serialize stale state over
+                        # the successor even though the generation-guarded
+                        # finalizer below later no-ops. The pause is
+                        # session-wide suppression metadata that must survive
+                        # regardless of stream ownership (#6623 re-gate).
+                        _wakeup_pause_recorded = _merge_process_wakeup_pause_into_current_session(
                             s,
                             classification=_classification['type'],
                             model=_turn_route_model,
@@ -11880,21 +12077,17 @@ def _run_agent_streaming(
             with _lock_ctx:
                 if not ephemeral and not _stream_writeback_is_current(s, stream_id):
                     if _turn_pending_source == 'process_wakeup':
-                        _pause = record_process_wakeup_provider_unavailable_pause(
+                        # #6623 re-gate: merge the pause into the CURRENT
+                        # session object under the canonical lock — never save
+                        # the worker's detached snapshot. The helper fails
+                        # closed (no write) when the current object cannot be
+                        # resolved.
+                        _merge_process_wakeup_pause_into_current_session(
                             s,
                             classification=_exc_type,
                             model=_turn_route_model,
                             provider=_turn_route_provider,
                         )
-                        if _pause is not None:
-                            try:
-                                s.save(touch_updated_at=False)
-                            except Exception:
-                                logger.debug(
-                                    "Failed to persist stale-stream process_wakeup pause for session %s",
-                                    getattr(s, 'session_id', session_id),
-                                    exc_info=True,
-                                )
                     logger.info(
                         "Skipping stale stream error writeback for session %s stream %s; active_stream_id=%s",
                         getattr(s, 'session_id', session_id),
@@ -12048,6 +12241,16 @@ def _run_agent_streaming(
             # Clean up the stream-owner registry so stale stream_id→session_id
             # mappings do not accumulate over thousands of completed streams (#6351).
             unregister_stream_owner(stream_id)
+            # Release the session's writeback-ownership entry only while this
+            # stream still owns it (#6623 re-gate): a successor admitted after
+            # cancel must keep its registry claim.
+            try:
+                clear_session_writeback_owner_if_owned(session_id, stream_id)
+            except Exception:
+                logger.debug(
+                    "Failed to clear session writeback owner for stream %s", stream_id,
+                    exc_info=True,
+                )
             # NOTE: do NOT discard PENDING_GOAL_CONTINUATION here. The marker
             # is set by goal_continue (line ~3328) inside the SAME function
             # call and consumed atomically by `_start_chat_stream_for_session`
@@ -12257,6 +12460,7 @@ def cancel_stream(stream_id: str) -> bool:
     _snap_tool_calls = None
     _snap_flag = None
     _snap_agent = None
+    _snap_owner_session_id = None
     _cancel_session_payload = None
 
     with streams_lock:
@@ -12268,6 +12472,16 @@ def cancel_stream(stream_id: str) -> bool:
         # cancel must snapshot them too or it loses the already-streamed text.
         _snap_flag = cancel_flags.get(stream_id)
         _snap_agent = agent_instances.get(stream_id)
+        # Capture the stream owner WHILE the stream still exists (#6623). The
+        # just-starting worker takes its `q is None -> unregister_stream_owner`
+        # early path (api/streaming.py `_run_agent_streaming` and
+        # api/gateway_chat.py `_run_gateway_chat_streaming`) the instant
+        # STREAMS[stream_id] is popped below, so reading the owner AFTER the
+        # pop can race that teardown and yield None — leaving the session's
+        # active_stream_id/pending_* stuck while cancel still returns True.
+        # Reading it here, under streams_lock and before any pop, gives cancel
+        # a stable owner to resolve session cleanup against.
+        _snap_owner_session_id = stream_owner_session_id(stream_id)
         _snap_partial_text = partial_texts.get(stream_id, '')
         if not _snap_partial_text:
             _live_partials = getattr(_live_config, 'STREAM_PARTIAL_TEXT', partial_texts)
@@ -12306,8 +12520,10 @@ def cancel_stream(stream_id: str) -> bool:
 
     # Mark the worker lifecycle registry immediately. The SSE maps may be popped
     # below while the worker is still unwinding; ACTIVE_RUNS is what recovery /
-    # health polling sees during that detached window.
-    update_active_run(stream_id, phase="cancelling")
+    # health polling sees during that detached window. Stamp cancelled_at so
+    # _clear_stale_stream_state() can eventually reclaim the session if the
+    # worker is stuck in C-level I/O and never reaches its finally (#6623).
+    update_active_run(stream_id, phase="cancelling", cancelled_at=time.time())
 
     # Set WebUI layer cancel flag. Prefer the snapshot captured under the lock;
     # fall back to a fresh lookup for the ACTIVE_RUNS-only path (stream absent).
@@ -12383,6 +12599,15 @@ def cancel_stream(stream_id: str) -> bool:
     _cancel_session_id = getattr(agent, 'session_id', None) if agent else None
     if not _cancel_session_id and active_run_session_id:
         _cancel_session_id = active_run_session_id
+    # Third fallback: stream owner registry — populated before the worker
+    # thread starts, so it's always available even for early cancels that
+    # race ahead of AGENT_INSTANCES and ACTIVE_RUNS (#6623). The owner is
+    # read UNDER streams_lock above (while STREAMS[stream_id] still exists),
+    # NOT here after the eager pop: the just-starting worker unregisters the
+    # owner the instant the stream map entry disappears, so a post-pop lookup
+    # would race that teardown and return None.
+    if not _cancel_session_id and _snap_owner_session_id:
+        _cancel_session_id = _snap_owner_session_id
     # Use the snapshots captured under streams_lock above (the worker's finally
     # may have popped the live buffers by now via agent.interrupt()). For the
     # ACTIVE_RUNS-only path (stream absent) the snapshots are None → fall back to
