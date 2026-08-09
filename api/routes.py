@@ -21062,8 +21062,28 @@ def _handle_btw(handler, body):
     ephemeral.messages = list(s.messages or [])
     ephemeral.title = f"btw: {question[:60]}"
     ephemeral.save()
-    from api.run_journal import activate_run_journal_session
-    run_journal_incarnation = activate_run_journal_session(ephemeral.session_id)
+    from api.run_journal import (
+        RunJournalRetiredAuthorityError,
+        activate_run_journal_session,
+    )
+    try:
+        run_journal_incarnation = activate_run_journal_session(ephemeral.session_id)
+    except RunJournalRetiredAuthorityError as exc:
+        return j(
+            handler,
+            {
+                "error": str(exc),
+                "type": "run_journal_authority_unavailable",
+            },
+            status=409,
+        )
+    except (RuntimeError, OSError):
+        logger.warning(
+            "Failed to activate run journal for /btw session %s; continuing unjournaled",
+            ephemeral.session_id,
+            exc_info=True,
+        )
+        run_journal_incarnation = None
     stream_id = uuid.uuid4().hex
     ephemeral.active_stream_id = stream_id
     register_session_writeback_owner(ephemeral.session_id, stream_id)
@@ -21119,8 +21139,28 @@ def _handle_background(handler, body):
     )
     bg.title = f"bg: {prompt[:60]}"
     bg.save()
-    from api.run_journal import activate_run_journal_session
-    run_journal_incarnation = activate_run_journal_session(bg.session_id)
+    from api.run_journal import (
+        RunJournalRetiredAuthorityError,
+        activate_run_journal_session,
+    )
+    try:
+        run_journal_incarnation = activate_run_journal_session(bg.session_id)
+    except RunJournalRetiredAuthorityError as exc:
+        return j(
+            handler,
+            {
+                "error": str(exc),
+                "type": "run_journal_authority_unavailable",
+            },
+            status=409,
+        )
+    except (RuntimeError, OSError):
+        logger.warning(
+            "Failed to activate run journal for background session %s; continuing unjournaled",
+            bg.session_id,
+            exc_info=True,
+        )
+        run_journal_incarnation = None
     stream_id = uuid.uuid4().hex
     bg.active_stream_id = stream_id
     register_session_writeback_owner(bg.session_id, stream_id)
@@ -21135,7 +21175,7 @@ def _handle_background(handler, body):
     bg_sid = bg.session_id
     track_background(parent_sid, bg_sid, stream_id, task_id, prompt)
 
-    def _run_bg_and_notify():
+    def _run_bg_and_notify(*, run_journal_incarnation):
         """Run the background agent, then mark the tracked task `done` with the
         last assistant reply so `/api/background/status` can surface it.  Without
         this, `complete_background()` is never called and the result is lost —
@@ -21182,7 +21222,11 @@ def _handle_background(handler, body):
             except Exception:
                 pass
 
-    thr = threading.Thread(target=_run_bg_and_notify, daemon=True)
+    thr = threading.Thread(
+        target=_run_bg_and_notify,
+        kwargs={"run_journal_incarnation": run_journal_incarnation},
+        daemon=True,
+    )
     thr.start()
     return j(handler, {"task_id": task_id, "stream_id": stream_id, "session_id": bg.session_id})
 
@@ -21533,17 +21577,24 @@ def _start_chat_stream_for_session(
                     }
                 needs_stale_cleanup = False
                 from api.run_journal import (
+                    RunJournalRetiredAuthorityError,
                     activate_run_journal_session,
                     validate_run_journal_session_activation,
                 )
                 try:
                     validate_run_journal_session_activation(s.session_id)
-                except RuntimeError as exc:
+                except RunJournalRetiredAuthorityError as exc:
                     return {
                         "error": str(exc),
                         "type": "run_journal_authority_unavailable",
                         "_status": 409,
                     }
+                except (RuntimeError, OSError):
+                    logger.warning(
+                        "Failed to validate run journal authority for session %s; continuing unjournaled",
+                        s.session_id,
+                        exc_info=True,
+                    )
                 stream_id = uuid.uuid4().hex
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
@@ -21557,7 +21608,21 @@ def _start_chat_stream_for_session(
                     stream_id=stream_id,
                     source=source,
                 )
-                run_journal_incarnation = activate_run_journal_session(s.session_id)
+                try:
+                    run_journal_incarnation = activate_run_journal_session(s.session_id)
+                except RunJournalRetiredAuthorityError as exc:
+                    return {
+                        "error": str(exc),
+                        "type": "run_journal_authority_unavailable",
+                        "_status": 409,
+                    }
+                except (RuntimeError, OSError):
+                    logger.warning(
+                        "Failed to activate run journal for session %s; continuing unjournaled",
+                        s.session_id,
+                        exc_info=True,
+                    )
+                    run_journal_incarnation = None
                 break
         if needs_stale_cleanup:
             diag.stage("stale_stream_cleanup") if diag else None

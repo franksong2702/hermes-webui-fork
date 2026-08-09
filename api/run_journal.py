@@ -101,6 +101,10 @@ _SNAPSHOT_ARGS_MAX_TOTAL_CHARS = 64 * 1024
 _SNAPSHOT_ARGS_TRUNCATED_SUFFIX = "...[truncated]"
 
 
+class RunJournalRetiredAuthorityError(RuntimeError):
+    """Raised when a valid retired authority blocks a new activation."""
+
+
 def _default_session_dir() -> Path:
     from api.models import SESSION_DIR
 
@@ -242,6 +246,8 @@ def _activate_run_journal_incarnation_locked(
             _write_run_journal_incarnation(path, incarnation, state="active")
         return incarnation
     if current is not None and not reactivate_retired:
+        if current["state"] == "retired":
+            raise RunJournalRetiredAuthorityError(_RUN_JOURNAL_WRITER_RETIRED_ERROR)
         raise RuntimeError(_RUN_JOURNAL_WRITER_RETIRED_ERROR)
     incarnation = secrets.token_hex(16)
     _write_run_journal_incarnation(path, incarnation, state="active")
@@ -278,6 +284,8 @@ def validate_run_journal_session_activation(
     path = _run_path(session_id, ".authority", session_dir=session_dir)
     with _run_journal_lifecycle_authority(path):
         current = _read_run_journal_incarnation(path)
+        if current is not None and current["state"] == "retired":
+            raise RunJournalRetiredAuthorityError(_RUN_JOURNAL_WRITER_RETIRED_ERROR)
         if current is not None and current["state"] != "active":
             raise RuntimeError(_RUN_JOURNAL_WRITER_RETIRED_ERROR)
 
