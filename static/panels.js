@@ -8542,6 +8542,14 @@ async function _autosaveAppearanceSettings(payload){
     }
     window._sessionEndlessScrollEnabled=!!(saved&&saved.session_endless_scroll);
     window._autoScrollFollow=!saved||saved.auto_scroll_follow!==false;
+    // #6819: persist ONLY from an explicit boolean in the server response.
+    // A failed autosave (`saved` falsy) or a partial response without the key
+    // would otherwise write the synthesized default (ON) into the mirror,
+    // corrupting the value a later boot-failure fallback would restore
+    // (Greptile P1 review on #6856).
+    if(saved&&typeof saved.auto_scroll_follow==='boolean'&&typeof _persistAutoScrollFollow==='function'){
+      _persistAutoScrollFollow(saved.auto_scroll_follow);
+    }
     window._largeTextPasteAsAttachment=!saved||saved.large_text_paste_as_attachment!==false;
     window._projectQuickCreate=!!(saved&&saved.project_quick_create_buttons);
     if(saved&&Object.prototype.hasOwnProperty.call(saved,'structured_code_default_view')){
@@ -8678,6 +8686,8 @@ function _preferencesPayloadFromUi(){
   if(showCronCb) payload.show_cron_sessions=!!(showCliCb&&showCliCb.checked&&showCronCb.checked);
   const showWebhookCb=$('settingsShowWebhookSessions');
   if(showWebhookCb) payload.show_webhook_sessions=!!(showCliCb&&showCliCb.checked&&showWebhookCb.checked);
+  const showKanbanCb=$('settingsShowKanbanSessions');
+  if(showKanbanCb) payload.show_kanban_sessions=!!(showCliCb&&showCliCb.checked&&showKanbanCb.checked);
   const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
   if(showPreviousMessagingCb) payload.show_previous_messaging_sessions=showPreviousMessagingCb.checked;
   const syncCb=$('settingsSyncInsights');
@@ -9049,6 +9059,14 @@ async function loadSettingsPanel(){
     if(autoScrollFollowCb){
       autoScrollFollowCb.checked=settings.auto_scroll_follow!==false;
       window._autoScrollFollow=autoScrollFollowCb.checked;
+      // #6819/#6856: a successful settings GET is an authoritative resolve, so
+      // sync the global mirror too — otherwise an explicit OFF applied here
+      // leaves a stale ON mirror that a later boot-fetch failure would restore.
+      // Persist ONLY when the server explicitly sent a boolean (never persist a
+      // synthesized default from an absent field — matches the boot contract).
+      if(typeof settings.auto_scroll_follow==='boolean'&&typeof _persistAutoScrollFollow==='function'){
+        _persistAutoScrollFollow(settings.auto_scroll_follow);
+      }
       autoScrollFollowCb.onchange=function(){
         window._autoScrollFollow=this.checked;
         _scheduleAppearanceAutosave();
@@ -9393,6 +9411,13 @@ async function loadSettingsPanel(){
       showWebhookCb.disabled=showCliCb?!showCliCb.checked:true;
       showWebhookCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
       if(showCliCb){showCliCb.addEventListener('change',function(){showWebhookCb.disabled=!showCliCb.checked;},{once:false});}
+    }
+    const showKanbanCb=$('settingsShowKanbanSessions');
+    if(showKanbanCb){
+      showKanbanCb.checked=!!settings.show_kanban_sessions;
+      showKanbanCb.disabled=showCliCb?!showCliCb.checked:true;
+      showKanbanCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
+      if(showCliCb){showCliCb.addEventListener('change',function(){showKanbanCb.disabled=!showCliCb.checked;},{once:false});}
     }
     const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
     if(showPreviousMessagingCb){showPreviousMessagingCb.checked=!!settings.show_previous_messaging_sessions;showPreviousMessagingCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
@@ -11948,7 +11973,13 @@ function _applySavedSettingsUi(saved, body, opts){
     ? _persistDefaultMessageMode(body.default_message_mode||body.busy_input_mode)
     : (body.default_message_mode||body.busy_input_mode||'steer');
   window._sessionEndlessScrollEnabled=!!body.session_endless_scroll;
-  window._autoScrollFollow=body.auto_scroll_follow!==false;
+  // #6819: only override auto-follow when the body actually carries the key.
+  // A partial settings body without it must not silently re-enable follow
+  // (`undefined !== false` evaluates true — the old clobber).
+  if(Object.prototype.hasOwnProperty.call(body,'auto_scroll_follow')){
+    window._autoScrollFollow=body.auto_scroll_follow!==false;
+    if(typeof _persistAutoScrollFollow==='function') _persistAutoScrollFollow(window._autoScrollFollow);
+  }
   window._largeTextPasteAsAttachment=body.large_text_paste_as_attachment!==false;
   window._projectQuickCreate=!!body.project_quick_create_buttons;
   if(Object.prototype.hasOwnProperty.call(body,'structured_code_default_view')){
@@ -12557,6 +12588,7 @@ async function saveSettings(andClose){
   const showClaudeCodeSessions=!!($('settingsShowClaudeCodeSessions')||{}).checked;
   const showCronSessions=!!($('settingsShowCronSessions')||{}).checked;
   const showWebhookSessions=!!($('settingsShowWebhookSessions')||{}).checked;
+  const showKanbanSessions=!!($('settingsShowKanbanSessions')||{}).checked;
   const showPreviousMessagingSessions=!!($('settingsShowPreviousMessagingSessions')||{}).checked;
   const pinnedSessionsLimit=parseInt(($('settingsPinnedSessionsLimit')||{}).value,10)||3;
   const pw=($('settingsPassword')||{}).value;
@@ -12613,6 +12645,7 @@ async function saveSettings(andClose){
   // mirror the autosave path so the explicit Save Settings button persists them too. (#3514)
   body.show_cron_sessions=showCliSessions&&showCronSessions;
   body.show_webhook_sessions=showCliSessions&&showWebhookSessions;
+  body.show_kanban_sessions=showCliSessions&&showKanbanSessions;
   body.show_previous_messaging_sessions=showPreviousMessagingSessions;
   body.pinned_sessions_limit=pinnedSessionsLimit;
   body.sync_to_insights=!!($('settingsSyncInsights')||{}).checked;

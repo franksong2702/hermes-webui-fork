@@ -1942,6 +1942,7 @@ def _session_list_cache_key(
     exclude_hidden: bool = False,
     visible_only: bool = False,
     show_webhook_sessions: bool = False,
+    show_kanban_sessions: bool = False,
     source_filter: str | None = None,
     sidebar_source: str | None = None,
     archived_limit: int | None = None,
@@ -1958,6 +1959,7 @@ def _session_list_cache_key(
         exclude_hidden=exclude_hidden,
         visible_only=visible_only,
         show_webhook_sessions=show_webhook_sessions,
+        show_kanban_sessions=show_kanban_sessions,
         source_filter=source_filter,
         sidebar_source=sidebar_source,
         archived_limit=archived_limit,
@@ -2203,6 +2205,7 @@ def _build_session_list_cache_payload(
     exclude_hidden: bool = False,
     visible_only: bool = False,
     show_webhook_sessions: bool = False,
+    show_kanban_sessions: bool = False,
     source_filter: str | None = None,
     sidebar_source: str | None = None,
     archived_limit: int | None = None,
@@ -2254,6 +2257,7 @@ def _build_session_list_cache_payload(
     show_previous_messaging_sessions = bool(show_previous_messaging_sessions)
     show_cron_sessions = bool(show_cron_sessions)
     show_webhook_sessions = bool(show_webhook_sessions)
+    show_kanban_sessions = bool(show_kanban_sessions)
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
     if show_cli_sessions:
         diag_stage("get_cli_sessions")
@@ -2400,6 +2404,8 @@ def _build_session_list_cache_payload(
             represented_webui_ids,
             show_cron_sessions=show_cron_sessions,
             show_webhook_sessions=show_webhook_sessions,
+            show_kanban_sessions=show_kanban_sessions,
+            source_filter=source_filter,
         )
     else:
         diag_stage("filter_webui_sessions")
@@ -2573,6 +2579,7 @@ def _build_session_list_cache_payload(
             "show_cron_sessions": show_cron_sessions,
             "show_claude_code_sessions": show_claude_code_sessions if show_cli_sessions else False,
             "show_webhook_sessions": show_webhook_sessions,
+            "show_kanban_sessions": show_kanban_sessions,
         },
     }
 
@@ -2842,6 +2849,8 @@ from api.config import (
     ACTIVE_RUNS_LOCK,
     register_stream_owner,
     register_session_writeback_owner,
+    clear_session_writeback_owner_if_owned,
+    session_writeback_owner,
     stream_owner_session_id,
     unregister_stream_owner,
     CHAT_LOCK,
@@ -9405,6 +9414,8 @@ def _dedupe_cli_sidebar_sessions_for_api(
     *,
     show_cron_sessions: bool = False,
     show_webhook_sessions: bool = False,
+    show_kanban_sessions: bool = False,
+    source_filter: str | None = None,
 ) -> list[dict]:
     """Return state sidebar rows while preserving project-hidden background rows.
 
@@ -9412,11 +9423,25 @@ def _dedupe_cli_sidebar_sessions_for_api(
     session store. They should stay hidden from the default sidebar, but
     project-assigned messageful rows must remain in the `/api/sessions` payload
     with `default_hidden` so the matching project chip can reveal them (#3134).
+
+    An explicit ``source_filter`` for a background source (cron/webhook/kanban)
+    is a deliberate request to view those rows, so it overrides the default
+    hide for that source only — the user asked for them.
     """
     from api.models import (
         _hide_from_default_sidebar as _hide_background,
         _include_project_hidden_background_sidebar_sessions,
     )
+
+    # An explicit background source filter reveals that source (override the hide).
+    # Normalize to match how the loader canonicalizes source_filter (strip+lower).
+    _sf = str(source_filter or '').strip().lower()
+    if _sf == 'cron':
+        show_cron_sessions = True
+    elif _sf == 'webhook':
+        show_webhook_sessions = True
+    elif _sf == 'kanban':
+        show_kanban_sessions = True
 
     candidates = [
         s for s in cli
@@ -9430,6 +9455,7 @@ def _dedupe_cli_sidebar_sessions_for_api(
             s,
             show_cron=show_cron_sessions,
             show_webhook=show_webhook_sessions,
+            show_kanban=show_kanban_sessions,
         )
     ]
     return _include_project_hidden_background_sidebar_sessions(candidates, visible)
@@ -10002,6 +10028,7 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "is_cli_session",
     "is_messaging_session",
     "is_streaming",
+    "cron_running",
     "active_stream_id",
     "has_pending_user_message",
     "pending_started_at",
@@ -13320,6 +13347,7 @@ def handle_get(handler, parsed) -> bool:
             )
             show_cron_sessions = bool(settings.get("show_cron_sessions"))
             show_webhook_sessions = bool(settings.get("show_webhook_sessions"))
+            show_kanban_sessions = bool(settings.get("show_kanban_sessions"))
             agent_session_source_filter = settings.get("agent_session_source_filter")
             active_profile = profiles_api.get_active_profile_name()
             all_profiles = _all_profiles_enabled(parsed)
@@ -13343,6 +13371,7 @@ def handle_get(handler, parsed) -> bool:
                 exclude_hidden=exclude_hidden,
                 visible_only=True,
                 show_webhook_sessions=show_webhook_sessions,
+                show_kanban_sessions=show_kanban_sessions,
                 source_filter=agent_session_source_filter,
                 sidebar_source=sidebar_source,
                 archived_limit=archived_limit,
@@ -13365,6 +13394,7 @@ def handle_get(handler, parsed) -> bool:
                     exclude_hidden=exclude_hidden,
                     visible_only=True,
                     show_webhook_sessions=show_webhook_sessions,
+                    show_kanban_sessions=show_kanban_sessions,
                     source_filter=agent_session_source_filter,
                     sidebar_source=sidebar_source,
                     archived_limit=archived_limit,
@@ -16022,6 +16052,7 @@ def handle_post(handler, parsed) -> bool:
                 "show_claude_code_sessions",
                 "show_cron_sessions",
                 "show_webhook_sessions",
+                "show_kanban_sessions",
                 "show_previous_messaging_sessions",
             )
         ):
@@ -21330,6 +21361,243 @@ def _prepare_chat_start_session_for_stream(
     s.save()
 
 
+_CHAT_START_ROLLBACK_FIELDS = (
+    "active_stream_id",
+    "pending_user_message",
+    "pending_attachments",
+    "pending_started_at",
+    "pending_user_source",
+    "title",
+    "messages",
+    "truncation_watermark",
+    "workspace",
+    "model",
+    "model_provider",
+    "post_compression_context_tokens_estimate",
+    # ``save()`` updates this metadata field even though the prepare helper
+    # does not assign it directly.  Restoring it keeps the compensation write
+    # observationally identical to the pre-admission sidecar.
+    "updated_at",
+)
+_CHAT_START_ROLLBACK_MISSING = object()
+
+
+def _snapshot_chat_start_session_for_rollback(session) -> dict:
+    """Capture only fields mutated by chat-start prepare/save.
+
+    The snapshot is intentionally narrow: it covers pending/display state,
+    routing metadata, and the save timestamp touched by the prepare helper,
+    without copying unrelated session state.  Values are deep-copied so eager
+    mode's in-place message append cannot mutate the rollback source.
+    """
+    snapshot = {}
+    for field in _CHAT_START_ROLLBACK_FIELDS:
+        if hasattr(session, field):
+            snapshot[field] = copy.deepcopy(getattr(session, field))
+        else:
+            snapshot[field] = _CHAT_START_ROLLBACK_MISSING
+    snapshot["_persistence_before"] = _snapshot_chat_start_persistence(session)
+    return snapshot
+
+
+def _snapshot_chat_start_file(path: Path) -> dict:
+    """Capture one exact file image, or the absence of that file."""
+    try:
+        payload = path.read_bytes()
+        mode = _stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        return {"path": path, "exists": False, "bytes": None, "mode": None}
+    except OSError as exc:
+        return {"path": path, "error": str(exc)}
+    return {"path": path, "exists": True, "bytes": payload, "mode": mode}
+
+
+def _snapshot_chat_start_persistence(session) -> dict | None:
+    """Capture the sidecar and backup images around chat-start preparation."""
+    path = getattr(session, "path", None)
+    if path is None:
+        # Focused route doubles do not expose a real sidecar; their save() is
+        # the persistence boundary and the in-memory fallback remains useful.
+        return None
+    try:
+        path = Path(path)
+    except (TypeError, ValueError):
+        return {"error": "invalid session sidecar path"}
+    backup = path.with_suffix(".json.bak")
+    return {
+        "path": path,
+        "sidecar": _snapshot_chat_start_file(path),
+        "backup": _snapshot_chat_start_file(backup),
+    }
+
+
+def _chat_start_persistence_matches(snapshot: dict | None) -> bool:
+    """Return whether both files still equal the post-prepare snapshot."""
+    if not isinstance(snapshot, dict) or snapshot.get("error"):
+        return False
+    path = snapshot.get("path")
+    if not isinstance(path, Path):
+        return False
+    current = {
+        "sidecar": _snapshot_chat_start_file(path),
+        "backup": _snapshot_chat_start_file(path.with_suffix(".json.bak")),
+    }
+    for key in ("sidecar", "backup"):
+        expected = snapshot.get(key) or {}
+        actual = current[key]
+        if expected.get("error") or actual.get("error"):
+            return False
+        if expected.get("exists") != actual.get("exists"):
+            return False
+        if expected.get("exists") and expected.get("bytes") != actual.get("bytes"):
+            return False
+    return True
+
+
+def _restore_chat_start_file(snapshot: dict) -> None:
+    """Atomically restore one exact file image or its prior absence."""
+    path = snapshot["path"]
+    if not snapshot.get("exists"):
+        path.unlink(missing_ok=True)
+        return
+    from api.models import _safe_replace
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.rollback.tmp.{os.getpid()}.{threading.current_thread().ident}"
+    )
+    try:
+        with open(temporary, "wb") as fh:
+            fh.write(snapshot["bytes"])
+            fh.flush()
+            os.fsync(fh.fileno())
+        _safe_replace(temporary, path)
+        mode = snapshot.get("mode")
+        if mode is not None:
+            os.chmod(path, mode)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _restore_chat_start_persistence(
+    session,
+    *,
+    before: dict | None,
+    prepared: dict | None,
+) -> bool:
+    """Restore sidecar/backup bytes without producing a rollback ``.bak``.
+
+    The post-prepare images are compared byte-for-byte first.  If another
+    process replaced or removed either file, recovery refuses to overwrite it.
+    Existing sidecars update only this session's index entry; a previously
+    absent sidecar is removed from the index by session id.
+    """
+    if before is None:
+        try:
+            session.save(touch_updated_at=False)
+        except Exception:
+            return False
+        return True
+    if (
+        before.get("error")
+        or any((before.get(key) or {}).get("error") for key in ("sidecar", "backup"))
+        or not _chat_start_persistence_matches(prepared)
+    ):
+        logger.warning(
+            "Refusing run-journal persistence rollback for session %s: sidecar rotated",
+            getattr(session, "session_id", "?"),
+        )
+        return False
+    try:
+        _restore_chat_start_file(before["sidecar"])
+        _restore_chat_start_file(before["backup"])
+        from api.models import _write_session_index, prune_session_from_index
+
+        if before["sidecar"].get("exists"):
+            _write_session_index(updates=[session])
+        else:
+            prune_session_from_index(session.session_id)
+    except Exception:
+        logger.exception(
+            "Failed to restore run-journal persistence for session %s",
+            getattr(session, "session_id", "?"),
+        )
+        return False
+    return True
+
+
+def _rollback_chat_start_session_after_authority_failure(
+    session,
+    *,
+    stream_id: str,
+    snapshot: dict,
+) -> bool:
+    """Compensate a prepared turn after a retired journal authority failure.
+
+    The caller holds the per-session agent lock.  Rollback is compare-and-clear:
+    it only restores while the session still points at ``stream_id`` and the
+    writeback registry is either absent or still owned by that stream.  A
+    successor therefore remains untouched.  On a matching stream, the exact
+    snapshot is restored and persisted with ``touch_updated_at=False``; a
+    persistence error returns ``False`` so the route fails closed instead of
+    claiming a clean retryable 409.
+    """
+    current_stream_id = getattr(session, "active_stream_id", None)
+    if current_stream_id != stream_id:
+        logger.warning(
+            "Refusing run-journal rollback for session %s: stream moved from %s to %s",
+            getattr(session, "session_id", "?"),
+            stream_id,
+            current_stream_id,
+        )
+        return False
+    try:
+        current_owner = session_writeback_owner(session.session_id)
+    except Exception:
+        logger.exception(
+            "Failed to read writeback owner while rolling back stream %s for session %s",
+            stream_id,
+            getattr(session, "session_id", "?"),
+        )
+        return False
+    if current_owner not in (None, stream_id):
+        logger.warning(
+            "Refusing run-journal rollback for session %s: writeback owner moved from %s to %s",
+            getattr(session, "session_id", "?"),
+            stream_id,
+            current_owner,
+        )
+        return False
+
+    before_persistence = snapshot.get("_persistence_before")
+    prepared_persistence = snapshot.get("_persistence_after_prepare")
+    for field in _CHAT_START_ROLLBACK_FIELDS:
+        value = snapshot.get(field, _CHAT_START_ROLLBACK_MISSING)
+        if value is _CHAT_START_ROLLBACK_MISSING:
+            try:
+                delattr(session, field)
+            except AttributeError:
+                pass
+        else:
+            setattr(session, field, copy.deepcopy(value))
+    if not _restore_chat_start_persistence(
+        session,
+        before=before_persistence,
+        prepared=prepared_persistence,
+    ):
+        # No worker was started for this stream, so its owner cannot perform a
+        # later cleanup.  Clear only our exact owner even when persistence is
+        # broken; a successor's replacement remains protected by compare-and-clear.
+        clear_session_writeback_owner_if_owned(session.session_id, stream_id)
+        return False
+    clear_session_writeback_owner_if_owned(session.session_id, stream_id)
+    return True
+
+
 def _is_hidden_empty_session(s) -> bool:
     return (
         getattr(s, "title", "Untitled") == "Untitled"
@@ -21598,6 +21866,7 @@ def _start_chat_stream_for_session(
                 stream_id = uuid.uuid4().hex
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
+                chat_start_snapshot = _snapshot_chat_start_session_for_rollback(s)
                 _prepare_chat_start_session_for_stream(
                     s,
                     msg=msg,
@@ -21608,9 +21877,23 @@ def _start_chat_stream_for_session(
                     stream_id=stream_id,
                     source=source,
                 )
+                chat_start_snapshot["_persistence_after_prepare"] = (
+                    _snapshot_chat_start_persistence(s)
+                )
                 try:
                     run_journal_incarnation = activate_run_journal_session(s.session_id)
                 except RunJournalRetiredAuthorityError as exc:
+                    if not _rollback_chat_start_session_after_authority_failure(
+                        s,
+                        stream_id=stream_id,
+                        snapshot=chat_start_snapshot,
+                    ):
+                        return {
+                            "error": "run journal authority failure left session state uncertain",
+                            "type": "run_journal_authority_rollback_failed",
+                            "retryable": False,
+                            "_status": 500,
+                        }
                     return {
                         "error": str(exc),
                         "type": "run_journal_authority_unavailable",

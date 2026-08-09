@@ -7,12 +7,16 @@ unwritable authority degrades the run to an unjournaled execution.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
 import pytest
 
 from api import models, routes, run_journal, turn_journal
+
+
+_ORIGINAL_PREPARE_CHAT_START = routes._prepare_chat_start_session_for_stream
 
 
 class _Session:
@@ -43,6 +47,60 @@ class _Thread:
 
     def start(self):
         return None
+
+
+class _PersistentSession(_Session):
+    """Small sidecar stand-in that keeps each save observable."""
+
+    _STATE_FIELDS = (
+        "active_stream_id",
+        "pending_user_message",
+        "pending_attachments",
+        "pending_started_at",
+        "pending_user_source",
+        "title",
+        "messages",
+        "truncation_watermark",
+        "workspace",
+        "model",
+        "model_provider",
+        "post_compression_context_tokens_estimate",
+        "updated_at",
+    )
+
+    def __init__(self, session_id: str):
+        super().__init__(session_id)
+        self.active_stream_id = None
+        self.pending_user_message = "old pending"
+        self.pending_attachments = [{"name": "old.txt"}]
+        self.pending_started_at = 42.0
+        self.pending_user_source = "old-source"
+        self.title = "Untitled"
+        self.messages = [{"role": "assistant", "content": "before"}]
+        self.truncation_watermark = 123.0
+        self.workspace = "/old/workspace"
+        self.model = "old-model"
+        self.model_provider = "old-provider"
+        self.post_compression_context_tokens_estimate = 77
+        self.updated_at = 10.0
+        self.save_calls = []
+        self.fail_save_call = None
+        self.persisted = self.snapshot()
+
+    def snapshot(self):
+        return {
+            field: copy.deepcopy(getattr(self, field, None))
+            for field in self._STATE_FIELDS
+        }
+
+    def save(self, touch_updated_at=True, **_kwargs):
+        if self.fail_save_call is not None and len(self.save_calls) + 1 == self.fail_save_call:
+            raise OSError("session rollback write failed")
+        if touch_updated_at:
+            self.updated_at = 100.0 + len(self.save_calls)
+        persisted = self.snapshot()
+        self.save_calls.append(persisted)
+        self.persisted = copy.deepcopy(persisted)
 
 
 def _authority_path(root: Path, session_id: str) -> Path:
@@ -119,6 +177,40 @@ def route_harness(monkeypatch, tmp_path):
     return tmp_path
 
 
+@pytest.fixture
+def real_session_store(route_harness, monkeypatch):
+    session_dir = route_harness / "sessions"
+    session_dir.mkdir()
+    index_file = session_dir / "_index.json"
+    original_sessions = list(models.SESSIONS.items())
+    models.SESSIONS.clear()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", index_file)
+    monkeypatch.setattr(routes, "SESSION_DIR", session_dir, raising=False)
+    monkeypatch.setattr(routes, "SESSION_INDEX_FILE", index_file, raising=False)
+    yield session_dir, index_file
+    models.SESSIONS.clear()
+    models.SESSIONS.update(original_sessions)
+
+
+def _use_real_writeback_owner_registry(monkeypatch):
+    owners = {}
+    monkeypatch.setattr(
+        routes,
+        "register_session_writeback_owner",
+        lambda session_id, stream_id: owners.__setitem__(session_id, stream_id),
+    )
+    monkeypatch.setattr(routes, "session_writeback_owner", lambda session_id: owners.get(session_id))
+    monkeypatch.setattr(
+        routes,
+        "clear_session_writeback_owner_if_owned",
+        lambda session_id, stream_id: owners.pop(session_id, None)
+        if owners.get(session_id) == stream_id
+        else None,
+    )
+    return owners
+
+
 @pytest.mark.parametrize("mode", ["corrupt", "unreadable", "unwritable"])
 def test_send_degrades_authority_failure_to_unjournaled_execution(
     route_harness, monkeypatch, mode
@@ -153,6 +245,270 @@ def test_send_valid_retired_authority_still_blocks(route_harness, monkeypatch):
     assert response["_status"] == 409
     assert response["type"] == "run_journal_authority_unavailable"
     assert not _Thread.created
+
+
+@pytest.mark.parametrize("save_mode", ["deferred", "eager"])
+def test_retired_activation_rolls_back_prepared_stream_and_allows_retry(
+    route_harness, monkeypatch, save_mode
+):
+    """A retired authority after prepare must leave no abandoned pending turn."""
+    session = _PersistentSession(f"send-retired-after-prepare-{save_mode}")
+    before = session.snapshot()
+    owners = {}
+
+    monkeypatch.setattr(routes, "_prepare_chat_start_session_for_stream", _ORIGINAL_PREPARE_CHAT_START)
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: save_mode)
+    monkeypatch.setattr(routes, "_provisional_title_from_prompt", lambda *_args, **_kwargs: "Prompt title")
+    monkeypatch.setattr(
+        routes,
+        "register_session_writeback_owner",
+        lambda session_id, stream_id: owners.__setitem__(session_id, stream_id),
+    )
+    monkeypatch.setattr(
+        routes,
+        "clear_session_writeback_owner_if_owned",
+        lambda session_id, stream_id: owners.pop(session_id, None)
+        if owners.get(session_id) == stream_id
+        else None,
+    )
+    monkeypatch.setattr(run_journal, "validate_run_journal_session_activation", lambda _sid: None)
+    activation_results = [
+        run_journal.RunJournalRetiredAuthorityError("retired"),
+        "incarnation-after-retry",
+    ]
+
+    def activate(_sid):
+        result = activation_results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(run_journal, "activate_run_journal_session", activate)
+
+    response = routes._start_chat_stream_for_session(
+        session,
+        msg="hello",
+        workspace="/new/workspace",
+        model="new-model",
+        model_provider="new-provider",
+        external_runtime_owned=False,
+    )
+
+    assert response["_status"] == 409
+    assert response["type"] == "run_journal_authority_unavailable"
+    assert session.snapshot() == before
+    assert session.persisted == before
+    assert owners == {}
+
+    retry = routes._start_chat_stream_for_session(
+        session,
+        msg="hello again",
+        workspace="/new/workspace",
+        model="new-model",
+        model_provider="new-provider",
+        external_runtime_owned=False,
+    )
+
+    assert retry["stream_id"]
+    assert retry["session_id"] == session.session_id
+    assert len(_Thread.created) == 1
+
+
+def test_retired_activation_rollback_failure_fails_closed(route_harness, monkeypatch):
+    session = _PersistentSession("send-retired-rollback-failure")
+    monkeypatch.setattr(routes, "_prepare_chat_start_session_for_stream", _ORIGINAL_PREPARE_CHAT_START)
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: "deferred")
+    monkeypatch.setattr(routes, "_provisional_title_from_prompt", lambda *_args, **_kwargs: "Prompt title")
+    monkeypatch.setattr(run_journal, "validate_run_journal_session_activation", lambda _sid: None)
+    monkeypatch.setattr(
+        run_journal,
+        "activate_run_journal_session",
+        lambda _sid: (_ for _ in ()).throw(
+            run_journal.RunJournalRetiredAuthorityError("retired")
+        ),
+    )
+    # Prepare performs save #1; force the compensating persistence write to fail.
+    session.fail_save_call = 2
+
+    response = routes._start_chat_stream_for_session(
+        session,
+        msg="hello",
+        workspace="/new/workspace",
+        model="new-model",
+        model_provider="new-provider",
+        external_runtime_owned=False,
+    )
+
+    assert response["_status"] != 409
+    assert response.get("retryable") is not True
+    assert response["type"] == "run_journal_authority_rollback_failed"
+
+
+@pytest.mark.parametrize("rotation", ["active_stream", "writeback_owner"])
+def test_retired_rollback_does_not_clobber_successor_rotation(
+    route_harness, monkeypatch, rotation
+):
+    session = _PersistentSession(f"send-retired-successor-{rotation}")
+    owners = {}
+    monkeypatch.setattr(routes, "_prepare_chat_start_session_for_stream", _ORIGINAL_PREPARE_CHAT_START)
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: "deferred")
+    monkeypatch.setattr(routes, "_provisional_title_from_prompt", lambda *_args, **_kwargs: "Prompt title")
+    monkeypatch.setattr(
+        routes,
+        "register_session_writeback_owner",
+        lambda session_id, stream_id: owners.__setitem__(session_id, stream_id),
+    )
+    monkeypatch.setattr(routes, "session_writeback_owner", lambda session_id: owners.get(session_id))
+    monkeypatch.setattr(
+        routes,
+        "clear_session_writeback_owner_if_owned",
+        lambda session_id, stream_id: owners.pop(session_id, None)
+        if owners.get(session_id) == stream_id
+        else None,
+    )
+    monkeypatch.setattr(run_journal, "validate_run_journal_session_activation", lambda _sid: None)
+
+    def activate(_sid):
+        successor_stream_id = "successor-stream"
+        if rotation == "active_stream":
+            session.active_stream_id = successor_stream_id
+        owners[session.session_id] = successor_stream_id
+        session.pending_user_message = "successor pending"
+        session.save(touch_updated_at=False)
+        raise run_journal.RunJournalRetiredAuthorityError("retired")
+
+    monkeypatch.setattr(run_journal, "activate_run_journal_session", activate)
+
+    response = routes._start_chat_stream_for_session(
+        session,
+        msg="hello",
+        workspace="/new/workspace",
+        model="new-model",
+        model_provider="new-provider",
+        external_runtime_owned=False,
+    )
+
+    assert response["_status"] == 500
+    assert response["type"] == "run_journal_authority_rollback_failed"
+    assert owners[session.session_id] == "successor-stream"
+    assert session.pending_user_message == "successor pending"
+    if rotation == "active_stream":
+        assert session.active_stream_id == "successor-stream"
+    else:
+        assert session.active_stream_id
+    assert session.persisted["pending_user_message"] == "successor pending"
+
+
+def _configure_retired_activation_after_real_prepare(monkeypatch):
+    monkeypatch.setattr(routes, "_prepare_chat_start_session_for_stream", _ORIGINAL_PREPARE_CHAT_START)
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: "eager")
+    monkeypatch.setattr(routes, "_provisional_title_from_prompt", lambda *_args, **_kwargs: "Prompt title")
+    monkeypatch.setattr(run_journal, "validate_run_journal_session_activation", lambda _sid: None)
+    monkeypatch.setattr(
+        run_journal,
+        "activate_run_journal_session",
+        lambda _sid: (_ for _ in ()).throw(
+            run_journal.RunJournalRetiredAuthorityError("retired")
+        ),
+    )
+
+
+def test_real_eager_rollback_restores_sidecar_and_existing_backup(
+    real_session_store, monkeypatch
+):
+    _configure_retired_activation_after_real_prepare(monkeypatch)
+    _use_real_writeback_owner_registry(monkeypatch)
+    session = models.Session(
+        session_id="real-eager-existing",
+        title="Existing title",
+        workspace="/old/workspace",
+        model="old-model",
+        model_provider="old-provider",
+        messages=[{"role": "assistant", "content": "before"}],
+        pending_user_message="old pending",
+        pending_attachments=[{"name": "old.txt"}],
+        pending_started_at=42.0,
+        pending_user_source="old-source",
+        truncation_watermark=123.0,
+        post_compression_context_tokens_estimate=77,
+    )
+    session.save(touch_updated_at=False)
+    sidecar_before = session.path.read_bytes()
+    backup_before = b'{"preexisting":true}'
+    backup_path = session.path.with_suffix(".json.bak")
+    backup_path.write_bytes(backup_before)
+
+    response = routes._start_chat_stream_for_session(
+        session,
+        msg="hello",
+        workspace="/new/workspace",
+        model="new-model",
+        model_provider="new-provider",
+        external_runtime_owned=False,
+    )
+
+    assert response["_status"] == 409
+    assert session.path.read_bytes() == sidecar_before
+    assert backup_path.read_bytes() == backup_before
+    index_rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+    row = next(item for item in index_rows if item["session_id"] == session.session_id)
+    assert row["title"] == "Existing title"
+    assert row["message_count"] == 1
+
+
+def test_real_eager_rollback_removes_fresh_sidecar_and_backup(
+    real_session_store, monkeypatch
+):
+    _configure_retired_activation_after_real_prepare(monkeypatch)
+    _use_real_writeback_owner_registry(monkeypatch)
+    session = models.Session(session_id="real-eager-fresh", title="Untitled", messages=[])
+    assert not session.path.exists()
+    backup_path = session.path.with_suffix(".json.bak")
+
+    response = routes._start_chat_stream_for_session(
+        session,
+        msg="hello",
+        workspace="/new/workspace",
+        model="new-model",
+        model_provider="new-provider",
+        external_runtime_owned=False,
+    )
+
+    assert response["_status"] == 409
+    assert not session.path.exists()
+    assert not backup_path.exists()
+    assert json.loads(real_session_store[1].read_text(encoding="utf-8")) == []
+
+
+def test_real_rollback_refuses_external_sidecar_rotation(real_session_store, monkeypatch):
+    _configure_retired_activation_after_real_prepare(monkeypatch)
+    _use_real_writeback_owner_registry(monkeypatch)
+    session = models.Session(
+        session_id="real-eager-rotated",
+        title="Existing title",
+        messages=[{"role": "assistant", "content": "before"}],
+    )
+    session.save(touch_updated_at=False)
+    backup_path = session.path.with_suffix(".json.bak")
+
+    def rotate_then_retire(_sid):
+        session.path.write_bytes(b"external-sidecar-rotation")
+        raise run_journal.RunJournalRetiredAuthorityError("retired")
+
+    monkeypatch.setattr(run_journal, "activate_run_journal_session", rotate_then_retire)
+    response = routes._start_chat_stream_for_session(
+        session,
+        msg="hello",
+        workspace="/new/workspace",
+        model="new-model",
+        model_provider="new-provider",
+        external_runtime_owned=False,
+    )
+
+    assert response["_status"] == 500
+    assert response["type"] == "run_journal_authority_rollback_failed"
+    assert session.path.read_bytes() == b"external-sidecar-rotation"
+    assert not backup_path.exists()
 
 
 @pytest.mark.parametrize("endpoint", ["btw", "background"])
