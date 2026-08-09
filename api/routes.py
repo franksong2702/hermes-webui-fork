@@ -9447,6 +9447,7 @@ from api.models import (
     get_state_db_session_message_keys_before_timestamp,
     get_state_db_session_summary,
     merge_session_messages_append_only,
+    _reconcile_api_content_sidecars,
     _enrich_sidebar_lineage_metadata,
     _active_stream_ids,
     _evict_sessions_over_cap,
@@ -15263,11 +15264,21 @@ def handle_post(handler, parsed) -> bool:
         from api.session_ops import truncate_context_for_display_keep
 
         fork_keep = keep_count if keep_count is not None else len(source_messages)
-        forked_context = truncate_context_for_display_keep(
-            getattr(source, "context_messages", None),
-            source_messages,
-            fork_keep,
+        forked_context = copy.deepcopy(
+            truncate_context_for_display_keep(
+                getattr(source, "context_messages", None),
+                source_messages,
+                fork_keep,
+            )
         )
+        # `truncate_context_for_display_keep` aligns rows by visible display
+        # identity but intentionally does not carry provider replay sidecars.
+        # Reconcile only the retained prefix before constructing the branch so
+        # its persisted model context receives the same conservative
+        # api_content bytes as the forked display messages.  The helper mutates
+        # the freshly aligned context copy; the source session and
+        # forked_messages ownership remain untouched.
+        _reconcile_api_content_sidecars(forked_context, forked_messages)
         branch = Session(
             workspace=source.workspace,
             model=source.model,
@@ -25833,6 +25844,11 @@ def _normalize_message_for_import_refresh(message: object) -> object:
     normalized = dict(message)
     normalized.pop("timestamp", None)
     normalized.pop("_ts", None)
+    # These are WebUI/Agent replay bookkeeping aliases at the message's top
+    # level.  Strip only those exact keys; nested business payloads are opaque
+    # and must remain part of the semantic import comparison.
+    for key in ("api_content", "_state_db_row_id", "_db_row_id", "state_db_row_id"):
+        normalized.pop(key, None)
     return normalized
 
 

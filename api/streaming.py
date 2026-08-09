@@ -5662,6 +5662,11 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
                     # history in previous_context untouched.
                     cleaned_boundary = copy.deepcopy(boundary_row)
                     cleaned_boundary['content'] = msg_text
+                    # The stale row's provider-facing payload describes the
+                    # discarded prefix + current turn, not the rewritten
+                    # visible turn.  Do not let those obsolete bytes survive
+                    # into Agent context.
+                    cleaned_boundary.pop('api_content', None)
                     candidates = [cleaned_boundary] + result_messages[boundary_idx + 1:]
                 else:
                     candidates = result_messages[boundary_idx:]
@@ -6003,6 +6008,10 @@ def _strip_stale_user_merge_from_messages(
         ):
             cleaned = copy.deepcopy(msg) if isinstance(msg, dict) else {'role': 'user', 'content': msg_text}
             cleaned['content'] = msg_text
+            # The stale row's provider-facing payload describes the discarded
+            # merged prefix, so it is invalid once the visible content is
+            # rewritten to the submitted turn.
+            cleaned.pop('api_content', None)
             out.append(cleaned)
         else:
             out.append(msg)

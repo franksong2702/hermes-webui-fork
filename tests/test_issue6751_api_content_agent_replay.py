@@ -1104,3 +1104,224 @@ def test_issue6751_same_row_id_different_sidecars_remain_distinct():
         "wire-one",
         "wire-two",
     ]
+
+
+def test_issue6751_unique_same_second_timestamp_drift_reconciles_before_merge_identity():
+    """One logical turn with sub-second storage drift must not persist twice."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {"role": "user", "content": "same visible", "timestamp": 100.1}
+    ]
+    state = [
+        {
+            "role": "user",
+            "content": "same visible",
+            "timestamp": 100.8,
+            "api_content": "provider wire",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert len(merged) == 1
+    assert merged[0]["api_content"] == "provider wire"
+
+
+def test_issue6751_same_second_drift_with_repeated_text_remains_ambiguous():
+    """Sub-second proximity alone cannot choose between repeated user turns."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {"role": "user", "content": "same visible", "timestamp": 100.1},
+        {"role": "user", "content": "same visible", "timestamp": 100.2},
+    ]
+    state = [
+        {
+            "role": "user",
+            "content": "same visible",
+            "timestamp": 100.8,
+            "api_content": "provider wire",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert len(merged) == 3
+    assert [message.get("api_content") for message in merged[:2]] == [None, None]
+    assert merged[2]["api_content"] == "provider wire"
+
+
+def test_issue6751_stale_user_cleanup_drops_obsolete_api_content_on_both_paths():
+    """Rewritten visible content must never retain the superseded wire payload."""
+    from api.streaming import (
+        _dedupe_replayed_context_messages,
+        _strip_stale_user_merge_from_messages,
+    )
+
+    previous = [{"role": "user", "content": "old turn"}]
+    stale = {
+        "role": "user",
+        "content": "old turn\n\nnew turn",
+        "api_content": "obsolete provider bytes",
+    }
+
+    stripped = _strip_stale_user_merge_from_messages(
+        [stale],
+        "new turn",
+        "old turn",
+        previous_context=previous,
+    )
+    reconciled = _dedupe_replayed_context_messages(
+        previous,
+        [stale, {"role": "assistant", "content": "answer"}],
+        "new turn",
+    )
+
+    assert stripped[0]["content"] == "new turn"
+    assert "api_content" not in stripped[0]
+    rewritten = next(
+        message
+        for message in reconciled
+        if message.get("role") == "user" and message.get("content") == "new turn"
+    )
+    assert "api_content" not in rewritten
+
+
+def test_issue6751_cli_refresh_ignores_internal_aliases_and_appends_new_rows(monkeypatch):
+    """A pre-upgrade import remains a semantic prefix of enriched fresh rows."""
+    import api.routes as routes
+
+    existing = SimpleNamespace(
+        session_id="issue6751-cli-refresh",
+        profile="default",
+        messages=[{"role": "user", "content": "first", "timestamp": 1}],
+        source_tag="cli",
+        raw_source="cli",
+        session_source="cli",
+        source_label="CLI",
+        parent_session_id=None,
+        read_only=False,
+        compact=lambda: {"session_id": "issue6751-cli-refresh"},
+    )
+    saved = []
+    existing.save = lambda **kwargs: saved.append(kwargs)
+    fresh = [
+        {
+            "role": "user",
+            "content": "first",
+            "timestamp": 1.9,
+            "api_content": "provider wire",
+            "_state_db_row_id": 1,
+            "_db_row_id": 1,
+            "state_db_row_id": 1,
+        },
+        {"role": "assistant", "content": "new CLI reply", "timestamp": 2.0},
+    ]
+
+    monkeypatch.setattr(routes.Session, "load", lambda _sid: existing)
+    monkeypatch.setattr(routes, "_session_visible_to_active_profile", lambda *_args: True)
+    monkeypatch.setattr(routes, "_resolve_cli_import_metadata", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(routes, "get_cli_session_messages", lambda *_args, **_kwargs: fresh)
+    monkeypatch.setattr(routes, "_is_subagent_child_session_id", lambda _sid: False)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "public_session_projection", lambda payload: payload)
+    captured = {}
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, payload, **_kwargs: captured.setdefault("payload", payload),
+    )
+
+    routes._handle_session_import_cli(None, {"session_id": existing.session_id})
+
+    assert existing.messages == fresh
+    assert saved == [{"touch_updated_at": False}]
+    assert captured["payload"]["imported"] is False
+
+
+def test_issue6751_branch_endpoint_reconciles_provider_sidecars_into_first_agent_context(
+    monkeypatch,
+):
+    """The branch must persist and execute from the same reconciled prefix."""
+    from collections import OrderedDict
+
+    import api.routes as routes
+
+    source_messages = [
+        {
+            "role": "user",
+            "content": "visible request",
+            "timestamp": 1.0,
+            "api_content": "[Workspace::v1: /original]\nvisible request",
+        },
+        {
+            "role": "assistant",
+            "content": "visible answer",
+            "timestamp": 2.0,
+            "api_content": "provider answer bytes",
+        },
+    ]
+    source = SimpleNamespace(
+        _branch_source_readonly=True,
+        session_id="issue6751-parent",
+        title="Parent",
+        workspace="/tmp/workspace",
+        model="test-model",
+        model_provider="test-provider",
+        profile="default",
+        messages=source_messages,
+        context_messages=[
+            {"role": "user", "content": "visible request", "timestamp": 1.0},
+            {"role": "assistant", "content": "visible answer", "timestamp": 2.0},
+        ],
+        project_id=None,
+        personality=None,
+        enabled_toolsets=None,
+        context_length=None,
+        threshold_tokens=None,
+        gateway_routing=None,
+        context_engine=None,
+        context_engine_state={},
+    )
+    captured = {}
+
+    class Branch:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.session_id = "issue6751-branch"
+            captured["branch"] = self
+
+        def save(self):
+            captured["saved"] = True
+
+    monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(routes, "read_body", lambda _handler: {"session_id": source.session_id})
+    monkeypatch.setattr(routes, "_guard_request_session_visibility", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(routes, "_load_branch_source_or_refuse", lambda *_args: source)
+    monkeypatch.setattr(routes, "_session_requires_cli_metadata_lookup", lambda _source: False)
+    monkeypatch.setattr(routes, "_is_messaging_session_record", lambda _record: False)
+    monkeypatch.setattr(routes, "Session", Branch)
+    monkeypatch.setattr(routes, "SESSIONS", OrderedDict())
+    monkeypatch.setattr(routes, "_evict_sessions_over_cap", lambda: None)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "j", lambda _handler, payload, **_kwargs: payload)
+    handler = SimpleNamespace(
+        client_address=("127.0.0.1", 12345),
+        headers={},
+        command="POST",
+        path="/api/session/branch",
+    )
+
+    routes.handle_post(
+        handler,
+        SimpleNamespace(path="/api/session/branch", query=""),
+    )
+
+    branch = captured["branch"]
+    assert captured["saved"] is True
+    assert branch.messages == source_messages
+    assert [message.get("api_content") for message in branch.context_messages] == [
+        "[Workspace::v1: /original]\nvisible request",
+        "provider answer bytes",
+    ]

@@ -8660,6 +8660,10 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
             state_by_exact_timestamp.setdefault((role, timestamp), []).append((source_index, message))
     for key, state_rows in state_by_exact_timestamp.items():
         candidates = [index for index in sidecar_by_exact_timestamp.get(key, ()) if index not in used_targets]
+        # No exact-timestamp target is not an ambiguity: leave the source row
+        # available for the documented same-second fractional-drift tier below.
+        if not candidates:
+            continue
         if len(candidates) != 1 or len(state_rows) != 1:
             used_targets.update(candidates)
             used_sources.update(source_index for source_index, _ in state_rows)
@@ -8670,7 +8674,83 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
         used_sources.add(source_index)
         _copy_api_content_sidecar(sidecar[index], message)
 
-    # 3. Metadata-free fallback is safe only for a unique role bucket. A
+    # 3. Same-second sub-second drift.  The sidecar JSON and state.db can
+    # record one logical turn with different fractional timestamps while still
+    # landing in the same wall-clock second.  Do not use the truncated second
+    # as identity by itself: build only role/timestamp buckets whose rows have
+    # no durable provenance, then require a unique *compatible* visible row on
+    # each side.  A candidate is compatible only when role + normalized visible
+    # content agree and neither side carries a conflicting provider sidecar.
+    # This keeps repeated text, contradictory provenance, and conflicting wire
+    # payloads fail-closed instead of guessing by list order.
+    sidecar_by_same_second = {}
+    state_by_same_second = {}
+    for index, message in enumerate(sidecar):
+        if index in used_targets:
+            continue
+        role = _message_sidecar_role(message)
+        timestamp = _message_exact_timestamp(message)
+        row_id, valid = _state_db_row_identity_details(message)
+        if valid and row_id is None and role is not None and timestamp is not None:
+            second = _normalized_message_timestamp_for_key(timestamp)
+            sidecar_by_same_second.setdefault((role, second), []).append(index)
+    for source_index, message in enumerate(state):
+        if source_index in used_sources:
+            continue
+        role = _message_sidecar_role(message)
+        timestamp = _message_exact_timestamp(message)
+        row_id, valid = _state_db_row_identity_details(message)
+        if valid and row_id is None and role is not None and timestamp is not None:
+            second = _normalized_message_timestamp_for_key(timestamp)
+            state_by_same_second.setdefault((role, second), []).append(source_index)
+
+    for key, state_indexes in state_by_same_second.items():
+        target_indexes = [
+            index
+            for index in sidecar_by_same_second.get(key, ())
+            if index not in used_targets
+        ]
+        if not target_indexes:
+            continue
+
+        compatible_targets_by_source = {}
+        for source_index in state_indexes:
+            if source_index in used_sources:
+                continue
+            source_message = state[source_index]
+            compatible_targets_by_source[source_index] = [
+                target_index
+                for target_index in target_indexes
+                if target_index not in used_targets
+                and _visible_content_compatible(sidecar[target_index], source_message)
+                and (
+                    _session_message_api_content_key(sidecar[target_index]) is None
+                    or _session_message_api_content_key(sidecar[target_index])
+                    == _session_message_api_content_key(source_message)
+                )
+            ]
+
+        compatible_sources_by_target = {}
+        for source_index, candidates in compatible_targets_by_source.items():
+            for target_index in candidates:
+                compatible_sources_by_target.setdefault(target_index, []).append(source_index)
+
+        # Accept only one-to-one compatible pairs.  This deliberately does not
+        # zip a bucket: repeated same-text rows or equal timestamps remain
+        # distinct until durable provenance resolves them.
+        for source_index, candidates in compatible_targets_by_source.items():
+            if len(candidates) != 1:
+                continue
+            target_index = candidates[0]
+            if len(compatible_sources_by_target.get(target_index, ())) != 1:
+                continue
+            if source_index in used_sources or target_index in used_targets:
+                continue
+            used_sources.add(source_index)
+            used_targets.add(target_index)
+            _copy_api_content_sidecar(sidecar[target_index], state[source_index])
+
+    # 4. Metadata-free fallback is safe only for a unique role bucket. A
     # repeated role with no durable identity has no principled ordering, so it
     # must remain unattached rather than being paired by zip/list position.
     sidecar_by_role_sequence = {}
