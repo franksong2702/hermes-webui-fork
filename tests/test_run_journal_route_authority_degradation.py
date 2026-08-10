@@ -515,6 +515,100 @@ def test_real_rollback_refuses_external_sidecar_rotation(real_session_store, mon
     assert not backup_path.exists()
 
 
+def test_chat_start_rollback_serializes_concurrent_same_session_save(
+    real_session_store, monkeypatch
+):
+    """A save owning persistence must finish before rollback compares or restores."""
+    sid = "chat-start-save-first-persistence-barrier"
+    stream_id = "rejected-stream"
+    session = models.Session(
+        session_id=sid,
+        title="before",
+        messages=[{"role": "assistant", "content": "before"}],
+        pending_user_message="before pending",
+    )
+    models.SESSIONS[sid] = session
+    session.save(touch_updated_at=False)
+    snapshot = routes._snapshot_chat_start_session_for_rollback(session)
+
+    session.active_stream_id = stream_id
+    session.title = "prepared"
+    session.pending_user_message = "prepared pending"
+    session.save(touch_updated_at=False)
+    snapshot["_persistence_after_prepare"] = routes._snapshot_chat_start_persistence(
+        session
+    )
+    owners = _use_real_writeback_owner_registry(monkeypatch)
+    owners[sid] = stream_id
+
+    session.title = "successor"
+    session.pending_user_message = "successor pending"
+    about_to_replace = threading.Event()
+    allow_replace = threading.Event()
+    rollback_done = threading.Event()
+    save_errors = []
+    rollback_errors = []
+    result = {}
+    save_thread = None
+
+    real_safe_replace = models._safe_replace
+
+    def gated_safe_replace(src, dst):
+        if threading.current_thread() is save_thread and Path(dst) == session.path:
+            about_to_replace.set()
+            if not allow_replace.wait(3):
+                raise RuntimeError("timed out waiting to replace successor sidecar")
+        return real_safe_replace(src, dst)
+
+    monkeypatch.setattr(models, "_safe_replace", gated_safe_replace)
+
+    def save_successor():
+        try:
+            session.save(touch_updated_at=False)
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            save_errors.append(exc)
+
+    def rollback_rejected_stream():
+        try:
+            result["value"] = routes._rollback_chat_start_session_after_authority_failure(
+                session,
+                stream_id=stream_id,
+                snapshot=snapshot,
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            rollback_errors.append(exc)
+        finally:
+            rollback_done.set()
+
+    save_thread = _REAL_THREAD(target=save_successor, name="chat-start-successor-save")
+    rollback_thread = _REAL_THREAD(
+        target=rollback_rejected_stream,
+        name="chat-start-rollback",
+    )
+    try:
+        save_thread.start()
+        assert about_to_replace.wait(3)
+        rollback_thread.start()
+        rollback_finished_before_save = rollback_done.wait(1)
+        allow_replace.set()
+    finally:
+        allow_replace.set()
+        save_thread.join(5)
+        rollback_thread.join(5)
+
+    assert not save_thread.is_alive()
+    assert not rollback_thread.is_alive()
+    assert not save_errors
+    assert not rollback_errors
+    assert rollback_finished_before_save is False
+    assert result["value"] is False
+    assert session.title == "successor"
+    assert session.pending_user_message == "successor pending"
+    persisted = json.loads(session.path.read_text(encoding="utf-8"))
+    assert persisted["title"] == "successor"
+    assert persisted["pending_user_message"] == "successor pending"
+
+
 @pytest.mark.parametrize("endpoint", ["btw", "background"])
 @pytest.mark.parametrize("mode", ["corrupt", "unreadable", "unwritable"])
 def test_auxiliary_route_degrades_authority_failure_to_unjournaled_execution(

@@ -21753,56 +21753,89 @@ def _rollback_chat_start_session_after_authority_failure(
     persistence error returns ``False`` so the route fails closed instead of
     claiming a clean retryable 409.
     """
-    current_stream_id = getattr(session, "active_stream_id", None)
-    if current_stream_id != stream_id:
-        logger.warning(
-            "Refusing run-journal rollback for session %s: stream moved from %s to %s",
-            getattr(session, "session_id", "?"),
-            stream_id,
-            current_stream_id,
-        )
-        return False
-    try:
-        current_owner = session_writeback_owner(session.session_id)
-    except Exception:
-        logger.exception(
-            "Failed to read writeback owner while rolling back stream %s for session %s",
-            stream_id,
-            getattr(session, "session_id", "?"),
-        )
-        return False
-    if current_owner not in (None, stream_id):
-        logger.warning(
-            "Refusing run-journal rollback for session %s: writeback owner moved from %s to %s",
-            getattr(session, "session_id", "?"),
-            stream_id,
-            current_owner,
-        )
-        return False
+    session_id = str(getattr(session, "session_id", "") or "")
+    from api.models import _get_session_persistence_lock
 
-    before_persistence = snapshot.get("_persistence_before")
-    prepared_persistence = snapshot.get("_persistence_after_prepare")
-    for field in _CHAT_START_ROLLBACK_FIELDS:
-        value = snapshot.get(field, _CHAT_START_ROLLBACK_MISSING)
-        if value is _CHAT_START_ROLLBACK_MISSING:
-            try:
-                delattr(session, field)
-            except AttributeError:
-                pass
-        else:
-            setattr(session, field, copy.deepcopy(value))
-    if not _restore_chat_start_persistence(
-        session,
-        before=before_persistence,
-        prepared=prepared_persistence,
-    ):
-        # No worker was started for this stream, so its owner cannot perform a
-        # later cleanup.  Clear only our exact owner even when persistence is
-        # broken; a successor's replacement remains protected by compare-and-clear.
-        clear_session_writeback_owner_if_owned(session.session_id, stream_id)
-        return False
-    clear_session_writeback_owner_if_owned(session.session_id, stream_id)
-    return True
+    # The caller already owns the per-session agent lock.  Keep the persistence
+    # lock across the owner checks, compare, in-memory rollback, and file/index
+    # restore so a same-session save cannot replace the prepared image between
+    # any of those steps.  Session.save() takes this lock before entering the
+    # index writer, preserving the existing agent -> persistence -> index order.
+    with _get_session_persistence_lock(session_id):
+        current_stream_id = getattr(session, "active_stream_id", None)
+        if current_stream_id != stream_id:
+            logger.warning(
+                "Refusing run-journal rollback for session %s: stream moved from %s to %s",
+                session_id or "?",
+                stream_id,
+                current_stream_id,
+            )
+            return False
+        try:
+            current_owner = session_writeback_owner(session_id)
+        except Exception:
+            logger.exception(
+                "Failed to read writeback owner while rolling back stream %s for session %s",
+                stream_id,
+                session_id or "?",
+            )
+            return False
+        if current_owner not in (None, stream_id):
+            logger.warning(
+                "Refusing run-journal rollback for session %s: writeback owner moved from %s to %s",
+                session_id or "?",
+                stream_id,
+                current_owner,
+            )
+            return False
+
+        before_persistence = snapshot.get("_persistence_before")
+        prepared_persistence = snapshot.get("_persistence_after_prepare")
+        # Check the exact post-prepare image before changing any in-memory
+        # fields.  A save that completed while rollback was waiting owns the
+        # successor image; restoring the old snapshot in memory would then
+        # diverge from that durable successor and could overwrite it later.
+        if before_persistence is not None and (
+            not isinstance(before_persistence, dict)
+            or before_persistence.get("error")
+            or any(
+                not isinstance(before_persistence.get(key), dict)
+                or before_persistence[key].get("error")
+                for key in ("sidecar", "backup")
+            )
+            or not _chat_start_persistence_matches(prepared_persistence)
+        ):
+            logger.warning(
+                "Refusing run-journal persistence rollback for session %s: sidecar rotated",
+                session_id or "?",
+            )
+            # No worker was started for this stream, so its owner cannot perform
+            # a later cleanup.  Clear only our exact owner; a successor's
+            # replacement remains protected by compare-and-clear.
+            clear_session_writeback_owner_if_owned(session_id, stream_id)
+            return False
+
+        for field in _CHAT_START_ROLLBACK_FIELDS:
+            value = snapshot.get(field, _CHAT_START_ROLLBACK_MISSING)
+            if value is _CHAT_START_ROLLBACK_MISSING:
+                try:
+                    delattr(session, field)
+                except AttributeError:
+                    pass
+            else:
+                setattr(session, field, copy.deepcopy(value))
+        if not _restore_chat_start_persistence(
+            session,
+            before=before_persistence,
+            prepared=prepared_persistence,
+        ):
+            # No worker was started for this stream, so its owner cannot perform a
+            # later cleanup.  Clear only our exact owner even when persistence is
+            # broken; a successor's replacement remains protected by compare-and-clear.
+            clear_session_writeback_owner_if_owned(session_id, stream_id)
+            return False
+        clear_session_writeback_owner_if_owned(session_id, stream_id)
+        return True
 
 
 def _is_hidden_empty_session(s) -> bool:
