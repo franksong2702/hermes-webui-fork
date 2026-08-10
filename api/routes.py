@@ -21622,37 +21622,42 @@ def _rollback_auxiliary_session_after_authority_failure(
     session_id = str(getattr(session, "session_id", "") or "")
     if not isinstance(prepared, dict):
         return False
-    from api.models import _INDEX_WRITE_LOCK
+    from api.models import _INDEX_WRITE_LOCK, _get_session_persistence_lock
 
-    # Match models.py's writer order (_INDEX_WRITE_LOCK -> LOCK) so the exact
-    # owner check remains held while the targeted index prune and child file
-    # cleanup run.  This closes the in-process successor-rotation window
-    # without introducing the inverse LOCK -> _INDEX_WRITE_LOCK order.
-    with _INDEX_WRITE_LOCK:
-        with LOCK:
-            current = SESSIONS.get(session_id)
-        if current is not session:
-            logger.warning(
-                "Refusing auxiliary run-journal rollback for %s: in-memory child owner rotated",
-                session_id,
-            )
-            return False
-        if not _restore_auxiliary_session_persistence(
-            session_id=session_id,
-            before=before,
-            prepared=prepared,
-        ):
-            return False
-        with LOCK:
-            current = SESSIONS.get(session_id)
-            if current is session:
+    # Fixed lock order: persistence lock -> index writer -> in-memory owner.
+    # The persistence lock keeps a same-object Session.save() from replacing a
+    # sidecar between the compare and restore.  LOCK stays held continuously
+    # from the exact-owner check through file/index cleanup and owner removal,
+    # so a successor cannot enter the window and be cleaned as the old child.
+    with _get_session_persistence_lock(session_id):
+        with _INDEX_WRITE_LOCK:
+            with LOCK:
+                current = SESSIONS.get(session_id)
+                if current is not session:
+                    logger.warning(
+                        "Refusing auxiliary run-journal rollback for %s: in-memory child owner rotated",
+                        session_id,
+                    )
+                    return False
+                if not _restore_auxiliary_session_persistence(
+                    session_id=session_id,
+                    before=before,
+                    prepared=prepared,
+                ):
+                    return False
+                # This object is no longer an admissible writer after a
+                # successful auxiliary rollback.  Keep the transient marker
+                # private so a save already waiting on the persistence lock
+                # cannot resurrect the removed sidecar/index row.  A distinct
+                # successor object for the same sid has no marker.
+                if SESSIONS.get(session_id) is not session:
+                    logger.warning(
+                        "Refusing auxiliary run-journal rollback for %s: in-memory child owner rotated during cleanup",
+                        session_id,
+                    )
+                    return False
+                session._auxiliary_persistence_revoked = True
                 SESSIONS.pop(session_id, None)
-            else:
-                logger.warning(
-                    "Refusing auxiliary run-journal rollback for %s: in-memory child owner rotated during cleanup",
-                    session_id,
-                )
-                return False
     return True
 
 

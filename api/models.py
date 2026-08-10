@@ -12,6 +12,7 @@ import re
 import threading
 import time
 import uuid
+import weakref
 from contextlib import closing, contextmanager
 from pathlib import Path
 
@@ -183,6 +184,28 @@ def _safe_replace(src: Path, dst: Path) -> None:
 # Serializes index writers so concurrent Session.save() calls cannot race on
 # stale baselines while still allowing LOCK to be released before disk I/O.
 _INDEX_WRITE_LOCK = threading.RLock()
+
+# Serializes durable writes for one session from the first sidecar read through
+# the sidecar replacement and the targeted index write.  This lock is separate
+# from the non-reentrant agent-mutation lock in api.config: rollback may be
+# called from a path that already owns that lock, and save callers may nest
+# persistence helpers.  Weak values preserve one lock for overlapping holders
+# and waiters without leaking an entry for every deleted session id.
+_SESSION_PERSISTENCE_LOCKS = weakref.WeakValueDictionary()
+_SESSION_PERSISTENCE_LOCKS_LOCK = threading.Lock()
+
+
+def _get_session_persistence_lock(session_id: str) -> threading.RLock:
+    """Return the reentrant persistence lock shared by one session id."""
+    sid = str(session_id or "")
+    with _SESSION_PERSISTENCE_LOCKS_LOCK:
+        lock = _SESSION_PERSISTENCE_LOCKS.get(sid)
+        if lock is None:
+            lock = threading.RLock()
+            _SESSION_PERSISTENCE_LOCKS[sid] = lock
+        return lock
+
+
 _SESSION_INDEX_REBUILD_LOCK = threading.Lock()
 _SESSION_INDEX_REBUILD_THREAD = None
 _SESSION_INDEX_REBUILD_THREAD_TARGET: tuple[Path, Path] | None = None
@@ -1364,6 +1387,7 @@ class Session:
         return SESSION_DIR / f'{self.session_id}.json'
 
     def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
+        """Persist this session while serializing all same-id durable writes."""
         if not is_safe_session_id(self.session_id):
             raise ValueError(f"Unsafe session_id {self.session_id!r}; refusing to write outside session store")
         # ── #1558 P0 guard ──────────────────────────────────────────────
@@ -1382,6 +1406,18 @@ class Session:
                 f"would atomically overwrite on-disk messages with []. "
                 f"Reload with metadata_only=False before mutating state. "
                 f"See #1558."
+            )
+        with _get_session_persistence_lock(self.session_id):
+            return self._save_locked(
+                touch_updated_at=touch_updated_at,
+                skip_index=skip_index,
+            )
+
+    def _save_locked(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
+        if getattr(self, "_auxiliary_persistence_revoked", False):
+            raise RuntimeError(
+                f"Refusing to save revoked auxiliary session {self.session_id!r}: "
+                "the exact object was removed after run-journal authority failure"
             )
         if touch_updated_at:
             self.updated_at = time.time()

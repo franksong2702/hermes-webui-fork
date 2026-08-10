@@ -8,7 +8,10 @@ unwritable authority degrades the run to an unjournaled execution.
 from __future__ import annotations
 
 import copy
+import gc
 import json
+import threading
+import weakref
 from pathlib import Path
 
 import pytest
@@ -16,6 +19,7 @@ import pytest
 from api import models, routes, run_journal, turn_journal
 
 
+_REAL_THREAD = threading.Thread
 _ORIGINAL_PREPARE_CHAT_START = routes._prepare_chat_start_session_for_stream
 
 
@@ -811,6 +815,374 @@ def test_auxiliary_rollback_prunes_only_child_index_row(
     assert child.session_id not in models.SESSIONS
     assert not _Thread.created
     assert trackers == []
+
+
+def test_auxiliary_rollback_serializes_same_object_save_barrier(
+    real_session_store, monkeypatch
+):
+    """A waiting save cannot resurrect an auxiliary object revoked by rollback."""
+    sid = "auxiliary-same-object-save-barrier"
+    child = models.Session(
+        session_id=sid,
+        title="prepared child",
+        messages=[{"role": "assistant", "content": "prepared"}],
+    )
+    models.SESSIONS[sid] = child
+    before = routes._snapshot_auxiliary_session_persistence(child)
+    child.save(touch_updated_at=False)
+    prepared = routes._snapshot_auxiliary_session_persistence(child)
+    child.title = "successor child"
+
+    sidecar_replaced = threading.Event()
+    index_write_attempted = threading.Event()
+    release_index = threading.Event()
+    compare_observed = threading.Event()
+    allow_compare = threading.Event()
+    save_errors = []
+    rollback_errors = []
+    result = {}
+    save_thread = None
+
+    real_safe_replace = models._safe_replace
+
+    def gated_safe_replace(src, dst):
+        if Path(dst) == child.path and not sidecar_replaced.is_set():
+            real_safe_replace(src, dst)
+            sidecar_replaced.set()
+            return
+        return real_safe_replace(src, dst)
+
+    monkeypatch.setattr(models, "_safe_replace", gated_safe_replace)
+    real_write_index = models._write_session_index
+
+    def gated_write_index(*args, **kwargs):
+        if threading.current_thread() is save_thread:
+            index_write_attempted.set()
+            if not release_index.wait(3):
+                raise RuntimeError("timed out waiting to update session index")
+        return real_write_index(*args, **kwargs)
+
+    monkeypatch.setattr(models, "_write_session_index", gated_write_index)
+    real_matches = routes._auxiliary_session_persistence_matches
+
+    def gated_matches(snapshot):
+        matched = real_matches(snapshot)
+        compare_observed.set()
+        if not allow_compare.wait(3):
+            raise RuntimeError("timed out waiting to compare persistence")
+        return matched
+
+    monkeypatch.setattr(routes, "_auxiliary_session_persistence_matches", gated_matches)
+
+    def save_successor():
+        try:
+            child.save(touch_updated_at=False)
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            save_errors.append(exc)
+
+    def rollback_rejected_child():
+        try:
+            result["value"] = routes._rollback_auxiliary_session_after_authority_failure(
+                child,
+                before=before,
+                prepared=prepared,
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            rollback_errors.append(exc)
+
+    save_thread = _REAL_THREAD(target=save_successor, name="same-object-save")
+    rollback_thread = _REAL_THREAD(target=rollback_rejected_child, name="auxiliary-rollback")
+    try:
+        rollback_thread.start()
+        assert compare_observed.wait(3)
+        # The old rollback holds _INDEX_WRITE_LOCK after this compare.  Its
+        # concurrent save can replace the sidecar, then block in index write.
+        # The fixed rollback holds the persistence lock too, so this same save
+        # remains before any sidecar mutation until rollback revokes the object.
+        save_thread.start()
+        sidecar_replaced_seen = sidecar_replaced.wait(1)
+        if sidecar_replaced_seen:
+            assert index_write_attempted.wait(3)
+        allow_compare.set()
+        rollback_thread.join(3)
+        release_index.set()
+    finally:
+        allow_compare.set()
+        release_index.set()
+        save_thread.join(5)
+        rollback_thread.join(5)
+
+    assert not save_thread.is_alive()
+    assert not rollback_thread.is_alive()
+    assert not rollback_errors
+    assert result["value"] is True
+    assert sidecar_replaced_seen is False
+    assert len(save_errors) == 1
+    assert isinstance(save_errors[0], RuntimeError)
+    assert "revoked" in str(save_errors[0])
+    assert not child.path.exists()
+    rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+    assert all(row.get("session_id") != sid for row in rows)
+    assert sid not in models.SESSIONS
+
+
+def test_auxiliary_rollback_fails_closed_when_save_replaces_sidecar_first(
+    real_session_store, monkeypatch
+):
+    """A save that owns persistence wins; rollback observes its rotated image."""
+    sid = "auxiliary-save-first-rotation-barrier"
+    child = models.Session(
+        session_id=sid,
+        title="prepared child",
+        messages=[{"role": "assistant", "content": "prepared"}],
+    )
+    models.SESSIONS[sid] = child
+    before = routes._snapshot_auxiliary_session_persistence(child)
+    child.save(touch_updated_at=False)
+    prepared = routes._snapshot_auxiliary_session_persistence(child)
+    child.title = "successor child"
+
+    about_to_replace = threading.Event()
+    allow_replace = threading.Event()
+    sidecar_replaced = threading.Event()
+    index_paused = threading.Event()
+    release_index = threading.Event()
+    compare_observed = threading.Event()
+    allow_compare = threading.Event()
+    successor_bytes = {}
+    save_errors = []
+    rollback_errors = []
+    result = {}
+    save_thread = None
+
+    real_safe_replace = models._safe_replace
+
+    def gated_safe_replace(src, dst):
+        if Path(dst) == child.path and not sidecar_replaced.is_set():
+            about_to_replace.set()
+            if not allow_replace.wait(3):
+                raise RuntimeError("timed out waiting to replace sidecar")
+            successor_bytes["payload"] = Path(src).read_bytes()
+            real_safe_replace(src, dst)
+            sidecar_replaced.set()
+            return
+        return real_safe_replace(src, dst)
+
+    monkeypatch.setattr(models, "_safe_replace", gated_safe_replace)
+    real_write_index = models._write_session_index
+
+    def gated_write_index(*args, **kwargs):
+        if threading.current_thread() is save_thread:
+            index_paused.set()
+            if not release_index.wait(3):
+                raise RuntimeError("timed out waiting to update session index")
+        return real_write_index(*args, **kwargs)
+
+    monkeypatch.setattr(models, "_write_session_index", gated_write_index)
+    real_matches = routes._auxiliary_session_persistence_matches
+
+    def gated_matches(snapshot):
+        matched = real_matches(snapshot)
+        compare_observed.set()
+        if not allow_compare.wait(3):
+            raise RuntimeError("timed out waiting to compare persistence")
+        return matched
+
+    monkeypatch.setattr(routes, "_auxiliary_session_persistence_matches", gated_matches)
+
+    def save_successor():
+        try:
+            child.save(touch_updated_at=False)
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            save_errors.append(exc)
+
+    def rollback_rejected_child():
+        try:
+            result["value"] = routes._rollback_auxiliary_session_after_authority_failure(
+                child,
+                before=before,
+                prepared=prepared,
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            rollback_errors.append(exc)
+
+    save_thread = _REAL_THREAD(target=save_successor, name="save-first")
+    rollback_thread = _REAL_THREAD(target=rollback_rejected_child, name="rollback-after-save")
+    try:
+        save_thread.start()
+        assert about_to_replace.wait(3)
+        rollback_thread.start()
+        # Old rollback reaches the compare while the save is still before
+        # replacement.  The fixed rollback is waiting on the save's RLock.
+        compared_before_replace = compare_observed.wait(1)
+        allow_replace.set()
+        assert sidecar_replaced.wait(3)
+        assert index_paused.wait(3)
+        allow_compare.set()
+        release_index.set()
+    finally:
+        allow_replace.set()
+        allow_compare.set()
+        release_index.set()
+        save_thread.join(5)
+        rollback_thread.join(5)
+
+    assert not save_thread.is_alive()
+    assert not rollback_thread.is_alive()
+    assert not save_errors
+    assert not rollback_errors
+    assert compared_before_replace is False
+    assert result["value"] is False
+    assert child.path.read_bytes() == successor_bytes["payload"]
+    rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+    row = next(row for row in rows if row.get("session_id") == sid)
+    assert row["title"] == "successor child"
+    assert models.SESSIONS[sid] is child
+
+
+def test_auxiliary_rollback_holds_owner_lock_through_cleanup(
+    real_session_store, monkeypatch
+):
+    """A successor cannot enter the owner window while rollback mutates files/index."""
+    sid = "auxiliary-owner-replacement-barrier"
+    child = models.Session(
+        session_id=sid,
+        title="prepared child",
+        messages=[{"role": "assistant", "content": "prepared"}],
+    )
+    models.SESSIONS[sid] = child
+    before = routes._snapshot_auxiliary_session_persistence(child)
+    child.save(touch_updated_at=False)
+    prepared = routes._snapshot_auxiliary_session_persistence(child)
+    successor = object()
+    restore_entered = threading.Event()
+    replacement_probe_done = threading.Event()
+    allow_restore = threading.Event()
+    replacement_entered = threading.Event()
+    replacement_thread = None
+    order = []
+    order_lock = threading.Lock()
+    observed = {}
+    result = {}
+    rollback_errors = []
+
+    def mark(label):
+        with order_lock:
+            order.append(label)
+
+    def replace_owner():
+        nonlocal replacement_thread
+        mark("replacement_attempt")
+        with routes.LOCK:
+            mark("replacement_enter")
+            models.SESSIONS[sid] = successor
+            replacement_entered.set()
+
+    real_restore = routes._restore_auxiliary_session_persistence
+
+    def gated_restore(**kwargs):
+        nonlocal replacement_thread
+        mark("restore_enter")
+        restore_entered.set()
+        replacement_thread = _REAL_THREAD(target=replace_owner, name="owner-successor")
+        replacement_thread.start()
+        observed["entered_during_restore"] = replacement_entered.wait(1)
+        replacement_probe_done.set()
+        if not allow_restore.wait(3):
+            raise RuntimeError("timed out waiting to restore rejected child")
+        restored = real_restore(**kwargs)
+        mark("restore_exit")
+        return restored
+
+    monkeypatch.setattr(routes, "_restore_auxiliary_session_persistence", gated_restore)
+
+    def rollback_rejected_child():
+        try:
+            result["value"] = routes._rollback_auxiliary_session_after_authority_failure(
+                child,
+                before=before,
+                prepared=prepared,
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            rollback_errors.append(exc)
+
+    rollback_thread = _REAL_THREAD(target=rollback_rejected_child, name="owner-rollback")
+    try:
+        rollback_thread.start()
+        assert restore_entered.wait(3)
+        assert replacement_probe_done.wait(3)
+        allow_restore.set()
+    finally:
+        allow_restore.set()
+        rollback_thread.join(5)
+        if replacement_thread is not None:
+            replacement_thread.join(5)
+
+    assert not rollback_thread.is_alive()
+    assert replacement_thread is not None
+    assert not replacement_thread.is_alive()
+    assert not rollback_errors
+    assert result["value"] is True
+    assert observed["entered_during_restore"] is False
+    assert order.index("replacement_enter") > order.index("restore_exit")
+    assert models.SESSIONS[sid] is successor
+    assert not child.path.exists()
+    rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+    assert all(row.get("session_id") != sid for row in rows)
+
+
+def test_session_persistence_lock_registry_reuses_and_reclaims_weak_lock():
+    sid = "weak-persistence-lock"
+    with models._SESSION_PERSISTENCE_LOCKS_LOCK:
+        models._SESSION_PERSISTENCE_LOCKS.pop(sid, None)
+
+    first = models._get_session_persistence_lock(sid)
+    first_ref = weakref.ref(first)
+    assert models._get_session_persistence_lock(sid) is first
+
+    holder_started = threading.Event()
+    waiter_started = threading.Event()
+    release_holder = threading.Event()
+    waiter_acquired = threading.Event()
+    waiter_result = {}
+
+    def hold_lock():
+        with first:
+            holder_started.set()
+            assert release_holder.wait(3)
+
+    def wait_for_lock():
+        waiter_lock = models._get_session_persistence_lock(sid)
+        waiter_result["same"] = waiter_lock is first
+        waiter_started.set()
+        with waiter_lock:
+            waiter_acquired.set()
+
+    holder_thread = _REAL_THREAD(target=hold_lock, name="persistence-lock-holder")
+    waiter_thread = _REAL_THREAD(target=wait_for_lock, name="persistence-lock-waiter")
+    try:
+        holder_thread.start()
+        assert holder_started.wait(3)
+        waiter_thread.start()
+        assert waiter_started.wait(3)
+        assert not waiter_acquired.is_set()
+        release_holder.set()
+        assert waiter_acquired.wait(3)
+    finally:
+        release_holder.set()
+        holder_thread.join(5)
+        waiter_thread.join(5)
+
+    assert not holder_thread.is_alive()
+    assert not waiter_thread.is_alive()
+    assert waiter_result["same"] is True
+
+    del first
+    gc.collect()
+
+    assert first_ref() is None
+    with models._SESSION_PERSISTENCE_LOCKS_LOCK:
+        assert sid not in models._SESSION_PERSISTENCE_LOCKS
 
 
 @pytest.mark.parametrize("endpoint", ["send", "btw", "background"])
