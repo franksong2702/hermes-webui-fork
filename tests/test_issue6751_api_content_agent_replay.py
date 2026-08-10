@@ -1449,8 +1449,8 @@ def test_issue6751_nan_timestamps_cannot_be_reaccepted_by_row_id_tier():
     assert merged[0].get("api_content") is None
 
 
-def test_issue6751_duplicate_stable_bucket_quarantines_row_id_fast_path():
-    """Duplicate stable ids stay isolated even when one row id also agrees."""
+def test_issue6751_unique_row_id_resolves_duplicate_stable_bucket():
+    """A unique durable row pair outranks an otherwise ambiguous stable id."""
     from api.models import merge_session_messages_append_only
 
     sidecar = [
@@ -1473,14 +1473,140 @@ def test_issue6751_duplicate_stable_bucket_quarantines_row_id_fast_path():
             "content": "same request",
             "id": "duplicate-turn",
             "_state_db_row_id": 51,
-            "api_content": "must-remain-independent",
+            "api_content": "row-51-wire",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert len(merged) == 2
+    assert [message.get("api_content") for message in merged] == ["row-51-wire", None]
+
+
+def test_issue6751_row_id_identity_conflict_is_quarantined_before_fallback():
+    """A row-id match cannot override contradictory stable message identity."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "timestamp": 100.0,
+            "id": "turn-a",
+            "_state_db_row_id": 7,
+        },
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "timestamp": 200.0,
+        },
+    ]
+    state = [
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "timestamp": 200.0,
+            "id": "turn-b",
+            "_state_db_row_id": 7,
+            "api_content": "turn-b-wire",
         }
     ]
 
     merged = merge_session_messages_append_only(sidecar, state)
 
     assert [message.get("api_content") for message in merged[:2]] == [None, None]
-    assert merged[2]["api_content"] == "must-remain-independent"
+
+
+def test_issue6751_row_id_sidecar_conflict_cannot_fall_through_by_timestamp():
+    """Conflicting authoritative payloads quarantine both row-id candidates."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {
+            "role": "user",
+            "content": "same request",
+            "timestamp": 100.0,
+            "_state_db_row_id": 7,
+            "api_content": "existing-wire",
+        },
+        {
+            "role": "user",
+            "content": "same request",
+            "timestamp": 200.0,
+        },
+    ]
+    state = [
+        {
+            "role": "user",
+            "content": "same request",
+            "timestamp": 200.0,
+            "_state_db_row_id": 7,
+            "api_content": "conflicting-wire",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert [message.get("api_content") for message in merged[:2]] == [
+        "existing-wire",
+        None,
+    ]
+
+
+def test_issue6751_exact_timestamp_bucket_matches_mutually_unique_content_pairs():
+    """Equal timestamps do not hide unique compatible message pairs."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {"role": "assistant", "content": "answer one", "timestamp": 300.0},
+        {"role": "assistant", "content": "answer two", "timestamp": 300.0},
+    ]
+    state = [
+        {
+            "role": "assistant",
+            "content": "answer two",
+            "timestamp": 300.0,
+            "api_content": "wire-two",
+        },
+        {
+            "role": "assistant",
+            "content": "answer one",
+            "timestamp": 300.0,
+            "api_content": "wire-one",
+        },
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert len(merged) == 2
+    assert [message.get("api_content") for message in merged] == [
+        "wire-one",
+        "wire-two",
+    ]
+
+
+def test_issue6751_incompatible_exact_timestamp_pair_keeps_mixed_fallback_open():
+    """An incompatible exact-time row must not consume a later unique match."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {"role": "assistant", "content": "different answer", "timestamp": 400.0},
+        {"role": "assistant", "content": "matching answer"},
+    ]
+    state = [
+        {
+            "role": "assistant",
+            "content": "matching answer",
+            "timestamp": 400.0,
+            "api_content": "matching-wire",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert len(merged) == 2
+    assert merged[0].get("api_content") is None
+    assert merged[1]["api_content"] == "matching-wire"
 
 
 def test_issue6751_conflicting_stable_aliases_cannot_be_reaccepted_by_row_id_tier():

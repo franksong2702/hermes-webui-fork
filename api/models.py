@@ -8677,15 +8677,17 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
         for stable_id in state_by_stable_id
         if stable_id not in targets_by_stable_id
     )
+    duplicate_stable_target_indexes = set()
+    duplicate_stable_source_indexes = set()
     for stable_id in stable_ids:
         target_indexes = targets_by_stable_id.get(stable_id, [])
         source_indexes = state_by_stable_id.get(stable_id, [])
         if len(target_indexes) > 1 or len(source_indexes) > 1:
-            # A duplicate bucket is ambiguous even when the other side has a
-            # singleton row. Quarantine both sides symmetrically so a weaker
-            # identity tier cannot re-admit one of the conflicting rows.
-            used_targets.update(target_indexes)
-            used_sources.update(source_indexes)
+            # Durable row ids are stronger provenance than a repeated stable
+            # message id. Defer this bucket's quarantine until after the row-id
+            # tier so unique row-id pairs can still resolve it one-to-one.
+            duplicate_stable_target_indexes.update(target_indexes)
+            duplicate_stable_source_indexes.update(source_indexes)
 
     for stable_id in stable_ids:
         target_indexes = [
@@ -8769,6 +8771,12 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
             continue
         target_index = target_indexes[0]
         source_index = source_indexes[0]
+        if not _message_identity_compatible(sidecar[target_index], state[source_index]):
+            # Row ids never override contradictory stable ids, aliases, roles,
+            # or visible content. Quarantine both sides before fallback.
+            used_targets.add(target_index)
+            used_sources.add(source_index)
+            continue
         target_api_content = _session_message_api_content_key(sidecar[target_index])
         source_api_content = _session_message_api_content_key(state[source_index])
         if (
@@ -8777,17 +8785,28 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
             and target_api_content != source_api_content
         ):
             # A durable row id is not sufficient to reconcile two already
-            # authoritative provider payloads.  Leave both rows available to
-            # the append-only merge, where their distinct sidecar identities
-            # keep them separate.
+            # authoritative provider payloads. Quarantine both rows so a
+            # weaker timestamp/content tier cannot attach one payload to the
+            # other row.
+            used_targets.add(target_index)
+            used_sources.add(source_index)
             continue
         used_targets.add(target_index)
         used_sources.add(source_index)
         _copy_api_content_sidecar(sidecar[target_index], state[source_index])
 
-    # 3. Exact role + timestamp. A bucket is safe only when it has one
-    # remaining candidate on each side. Equal timestamps are not provenance;
-    # never guess by list order when a bucket is ambiguous.
+    # Any duplicate stable-id rows left unresolved by the authoritative row-id
+    # tier are ambiguous and must not fall through to timestamps/content.
+    used_targets.update(
+        index for index in duplicate_stable_target_indexes if index not in used_targets
+    )
+    used_sources.update(
+        index for index in duplicate_stable_source_indexes if index not in used_sources
+    )
+
+    # 3. Exact role + timestamp. Equal timestamps are not provenance; resolve
+    # only mutually-unique compatible pairs inside a bucket and never guess by
+    # list order when a relationship is ambiguous.
     sidecar_by_exact_timestamp = {}
     state_by_exact_timestamp = {}
     for index, message in enumerate(sidecar):
@@ -8807,22 +8826,51 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
         if valid and role is not None and timestamp is not None:
             state_by_exact_timestamp.setdefault((role, timestamp), []).append((source_index, message))
     for key, state_rows in state_by_exact_timestamp.items():
-        candidates = [index for index in sidecar_by_exact_timestamp.get(key, ()) if index not in used_targets]
-        # No exact-timestamp target is not an ambiguity: leave the source row
-        # available for the documented same-second fractional-drift tier below.
-        if not candidates:
+        target_indexes = [
+            index
+            for index in sidecar_by_exact_timestamp.get(key, ())
+            if index not in used_targets
+        ]
+        if not target_indexes:
+            # No exact-timestamp target is not an ambiguity: leave the source
+            # row available for the documented same-second/content tiers.
             continue
-        if len(candidates) != 1 or len(state_rows) != 1:
-            used_targets.update(candidates)
-            used_sources.update(source_index for source_index, _ in state_rows)
-            continue
-        index = candidates[0]
-        source_index, message = state_rows[0]
-        used_targets.add(index)
-        used_sources.add(source_index)
-        if not _message_identity_compatible(sidecar[index], message):
-            continue
-        _copy_api_content_sidecar(sidecar[index], message)
+
+        # Use the same mutually-unique compatibility graph as the same-second
+        # tier. This resolves distinct content pairs inside a repeated exact
+        # timestamp bucket without guessing by list order.
+        compatible_targets_by_source = {}
+        for source_index, source_message in state_rows:
+            if source_index in used_sources:
+                continue
+            compatible_targets_by_source[source_index] = [
+                target_index
+                for target_index in target_indexes
+                if target_index not in used_targets
+                and _message_identity_compatible(sidecar[target_index], source_message)
+                and (
+                    _session_message_api_content_key(sidecar[target_index]) is None
+                    or _session_message_api_content_key(sidecar[target_index])
+                    == _session_message_api_content_key(source_message)
+                )
+            ]
+
+        compatible_sources_by_target = {}
+        for source_index, candidates in compatible_targets_by_source.items():
+            for target_index in candidates:
+                compatible_sources_by_target.setdefault(target_index, []).append(source_index)
+
+        for source_index, candidates in compatible_targets_by_source.items():
+            if len(candidates) != 1:
+                continue
+            target_index = candidates[0]
+            if len(compatible_sources_by_target.get(target_index, ())) != 1:
+                continue
+            if source_index in used_sources or target_index in used_targets:
+                continue
+            used_sources.add(source_index)
+            used_targets.add(target_index)
+            _copy_api_content_sidecar(sidecar[target_index], state[source_index])
 
     # 4. Same-second sub-second drift. The sidecar JSON and state.db can
     # record one logical turn with different fractional timestamps while still
@@ -9432,21 +9480,13 @@ def merge_session_messages_append_only(
     # The reconciler's quarantine sets are invocation-local. Mirror the
     # identity-bucket guards here because this append-only merge has its own
     # row-id fast path that must not re-admit a row isolated above.
-    sidecar_stable_id_counts = collections.Counter()
-    state_stable_id_counts = collections.Counter()
     sidecar_row_id_counts = collections.Counter()
     state_row_id_counts = collections.Counter()
     for message in sidecar_messages:
-        stable_id, stable_id_valid = _stable_message_identity_details(message)
-        if stable_id_valid and stable_id is not None:
-            sidecar_stable_id_counts[stable_id] += 1
         row_id, row_id_valid = _state_db_row_identity_details(message)
         if row_id_valid and row_id is not None:
             sidecar_row_id_counts[row_id] += 1
     for message in state_messages:
-        stable_id, stable_id_valid = _stable_message_identity_details(message)
-        if stable_id_valid and stable_id is not None:
-            state_stable_id_counts[stable_id] += 1
         row_id, row_id_valid = _state_db_row_identity_details(message)
         if row_id_valid and row_id is not None:
             state_row_id_counts[row_id] += 1
@@ -9466,18 +9506,6 @@ def merge_session_messages_append_only(
         if (
             sidecar_row_id_counts.get(existing_row_id, 0) > 1
             or state_row_id_counts.get(existing_row_id, 0) > 1
-        ):
-            return False
-        existing_stable_id, existing_stable_id_valid = _stable_message_identity_details(existing)
-        incoming_stable_id, incoming_stable_id_valid = _stable_message_identity_details(incoming)
-        if not existing_stable_id_valid or not incoming_stable_id_valid:
-            return False
-        if (
-            existing_stable_id is not None
-            and sidecar_stable_id_counts.get(existing_stable_id, 0) > 1
-        ) or (
-            incoming_stable_id is not None
-            and state_stable_id_counts.get(incoming_stable_id, 0) > 1
         ):
             return False
         _, existing_timestamp_valid = _message_exact_timestamp_details(existing)
