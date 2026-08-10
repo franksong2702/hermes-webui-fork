@@ -1146,20 +1146,28 @@ def test_session_persistence_lock_registry_reuses_and_reclaims_weak_lock():
     waiter_acquired = threading.Event()
     waiter_result = {}
 
-    def hold_lock():
-        with first:
+    def hold_lock(lock):
+        with lock:
             holder_started.set()
             assert release_holder.wait(3)
 
-    def wait_for_lock():
+    def wait_for_lock(expected_lock):
         waiter_lock = models._get_session_persistence_lock(sid)
-        waiter_result["same"] = waiter_lock is first
+        waiter_result["same"] = waiter_lock is expected_lock
         waiter_started.set()
         with waiter_lock:
             waiter_acquired.set()
 
-    holder_thread = _REAL_THREAD(target=hold_lock, name="persistence-lock-holder")
-    waiter_thread = _REAL_THREAD(target=wait_for_lock, name="persistence-lock-waiter")
+    holder_thread = _REAL_THREAD(
+        target=hold_lock,
+        args=(first,),
+        name="persistence-lock-holder",
+    )
+    waiter_thread = _REAL_THREAD(
+        target=wait_for_lock,
+        args=(first,),
+        name="persistence-lock-waiter",
+    )
     try:
         holder_thread.start()
         assert holder_started.wait(3)
