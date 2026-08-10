@@ -1366,7 +1366,14 @@ def test_issue6751_real_state_reader_unique_row_id_reconciles_timestamp_drift(
     ]
 
     merged = models.merge_session_messages_append_only(
-        [{"role": "user", "content": "same visible", "timestamp": 100.1}],
+        [
+            {
+                "role": "user",
+                "content": "same visible",
+                "timestamp": 100.1,
+                "id": "display-turn-1",
+            }
+        ],
         state_messages,
     )
 
@@ -1413,6 +1420,125 @@ def test_issue6751_reconciliation_prefers_unique_stable_message_id_before_weaker
         ("turn-a", "wire-a"),
         ("turn-b", "wire-b"),
     ]
+
+
+def test_issue6751_nan_timestamps_cannot_be_reaccepted_by_row_id_tier():
+    """Invalid timestamp provenance remains isolated even when row ids agree."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {
+            "role": "user",
+            "content": "same request",
+            "timestamp": float("nan"),
+            "_state_db_row_id": 42,
+        }
+    ]
+    state = [
+        {
+            "role": "user",
+            "content": "same request",
+            "timestamp": float("nan"),
+            "_state_db_row_id": 42,
+            "api_content": "must-not-attach",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert merged[0].get("api_content") is None
+
+
+def test_issue6751_duplicate_stable_bucket_quarantines_row_id_fast_path():
+    """Duplicate stable ids stay isolated even when one row id also agrees."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {
+            "role": "user",
+            "content": "same request",
+            "id": "duplicate-turn",
+            "_state_db_row_id": 51,
+        },
+        {
+            "role": "user",
+            "content": "same request",
+            "id": "duplicate-turn",
+            "_state_db_row_id": 52,
+        },
+    ]
+    state = [
+        {
+            "role": "user",
+            "content": "same request",
+            "id": "duplicate-turn",
+            "_state_db_row_id": 51,
+            "api_content": "must-remain-independent",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert [message.get("api_content") for message in merged[:2]] == [None, None]
+    assert merged[2]["api_content"] == "must-remain-independent"
+
+
+def test_issue6751_conflicting_stable_aliases_cannot_be_reaccepted_by_row_id_tier():
+    """Contradictory stable aliases stay isolated from weaker identity tiers."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "id": "stable-a",
+            "message_id": "stable-b",
+            "_state_db_row_id": 43,
+        }
+    ]
+    state = [
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "_state_db_row_id": 43,
+            "api_content": "must-not-attach",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert merged[0].get("api_content") is None
+
+
+@pytest.mark.parametrize(
+    ("sidecar_timestamp", "state_timestamp"),
+    [(0, 1), (1, 0)],
+)
+def test_issue6751_conflicting_present_timestamps_block_role_content_fallback(
+    sidecar_timestamp, state_timestamp
+):
+    """Two present timestamps that miss time tiers must fail closed."""
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "timestamp": sidecar_timestamp,
+        }
+    ]
+    state = [
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "timestamp": state_timestamp,
+            "api_content": "must-not-attach",
+        }
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert merged[0].get("api_content") is None
 
 
 def test_issue6751_reconciliation_role_content_fallback_tolerates_mixed_timestamps():

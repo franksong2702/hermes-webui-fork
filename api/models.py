@@ -8671,11 +8671,36 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
         stable_id, valid = _stable_message_identity_details(message)
         if valid and stable_id is not None:
             state_by_stable_id.setdefault(stable_id, []).append(source_index)
-    for stable_id, target_indexes in targets_by_stable_id.items():
+    stable_ids = list(targets_by_stable_id)
+    stable_ids.extend(
+        stable_id
+        for stable_id in state_by_stable_id
+        if stable_id not in targets_by_stable_id
+    )
+    for stable_id in stable_ids:
+        target_indexes = targets_by_stable_id.get(stable_id, [])
         source_indexes = state_by_stable_id.get(stable_id, [])
-        if len(target_indexes) != 1 or len(source_indexes) != 1:
+        if len(target_indexes) > 1 or len(source_indexes) > 1:
+            # A duplicate bucket is ambiguous even when the other side has a
+            # singleton row. Quarantine both sides symmetrically so a weaker
+            # identity tier cannot re-admit one of the conflicting rows.
             used_targets.update(target_indexes)
             used_sources.update(source_indexes)
+
+    for stable_id in stable_ids:
+        target_indexes = [
+            index
+            for index in targets_by_stable_id.get(stable_id, ())
+            if index not in used_targets
+        ]
+        source_indexes = [
+            index
+            for index in state_by_stable_id.get(stable_id, ())
+            if index not in used_sources
+        ]
+        # A singleton stable id present on only one side remains eligible for
+        # stronger durable-row, timestamp, or content matching below.
+        if len(target_indexes) != 1 or len(source_indexes) != 1:
             continue
         target_index = target_indexes[0]
         source_index = source_indexes[0]
@@ -8703,6 +8728,8 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
     # can preserve both authoritative payloads without guessing.
     targets_by_row_id = {}
     for index, message in enumerate(sidecar):
+        if index in used_targets:
+            continue
         row_id, valid = _state_db_row_identity_details(message)
         if not valid:
             used_targets.add(index)
@@ -8710,6 +8737,8 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
             targets_by_row_id.setdefault(row_id, []).append(index)
     state_by_row_id = {}
     for source_index, message in enumerate(state):
+        if source_index in used_sources:
+            continue
         row_id, valid = _state_db_row_identity_details(message)
         if not valid:
             used_sources.add(source_index)
@@ -8724,11 +8753,19 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
         if len(source_indexes) > 1:
             used_sources.update(source_indexes)
 
-    for row_id, target_indexes in targets_by_row_id.items():
-        source_indexes = state_by_row_id.get(row_id, [])
-        if len(target_indexes) != 1 or len(source_indexes) != 1:
+    for row_id, original_target_indexes in targets_by_row_id.items():
+        original_source_indexes = state_by_row_id.get(row_id, [])
+        target_indexes = [
+            index for index in original_target_indexes if index not in used_targets
+        ]
+        source_indexes = [
+            index for index in original_source_indexes if index not in used_sources
+        ]
+        if len(original_target_indexes) != 1 or len(original_source_indexes) != 1:
             used_targets.update(target_indexes)
             used_sources.update(source_indexes)
+            continue
+        if len(target_indexes) != 1 or len(source_indexes) != 1:
             continue
         target_index = target_indexes[0]
         source_index = source_indexes[0]
@@ -8904,6 +8941,18 @@ def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list
             continue
         target_index = target_indexes[0]
         source_index = source_indexes[0]
+        target_timestamp, target_timestamp_valid = _message_exact_timestamp_details(
+            sidecar[target_index]
+        )
+        source_timestamp, source_timestamp_valid = _message_exact_timestamp_details(
+            state[source_index]
+        )
+        if (
+            not target_timestamp_valid
+            or not source_timestamp_valid
+            or (target_timestamp is not None and source_timestamp is not None)
+        ):
+            continue
         if not _message_identity_compatible(sidecar[target_index], state[source_index]):
             continue
         target_api_content = _session_message_api_content_key(sidecar[target_index])
@@ -9380,6 +9429,65 @@ def merge_session_messages_append_only(
     sidecar_messages = list(sidecar_messages or [])
     state_messages = list(state_messages or [])
     _reconcile_api_content_sidecars(sidecar_messages, state_messages)
+    # The reconciler's quarantine sets are invocation-local. Mirror the
+    # identity-bucket guards here because this append-only merge has its own
+    # row-id fast path that must not re-admit a row isolated above.
+    sidecar_stable_id_counts = collections.Counter()
+    state_stable_id_counts = collections.Counter()
+    sidecar_row_id_counts = collections.Counter()
+    state_row_id_counts = collections.Counter()
+    for message in sidecar_messages:
+        stable_id, stable_id_valid = _stable_message_identity_details(message)
+        if stable_id_valid and stable_id is not None:
+            sidecar_stable_id_counts[stable_id] += 1
+        row_id, row_id_valid = _state_db_row_identity_details(message)
+        if row_id_valid and row_id is not None:
+            sidecar_row_id_counts[row_id] += 1
+    for message in state_messages:
+        stable_id, stable_id_valid = _stable_message_identity_details(message)
+        if stable_id_valid and stable_id is not None:
+            state_stable_id_counts[stable_id] += 1
+        row_id, row_id_valid = _state_db_row_identity_details(message)
+        if row_id_valid and row_id is not None:
+            state_row_id_counts[row_id] += 1
+
+    def _row_id_fast_path_allowed(existing, incoming) -> bool:
+        if not isinstance(existing, dict) or not isinstance(incoming, dict):
+            return False
+        existing_row_id, existing_row_id_valid = _state_db_row_identity_details(existing)
+        incoming_row_id, incoming_row_id_valid = _state_db_row_identity_details(incoming)
+        if (
+            not existing_row_id_valid
+            or not incoming_row_id_valid
+            or existing_row_id is None
+            or existing_row_id != incoming_row_id
+        ):
+            return False
+        if (
+            sidecar_row_id_counts.get(existing_row_id, 0) > 1
+            or state_row_id_counts.get(existing_row_id, 0) > 1
+        ):
+            return False
+        existing_stable_id, existing_stable_id_valid = _stable_message_identity_details(existing)
+        incoming_stable_id, incoming_stable_id_valid = _stable_message_identity_details(incoming)
+        if not existing_stable_id_valid or not incoming_stable_id_valid:
+            return False
+        if (
+            existing_stable_id is not None
+            and sidecar_stable_id_counts.get(existing_stable_id, 0) > 1
+        ) or (
+            incoming_stable_id is not None
+            and state_stable_id_counts.get(incoming_stable_id, 0) > 1
+        ):
+            return False
+        _, existing_timestamp_valid = _message_exact_timestamp_details(existing)
+        _, incoming_timestamp_valid = _message_exact_timestamp_details(incoming)
+        return (
+            existing_timestamp_valid
+            and incoming_timestamp_valid
+            and _message_identity_compatible(existing, incoming)
+        )
+
     # Per-invocation cache keyed by message identity. Sidecar/state message objects
     # are retained for this call, and this function does not mutate key-defining
     # fields before each helper call.
@@ -9605,13 +9713,18 @@ def merge_session_messages_append_only(
             continue
         row_id, row_id_valid = _state_db_row_identity_details(msg)
         row_id_sidecar_conflict = False
+        existing = (
+            merged_by_row_id.get(row_id)
+            if row_id_valid and row_id is not None
+            else None
+        )
         if (
             row_id_valid
             and row_id is not None
-            and row_id in merged_by_row_id
+            and existing is not None
             and row_id not in ambiguous_row_ids
+            and _row_id_fast_path_allowed(existing, msg)
         ):
-            existing = merged_by_row_id[row_id]
             existing_api_content = _session_message_api_content_key(existing)
             incoming_api_content = _session_message_api_content_key(msg)
             row_id_sidecar_conflict = (
