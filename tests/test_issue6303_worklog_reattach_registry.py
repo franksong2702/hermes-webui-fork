@@ -324,6 +324,7 @@ def _run_harness(setup_code: str, include_loadsession: bool = False) -> dict:
         _MOCK_GLOBALS,
         _read(ANCHORS_JS),
         _function_source(_read(MESSAGES_JS), "_extractInlineThinkingFromContent"),
+        _function_source(_read(MESSAGES_JS), "_dispatchExtensionTurnLifecycle"),
         _function_source(_read(MESSAGES_JS), "closeLiveStream"),
         _function_source(_read(MESSAGES_JS), "closeOtherLiveStreams"),
         _function_source(_read(MESSAGES_JS), "attachLiveStream"),
@@ -1168,6 +1169,36 @@ def test_done_a_attach_b_without_done_timer_a_releases_only_a_grace():
         "graceTimerCount": 1,
         "streamJustFinishedAfterATimer": False,
         "bStillOwnsLiveEntry": True,
+    }
+
+
+def test_done_fade_survives_stream_end_followed_by_eventsource_error():
+    """A normal finite SSE close must not revoke the owner while done fade drains."""
+    setup = _done_callback_setup(
+        """\
+        window._fadeTextEffect = true;
+        renderMd = text => String(text || '');
+        esc = text => String(text || '');
+        scrollIfPinned = () => {};
+        const source = install('stream-a');
+        source.dispatch('token', { text: 'live answer still fading' });
+        complete(source, 'stream-a', 'settled answer');
+        __results.ownerAfterDone = !!(LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === source);
+        source.dispatch('stream_end', { session_id: SID });
+        __results.ownerAfterStreamEnd = !!(LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === source);
+        source.dispatch('error', {});
+        __results.ownerAfterBrowserError = !!(LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === source);
+        __results.transportClosedAfterBrowserError = source.readyState === EventSource.CLOSED;
+        __results.fadeTimerPending = timers.some(t => t.delay !== 5000 && !t.cancelled);
+        """
+    )
+    result = _run_harness(setup)
+    assert result == {
+        "ownerAfterDone": True,
+        "ownerAfterStreamEnd": True,
+        "ownerAfterBrowserError": True,
+        "transportClosedAfterBrowserError": True,
+        "fadeTimerPending": True,
     }
 
 
