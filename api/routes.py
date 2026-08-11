@@ -21465,10 +21465,15 @@ def _snapshot_chat_start_persistence(session) -> dict | None:
     except (TypeError, ValueError):
         return {"error": "invalid session sidecar path"}
     backup = path.with_suffix(".json.bak")
+    sidecar = _snapshot_chat_start_file(path)
     return {
         "path": path,
-        "sidecar": _snapshot_chat_start_file(path),
+        "sidecar": sidecar,
         "backup": _snapshot_chat_start_file(backup),
+        # Session.save() writes this exact compact row to the index.  Capturing
+        # only the target row avoids retaining another full _index.json image
+        # on every chat start while still giving rollback an exact CAS value.
+        "index_row": copy.deepcopy(session.compact()) if sidecar.get("exists") else None,
     }
 
 
@@ -21690,6 +21695,58 @@ def _restore_chat_start_file(snapshot: dict) -> None:
         raise
 
 
+def _chat_start_index_row_from_snapshot(snapshot: dict | None, session_id: str):
+    """Return the captured compact row for *session_id*, rejecting bad identity."""
+    if not isinstance(snapshot, dict) or "index_row" not in snapshot:
+        return False, None
+    row = snapshot.get("index_row")
+    if row is None:
+        return True, None
+    if not isinstance(row, dict) or row.get("session_id") != session_id:
+        return False, None
+    return True, row
+
+
+def _settle_chat_start_session_index_locked(
+    session_id: str,
+    *,
+    before: dict,
+    prepared: dict,
+) -> bool:
+    """Restore only one chat-start SID's index row under existing locks."""
+    before_ok, before_row = _chat_start_index_row_from_snapshot(before, session_id)
+    prepared_ok, prepared_row = _chat_start_index_row_from_snapshot(prepared, session_id)
+    if not before_ok or not prepared_ok:
+        return False
+    from api.models import _settle_session_index_row_locked
+
+    return _settle_session_index_row_locked(
+        session_id,
+        expected=prepared_row,
+        replacement=before_row,
+    )
+
+
+def _chat_start_session_index_matches_locked(
+    session_id: str,
+    *,
+    prepared: dict,
+) -> bool:
+    """Confirm this SID still has the exact post-prepare index row."""
+    prepared_ok, prepared_row = _chat_start_index_row_from_snapshot(prepared, session_id)
+    if not prepared_ok or prepared_row is None:
+        return False
+    from api.models import _settle_session_index_row_locked
+
+    # replacement==expected makes the lock-aware CAS a read-only exact-row
+    # validation.  The caller already holds both index and global owner locks.
+    return _settle_session_index_row_locked(
+        session_id,
+        expected=prepared_row,
+        replacement=prepared_row,
+    )
+
+
 def _restore_chat_start_persistence(
     session,
     *,
@@ -21698,10 +21755,9 @@ def _restore_chat_start_persistence(
 ) -> bool:
     """Restore sidecar/backup bytes without producing a rollback ``.bak``.
 
-    The post-prepare images are compared byte-for-byte first.  If another
-    process replaced or removed either file, recovery refuses to overwrite it.
-    Existing sidecars update only this session's index entry; a previously
-    absent sidecar is removed from the index by session id.
+    The caller holds the persistence, index, and global owner locks.  The
+    post-prepare images and exact SID index row are compared before any file is
+    restored; sibling index rows remain untouched.
     """
     if before is None:
         try:
@@ -21719,15 +21775,24 @@ def _restore_chat_start_persistence(
             getattr(session, "session_id", "?"),
         )
         return False
+    if not _chat_start_session_index_matches_locked(
+        str(getattr(session, "session_id", "") or ""),
+        prepared=prepared,
+    ):
+        logger.warning(
+            "Refusing run-journal persistence rollback for session %s: index owner rotated",
+            getattr(session, "session_id", "?"),
+        )
+        return False
     try:
         _restore_chat_start_file(before["sidecar"])
         _restore_chat_start_file(before["backup"])
-        from api.models import _write_session_index, prune_session_from_index
-
-        if before["sidecar"].get("exists"):
-            _write_session_index(updates=[session])
-        else:
-            prune_session_from_index(session.session_id)
+        if not _settle_chat_start_session_index_locked(
+            session.session_id,
+            before=before,
+            prepared=prepared,
+        ):
+            return False
     except Exception:
         logger.exception(
             "Failed to restore run-journal persistence for session %s",
@@ -21754,88 +21819,127 @@ def _rollback_chat_start_session_after_authority_failure(
     claiming a clean retryable 409.
     """
     session_id = str(getattr(session, "session_id", "") or "")
-    from api.models import _get_session_persistence_lock
+    from api.models import _INDEX_WRITE_LOCK, _get_session_persistence_lock
 
-    # The caller already owns the per-session agent lock.  Keep the persistence
-    # lock across the owner checks, compare, in-memory rollback, and file/index
-    # restore so a same-session save cannot replace the prepared image between
-    # any of those steps.  Session.save() takes this lock before entering the
-    # index writer, preserving the existing agent -> persistence -> index order.
+    # The caller already owns the per-session agent lock.  Keep the fixed
+    # agent -> persistence -> index -> global-owner lock order across every
+    # compare and compensation step.  In particular, LOCK remains held while
+    # in-memory fields, sidecar/backup bytes, this SID's index row, writeback
+    # ownership, and the canonical cache are settled; no helper that reacquires
+    # LOCK may run inside this fence.
     with _get_session_persistence_lock(session_id):
-        current_stream_id = getattr(session, "active_stream_id", None)
-        if current_stream_id != stream_id:
-            logger.warning(
-                "Refusing run-journal rollback for session %s: stream moved from %s to %s",
-                session_id or "?",
-                stream_id,
-                current_stream_id,
-            )
-            return False
-        try:
-            current_owner = session_writeback_owner(session_id)
-        except Exception:
-            logger.exception(
-                "Failed to read writeback owner while rolling back stream %s for session %s",
-                stream_id,
-                session_id or "?",
-            )
-            return False
-        if current_owner not in (None, stream_id):
-            logger.warning(
-                "Refusing run-journal rollback for session %s: writeback owner moved from %s to %s",
-                session_id or "?",
-                stream_id,
-                current_owner,
-            )
-            return False
-
-        before_persistence = snapshot.get("_persistence_before")
-        prepared_persistence = snapshot.get("_persistence_after_prepare")
-        # Check the exact post-prepare image before changing any in-memory
-        # fields.  A save that completed while rollback was waiting owns the
-        # successor image; restoring the old snapshot in memory would then
-        # diverge from that durable successor and could overwrite it later.
-        if before_persistence is not None and (
-            not isinstance(before_persistence, dict)
-            or before_persistence.get("error")
-            or any(
-                not isinstance(before_persistence.get(key), dict)
-                or before_persistence[key].get("error")
-                for key in ("sidecar", "backup")
-            )
-            or not _chat_start_persistence_matches(prepared_persistence)
-        ):
-            logger.warning(
-                "Refusing run-journal persistence rollback for session %s: sidecar rotated",
-                session_id or "?",
-            )
-            # No worker was started for this stream, so its owner cannot perform
-            # a later cleanup.  Clear only our exact owner; a successor's
-            # replacement remains protected by compare-and-clear.
-            clear_session_writeback_owner_if_owned(session_id, stream_id)
-            return False
-
-        for field in _CHAT_START_ROLLBACK_FIELDS:
-            value = snapshot.get(field, _CHAT_START_ROLLBACK_MISSING)
-            if value is _CHAT_START_ROLLBACK_MISSING:
+        with _INDEX_WRITE_LOCK:
+            with LOCK:
+                if SESSIONS.get(session_id) is not session:
+                    logger.warning(
+                        "Refusing run-journal rollback for session %s: canonical owner rotated",
+                        session_id or "?",
+                    )
+                    clear_session_writeback_owner_if_owned(session_id, stream_id)
+                    return False
+                current_stream_id = getattr(session, "active_stream_id", None)
+                if current_stream_id != stream_id:
+                    logger.warning(
+                        "Refusing run-journal rollback for session %s: stream moved from %s to %s",
+                        session_id or "?",
+                        stream_id,
+                        current_stream_id,
+                    )
+                    return False
                 try:
-                    delattr(session, field)
-                except AttributeError:
-                    pass
-            else:
-                setattr(session, field, copy.deepcopy(value))
-        if not _restore_chat_start_persistence(
-            session,
-            before=before_persistence,
-            prepared=prepared_persistence,
-        ):
-            # No worker was started for this stream, so its owner cannot perform a
-            # later cleanup.  Clear only our exact owner even when persistence is
-            # broken; a successor's replacement remains protected by compare-and-clear.
-            clear_session_writeback_owner_if_owned(session_id, stream_id)
-            return False
-        clear_session_writeback_owner_if_owned(session_id, stream_id)
-        return True
+                    current_owner = session_writeback_owner(session_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to read writeback owner while rolling back stream %s for session %s",
+                        stream_id,
+                        session_id or "?",
+                    )
+                    return False
+                if current_owner not in (None, stream_id):
+                    logger.warning(
+                        "Refusing run-journal rollback for session %s: writeback owner moved from %s to %s",
+                        session_id or "?",
+                        stream_id,
+                        current_owner,
+                    )
+                    return False
+
+                before_persistence = snapshot.get("_persistence_before")
+                prepared_persistence = snapshot.get("_persistence_after_prepare")
+                # Check the exact post-prepare image before changing any
+                # in-memory fields.  A save that completed while rollback was
+                # waiting owns the successor image; restoring the old snapshot
+                # in memory would then diverge from that durable successor.
+                if before_persistence is not None and (
+                    not isinstance(before_persistence, dict)
+                    or before_persistence.get("error")
+                    or any(
+                        not isinstance(before_persistence.get(key), dict)
+                        or before_persistence[key].get("error")
+                        for key in ("sidecar", "backup")
+                    )
+                    or not _chat_start_persistence_matches(prepared_persistence)
+                ):
+                    logger.warning(
+                        "Refusing run-journal persistence rollback for session %s: sidecar rotated",
+                        session_id or "?",
+                    )
+                    clear_session_writeback_owner_if_owned(session_id, stream_id)
+                    return False
+
+                if before_persistence is not None:
+                    before_index_ok, _ = _chat_start_index_row_from_snapshot(
+                        before_persistence,
+                        session_id,
+                    )
+                    prepared_index_ok, prepared_index_row = (
+                        _chat_start_index_row_from_snapshot(
+                            prepared_persistence,
+                            session_id,
+                        )
+                    )
+                    if (
+                        not before_index_ok
+                        or not prepared_index_ok
+                        or prepared_index_row is None
+                        or not _chat_start_session_index_matches_locked(
+                            session_id,
+                            prepared=prepared_persistence,
+                        )
+                    ):
+                        logger.warning(
+                            "Refusing run-journal persistence rollback for session %s: index owner rotated",
+                            session_id or "?",
+                        )
+                        clear_session_writeback_owner_if_owned(session_id, stream_id)
+                        return False
+
+                for field in _CHAT_START_ROLLBACK_FIELDS:
+                    value = snapshot.get(field, _CHAT_START_ROLLBACK_MISSING)
+                    if value is _CHAT_START_ROLLBACK_MISSING:
+                        try:
+                            delattr(session, field)
+                        except AttributeError:
+                            pass
+                    else:
+                        setattr(session, field, copy.deepcopy(value))
+                if not _restore_chat_start_persistence(
+                    session,
+                    before=before_persistence,
+                    prepared=prepared_persistence,
+                ):
+                    clear_session_writeback_owner_if_owned(session_id, stream_id)
+                    return False
+                if SESSIONS.get(session_id) is not session:
+                    logger.warning(
+                        "Refusing run-journal rollback for session %s: canonical owner rotated during restore",
+                        session_id or "?",
+                    )
+                    clear_session_writeback_owner_if_owned(session_id, stream_id)
+                    return False
+                clear_session_writeback_owner_if_owned(session_id, stream_id)
+                SESSIONS.move_to_end(session_id)
+                return True
 
 
 def _is_hidden_empty_session(s) -> bool:
@@ -22002,6 +22106,49 @@ def _agent_runtime_barrier_response(
     return None
 
 
+def _bind_chat_start_session_owner(session) -> dict | None:
+    """Bind a chat-start request to its exact in-memory session owner.
+
+    Callers hold the per-session agent lock before invoking this helper.  A
+    missing cache entry is installed with the request's object; an exact
+    same-object hit is retained; and a distinct or mismatched object fails
+    closed so preparation cannot mutate a stale owner.
+    """
+    sid = str(getattr(session, "session_id", "") or "")
+    if not sid or str(getattr(session, "session_id", "") or "") != sid:
+        return {
+            "error": "chat-start session owner identity is unavailable",
+            "type": "session_owner_unavailable",
+            "retryable": True,
+            "_status": 409,
+        }
+    with LOCK:
+        current = SESSIONS.get(sid)
+        if current is not None and str(getattr(current, "session_id", "") or "") != sid:
+            return {
+                "error": "chat-start canonical session owner identity is invalid",
+                "type": "session_owner_unavailable",
+                "retryable": True,
+                "_status": 409,
+            }
+        if current is None:
+            SESSIONS[sid] = session
+            SESSIONS.move_to_end(sid)
+            # Do not run cache eviction inside the identity fence: when every
+            # older entry is active, the not-yet-prepared owner could be the
+            # only evictable object and immediately lose canonical ownership.
+        elif current is session:
+            SESSIONS.move_to_end(sid)
+        else:
+            return {
+                "error": "chat-start canonical session owner changed; retry the request",
+                "type": "session_owner_conflict",
+                "retryable": True,
+                "_status": 409,
+            }
+    return None
+
+
 def _start_chat_stream_for_session(
     s,
     *,
@@ -22041,9 +22188,9 @@ def _start_chat_stream_for_session(
                 "active_stream_id": current_stream_id,
                 "_status": 409,
             }
-        # Stale stream id from a previous run; clear and continue.
-        diag.stage("stale_stream_cleanup") if diag else None
-        _clear_stale_stream_state(s)
+        # A stale stream id is cleared only after the per-session lock binds
+        # the exact canonical owner below.  Do not mutate a non-canonical
+        # object before that ownership fence.
 
     # #1932: check if this session has a pending goal continuation flag.
     # The streaming hook sets PENDING_GOAL_CONTINUATION when goal_continue fires,
@@ -22064,6 +22211,10 @@ def _start_chat_stream_for_session(
     diag.stage("session_lock_wait") if diag else None
     while True:
         with session_lock:
+            owner_error = _bind_chat_start_session_owner(s)
+            if owner_error is not None:
+                diag.stage("response_write") if diag else None
+                return owner_error
             locked_stream_id = getattr(s, "active_stream_id", None)
             if locked_stream_id:
                 if _active_stream_blocks_chat_start(s, locked_stream_id):

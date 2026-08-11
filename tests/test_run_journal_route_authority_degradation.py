@@ -153,6 +153,8 @@ def _install_authority_failure(monkeypatch, root: Path, session_id: str, mode: s
 
 @pytest.fixture
 def route_harness(monkeypatch, tmp_path):
+    original_sessions = list(models.SESSIONS.items())
+    models.SESSIONS.clear()
     _Thread.created = []
     monkeypatch.setattr(run_journal, "_default_session_dir", lambda: tmp_path)
     monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **_kwargs: None)
@@ -178,7 +180,9 @@ def route_harness(monkeypatch, tmp_path):
         "j",
         lambda _handler, payload, status=200, **_kwargs: {**payload, "_status": status},
     )
-    return tmp_path
+    yield tmp_path
+    models.SESSIONS.clear()
+    models.SESSIONS.update(original_sessions)
 
 
 @pytest.fixture
@@ -513,6 +517,195 @@ def test_real_rollback_refuses_external_sidecar_rotation(real_session_store, mon
     assert response["type"] == "run_journal_authority_rollback_failed"
     assert session.path.read_bytes() == b"external-sidecar-rotation"
     assert not backup_path.exists()
+
+
+def test_chat_start_rollback_refuses_distinct_canonical_owner(
+    real_session_store, monkeypatch
+):
+    """A rejected turn cannot roll back after the in-memory owner rotates."""
+    _configure_retired_activation_after_real_prepare(monkeypatch)
+    _use_real_writeback_owner_registry(monkeypatch)
+    session = models.Session(
+        session_id="chat-start-distinct-owner",
+        title="Existing title",
+        messages=[{"role": "assistant", "content": "before"}],
+    )
+    models.SESSIONS[session.session_id] = session
+    session.save(touch_updated_at=False)
+    successor = models.Session(
+        session_id=session.session_id,
+        title="Successor title",
+        messages=[{"role": "assistant", "content": "successor"}],
+    )
+
+    def rotate_owner_then_retire(_sid):
+        with models.LOCK:
+            models.SESSIONS[session.session_id] = successor
+        raise run_journal.RunJournalRetiredAuthorityError("retired")
+
+    monkeypatch.setattr(run_journal, "activate_run_journal_session", rotate_owner_then_retire)
+
+    response = routes._start_chat_stream_for_session(
+        session,
+        msg="rejected prompt",
+        workspace="/new/workspace",
+        model="new-model",
+        model_provider="new-provider",
+        external_runtime_owned=False,
+    )
+
+    assert response["_status"] == 500
+    assert response["type"] == "run_journal_authority_rollback_failed"
+    assert models.SESSIONS[session.session_id] is successor
+    assert successor.title == "Successor title"
+    persisted = json.loads(session.path.read_text(encoding="utf-8"))
+    assert persisted["pending_user_message"] == "rejected prompt"
+
+
+def test_chat_start_rollback_checks_index_owner_before_restoring_files(
+    real_session_store, monkeypatch
+):
+    """An externally replaced index row must leave prepared files untouched."""
+    _configure_retired_activation_after_real_prepare(monkeypatch)
+    _use_real_writeback_owner_registry(monkeypatch)
+    session = models.Session(
+        session_id="chat-start-rotated-index",
+        title="Existing title",
+        messages=[{"role": "assistant", "content": "before"}],
+    )
+    models.SESSIONS[session.session_id] = session
+    session.save(touch_updated_at=False)
+
+    def rotate_index_then_retire(_sid):
+        rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+        row = next(item for item in rows if item["session_id"] == session.session_id)
+        row["title"] = "Externally rotated index title"
+        real_session_store[1].write_text(json.dumps(rows), encoding="utf-8")
+        raise run_journal.RunJournalRetiredAuthorityError("retired")
+
+    monkeypatch.setattr(run_journal, "activate_run_journal_session", rotate_index_then_retire)
+
+    response = routes._start_chat_stream_for_session(
+        session,
+        msg="rejected prompt",
+        workspace="/new/workspace",
+        model="new-model",
+        model_provider="new-provider",
+        external_runtime_owned=False,
+    )
+
+    assert response["_status"] == 500
+    assert response["type"] == "run_journal_authority_rollback_failed"
+    assert session.pending_user_message == "rejected prompt"
+    persisted = json.loads(session.path.read_text(encoding="utf-8"))
+    assert persisted["pending_user_message"] == "rejected prompt"
+    index_rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+    index_row = next(item for item in index_rows if item["session_id"] == session.session_id)
+    assert index_row["title"] == "Externally rotated index title"
+
+
+@pytest.mark.parametrize("save_mode", ["deferred", "eager"])
+def test_chat_start_cold_resolver_cannot_replace_canonical_rollback_owner(
+    real_session_store, monkeypatch, save_mode
+):
+    """A loader that missed before prepare cannot publish rejected turn state."""
+    sid = f"chat-start-cold-owner-{save_mode}"
+    seed = models.Session(
+        session_id=sid,
+        title="Existing title",
+        workspace="/old/workspace",
+        model="old-model",
+        model_provider="old-provider",
+        messages=[{"role": "assistant", "content": "before"}],
+    )
+    seed.save(touch_updated_at=False)
+    before_bytes = seed.path.read_bytes()
+    before_payload = json.loads(before_bytes)
+
+    monkeypatch.setattr(routes, "_prepare_chat_start_session_for_stream", _ORIGINAL_PREPARE_CHAT_START)
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: save_mode)
+    monkeypatch.setattr(
+        routes,
+        "_provisional_title_from_prompt",
+        lambda *_args, **_kwargs: "Prompt title",
+    )
+    monkeypatch.setattr(run_journal, "validate_run_journal_session_activation", lambda _sid: None)
+    _use_real_writeback_owner_registry(monkeypatch)
+
+    load_observed_miss = threading.Event()
+    prepare_persisted = threading.Event()
+    cold_resolver_done = threading.Event()
+    resolver_errors = []
+    resolver_result = {}
+    real_load = models.Session.load
+    resolver_thread = None
+
+    def gated_load(cls, requested_sid):
+        assert requested_sid == sid
+        if threading.current_thread() is not resolver_thread:
+            return real_load(requested_sid)
+        load_observed_miss.set()
+        if not prepare_persisted.wait(3):
+            raise RuntimeError("timed out waiting for prepared sidecar")
+        return real_load(requested_sid)
+
+    monkeypatch.setattr(models.Session, "load", classmethod(gated_load))
+
+    def resolve_cold_session():
+        try:
+            resolver_result["session"] = models.get_session(sid)
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            resolver_errors.append(exc)
+        finally:
+            cold_resolver_done.set()
+
+    def retire_after_cold_publish(requested_sid):
+        assert requested_sid == sid
+        prepare_persisted.set()
+        if not cold_resolver_done.wait(3):
+            raise RuntimeError("timed out waiting for cold resolver publication")
+        raise run_journal.RunJournalRetiredAuthorityError("retired")
+
+    monkeypatch.setattr(run_journal, "activate_run_journal_session", retire_after_cold_publish)
+    resolver_thread = _REAL_THREAD(target=resolve_cold_session, name=f"cold-resolver-{save_mode}")
+    try:
+        resolver_thread.start()
+        assert load_observed_miss.wait(3)
+        chat_owner = models.get_session(sid)
+        assert models.SESSIONS[sid] is chat_owner
+        response = routes._start_chat_stream_for_session(
+            chat_owner,
+            msg="rejected prompt",
+            workspace="/new/workspace",
+            model="new-model",
+            model_provider="new-provider",
+            external_runtime_owned=False,
+        )
+    finally:
+        prepare_persisted.set()
+        resolver_thread.join(5)
+
+    assert not resolver_thread.is_alive()
+    assert not resolver_errors
+    assert response["_status"] == 409
+    assert response["type"] == "run_journal_authority_unavailable"
+    assert resolver_result["session"] is chat_owner
+    assert models.SESSIONS[sid] is chat_owner
+    assert chat_owner.path.read_bytes() == before_bytes
+
+    canonical = models.SESSIONS[sid]
+    canonical.title = "Metadata updated after rollback"
+    canonical.save(touch_updated_at=False)
+    after_metadata_save = json.loads(chat_owner.path.read_text(encoding="utf-8"))
+    assert after_metadata_save["active_stream_id"] == before_payload["active_stream_id"]
+    assert after_metadata_save["pending_user_message"] == before_payload["pending_user_message"]
+    assert after_metadata_save["pending_attachments"] == before_payload["pending_attachments"]
+    assert after_metadata_save["messages"] == before_payload["messages"]
+    durable_reload = real_load(sid)
+    assert durable_reload.active_stream_id == before_payload["active_stream_id"]
+    assert durable_reload.pending_user_message == before_payload["pending_user_message"]
+    assert durable_reload.pending_attachments == before_payload["pending_attachments"]
+    assert durable_reload.messages == before_payload["messages"]
 
 
 def test_chat_start_rollback_serializes_concurrent_same_session_save(

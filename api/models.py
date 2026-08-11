@@ -545,6 +545,98 @@ def prune_session_from_index(session_id: str) -> None:
         _write_session_index(updates=None)
 
 
+def _settle_session_index_row_locked(
+    session_id: str,
+    *,
+    expected: dict | None,
+    replacement: dict | None,
+) -> bool:
+    """Compare-and-set one session row while the index/global locks are held.
+
+    The caller must already hold ``_INDEX_WRITE_LOCK`` and the non-reentrant
+    ``LOCK``.  This helper deliberately acquires neither lock and never calls
+    ``_write_session_index``/``prune_session_from_index``; rollback paths use it
+    to settle one SID without re-entering ``LOCK`` or overwriting sibling rows.
+    ``expected`` is the exact post-prepare row (or ``None`` when no row should
+    exist).  ``replacement`` is the exact pre-prepare row to restore, or
+    ``None`` to remove the SID.
+    """
+    sid = str(session_id or "")
+    if not sid:
+        return False
+    index_path = SESSION_INDEX_FILE
+    try:
+        if index_path.exists():
+            rows = json.loads(index_path.read_bytes())
+        else:
+            rows = []
+    except (OSError, UnicodeDecodeError, TypeError, ValueError):
+        return False
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        return False
+
+    matches = [i for i, row in enumerate(rows) if row.get("session_id") == sid]
+    if expected is None:
+        if matches:
+            return False
+    elif len(matches) != 1 or rows[matches[0]] != expected:
+        return False
+
+    if replacement is None:
+        if not matches:
+            return True
+        settled = [row for i, row in enumerate(rows) if i not in matches]
+    elif matches:
+        settled = list(rows)
+        settled[matches[0]] = replacement
+    else:
+        settled = list(rows)
+        settled.append(replacement)
+    settled.sort(key=lambda row: row.get("updated_at", 0), reverse=True)
+
+    if settled == rows:
+        return True
+
+    temporary = index_path.with_suffix(
+        f".tmp.{os.getpid()}.{threading.current_thread().ident}"
+    )
+    try:
+        with open(temporary, "w", encoding="utf-8") as fh:
+            json.dump(settled, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _safe_replace(temporary, index_path)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def _session_index_row_matches_locked(
+    session_id: str,
+    *,
+    expected: dict | None,
+) -> bool:
+    """Check one SID's current index row without acquiring either lock."""
+    sid = str(session_id or "")
+    if not sid:
+        return False
+    index_path = SESSION_INDEX_FILE
+    try:
+        rows = json.loads(index_path.read_bytes()) if index_path.exists() else []
+    except (OSError, UnicodeDecodeError, TypeError, ValueError):
+        return False
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        return False
+    matches = [row for row in rows if row.get("session_id") == sid]
+    if expected is None:
+        return not matches
+    return len(matches) == 1 and matches[0] == expected
+
+
 # ---------------------------------------------------------------------------
 # #4985 webui zero-message orphan tombstone
 # ---------------------------------------------------------------------------
@@ -4785,8 +4877,42 @@ def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_m
     else:
         s = Session.load(sid)
     if s:
-        if cache_on_miss:
-            with LOCK:
+        # A cold loader can be delayed after reading the sidecar while a
+        # concurrent chat-start publishes a newer canonical owner.  Publish
+        # with compare-and-set semantics: never overwrite an exact same-SID
+        # owner that won the race, and fail closed if either object carries a
+        # different SID.  The latter is an identity violation, not a cache miss
+        # that can be healed by trusting the disk object.
+        if str(getattr(s, "session_id", "") or "") != str(sid):
+            logger.warning(
+                "refusing to publish mismatched cold session: requested %s but loaded %s",
+                sid,
+                getattr(s, "session_id", None),
+            )
+            raise KeyError(sid)
+        with LOCK:
+            current = SESSIONS.get(sid)
+            if current is not None:
+                if str(getattr(current, "session_id", "") or "") != str(sid):
+                    logger.warning(
+                        "refusing cold session publication behind mismatched owner: requested %s but cached %s",
+                        sid,
+                        getattr(current, "session_id", None),
+                    )
+                    raise KeyError(sid)
+                # The current exact object is authoritative.  A loader that
+                # observed the earlier miss must not replace it with a stale or
+                # metadata-only object read after the owner was published.
+                s = current
+                if promote_cache:
+                    SESSIONS.move_to_end(sid)
+                # Do not run cold-load repair/reconciliation against the
+                # losing loader's object after CAS.  The canonical owner may be
+                # under a chat-start prepare/rollback fence; returning it
+                # directly keeps the loser from mutating that owner outside
+                # the per-session lock.
+                return s
+            elif cache_on_miss:
                 SESSIONS[sid] = s
                 if promote_cache:
                     SESSIONS.move_to_end(sid)
