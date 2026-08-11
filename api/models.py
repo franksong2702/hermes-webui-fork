@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 import weakref
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
 try:  # pragma: no cover - platform-specific imports.
@@ -252,6 +252,48 @@ def _session_persistence_generation_is_current(session) -> bool:
             and not getattr(generation, "revoked", True)
             and _SESSION_PERSISTENCE_GENERATIONS.get(sid) is generation
         )
+
+
+def _bind_session_persistence_capability_for_identity_transition(
+    session, source_sid: str, target_sid: str
+) -> None:
+    """Bind *session* to the capability for an explicit SID transition.
+
+    ``Session.session_id`` remains an ordinary dynamic field: assigning it does
+    not implicitly acquire a write capability.  Callers that deliberately move
+    one live object to a new identity must identify both sides of that move so
+    the source generation can be checked before the target generation is
+    adopted.  Both SID locks are held in lexical order to keep this helper
+    composable with another concurrent transition.
+    """
+    source = str(source_sid or "")
+    target = str(target_sid or "")
+    if not source or not target or source == target:
+        raise ValueError("Identity transition requires distinct non-empty session ids")
+    if str(getattr(session, "session_id", "") or "") != target:
+        raise ValueError(
+            f"Identity transition target {target!r} does not match session.session_id"
+        )
+
+    with ExitStack() as locks:
+        for sid in sorted((source, target)):
+            locks.enter_context(_get_session_persistence_lock(sid))
+        with _SESSION_PERSISTENCE_GENERATIONS_LOCK:
+            source_generation = _SESSION_PERSISTENCE_GENERATIONS.get(source)
+            owned_generation = getattr(session, "_persistence_generation", None)
+            if (
+                owned_generation is None
+                or owned_generation is not source_generation
+                or getattr(owned_generation, "revoked", True)
+            ):
+                raise RuntimeError(
+                    f"Refusing identity transition from revoked/deleted session {source!r}"
+                )
+            target_generation = _SESSION_PERSISTENCE_GENERATIONS.get(target)
+            if target_generation is None or getattr(target_generation, "revoked", True):
+                target_generation = _SessionPersistenceCapability()
+                _SESSION_PERSISTENCE_GENERATIONS[target] = target_generation
+            session._persistence_generation = target_generation
 
 
 def _get_session_persistence_lock(session_id: str) -> threading.RLock:
@@ -1342,6 +1384,11 @@ def model_explicit_pick_signature(model, model_provider) -> str:
 
 
 class Session:
+    # Keep the in-process persistence capability out of the dynamic payload
+    # that is serialized/exported, while retaining every historical dynamic
+    # Session field and weak-reference support.
+    __slots__ = ("_persistence_generation", "__dict__", "__weakref__")
+
     def __init__(self, session_id: str=None, title: str='Untitled',
                  workspace=str(DEFAULT_WORKSPACE), created_workspace=None,
                  model=DEFAULT_MODEL,

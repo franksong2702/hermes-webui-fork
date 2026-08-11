@@ -525,12 +525,46 @@ def test_session_persistence_generation_registry_releases_unused_sid(
     session = models_module.Session(session_id=sid)
     capability_ref = weakref.ref(session._persistence_generation)
     assert models_module._SESSION_PERSISTENCE_GENERATIONS[sid] is capability_ref()
+    assert "_persistence_generation" not in session.__dict__
+    json.dumps(session.__dict__)
 
     del session
     gc.collect()
 
     assert capability_ref() is None
     assert sid not in models_module._SESSION_PERSISTENCE_GENERATIONS
+
+
+def test_session_identity_transition_requires_current_source_capability(models_module):
+    """A revoked owner cannot adopt a fresh SID after changing session_id."""
+    source_sid = "identity-transition-revoked-source"
+    target_sid = "identity-transition-target"
+    stale = models_module.Session(session_id=source_sid)
+    source_capability = stale._persistence_generation
+
+    with models_module._get_session_persistence_lock(source_sid):
+        models_module._advance_session_persistence_generation(source_sid)
+
+    stale.session_id = target_sid
+    with pytest.raises(RuntimeError, match="revoked|deleted"):
+        models_module._bind_session_persistence_capability_for_identity_transition(
+            stale, source_sid, target_sid
+        )
+
+    assert stale._persistence_generation is source_capability
+    assert source_capability.revoked is True
+    assert target_sid not in models_module._SESSION_PERSISTENCE_GENERATIONS
+
+
+def test_session_identity_transition_rejects_same_sid(models_module):
+    """The privileged transition helper cannot refresh one SID in place."""
+    sid = "identity-transition-same-sid"
+    session = models_module.Session(session_id=sid)
+
+    with pytest.raises(ValueError, match="distinct"):
+        models_module._bind_session_persistence_capability_for_identity_transition(
+            session, sid, sid
+        )
 
 
 def test_successful_delete_revokes_delayed_session_save(
