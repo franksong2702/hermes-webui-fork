@@ -263,6 +263,10 @@ var __autoReadCalls = 0;
 function autoReadLastAssistant() { __autoReadCalls += 1; }
 var __highlightCalls = 0;
 function highlightCode() { __highlightCalls += 1; }
+var __copyButtonCalls = 0;
+function addCopyButtons() { __copyButtonCalls += 1; }
+var __katexCalls = 0;
+function renderKatexBlocks() { __katexCalls += 1; }
 
 // ui.js renderer hooks: chatActivityMode() is the production mode source;
 // renderLiveAnchorActivityScene() is the DOM paint step — recorded here so
@@ -1206,9 +1210,17 @@ def test_done_a_attach_done_release_b_blocks_a_delayed_tts_callback():
         __results.terminalRafCount = terminalRafs.length;
         terminalRafs[0].fn();
         __results.highlightCallsAfterA = __highlightCalls;
+        __results.copyButtonCallsAfterA = __copyButtonCalls;
+        __results.katexCallsAfterA = __katexCalls;
         __results.ttsTimerCount = ttsTimers.length;
         ttsTimers[0].fn();
         __results.autoReadCallsAfterA = __autoReadCalls;
+        terminalRafs[1].fn();
+        __results.highlightCallsAfterB = __highlightCalls;
+        __results.copyButtonCallsAfterB = __copyButtonCalls;
+        __results.katexCallsAfterB = __katexCalls;
+        ttsTimers[1].fn();
+        __results.autoReadCallsAfterB = __autoReadCalls;
         __results.latestBIsReleased = !LIVE_STREAMS[SID] && __esCreated[1].readyState === EventSource.CLOSED;
         __results.bGraceStillPresent = window._streamJustFinished;
         """
@@ -1217,8 +1229,14 @@ def test_done_a_attach_done_release_b_blocks_a_delayed_tts_callback():
     assert result == {
         "terminalRafCount": 2,
         "highlightCallsAfterA": 0,
+        "copyButtonCallsAfterA": 0,
+        "katexCallsAfterA": 0,
         "ttsTimerCount": 2,
         "autoReadCallsAfterA": 0,
+        "highlightCallsAfterB": 1,
+        "copyButtonCallsAfterB": 1,
+        "katexCallsAfterB": 1,
+        "autoReadCallsAfterB": 1,
         "latestBIsReleased": True,
         "bGraceStillPresent": True,
     }
