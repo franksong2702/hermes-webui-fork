@@ -536,6 +536,9 @@ def test_chat_start_restore_failure_quarantines_exact_real_session(
     )
     models.SESSIONS[sid] = session
     session.save(touch_updated_at=False)
+    retired_generation = session._persistence_generation
+    captured_same_generation = models.Session(session_id=sid, title="captured")
+    assert captured_same_generation._persistence_generation is retired_generation
     backup_path = session.path.with_suffix(".json.bak")
     backup_path.write_bytes(b"preexisting-backup")
 
@@ -575,6 +578,7 @@ def test_chat_start_restore_failure_quarantines_exact_real_session(
     assert sid not in models.SESSIONS
     assert session._persistence_revoked is True
     assert "_persistence_revoked" not in session.__dict__
+    assert retired_generation.revoked is True
     durable_after_failure = {
         "sidecar": session.path.read_bytes() if session.path.exists() else None,
         "backup": backup_path.read_bytes() if backup_path.exists() else None,
@@ -585,6 +589,9 @@ def test_chat_start_restore_failure_quarantines_exact_real_session(
     session.title = "stale overwrite attempt"
     with pytest.raises(RuntimeError, match="persistence-revoked"):
         session.save(touch_updated_at=False)
+    captured_same_generation.title = "second stale overwrite attempt"
+    with pytest.raises(RuntimeError, match="revoked|deleted"):
+        captured_same_generation.save(touch_updated_at=False)
     assert (
         session.path.read_bytes() if session.path.exists() else None
     ) == durable_after_failure["sidecar"]
@@ -599,6 +606,8 @@ def test_chat_start_restore_failure_quarantines_exact_real_session(
 
     reloaded = models.Session.load(sid)
     assert reloaded is not session
+    assert reloaded._persistence_generation is not retired_generation
+    assert reloaded._persistence_generation.revoked is False
     assert reloaded.path.read_bytes() == durable_after_failure["sidecar"]
 
 

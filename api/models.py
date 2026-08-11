@@ -227,8 +227,8 @@ def _advance_session_persistence_generation(session_id: str):
 
     The caller must already hold the SID persistence lock.  Keeping this
     operation separate from the lock itself makes the lock order explicit at
-    delete call sites.  The registry entry is removed so the next explicit
-    same-SID construction gets a fresh capability.
+    deletion and uncertain-rollback call sites.  The registry entry is removed
+    so the next explicit same-SID construction gets a fresh capability.
     """
     sid = str(session_id or "")
     with _SESSION_PERSISTENCE_GENERATIONS_LOCK:

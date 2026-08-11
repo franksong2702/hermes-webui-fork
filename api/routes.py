@@ -21989,7 +21989,11 @@ def _rollback_chat_start_session_after_authority_failure(
     claiming a clean retryable 409.
     """
     session_id = str(getattr(session, "session_id", "") or "")
-    from api.models import _INDEX_WRITE_LOCK, _get_session_persistence_lock
+    from api.models import (
+        _INDEX_WRITE_LOCK,
+        _advance_session_persistence_generation,
+        _get_session_persistence_lock,
+    )
 
     # The caller already owns the per-session agent lock.  Keep the fixed
     # agent -> persistence -> index -> global-owner lock order across every
@@ -22105,6 +22109,7 @@ def _rollback_chat_start_session_after_authority_failure(
             # the existing agent -> persistence -> index -> LOCK fence, clear
             # only its writeback owner, and evict only if it remains canonical.
             session._persistence_revoked = True
+            _advance_session_persistence_generation(session_id)
             clear_session_writeback_owner_if_owned(session_id, stream_id)
             if SESSIONS.get(session_id) is session:
                 SESSIONS.pop(session_id, None)
