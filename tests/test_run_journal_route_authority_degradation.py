@@ -519,6 +519,89 @@ def test_real_rollback_refuses_external_sidecar_rotation(real_session_store, mon
     assert not backup_path.exists()
 
 
+@pytest.mark.parametrize("failure_stage", ["sidecar", "backup", "index"])
+def test_chat_start_restore_failure_quarantines_exact_real_session(
+    real_session_store, monkeypatch, failure_stage
+):
+    """Any partial durable restore failure quarantines the prepared owner."""
+    _configure_retired_activation_after_real_prepare(monkeypatch)
+    owners = _use_real_writeback_owner_registry(monkeypatch)
+    sid = "chat-start-restore-failure-quarantine"
+    session = models.Session(
+        session_id=sid,
+        title="Existing title",
+        workspace="/old/workspace",
+        model="old-model",
+        messages=[{"role": "assistant", "content": "before"}],
+    )
+    models.SESSIONS[sid] = session
+    session.save(touch_updated_at=False)
+    backup_path = session.path.with_suffix(".json.bak")
+    backup_path.write_bytes(b"preexisting-backup")
+
+    def retire_after_prepare(_sid):
+        raise run_journal.RunJournalRetiredAuthorityError("retired")
+
+    monkeypatch.setattr(run_journal, "activate_run_journal_session", retire_after_prepare)
+
+    if failure_stage in {"sidecar", "backup"}:
+        real_restore = routes._restore_chat_start_file
+        restore_calls = []
+
+        def fail_restore(snapshot):
+            restore_calls.append(snapshot["path"])
+            if len(restore_calls) == (1 if failure_stage == "sidecar" else 2):
+                raise OSError(f"rollback {failure_stage} restore denied")
+            return real_restore(snapshot)
+
+        monkeypatch.setattr(routes, "_restore_chat_start_file", fail_restore)
+    else:
+        monkeypatch.setattr(
+            routes,
+            "_settle_chat_start_session_index_locked",
+            lambda *_args, **_kwargs: False,
+        )
+    response = routes._start_chat_stream_for_session(
+        session,
+        msg="hello",
+        workspace="/new/workspace",
+        model="new-model",
+        external_runtime_owned=False,
+    )
+
+    assert response["_status"] == 500
+    assert response["type"] == "run_journal_authority_rollback_failed"
+    assert owners == {}
+    assert sid not in models.SESSIONS
+    assert session._persistence_revoked is True
+    assert "_persistence_revoked" not in session.__dict__
+    durable_after_failure = {
+        "sidecar": session.path.read_bytes() if session.path.exists() else None,
+        "backup": backup_path.read_bytes() if backup_path.exists() else None,
+        "index": real_session_store[1].read_bytes()
+        if real_session_store[1].exists()
+        else None,
+    }
+    session.title = "stale overwrite attempt"
+    with pytest.raises(RuntimeError, match="persistence-revoked"):
+        session.save(touch_updated_at=False)
+    assert (
+        session.path.read_bytes() if session.path.exists() else None
+    ) == durable_after_failure["sidecar"]
+    assert (
+        backup_path.read_bytes() if backup_path.exists() else None
+    ) == durable_after_failure["backup"]
+    assert (
+        real_session_store[1].read_bytes()
+        if real_session_store[1].exists()
+        else None
+    ) == durable_after_failure["index"]
+
+    reloaded = models.Session.load(sid)
+    assert reloaded is not session
+    assert reloaded.path.read_bytes() == durable_after_failure["sidecar"]
+
+
 def test_chat_start_rollback_refuses_distinct_canonical_owner(
     real_session_store, monkeypatch
 ):

@@ -1387,7 +1387,12 @@ class Session:
     # Keep the in-process persistence capability out of the dynamic payload
     # that is serialized/exported, while retaining every historical dynamic
     # Session field and weak-reference support.
-    __slots__ = ("_persistence_generation", "__dict__", "__weakref__")
+    __slots__ = (
+        "_persistence_generation",
+        "_persistence_revoked",
+        "__dict__",
+        "__weakref__",
+    )
 
     def __init__(self, session_id: str=None, title: str='Untitled',
                  workspace=str(DEFAULT_WORKSPACE), created_workspace=None,
@@ -1449,6 +1454,10 @@ class Session:
         if _persistence_generation is None:
             _persistence_generation = _current_session_persistence_generation(self.session_id)
         self._persistence_generation = _persistence_generation
+        # Exact-object quarantine state is process-local and must never enter
+        # the dynamic/exported payload.  A replacement Session.load() receives
+        # a fresh, unquarantined object for the same durable SID.
+        self._persistence_revoked = False
         self.title = title
         self.workspace = str(Path(workspace).expanduser().resolve())
         # #6672: immutable snapshot of the workspace at session creation time.
@@ -1599,15 +1608,15 @@ class Session:
             )
 
     def _save_locked(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
+        if getattr(self, "_persistence_revoked", False):
+            raise RuntimeError(
+                f"Refusing to save persistence-revoked session {self.session_id!r}: "
+                "the exact in-memory owner was quarantined after rollback failure"
+            )
         if not _session_persistence_generation_is_current(self):
             raise RuntimeError(
                 f"Refusing to save revoked/deleted session {self.session_id!r}: "
                 "its persistence generation is no longer current"
-            )
-        if getattr(self, "_auxiliary_persistence_revoked", False):
-            raise RuntimeError(
-                f"Refusing to save revoked auxiliary session {self.session_id!r}: "
-                "the exact object was removed after run-journal authority failure"
             )
         if touch_updated_at:
             self.updated_at = time.time()

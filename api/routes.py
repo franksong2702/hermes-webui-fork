@@ -21831,7 +21831,7 @@ def _rollback_auxiliary_session_after_authority_failure(
                         session_id,
                     )
                     return False
-                session._auxiliary_persistence_revoked = True
+                session._persistence_revoked = True
                 SESSIONS.pop(session_id, None)
     return True
 
@@ -22097,7 +22097,17 @@ def _rollback_chat_start_session_after_authority_failure(
             before=before_persistence,
             prepared=prepared_persistence,
         ):
+            # Durable restore failed after the in-memory rollback fields were
+            # staged.  The exact object is now unsafe to write: restoration
+            # may have partially changed the sidecar/index, so retaining a
+            # save-capable canonical object could overwrite the only durable
+            # image whose state is still authoritative.  Quarantine it inside
+            # the existing agent -> persistence -> index -> LOCK fence, clear
+            # only its writeback owner, and evict only if it remains canonical.
+            session._persistence_revoked = True
             clear_session_writeback_owner_if_owned(session_id, stream_id)
+            if SESSIONS.get(session_id) is session:
+                SESSIONS.pop(session_id, None)
             return False
         if SESSIONS.get(session_id) is not session:
             logger.warning(
