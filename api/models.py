@@ -615,28 +615,6 @@ def _settle_session_index_row_locked(
     return True
 
 
-def _session_index_row_matches_locked(
-    session_id: str,
-    *,
-    expected: dict | None,
-) -> bool:
-    """Check one SID's current index row without acquiring either lock."""
-    sid = str(session_id or "")
-    if not sid:
-        return False
-    index_path = SESSION_INDEX_FILE
-    try:
-        rows = json.loads(index_path.read_bytes()) if index_path.exists() else []
-    except (OSError, UnicodeDecodeError, TypeError, ValueError):
-        return False
-    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-        return False
-    matches = [row for row in rows if row.get("session_id") == sid]
-    if expected is None:
-        return not matches
-    return len(matches) == 1 and matches[0] == expected
-
-
 # ---------------------------------------------------------------------------
 # #4985 webui zero-message orphan tombstone
 # ---------------------------------------------------------------------------
