@@ -364,16 +364,17 @@ def test_server_delete_prunes_session_index(cleanup_test_sessions):
 
 def test_server_delete_removes_session_bak_snapshot(cleanup_test_sessions):
     """session/delete must remove sidecar backups so deleted sessions stay deleted."""
-    routes_src = (REPO_ROOT / "api" / "routes.py").read_text()
-    delete_idx = max(
-        routes_src.find("if parsed.path == '/api/session/delete':"),
-        routes_src.find('if parsed.path == "/api/session/delete":'),
-    )
-    assert delete_idx >= 0, "session/delete handler not found in api/routes.py"
-    delete_end = routes_src.find('if parsed.path == "/api/session/clear":', delete_idx)
-    delete_block = routes_src[delete_idx:delete_end if delete_end >= 0 else None]
-    assert "with_suffix('.json.bak').unlink" in delete_block or 'with_suffix(".json.bak").unlink' in delete_block, \
-        "session/delete must unlink <sid>.json.bak to avoid later orphan-backup recovery"
+    sid = make_session(cleanup_test_sessions)
+    from api.models import SESSION_DIR
+
+    backup = SESSION_DIR / f"{sid}.json.bak"
+    backup.write_text("{}", encoding="utf-8")
+    assert backup.exists(), f"failed to create backup fixture at {backup}"
+
+    result, status = post("/api/session/delete", {"session_id": sid})
+    assert status == 200, f"session/delete failed with {status}: {result}"
+    assert result.get("ok") is True, f"session/delete did not report success: {result}"
+    assert not backup.exists(), f"deleted session backup still exists at {backup}"
 
 # ── R9: Token/tool SSE events write to wrong session after switch ─────────────
 
