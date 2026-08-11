@@ -445,7 +445,69 @@ def _trace_payload(session, fake_queue, stream_id: str):
     }
 
 
-def test_process_wakeup_normal_completion_beats_late_partial_snapshot(tmp_path, monkeypatch):
+def _phase0_merge_inputs(scope):
+    stream_id = f"stream-6749-phase0-{scope}"
+    wakeup_prompt = "[IMPORTANT: Background process completed]"
+    previous_session = _prepare_persisted_wakeup_final(
+        f"issue6749-phase0-previous-{scope}",
+        stream_id,
+        wakeup_prompt,
+    )
+    previous_display = copy.deepcopy(previous_session.messages)
+    candidates = copy.deepcopy(
+        _closed_wakeup_session(
+            f"issue6749-phase0-candidates-{scope}",
+            stream_id,
+        ).messages
+    )
+    active_identity = {
+        "source": "process_wakeup",
+        "stream_id": stream_id,
+        "token": streaming.build_active_turn_token(stream_id, 1234567890.0),
+        "turn_id": "turn-6749-wakeup",
+        "run_id": f"run:{stream_id}",
+    }
+    provenance = {
+        "verification_nudge_seen": False,
+        "active_turn_identity": active_identity,
+    }
+    return (
+        previous_display,
+        copy.deepcopy(previous_display),
+        candidates,
+        wakeup_prompt,
+        provenance,
+    )
+
+
+def test_process_wakeup_merge_preserves_replay_without_settlement_authorization(monkeypatch):
+    previous_display, previous_context, candidates, wakeup_prompt, provenance = (
+        _phase0_merge_inputs("default")
+    )
+    strip_calls = []
+
+    def spy_strip(previous, candidate_rows, active_identity):
+        strip_calls.append((previous, candidate_rows, active_identity))
+        return previous
+
+    monkeypatch.setattr(streaming, "_strip_replayed_process_wakeup_arc", spy_strip)
+    merged = streaming._merge_display_messages_after_agent_result(
+        previous_display,
+        previous_context,
+        candidates,
+        wakeup_prompt,
+        source="process_wakeup",
+        verification_nudge_provenance=provenance,
+    )
+
+    assert strip_calls == []
+    assert sum(
+        row.get("role") == "assistant" and row.get("content") == "Final wakeup answer"
+        for row in merged
+    ) == 2
+
+
+def test_process_wakeup_normal_completion_preserves_replay_before_settlement(tmp_path, monkeypatch):
     session_id = "issue6749-wakeup"
     stream_id = "stream-6749-wakeup"
     wakeup_prompt = "[IMPORTANT: Background process completed]"
@@ -471,14 +533,20 @@ def test_process_wakeup_normal_completion_beats_late_partial_snapshot(tmp_path, 
     stream_event_names = trace["stream_events"]
     assert stream_event_names.count("done") == 1, f"faithful trace emitted wrong terminal events; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
     assert "apperror" not in stream_event_names, f"faithful trace emitted generated failure; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
-    assert len(final_rows) == 1, f"final assistant ownership was not preserved; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
+    assert len(final_rows) == 2, f"phase-0 settlement deleted a replay observation without authorization; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
     assert not any(row.get("_error") for row in saved.messages), f"error row persisted; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
     assert not any(row.get("_partial") for row in saved.messages), f"late partial marker survived; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
-    final_index = saved.messages.index(final_rows[0])
     active_user_index = next(
         index
         for index, row in enumerate(saved.messages)
         if row.get("role") == "user" and row.get("_source") == "process_wakeup"
+    )
+    final_index = next(
+        index
+        for index, row in enumerate(saved.messages)
+        if index > active_user_index
+        and row.get("role") == "assistant"
+        and row.get("content") == "Final wakeup answer"
     )
     assert final_index > active_user_index, f"final row not settled behind its owner; evidence={trace_path}\n{json.dumps(trace, indent=2)}"
     current_arc = saved.messages[active_user_index + 1 : final_index]
@@ -509,20 +577,24 @@ def test_process_wakeup_normal_completion_beats_late_partial_snapshot(tmp_path, 
         for row in saved.messages
         if row.get("role") == "tool" and row.get("tool_call_id")
     ]
-    assert all_call_ids.count("call-6749-1") == 1
-    assert all_call_ids.count("call-6749-2") == 1
-    assert all_result_ids.count("call-6749-1") == 1
-    assert all_result_ids.count("call-6749-2") == 1
-    assert not any(
-        row.get("role") == "assistant"
-        and any(call.get("id") in {"call-6749-1", "call-6749-2"} for call in row.get("tool_calls") or [])
+    assert all_call_ids.count("call-6749-1") == 2
+    assert all_call_ids.count("call-6749-2") == 2
+    assert all_result_ids.count("call-6749-1") == 2
+    assert all_result_ids.count("call-6749-2") == 2
+    prior_call_ids = [
+        call.get("id")
         for row in saved.messages[:active_user_index]
-    )
-    assert not any(
-        row.get("role") == "tool"
-        and row.get("tool_call_id") in {"call-6749-1", "call-6749-2"}
+        if row.get("role") == "assistant"
+        for call in row.get("tool_calls") or []
+        if isinstance(call, dict) and call.get("id")
+    ]
+    prior_result_ids = [
+        row.get("tool_call_id")
         for row in saved.messages[:active_user_index]
-    )
+        if row.get("role") == "tool" and row.get("tool_call_id")
+    ]
+    assert prior_call_ids == ["call-6749-1", "call-6749-2"]
+    assert prior_result_ids == prior_call_ids
     assert next(
         row["terminal_state"]
         for row in trace["run_journal"]

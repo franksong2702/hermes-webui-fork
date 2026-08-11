@@ -6685,11 +6685,11 @@ def _merge_display_messages_after_agent_result(
             )
         candidates = turn_candidates
 
-    previous_display = _strip_replayed_process_wakeup_arc(
-        previous_display,
-        candidates,
-        _active_turn_identity,
-    )
+    # Phase 0 of the process-wakeup replay settlement contract: display merge
+    # runs before terminal classification and persistence, so it cannot
+    # authorize destructive history cleanup. A future prepare -> classify ->
+    # commit path must live after durable normal completion and must not
+    # re-enable deletion here with a caller-provided boolean.
 
     merged = previous_display[:]
     seen = {_message_identity(m) for m in merged}
