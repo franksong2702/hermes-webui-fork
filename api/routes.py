@@ -15152,33 +15152,55 @@ def handle_post(handler, parsed) -> bool:
                         "ok": False,
                         "state_db_cleanup_failed": False,
                         "run_journal_cleanup_failed": True,
+                        "session_artifact_cleanup_failed": False,
                         **worktree_retained,
                         "error": "Run journal cleanup failed; retry deletion",
+                    },
+                    status=500,
+                )
+            try:
+                p = (SESSION_DIR / f"{sid}.json").resolve()
+                p.relative_to(SESSION_DIR.resolve())
+            except Exception:
+                return bad(handler, "Invalid session_id", 400)
+            backup = p.with_suffix('.json.bak')
+            residual_artifacts = []
+            for artifact in (p, backup):
+                try:
+                    artifact.unlink(missing_ok=True)
+                except Exception:
+                    logger.debug("Failed to unlink session artifact %s", artifact, exc_info=True)
+                try:
+                    if artifact.exists():
+                        residual_artifacts.append(artifact.name)
+                except Exception:
+                    logger.debug("Failed to verify session artifact removal %s", artifact, exc_info=True)
+                    residual_artifacts.append(artifact.name)
+            if residual_artifacts:
+                logger.warning(
+                    "Session artifact cleanup failed for %s: %s",
+                    sid,
+                    ", ".join(residual_artifacts),
+                )
+                return j(
+                    handler,
+                    {
+                        "ok": False,
+                        "state_db_cleanup_failed": False,
+                        "run_journal_cleanup_failed": False,
+                        "session_artifact_cleanup_failed": True,
+                        **worktree_retained,
+                        "error": "Session file cleanup failed; retry deletion",
                     },
                     status=500,
                 )
             with LOCK:
                 SESSIONS.pop(sid, None)
             try:
-                p = (SESSION_DIR / f"{sid}.json").resolve()
-                p.relative_to(SESSION_DIR.resolve())
-            except Exception:
-                return bad(handler, "Invalid session_id", 400)
-            sidecar_deleted = False
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to unlink session file %s", p)
-            sidecar_deleted = not p.exists()
-            try:
                 prune_session_from_index(sid)
             except Exception:
                 logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
-            try:
-                p.with_suffix('.json.bak').unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to unlink session backup file %s", p.with_suffix('.json.bak'))
-            if sidecar_deleted and not is_messaging_session:
+            if not is_messaging_session:
                 try:
                     _record_webui_deleted_session_tombstone(sid)
                 except Exception:
@@ -15240,6 +15262,7 @@ def handle_post(handler, parsed) -> bool:
                 "ok": True,
                 "state_db_cleanup_failed": state_db_cleanup_failed,
                 "run_journal_cleanup_failed": False,
+                "session_artifact_cleanup_failed": False,
                 **worktree_retained,
             },
         )

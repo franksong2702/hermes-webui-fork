@@ -2,6 +2,8 @@ import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import api.models as models
 import api.run_journal as run_journal
 import api.routes as routes
@@ -127,15 +129,7 @@ def test_delete_session_records_tombstone_when_state_db_delete_fails(tmp_path, m
     def fail_delete(value):
         raise RuntimeError("state.db locked")
 
-    real_unlink = Path.unlink
-
-    def fail_backup_unlink(path, *args, **kwargs):
-        if path.name == f"{sid}.json.bak":
-            raise PermissionError("backup locked")
-        return real_unlink(path, *args, **kwargs)
-
     monkeypatch.setattr(models, "delete_cli_session", fail_delete)
-    monkeypatch.setattr(Path, "unlink", fail_backup_unlink)
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
 
@@ -143,6 +137,7 @@ def test_delete_session_records_tombstone_when_state_db_delete_fails(tmp_path, m
     assert captured["payload"]["ok"] is True
     assert captured["payload"]["state_db_cleanup_failed"] is True
     assert not (session_dir / f"{sid}.json").exists()
+    assert not (session_dir / f"{sid}.json.bak").exists()
     assert sid in models._load_webui_deleted_session_tombstone()
 
 
@@ -198,6 +193,67 @@ def test_delete_session_reports_run_journal_cleanup_failure(tmp_path, monkeypatc
     assert captured["payload"]["run_journal_cleanup_failed"] is False
     assert "error" not in captured["payload"]
     assert not (session_dir / f"{sid}.json").exists()
+    assert sid not in SESSIONS
+    assert state_db_delete_calls == [sid]
+    assert [event for event, _kwargs in published] == ["session_delete"]
+
+
+@pytest.mark.parametrize("blocked_suffix", [".json", ".json.bak"])
+def test_delete_session_reports_durable_artifact_cleanup_failure(
+    tmp_path, monkeypatch, blocked_suffix
+):
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = f"{blocked_suffix.removeprefix('.').replace('.', '')}artifactdelete1"
+    session = Session(session_id=sid, title="Artifact cleanup failure")
+    session.save()
+    backup = session_dir / f"{sid}.json.bak"
+    backup.write_text("backup", encoding="utf-8")
+    captured = _capture_post(monkeypatch, {"session_id": sid})
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda value: {})
+    monkeypatch.setattr(routes, "_is_messaging_session_id", lambda value: False)
+
+    state_db_delete_calls = []
+    monkeypatch.setattr(
+        models,
+        "delete_cli_session",
+        lambda value: state_db_delete_calls.append(value) or True,
+    )
+    published = []
+    monkeypatch.setattr(
+        routes,
+        "_publish_session_list_changed",
+        lambda event, **kwargs: published.append((event, kwargs)),
+    )
+
+    real_unlink = Path.unlink
+    blocked_once = True
+
+    def fail_artifact_unlink_once(path, *args, **kwargs):
+        nonlocal blocked_once
+        if blocked_once and path.name == f"{sid}{blocked_suffix}":
+            blocked_once = False
+            raise PermissionError("session artifact locked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_artifact_unlink_once)
+
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
+
+    assert captured["status"] == 500
+    assert captured["payload"]["ok"] is False
+    assert captured["payload"]["session_artifact_cleanup_failed"] is True
+    assert captured["payload"]["run_journal_cleanup_failed"] is False
+    assert (session_dir / f"{sid}{blocked_suffix}").exists()
+    assert sid in SESSIONS
+    assert state_db_delete_calls == []
+    assert published == []
+
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
+
+    assert captured["status"] == 200
+    assert captured["payload"]["ok"] is True
+    assert not (session_dir / f"{sid}.json").exists()
+    assert not backup.exists()
     assert sid not in SESSIONS
     assert state_db_delete_calls == [sid]
     assert [event for event, _kwargs in published] == ["session_delete"]
