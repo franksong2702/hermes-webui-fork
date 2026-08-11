@@ -22189,9 +22189,9 @@ def _start_chat_stream_for_session(
                 "active_stream_id": current_stream_id,
                 "_status": 409,
             }
-        # A stale stream id is cleared only after the per-session lock binds
-        # the exact canonical owner below.  Do not mutate a non-canonical
-        # object before that ownership fence.
+        # Cleanup is deferred until the per-session lock binds the exact
+        # canonical owner below.  Do not mutate a non-canonical object before
+        # that ownership fence.
 
     # #1932: check if this session has a pending goal continuation flag.
     # The streaming hook sets PENDING_GOAL_CONTINUATION when goal_continue fires,
@@ -22300,6 +22300,7 @@ def _start_chat_stream_for_session(
                     run_journal_incarnation = None
                 break
         if needs_stale_cleanup:
+            # Stale stream id from a previous run; clear and continue.
             diag.stage("stale_stream_cleanup") if diag else None
             cleared = _clear_stale_stream_state(s)
             if not cleared and getattr(s, "active_stream_id", None):
