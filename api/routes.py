@@ -3918,6 +3918,52 @@ def _ensure_full_session_before_mutation(sid: str, session):
     return full_session
 
 
+def _revalidate_mutation_session_owner(sid: str, admitted_session):
+    """Resolve the canonical owner again while a mutation lock is held.
+
+    Route handlers resolve a session before waiting for the per-SID agent lock
+    so validation and profile checks can run cheaply.  A delete or owner
+    rotation may win that lock before the handler enters its mutation block,
+    however.  Re-resolving inside the lock and requiring object identity keeps
+    the decision and the subsequent save on one canonical owner: a missing
+    owner is a 404, while a live successor is a 409 conflict for the stale
+    request.
+    """
+    try:
+        # Revalidation is deliberately non-materializing.  A delete keeps the
+        # old sidecar available until its durable cleanup commits; falling
+        # back to state.db here could create a fresh sidecar under the stale
+        # mutation before the delete reaches its later cleanup phase.
+        current = get_session(sid)
+    except KeyError:
+        return None, 404, "Session not found"
+    except PermissionError:
+        return None, 403, "Read-only imported sessions cannot be modified from WebUI"
+    if current is not admitted_session:
+        return None, 409, "Session owner changed; retry the mutation"
+    return current, None, None
+
+
+def _session_index_prune_verified(sid: str) -> bool:
+    """Confirm that the durable index no longer contains ``sid``.
+
+    ``prune_session_from_index`` has a best-effort fallback for corrupt or
+    missing indexes and may therefore return without proving settlement.  A
+    delete may revoke the old persistence capability only after this readback
+    confirms either a missing index or a valid list with no matching row.
+    """
+    try:
+        if not SESSION_INDEX_FILE.exists():
+            return True
+        rows = json.loads(SESSION_INDEX_FILE.read_bytes())
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return False
+        return not any(row.get("session_id") == sid for row in rows)
+    except Exception:
+        logger.debug("Failed to verify deleted session index settlement for %s", sid, exc_info=True)
+        return False
+
+
 _ANCHOR_ACTIVITY_SCENE_MAX_BYTES = 256_000
 _ANCHOR_ACTIVITY_SCENE_MAX_ROWS = 1_000
 
@@ -5137,6 +5183,9 @@ def _handle_session_anchor_scene(handler, body):
     if not _session_visible_to_active_profile(getattr(s, "profile", None) or None, handler):
         return bad(handler, "Session not found", 404)
     with _get_session_agent_lock(sid):
+        s, owner_status, owner_error = _revalidate_mutation_session_owner(sid, s)
+        if owner_status:
+            return bad(handler, owner_error, owner_status)
         idx, message = _find_anchor_scene_message(
             getattr(s, "messages", None) or [],
             message_index=message_index,
@@ -9628,6 +9677,8 @@ from api.models import (
     _enrich_sidebar_lineage_metadata,
     _active_stream_ids,
     _evict_sessions_over_cap,
+    _get_session_persistence_lock,
+    _advance_session_persistence_generation,
     _merge_session_display_metadata,
     _session_message_merge_key,
     _session_messages_have_prefix,
@@ -14823,6 +14874,11 @@ def handle_post(handler, parsed) -> bool:
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be renamed from WebUI", 403)
         with _get_session_agent_lock(body["session_id"]):
+            s, owner_status, owner_error = _revalidate_mutation_session_owner(
+                body["session_id"], s
+            )
+            if owner_status:
+                return bad(handler, owner_error, owner_status)
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, body["title"])
             s.save()
@@ -14903,6 +14959,9 @@ def handle_post(handler, parsed) -> bool:
             else:
                 prompt = str(value)
         with _get_session_agent_lock(sid):
+            s, owner_status, owner_error = _revalidate_mutation_session_owner(sid, s)
+            if owner_status:
+                return bad(handler, owner_error, owner_status)
             s.personality = name if name else None
             s.save()
         return j(handler, {"ok": True, "personality": s.personality, "prompt": prompt})
@@ -14930,6 +14989,9 @@ def handle_post(handler, parsed) -> bool:
         except KeyError:
             return bad(handler, "Session not found", 404)
         with _get_session_agent_lock(sid):
+            s, owner_status, owner_error = _revalidate_mutation_session_owner(sid, s)
+            if owner_status:
+                return bad(handler, owner_error, owner_status)
             s.enabled_toolsets = toolsets
             s.save()
         return j(handler, {"ok": True, "enabled_toolsets": s.enabled_toolsets})
@@ -14988,6 +15050,9 @@ def handle_post(handler, parsed) -> bool:
         unchanged = False
         with _get_session_agent_lock(sid):
             _draft_mark("acquired_lock")
+            s, owner_status, owner_error = _revalidate_mutation_session_owner(sid, s)
+            if owner_status:
+                return bad(handler, owner_error, owner_status)
             current_draft = dict(getattr(s, "composer_draft", {}) or {})
             next_draft = dict(current_draft)
             if text is not None:
@@ -15039,14 +15104,19 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
-        old_ws = getattr(s, "workspace", "")
-        old_model = getattr(s, "model", None)
-        old_provider = getattr(s, "model_provider", None)
-        try:
-            new_ws = str(resolve_trusted_workspace(body.get("workspace", s.workspace)))
-        except ValueError as e:
-            return bad(handler, str(e))
         with _get_session_agent_lock(body["session_id"]):
+            s, owner_status, owner_error = _revalidate_mutation_session_owner(
+                body["session_id"], s
+            )
+            if owner_status:
+                return bad(handler, owner_error, owner_status)
+            old_ws = getattr(s, "workspace", "")
+            old_model = getattr(s, "model", None)
+            old_provider = getattr(s, "model_provider", None)
+            try:
+                new_ws = str(resolve_trusted_workspace(body.get("workspace", s.workspace)))
+            except ValueError as e:
+                return bad(handler, str(e))
             s.workspace = new_ws
             if "model" in body or "model_provider" in body:
                 model, provider = _session_model_state_from_request(
@@ -15130,6 +15200,8 @@ def handle_post(handler, parsed) -> bool:
         session_lock = _get_session_agent_lock(sid)
         if not session_lock.acquire(timeout=5):
             return bad(handler, "Session busy, try again", 503)
+        persistence_lock = _get_session_persistence_lock(sid)
+        persistence_lock.acquire()
         try:
             # The run journal contains the full plaintext request/response and
             # its retired authority is the durable delete-retry marker. Do not
@@ -15194,18 +15266,83 @@ def handle_post(handler, parsed) -> bool:
                     },
                     status=500,
                 )
-            with LOCK:
-                SESSIONS.pop(sid, None)
             try:
                 prune_session_from_index(sid)
             except Exception:
                 logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
+                return j(
+                    handler,
+                    {
+                        "ok": False,
+                        "state_db_cleanup_failed": False,
+                        "run_journal_cleanup_failed": False,
+                        "session_artifact_cleanup_failed": False,
+                        "session_index_cleanup_failed": True,
+                        **worktree_retained,
+                        "error": "Session index cleanup failed; retry deletion",
+                    },
+                    status=500,
+                )
+            if not _session_index_prune_verified(sid):
+                logger.warning("Session index row was not settled for %s", sid)
+                return j(
+                    handler,
+                    {
+                        "ok": False,
+                        "state_db_cleanup_failed": False,
+                        "run_journal_cleanup_failed": False,
+                        "session_artifact_cleanup_failed": False,
+                        "session_index_cleanup_failed": True,
+                        **worktree_retained,
+                        "error": "Session index cleanup failed; retry deletion",
+                    },
+                    status=500,
+                )
             if not is_messaging_session:
                 try:
                     _record_webui_deleted_session_tombstone(sid)
                 except Exception:
                     logger.debug("Failed to tombstone deleted WebUI session %s", sid, exc_info=True)
+                    return j(
+                        handler,
+                        {
+                            "ok": False,
+                            "state_db_cleanup_failed": False,
+                            "run_journal_cleanup_failed": False,
+                            "session_artifact_cleanup_failed": False,
+                            "session_index_cleanup_failed": False,
+                            "deleted_session_tombstone_cleanup_failed": True,
+                            **worktree_retained,
+                            "error": "Deleted-session tombstone failed; retry deletion",
+                        },
+                        status=500,
+                    )
+                if sid not in _load_webui_deleted_session_tombstone():
+                    logger.warning("Deleted-session tombstone was not published for %s", sid)
+                    return j(
+                        handler,
+                        {
+                            "ok": False,
+                            "state_db_cleanup_failed": False,
+                            "run_journal_cleanup_failed": False,
+                            "session_artifact_cleanup_failed": False,
+                            "session_index_cleanup_failed": False,
+                            "deleted_session_tombstone_cleanup_failed": True,
+                            **worktree_retained,
+                            "error": "Deleted-session tombstone failed; retry deletion",
+                        },
+                        status=500,
+                    )
+            # Keep the cache and generation transition behind the durable
+            # cleanup fence.  The index helper above already obeys
+            # persistence -> index -> global LOCK; this final cache pop does
+            # not acquire an index lock and therefore cannot reverse that
+            # ordering.
+            with LOCK:
+                SESSIONS.pop(sid, None)
+            _advance_session_persistence_generation(sid)
         finally:
+            persistence_lock.release()
             session_lock.release()
         # Evict outside the mutation lock: lifecycle commit may perform provider
         # I/O and must not hold a per-session Session lock.
@@ -15280,6 +15417,9 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         sid = body["session_id"]
         with _get_session_agent_lock(sid):
+            s, owner_status, owner_error = _revalidate_mutation_session_owner(sid, s)
+            if owner_status:
+                return bad(handler, owner_error, owner_status)
             had_sidecar_messages = bool(s.messages or [])
             # Clear is a full truncate-to-empty: route through the SAME helper the
             # /api/session/truncate handler uses (single source of truth) so the
@@ -15386,6 +15526,11 @@ def handle_post(handler, parsed) -> bool:
         if keep < 0:
             return bad(handler, "keep_count must be non-negative")
         with _get_session_agent_lock(body["session_id"]):
+            s, owner_status, owner_error = _revalidate_mutation_session_owner(
+                body["session_id"], s
+            )
+            if owner_status:
+                return bad(handler, owner_error, owner_status)
             from api.session_ops import truncate_session_at_keep
 
             old_msg_count, old_ctx_count = truncate_session_at_keep(s, keep)

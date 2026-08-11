@@ -379,6 +379,7 @@ class _DeleteJSONHandler:
     def __init__(self, body: dict):
         body_bytes = json.dumps(body).encode()
         self.status = None
+        self.command = "POST"
         self.rfile = BytesIO(body_bytes)
         self.wfile = BytesIO()
         self.headers = {"Content-Length": str(len(body_bytes))}
@@ -394,6 +395,276 @@ class _DeleteJSONHandler:
 
     def _safe_webui_print(self, *_args, **_kwargs):
         pass
+
+
+def _install_delete_route_test_harness(
+    models_module, routes_module, monkeypatch, tmp_path
+):
+    """Isolate the durable session store and non-session delete side effects."""
+    config_module = pytest.importorskip("api.config")
+    upload_module = pytest.importorskip("api.upload")
+    turn_journal_module = pytest.importorskip("api.turn_journal")
+    run_journal_module = pytest.importorskip("api.run_journal")
+    background_module = pytest.importorskip("api.background_process")
+    terminal_module = pytest.importorskip("api.terminal")
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    index_file = session_dir / "_index.json"
+    models_module.SESSIONS.clear()
+    monkeypatch.setattr(models_module, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models_module, "SESSION_INDEX_FILE", index_file)
+    monkeypatch.setattr(routes_module, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(routes_module, "SESSION_INDEX_FILE", index_file, raising=False)
+    monkeypatch.setattr(routes_module, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(routes_module, "get_session", models_module.get_session)
+    monkeypatch.setattr(routes_module, "_lookup_cli_session_metadata", lambda _sid: {})
+    monkeypatch.setattr(routes_module, "_session_is_subagent_view_only", lambda _sid: False)
+    monkeypatch.setattr(routes_module, "_is_messaging_session_id", lambda _sid: False)
+    monkeypatch.setattr(
+        routes_module, "_worktree_retained_payload_for_session_id", lambda _sid: {}
+    )
+    monkeypatch.setattr(
+        routes_module, "_publish_session_list_changed", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        routes_module, "publish_session_list_changed", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(routes_module, "_sync_session_title_to_insights", lambda _s: None)
+    monkeypatch.setattr(config_module, "_evict_session_agent", lambda _sid: None)
+    monkeypatch.setattr(models_module, "delete_cli_session", lambda _sid: True)
+    monkeypatch.setattr(
+        upload_module,
+        "_session_attachment_dir",
+        lambda _sid: tmp_path / "attachments" / _sid,
+    )
+    monkeypatch.setattr(turn_journal_module, "delete_turn_journal", lambda _sid: None)
+    monkeypatch.setattr(run_journal_module, "delete_run_journal", lambda _sid: None)
+    monkeypatch.setattr(
+        background_module, "forget_bg_task_completion_dedup", lambda _sid: None
+    )
+    monkeypatch.setattr(terminal_module, "close_terminal", lambda _sid: None)
+    return session_dir, index_file
+
+
+def _delete_via_route(routes_module, sid: str) -> int:
+    handler = _DeleteJSONHandler({"session_id": sid})
+    routes_module.handle_post(handler, SimpleNamespace(path="/api/session/delete"))
+    return handler.status
+
+
+def test_successful_delete_revokes_prelock_rename_owner(
+    models_module, monkeypatch, tmp_path
+):
+    """A rename admitted before delete cannot resurrect the deleted SID."""
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "delete-revokes-prelock-rename"
+    stale = models_module.Session(
+        session_id=sid,
+        title="before",
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "preserve"}],
+    )
+    models_module.SESSIONS[sid] = stale
+    stale.save()
+    backup = session_dir / f"{sid}.json.bak"
+    backup.write_text(stale.path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    rename_resolved = threading.Event()
+    allow_rename_to_lock = threading.Event()
+    original_resolve = routes_module._get_or_materialize_session
+    resolve_calls = {"count": 0}
+
+    def paused_resolve(candidate_sid):
+        assert candidate_sid == sid
+        resolve_calls["count"] += 1
+        if resolve_calls["count"] > 1:
+            return original_resolve(candidate_sid)
+        rename_resolved.set()
+        assert allow_rename_to_lock.wait(timeout=5)
+        return stale
+
+    monkeypatch.setattr(routes_module, "_get_or_materialize_session", paused_resolve)
+    rename_result = {}
+
+    def rename():
+        handler = _DeleteJSONHandler({"session_id": sid, "title": "after"})
+        routes_module.handle_post(
+            handler, SimpleNamespace(path="/api/session/rename")
+        )
+        rename_result["status"] = handler.status
+
+    rename_thread = threading.Thread(target=rename)
+    rename_thread.start()
+    assert rename_resolved.wait(timeout=5)
+
+    assert _delete_via_route(routes_module, sid) == 200
+    allow_rename_to_lock.set()
+    rename_thread.join(timeout=5)
+
+    assert not rename_thread.is_alive()
+    assert rename_result["status"] in {404, 409}
+    assert not stale.path.exists()
+    assert not backup.exists()
+    assert sid not in {
+        row.get("session_id")
+        for row in json.loads(index_file.read_text(encoding="utf-8"))
+    }
+    assert sid in models_module._load_webui_deleted_session_tombstone()
+    models_module.SESSIONS.clear()
+    assert models_module.Session.load(sid) is None
+
+
+def test_session_persistence_generation_registry_releases_unused_sid(
+    models_module,
+):
+    """The in-process deletion fence must not retain every historical SID."""
+    sid = "weak-session-persistence-generation"
+    session = models_module.Session(session_id=sid)
+    capability_ref = weakref.ref(session._persistence_generation)
+    assert models_module._SESSION_PERSISTENCE_GENERATIONS[sid] is capability_ref()
+
+    del session
+    gc.collect()
+
+    assert capability_ref() is None
+    assert sid not in models_module._SESSION_PERSISTENCE_GENERATIONS
+
+
+def test_successful_delete_revokes_delayed_session_save(
+    models_module, monkeypatch, tmp_path
+):
+    """A captured Session object loses persistence authority after delete 200."""
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "delete-revokes-delayed-save"
+    stale = models_module.Session(
+        session_id=sid,
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "preserve"}],
+    )
+    models_module.SESSIONS[sid] = stale
+    stale.save()
+
+    assert _delete_via_route(routes_module, sid) == 200
+    stale.title = "must not return"
+    with pytest.raises(RuntimeError, match="revoked|deleted"):
+        stale.save()
+
+    assert not (session_dir / f"{sid}.json").exists()
+    assert sid not in {
+        row.get("session_id")
+        for row in json.loads(index_file.read_text(encoding="utf-8"))
+    }
+    assert sid in models_module._load_webui_deleted_session_tombstone()
+
+    successor = models_module.Session(
+        session_id=sid,
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "explicit recreation"}],
+    )
+    models_module.SESSIONS[sid] = successor
+    successor.save()
+    assert successor.path.exists()
+    assert sid not in models_module._load_webui_deleted_session_tombstone()
+
+
+def test_failed_delete_does_not_revoke_session_save(
+    models_module, monkeypatch, tmp_path
+):
+    """A truthful delete 500 keeps the existing owner able to persist/retry."""
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, _index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "failed-delete-keeps-owner"
+    owner = models_module.Session(
+        session_id=sid,
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "preserve"}],
+    )
+    models_module.SESSIONS[sid] = owner
+    owner.save()
+    sidecar = session_dir / f"{sid}.json"
+    real_unlink = Path.unlink
+
+    def fail_primary_unlink(path, *args, **kwargs):
+        if path == sidecar:
+            raise PermissionError("simulated retained primary")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_primary_unlink)
+
+    assert _delete_via_route(routes_module, sid) == 500
+    assert models_module.SESSIONS[sid] is owner
+    assert sid not in models_module._load_webui_deleted_session_tombstone()
+    owner.title = "retry remains usable"
+    owner.save()
+    assert json.loads(sidecar.read_text(encoding="utf-8"))["title"] == owner.title
+
+
+def test_failed_delete_tombstone_publish_does_not_revoke_session_save(
+    models_module, monkeypatch, tmp_path
+):
+    """A swallowed tombstone write failure cannot commit deletion/revocation."""
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, _index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "failed-delete-tombstone-keeps-owner"
+    owner = models_module.Session(
+        session_id=sid,
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "preserve"}],
+    )
+    models_module.SESSIONS[sid] = owner
+    owner.save()
+    sidecar = session_dir / f"{sid}.json"
+    monkeypatch.setattr(
+        models_module, "_save_webui_deleted_session_tombstone", lambda _ids: None
+    )
+
+    assert _delete_via_route(routes_module, sid) == 500
+    assert models_module.SESSIONS[sid] is owner
+    assert sid not in models_module._load_webui_deleted_session_tombstone()
+    owner.title = "tombstone retry remains usable"
+    owner.save()
+    assert json.loads(sidecar.read_text(encoding="utf-8"))["title"] == owner.title
+
+
+def test_failed_delete_index_settlement_does_not_revoke_session_save(
+    models_module, monkeypatch, tmp_path
+):
+    """A swallowed/no-op index prune cannot commit deletion/revocation."""
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "failed-delete-index-keeps-owner"
+    owner = models_module.Session(
+        session_id=sid,
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "preserve"}],
+    )
+    models_module.SESSIONS[sid] = owner
+    owner.save()
+    sidecar = session_dir / f"{sid}.json"
+    monkeypatch.setattr(routes_module, "prune_session_from_index", lambda _sid: None)
+
+    assert _delete_via_route(routes_module, sid) == 500
+    assert models_module.SESSIONS[sid] is owner
+    assert sid in {
+        row.get("session_id")
+        for row in json.loads(index_file.read_text(encoding="utf-8"))
+    }
+    assert sid not in models_module._load_webui_deleted_session_tombstone()
+    owner.title = "index retry remains usable"
+    owner.save()
+    assert json.loads(sidecar.read_text(encoding="utf-8"))["title"] == owner.title
 
 
 def test_delete_serializes_with_workspace_recovery_and_sidecar_stays_deleted(
@@ -451,9 +722,6 @@ def test_delete_serializes_with_workspace_recovery_and_sidecar_stays_deleted(
         routes_module, "_worktree_retained_payload_for_session_id", lambda _sid: {}
     )
     monkeypatch.setattr(routes_module, "prune_session_from_index", lambda _sid: None)
-    monkeypatch.setattr(
-        routes_module, "_record_webui_deleted_session_tombstone", lambda _sid: None
-    )
     monkeypatch.setattr(
         routes_module, "_publish_session_list_changed", lambda *_args, **_kwargs: None
     )

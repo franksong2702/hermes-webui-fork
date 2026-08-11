@@ -194,6 +194,65 @@ _INDEX_WRITE_LOCK = threading.RLock()
 _SESSION_PERSISTENCE_LOCKS = weakref.WeakValueDictionary()
 _SESSION_PERSISTENCE_LOCKS_LOCK = threading.Lock()
 
+# Every in-process Session object carries the persistence capability that was
+# current when it was created/loaded.  Successful deletion revokes and removes
+# the capability for that SID while holding the SID persistence lock; captured
+# objects from the retired generation then fail closed before any write.  A
+# weak registry avoids retaining one entry forever for every historical SID,
+# while each live Session keeps its own capability strongly reachable.
+class _SessionPersistenceCapability:
+    __slots__ = ("revoked", "__weakref__")
+
+    def __init__(self):
+        self.revoked = False
+
+
+_SESSION_PERSISTENCE_GENERATIONS = weakref.WeakValueDictionary()
+_SESSION_PERSISTENCE_GENERATIONS_LOCK = threading.Lock()
+
+
+def _current_session_persistence_generation(session_id: str):
+    """Return (and lazily create) the current in-process SID capability."""
+    sid = str(session_id or "")
+    with _SESSION_PERSISTENCE_GENERATIONS_LOCK:
+        capability = _SESSION_PERSISTENCE_GENERATIONS.get(sid)
+        if capability is None or capability.revoked:
+            capability = _SessionPersistenceCapability()
+            _SESSION_PERSISTENCE_GENERATIONS[sid] = capability
+        return capability
+
+
+def _advance_session_persistence_generation(session_id: str):
+    """Revoke the current SID capability and return the retired object.
+
+    The caller must already hold the SID persistence lock.  Keeping this
+    operation separate from the lock itself makes the lock order explicit at
+    delete call sites.  The registry entry is removed so the next explicit
+    same-SID construction gets a fresh capability.
+    """
+    sid = str(session_id or "")
+    with _SESSION_PERSISTENCE_GENERATIONS_LOCK:
+        capability = _SESSION_PERSISTENCE_GENERATIONS.get(sid)
+        if capability is not None:
+            capability.revoked = True
+            if _SESSION_PERSISTENCE_GENERATIONS.get(sid) is capability:
+                _SESSION_PERSISTENCE_GENERATIONS.pop(sid, None)
+        return capability
+
+
+def _session_persistence_generation_is_current(session) -> bool:
+    """Return whether *session* still owns the current SID write capability."""
+    sid = str(getattr(session, "session_id", "") or "")
+    generation = getattr(session, "_persistence_generation", None)
+    if not sid or generation is None:
+        return False
+    with _SESSION_PERSISTENCE_GENERATIONS_LOCK:
+        return (
+            generation is not None
+            and not getattr(generation, "revoked", True)
+            and _SESSION_PERSISTENCE_GENERATIONS.get(sid) is generation
+        )
+
 
 def _get_session_persistence_lock(session_id: str) -> threading.RLock:
     """Return the reentrant persistence lock shared by one session id."""
@@ -1334,6 +1393,15 @@ class Session:
                  share_created_at=None,
                  **kwargs):
         self.session_id = session_id or uuid.uuid4().hex[:12]
+        # Bind every in-process object to the SID generation visible at
+        # construction time.  ``Session.load`` supplies an explicit snapshot
+        # while holding the SID persistence lock; direct/new/imported objects
+        # take the current capability here so a later successful delete can
+        # retire them before their next save.
+        _persistence_generation = kwargs.get('_persistence_generation')
+        if _persistence_generation is None:
+            _persistence_generation = _current_session_persistence_generation(self.session_id)
+        self._persistence_generation = _persistence_generation
         self.title = title
         self.workspace = str(Path(workspace).expanduser().resolve())
         # #6672: immutable snapshot of the workspace at session creation time.
@@ -1484,6 +1552,11 @@ class Session:
             )
 
     def _save_locked(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
+        if not _session_persistence_generation_is_current(self):
+            raise RuntimeError(
+                f"Refusing to save revoked/deleted session {self.session_id!r}: "
+                "its persistence generation is no longer current"
+            )
         if getattr(self, "_auxiliary_persistence_revoked", False):
             raise RuntimeError(
                 f"Refusing to save revoked auxiliary session {self.session_id!r}: "
@@ -1657,15 +1730,22 @@ class Session:
         if not is_safe_session_id(sid):
             return None
         p = SESSION_DIR / f'{sid}.json'
-        if not p.exists():
-            return None
-        # #5854: snapshot the stat signature BEFORE reading so a legacy-facts
-        # cache write is only committed if the file didn't change under us
-        # during the parse (TOCTOU guard against an atomic replace mid-read).
-        _pre_read_sig = _sidecar_stat_signature(p)
-        data = json.loads(p.read_text(encoding='utf-8'))
-        data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
-        session = cls(**data)
+        # Hold the same per-SID persistence lock across the durable read and
+        # generation bind.  A delete that wins this lock therefore cannot
+        # leave a loader with a pre-delete sidecar while constructing an owner
+        # that appears current after the delete commits.
+        with _get_session_persistence_lock(sid):
+            if not p.exists():
+                return None
+            # #5854: snapshot the stat signature BEFORE reading so a
+            # legacy-facts cache write is only committed if the file didn't
+            # change under us during the parse (TOCTOU guard against an atomic
+            # replace mid-read).
+            _pre_read_sig = _sidecar_stat_signature(p)
+            data = json.loads(p.read_text(encoding='utf-8'))
+            data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
+            data['_persistence_generation'] = _current_session_persistence_generation(sid)
+            session = cls(**data)
         if _collapsed_partials:
             try:
                 # Self-heal bloated sessions on first full load without touching
@@ -4778,6 +4858,72 @@ def get_session_for_scan(sid):
         return None
 
 
+def _load_and_publish_session(
+    sid,
+    *,
+    metadata_only: bool = False,
+    promote_cache: bool = True,
+    cache_on_miss: bool = True,
+):
+    """Load and publish one cold SID across two persistence lock phases.
+
+    ``Session.load`` holds the SID lock across durable read+bind.  This helper
+    then reacquires the same lock for generation validation and cache CAS, so a
+    delete either wins before publication (and invalidates the capability) or
+    waits until this publication is complete.
+    """
+    # Let concurrent cold readers perform their durable read independently;
+    # ``Session.load`` itself holds the SID lock across its read+bind.  We then
+    # take the same lock for generation validation and cache CAS.  If delete
+    # wins the gap, validation fails; if this loader wins, delete waits until
+    # the CAS completes.  This preserves the duplicate-cold-reader behavior
+    # used by chat-start rollback fences without reopening a publish race.
+    s = Session.load_metadata_only(sid) if metadata_only else Session.load(sid)
+    if not s:
+        return None, False
+    with _get_session_persistence_lock(sid):
+        if not _session_persistence_generation_is_current(s):
+            raise KeyError(sid)
+        if str(getattr(s, "session_id", "") or "") != str(sid):
+            logger.warning(
+                "refusing to publish mismatched cold session: requested %s but loaded %s",
+                sid,
+                getattr(s, "session_id", None),
+            )
+            raise KeyError(sid)
+        # Metadata-only callers intentionally never publish their stubs into
+        # SESSIONS; this preserves the pre-existing no-cache semantics that
+        # protect full transcripts from accidental stub saves.
+        if metadata_only:
+            return s, False
+        with LOCK:
+            current = SESSIONS.get(sid)
+            if current is not None:
+                if str(getattr(current, "session_id", "") or "") != str(sid):
+                    logger.warning(
+                        "refusing cold session publication behind mismatched owner: requested %s but cached %s",
+                        sid,
+                        getattr(current, "session_id", None),
+                    )
+                    raise KeyError(sid)
+                # The current exact object is authoritative.  A loader that
+                # observed the earlier miss must not replace it with a stale
+                # or metadata-only object read after the owner was published.
+                s = current
+                if promote_cache:
+                    SESSIONS.move_to_end(sid)
+                # Preserve the historical cold-loader fence: the loser must
+                # return the canonical winner immediately, without running
+                # state.db/journal reconciliation against its own disk read.
+                return s, True
+            if cache_on_miss:
+                SESSIONS[sid] = s
+                if promote_cache:
+                    SESSIONS.move_to_end(sid)
+                _evict_sessions_over_cap()
+        return s, False
+
+
 def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_miss=True):
     """Resolve a session through the canonical freshness/recovery path.
 
@@ -4808,27 +4954,49 @@ def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_m
                     SESSIONS.pop(sid, None)
             cached = None
     if cached is not None:
+        if not _session_persistence_generation_is_current(cached):
+            # A successful same-SID delete may have retired this object while
+            # a reader still held the cache reference.  Do not return or
+            # re-publish a stale owner; the next path must resolve the current
+            # durable state (or raise KeyError for the deleted SID).
+            with LOCK:
+                if SESSIONS.get(sid) is cached:
+                    SESSIONS.pop(sid, None)
+            cached = None
+    if cached is not None:
         if not metadata_only and _cached_session_lags_disk(cached):
             try:
-                disk_session = Session.load(sid)
-                with LOCK:
-                    SESSIONS[sid] = disk_session
-                    if promote_cache:
-                        SESSIONS.move_to_end(sid)
-                cached = disk_session
+                with _get_session_persistence_lock(sid):
+                    disk_session = Session.load(sid)
+                    if (
+                        disk_session is not None
+                        and _session_persistence_generation_is_current(disk_session)
+                    ):
+                        with LOCK:
+                            if SESSIONS.get(sid) is cached:
+                                SESSIONS[sid] = disk_session
+                                if promote_cache:
+                                    SESSIONS.move_to_end(sid)
+                                cached = disk_session
             except Exception:
                 logger.debug(
                     "cached session disk-freshness check failed for session %s", sid, exc_info=True,
                 )
         if not metadata_only and _inactive_cache_tail_needs_disk_check(cached):
             try:
-                disk_session = Session.load(sid)
-                if _cache_has_stale_unsaved_user_tail(cached, disk_session):
-                    with LOCK:
-                        SESSIONS[sid] = disk_session
-                        if promote_cache:
-                            SESSIONS.move_to_end(sid)
-                    cached = disk_session
+                with _get_session_persistence_lock(sid):
+                    disk_session = Session.load(sid)
+                    if (
+                        disk_session is not None
+                        and _session_persistence_generation_is_current(disk_session)
+                        and _cache_has_stale_unsaved_user_tail(cached, disk_session)
+                    ):
+                        with LOCK:
+                            if SESSIONS.get(sid) is cached:
+                                SESSIONS[sid] = disk_session
+                                if promote_cache:
+                                    SESSIONS.move_to_end(sid)
+                                cached = disk_session
             except Exception:
                 logger.debug(
                     "stale cached user-tail check failed for session %s", sid, exc_info=True,
@@ -4848,53 +5016,17 @@ def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_m
                     "state.db newer-sidecar sync failed on cache hit for session %s", sid, exc_info=True,
                 )
         return cached
-    if metadata_only:
-        s = Session.load_metadata_only(sid)
-        if s:
-            return s
-    else:
-        s = Session.load(sid)
+    s, cold_load_lost_cas = _load_and_publish_session(
+        sid,
+        metadata_only=metadata_only,
+        promote_cache=promote_cache,
+        cache_on_miss=cache_on_miss,
+    )
+    if metadata_only and s:
+        return s
     if s:
-        # A cold loader can be delayed after reading the sidecar while a
-        # concurrent chat-start publishes a newer canonical owner.  Publish
-        # with compare-and-set semantics: never overwrite an exact same-SID
-        # owner that won the race, and fail closed if either object carries a
-        # different SID.  The latter is an identity violation, not a cache miss
-        # that can be healed by trusting the disk object.
-        if str(getattr(s, "session_id", "") or "") != str(sid):
-            logger.warning(
-                "refusing to publish mismatched cold session: requested %s but loaded %s",
-                sid,
-                getattr(s, "session_id", None),
-            )
-            raise KeyError(sid)
-        with LOCK:
-            current = SESSIONS.get(sid)
-            if current is not None:
-                if str(getattr(current, "session_id", "") or "") != str(sid):
-                    logger.warning(
-                        "refusing cold session publication behind mismatched owner: requested %s but cached %s",
-                        sid,
-                        getattr(current, "session_id", None),
-                    )
-                    raise KeyError(sid)
-                # The current exact object is authoritative.  A loader that
-                # observed the earlier miss must not replace it with a stale or
-                # metadata-only object read after the owner was published.
-                s = current
-                if promote_cache:
-                    SESSIONS.move_to_end(sid)
-                # Do not run cold-load repair/reconciliation against the
-                # losing loader's object after CAS.  The canonical owner may be
-                # under a chat-start prepare/rollback fence; returning it
-                # directly keeps the loser from mutating that owner outside
-                # the per-session lock.
-                return s
-            elif cache_on_miss:
-                SESSIONS[sid] = s
-                if promote_cache:
-                    SESSIONS.move_to_end(sid)
-                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+        if cold_load_lost_cas:
+            return s
         if not metadata_only:
             try:
                 synced_from_state = _sync_sidecar_from_state_db_if_newer(s)
