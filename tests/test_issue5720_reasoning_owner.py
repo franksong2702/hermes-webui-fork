@@ -579,6 +579,7 @@ for(const name of [
 ]) eval(extractFunc(messagesSrc,name));
 function _anchorOutcomeTruncationMarker(){ return null; }
 function _messageAnchorBoundedActivityScene(scene){ return scene; }
+eval(extractFunc(messagesSrc,'_dispatchExtensionTurnLifecycle'));
 eval(messagesSrc.slice(attachStart,attachEnd));
 attachLiveStream('sid-1','stream-1');
 const source=FakeEventSource.instances[0];
