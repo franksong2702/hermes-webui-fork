@@ -427,17 +427,18 @@ def test_chat_start_forwards_goal_related_to_gateway_worker(monkeypatch, tmp_pat
     monkeypatch.setattr(routes.uuid, "uuid4", lambda: SimpleNamespace(hex="goal-stream-id"))
 
     session = FakeSession()
-    response = routes._start_chat_stream_for_session(
-        session,
-        msg="continue the goal",
-        attachments=[],
-        workspace=str(tmp_path),
-        model="gpt-5.5",
-        model_provider="openai-codex",
-        goal_related=True,
-    )
-
+    response = {}
     try:
+        response = routes._start_chat_stream_for_session(
+            session,
+            msg="continue the goal",
+            attachments=[],
+            workspace=str(tmp_path),
+            model="gpt-5.5",
+            model_provider="openai-codex",
+            goal_related=True,
+        )
+
         assert response["stream_id"] == "goal-stream-id"
         assert captured["target"] is routes._run_gateway_chat_streaming
         assert captured["kwargs"]["goal_related"] is True
