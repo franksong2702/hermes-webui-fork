@@ -1,40 +1,15 @@
-"""Regression: blank assistant turn (对话消失) — dead empty live-turn shell
-survives a session-updated swap re-render and hides the settled answer.
+"""Regression: settled assistant answers displace stale live-turn DOM.
 
-Root cause (reproduced + fixed on an isolated debug instance, 2026-07-01)
-------------------------------------------------------------------------
-`renderMessages()` (static/ui.js) preserves the `#liveAssistantTurn` DOM node
-across the `inner.innerHTML=''` wipe so the smd parser's live reference is not
-detached mid-stream (#3877 flicker fix). The preserve guard originally fired
-whenever `INFLIGHT[sid]` existed:
-
-    let _preservedLiveTurn=null;
-    if(sid&&INFLIGHT[sid]){
-      const _lt=document.getElementById('liveAssistantTurn');
-      if(_lt&&(...sessionId matches...)){ _preservedLiveTurn=_lt; }
-    }
-
-When a turn's SSE dropped (S.activeStreamId cleared to null) but its
-`INFLIGHT[sid]` entry was NOT cleaned, the live turn was a DEAD empty shell —
-avatar + an empty worklog group ("Processed Ns", no body/tool rows). On the
-next `session-updated` self-heal swap (loadSession force + keepStaleUntilLoaded,
-common under repeated self-wake restarts), the guard re-attached that empty
-shell OVER the freshly-wiped transcript, pinning an avatar-only blank turn on
-top of the already-persisted answer. That is the reported "对话消失".
-
-Fix
----
-Preserve the live turn ONLY when it is genuinely live: an active stream is
-still running (`S.activeStreamId`) — the #3877 case — OR it already holds real
-rendered content (`.msg-body`, `.tool-card-row`, or `.wl-reason`). A dead empty
-shell (no content, no active stream) is no longer preserved, so the swap wipe
-drops it and the settled transcript renders normally.
+The live DOM is a parser target, not ownership evidence.  A settled transcript
+must therefore win over stale ``#liveAssistantTurn`` content when the stream is
+gone, while the #3877 parser-owned node remains attached during a real stream.
 """
+
 import pathlib
-import re
 import shutil
 import subprocess
 import textwrap
+
 
 REPO = pathlib.Path(__file__).parent.parent
 
@@ -47,67 +22,114 @@ def _preserve_guard_src():
     src = read("static/ui.js")
     i = src.find("let _preservedLiveTurn=null;")
     assert i >= 0, "_preservedLiveTurn guard not found"
-    # capture through the closing of the if-block (next 'const compressionState')
+    # Capture only the production preserve guard, before unrelated render work.
     j = src.find("const compressionState", i)
     assert j > i, "guard block end not found"
     return src[i:j]
 
 
-class TestBlankLiveTurnPreserveGuard:
-    def test_guard_requires_real_content_or_active_stream(self):
-        guard = _preserve_guard_src()
-        # Must gate the preserve on real content OR an active stream — not merely
-        # on INFLIGHT existence.
-        assert "_hasRealLiveContent" in guard, (
-            "preserve guard must compute whether the live turn has real content"
-        )
-        assert ".msg-body" in guard and ".tool-card-row" in guard and ".wl-reason" in guard, (
-            "real-content check must look for a visible body / tool card / reason row"
-        )
-        assert "S.activeStreamId" in guard, (
-            "preserve guard must still preserve a genuinely-streaming turn (#3877)"
-        )
-        # The assignment must be inside the new conditional.
-        assert re.search(
-            r"if\(_hasRealLiveContent\s*\|\|\s*S\.activeStreamId\)\{\s*_preservedLiveTurn=_lt;",
-            guard,
-        ), "preserve assignment must be gated by (hasRealContent || activeStreamId)"
+def _production_helper_src():
+    """Return the pure helper source, if present.
 
-    def test_runtime_rejects_dead_shell_preserves_live(self):
+    On the pre-fix checkout no helper exists.  The runtime test still executes
+    the old guard below, making RED a real stale-content behavior failure rather
+    than merely a missing-symbol assertion.
+    """
+    src = read("static/ui.js")
+    marker = "function _shouldPreserveLiveAssistantTurn"
+    start = src.find(marker)
+    if start < 0:
+        return ""
+    signature_end = src.find("){", start)
+    brace = signature_end + 1 if signature_end >= 0 else -1
+    assert brace > start, "shared helper opening brace not found"
+    depth = 0
+    end = None
+    for idx in range(brace, len(src)):
+        if src[idx] == "{":
+            depth += 1
+        elif src[idx] == "}":
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                break
+    assert end is not None, "shared helper body is not balanced"
+    return src[start:end]
+
+
+class TestBlankLiveTurnPreserveGuard:
+    def test_guard_uses_authoritative_liveness_not_dom_content(self):
+        guard = _preserve_guard_src()
+        # Keep the test-first RED meaningful on the old production guard: the
+        # runtime test below must be the failure, not merely this new symbol.
+        if "_shouldPreserveLiveAssistantTurn" not in guard:
+            assert "_hasRealLiveContent" in guard
+            assert ".msg-body" in guard and ".tool-card-row" in guard and ".wl-reason" in guard
+            return
+        assert "_shouldPreserveLiveAssistantTurn" in guard
+        assert "_hasRealLiveContent" not in guard
+        assert ".msg-body" not in guard
+        assert ".tool-card-row" not in guard
+        assert ".wl-reason" not in guard
+        assert "S.messages" in guard
+        assert "S.activeStreamId" in guard
+
+    def test_runtime_preserve_matrix_uses_production_guard_and_helper(self):
         node = shutil.which("node")
         if not node:
             import pytest
+
             pytest.skip("node not available")
+        guard = _preserve_guard_src()
+        helper = _production_helper_src()
         script = textwrap.dedent(
-            """
+            f"""
             const assert=require('assert');
-            // Mirror the guard's decision predicate exactly.
-            function guardWouldPreserve(lt, activeStreamId){
-              if(!lt) return false;
-              const hasReal=!!lt.querySelector('.msg-body, .tool-card-row, .wl-reason');
-              return hasReal || !!activeStreamId;
-            }
-            // Minimal DOM element stub with querySelector over a class set.
-            function el(classes){
+            {helper}
+            function el(classes){{
               const set=new Set(classes||[]);
-              return { querySelector(sel){
-                // sel is a comma list of .class tokens
-                return sel.split(',').map(s=>s.trim().replace(/^\\./,''))
-                  .some(c=>set.has(c)) ? {} : null;
-              }};
-            }
-            const deadShell = el([]);                 // empty worklog shell, no content
-            const withBody  = el(['msg-body']);
-            const withTool  = el(['tool-card-row']);
-            const withReason= el(['wl-reason']);
-            assert.strictEqual(guardWouldPreserve(deadShell, null), false, 'dead shell must NOT be preserved');
-            assert.strictEqual(guardWouldPreserve(deadShell, 'sid'), true, 'streaming empty shell preserved (#3877)');
-            assert.strictEqual(guardWouldPreserve(withBody, null), true, 'body content preserved');
-            assert.strictEqual(guardWouldPreserve(withTool, null), true, 'tool card preserved');
-            assert.strictEqual(guardWouldPreserve(withReason, null), true, 'reason row preserved');
+              return {{dataset:{{sessionId:'sid'}}, querySelector(sel){{
+                return sel.split(',').map(s=>s.trim().slice(1))
+                  .some(c=>set.has(c)) ? {{}} : null;
+              }}}};
+            }}
+            function productionGuard({{sid, liveTurn, activeStreamId, messages, inflight}}){{
+              const S={{activeStreamId, messages}};
+              const INFLIGHT=inflight;
+              const document={{getElementById(id){{
+                return id==='liveAssistantTurn'?liveTurn:null;
+              }}}};
+              {guard}
+              return _preservedLiveTurn===liveTurn;
+            }}
+            const staleBody=el(['msg-body']);
+            const staleTool=el(['tool-card-row']);
+            const staleReason=el(['wl-reason']);
+            const empty=el([]);
+            const inflight={{sid:{{streamId:'stream-1'}}}};
+            const settled=[{{role:'assistant',content:'answer'}}];
+            const live=[{{role:'assistant',_live:true,content:''}}];
+            const opts=(liveTurn, activeStreamId, messages, owner=inflight)=>({{sid:'sid', liveTurn, activeStreamId, messages, inflight:owner}});
+            // active stream + empty/content => preserve (#3877)
+            assert.strictEqual(productionGuard(opts(empty,'stream-1',settled)), true);
+            assert.strictEqual(productionGuard(opts(staleBody,'stream-1',settled)), true);
+            // null active stream + explicit _live projection => preserve
+            assert.strictEqual(productionGuard(opts(empty,null,live)), true);
+            assert.strictEqual(productionGuard(opts(staleBody,null,live)), true);
+            // settled answer + stale body/tool/reason => reject (issue #6948)
+            for (const node of [staleBody, staleTool, staleReason]) {{
+              assert.strictEqual(productionGuard(opts(node,null,settled)), false);
+            }}
+            // dead shell, wrong session, and missing INFLIGHT => reject
+            assert.strictEqual(productionGuard(opts(empty,null,settled)), false);
+            const wrong=el([]); wrong.dataset.sessionId='other';
+            assert.strictEqual(productionGuard(opts(wrong,'stream-1',settled)), false);
+            assert.strictEqual(productionGuard(opts(empty,'stream-1',settled,{{}})), false);
             console.log('OK');
             """
         )
-        out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+        out = subprocess.run(
+            [node, "-e", script], capture_output=True, text=True, timeout=5
+        )
         assert out.returncode == 0, f"node harness failed: {out.stderr}\n{out.stdout}"
         assert "OK" in out.stdout

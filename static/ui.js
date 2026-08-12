@@ -16082,6 +16082,18 @@ function _processWakeupCardHtml(info, rawText, extras){
   return `<details class="process-wakeup-card"><summary class="process-wakeup-summary"><span class="process-wakeup-toggle">${li('chevron-right',12)}</span><span class="process-wakeup-label">${li('terminal',13)}<span>${esc(t('process_wakeup_label'))}</span></span>${cmdHtml}${chip}${extras.timeHtml||''}</summary><div class="process-wakeup-detail">${extras.filesHtml||''}${patternRow}${cmdRow}<div class="msg-body process-wakeup-body">${outHtml}</div>${extras.footHtml||''}</div></details>`;
 }
 
+// DOM content is not ownership evidence for a live assistant turn. The parser
+// can leave body/tool/reason rows in a detached node after the stream settles,
+// so preservation must use the session's explicit live state instead (#6948).
+function _shouldPreserveLiveAssistantTurn({sid, liveTurn, inflight, activeStreamId, messages}={}){
+  const sessionId=String(sid||'');
+  if(!sessionId||!liveTurn||!inflight||!Object.prototype.hasOwnProperty.call(inflight,sessionId)) return false;
+  const liveSessionId=String(liveTurn.dataset&&liveTurn.dataset.sessionId||'');
+  if(!liveSessionId||liveSessionId!==sessionId) return false;
+  if(activeStreamId) return true;
+  return Array.isArray(messages)&&messages.some(m=>m&&m.role==='assistant'&&m._live===true);
+}
+
 function renderMessages(options){
   _lastMessageRenderAt=performance.now();
   const preserveScroll=!!(options&&options.preserveScroll);
@@ -16166,31 +16178,18 @@ function renderMessages(options){
   // event rebuilds the turn ("disappears, then reappears"). Capture the live
   // turn's actual DOM node (not its HTML — the parser holds a live reference into
   // it) so it can be re-attached after the rebuild, keeping the parser target
-  // connected and the streamed text visible. Only for the streaming session's own
-  // live turn; never affects settled transcripts.
+  // connected and the streamed text visible. Only for the current session's
+  // explicitly owned live turn; settled transcripts never qualify.
   let _preservedLiveTurn=null;
   if(sid&&INFLIGHT[sid]){
     const _lt=document.getElementById('liveAssistantTurn');
-    if(_lt&&(!_lt.dataset||!_lt.dataset.sessionId||_lt.dataset.sessionId===sid)){
-      // Blank-turn fix (对话消失): only preserve the live turn across the DOM
-      // wipe if it is GENUINELY live — either an active stream is still running
-      // (S.activeStreamId set: the #3877 mid-stream flicker case this preserve
-      // was written for), or the turn already holds real rendered content (a
-      // visible answer body, a tool card, or a reasoning row). A DEAD shell —
-      // an interrupted turn whose stream dropped (S.activeStreamId cleared to
-      // null) but whose INFLIGHT[sid] entry was not cleaned, leaving only an
-      // empty worklog group ("Processed Ns" with no body/tool rows) — must NOT
-      // be preserved: re-attaching it on a session-updated swap re-render pins
-      // an avatar-only empty turn OVER the settled transcript, hiding the real
-      // (already-persisted) answer. That is the reported blank. Reproduced +
-      // fix verified on an isolated debug instance (8710): stale INFLIGHT +
-      // empty live-turn survived the swap → blank; gating on real-content /
-      // active-stream clears it while a genuine live turn still renders.
-      const _hasRealLiveContent=!!_lt.querySelector('.msg-body, .tool-card-row, .wl-reason');
-      if(_hasRealLiveContent || S.activeStreamId){
-        _preservedLiveTurn=_lt;
-      }
-    }
+    if(_shouldPreserveLiveAssistantTurn({
+      sid,
+      liveTurn:_lt,
+      inflight:INFLIGHT,
+      activeStreamId:S.activeStreamId,
+      messages:S.messages,
+    })) _preservedLiveTurn=_lt;
   }
   const compressionState=(()=>{
     let compressionState=_compressionStateForCurrentSession();
