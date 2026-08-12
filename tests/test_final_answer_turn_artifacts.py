@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -474,6 +475,109 @@ def test_native_preview_owner_switch_fences_old_loads_and_clears_all_sinks():
         **output["object"]["before"],
         "owner": None,
     }
+
+
+def test_active_workspace_owner_transition_is_the_only_session_workspace_publisher():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    panels = (ROOT / "static/panels.js").read_text(encoding="utf-8")
+    all_static_js = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted((ROOT / "static").glob("*.js"))
+    )
+
+    assert "function _transitionActiveSessionWorkspaceOwner(" in workspace
+    assert re.search(r"S\.session\.workspace\s*=(?!=)", all_static_js) is None
+
+    switch_start = panels.index("async function switchToWorkspace(path,name){")
+    switch_end = panels.index("// ── Profile panel + dropdown", switch_start)
+    switch_source = panels[switch_start:switch_end]
+    assert "_transitionActiveSessionWorkspaceOwner(" in switch_source
+
+    profile_start = panels.index("async function switchToProfile(name) {")
+    profile_end = panels.index("function openProfileCreate(){", profile_start)
+    profile_source = panels[profile_start:profile_end]
+    assert "_transitionActiveSessionWorkspaceOwner(" in profile_source
+
+    load_start = workspace.index("async function loadDir(path, opts={}){")
+    load_end = workspace.index("function refreshWorkspacePanel(){", load_start)
+    load_source = workspace[load_start:load_end]
+    assert "_transitionActiveSessionWorkspaceOwner(" in load_source
+
+
+def test_production_composed_same_session_workspace_switch_clears_native_sinks_before_refresh():
+    workspace = (ROOT / "static/workspace.js").read_text(encoding="utf-8")
+    helpers = workspace[workspace.index("const ARTIFACT_IGNORE_RE") : workspace.index("async function _workspacePathExists")]
+    open_file = workspace[
+        workspace.index("async function openFile") : workspace.index("function downloadFile")
+    ]
+    panels = (ROOT / "static/panels.js").read_text(encoding="utf-8")
+    switch_to_workspace = panels[
+        panels.index("async function switchToWorkspace(path,name){") : panels.index(
+            "// ── Profile panel + dropdown", panels.index("async function switchToWorkspace(path,name){")
+        )
+    ]
+    output = _run_node(
+        "const events=[]; const status=[]; let refreshGate;\n"
+        "const refreshWait = new Promise(resolve=>{ refreshGate=resolve; });\n"
+        "class Node{constructor(id){this.id=id;this.style={display:''};this.classList={add(){},remove(){},contains(){return false;}};this.src='';this.onerror=null;this.onload=null;this.onloadeddata=null;this.oncanplay=null;this.onabort=null;this.onstalled=null;this.innerHTML='';this.children=[];this.paused=false;this.title='';this.alt='';}\n"
+        "set innerHTML(value){this._innerHTML=String(value);if(!this._innerHTML)this.children=[];} get innerHTML(){return this._innerHTML||'';}\n"
+        "pause(){this.paused=true;} load(){} querySelectorAll(){return this.children;} removeAttribute(name){if(name==='src')this.src='';} setAttribute(){} appendChild(node){this.children.push(node);} }\n"
+        "const nodes={}; const $=(id)=>nodes[id]||(nodes[id]=new Node(id));\n"
+        "const document={createElement:()=>new Node('created'),body:{appendChild(){},removeChild(){}}}; const window={_newChatOnWorkspaceSwitch:false};\n"
+        "const S={session:{session_id:'sid-same',workspace:'/workspace-a'},messages:[],busy:false,currentDir:'.',_profileSwitchWorkspace:null,_pendingSessionToolsets:null};\n"
+        "const IMAGE_EXTS=new Set(['.png']); const AUDIO_EXTS=new Set(['.mp3']); const VIDEO_EXTS=new Set(['.mp4']); const PDF_EXTS=new Set(['.pdf']); const MD_EXTS=new Set(['.md']); const HTML_EXTS=new Set(['.html']); const DOWNLOAD_EXTS=new Set();\n"
+        "const fileExt=(path)=>path.slice(path.lastIndexOf('.')).toLowerCase(); const t=(value)=>value; const setStatus=(value)=>status.push(value); const showToast=()=>{};\n"
+        "const showPreview=(mode)=>{ $('previewArea').classList.add('visible'); $('previewBadge').textContent=mode; }; const renderFileBreadcrumb=()=>{}; const renderMarkdownPreviewContent=()=>{}; const renderCodePreviewContent=()=>{}; const renderCsvPreviewContent=()=>false; const shouldRenderMarkdownPreviewAsPlainText=()=>false; const setLargeMarkdownForceRenderVisible=()=>{}; const largeMarkdownPlainTextStatus=()=>'';\n"
+        "const _workspaceRouteForPath=()=>'/raw'; const _workspaceRouteForPathRel=()=>'/raw'; const _workspaceEscapeGrantForPath=()=>null; const _clearWorkspaceEscapeGrant=()=>{}; const _mediaPlayerHtml=(mode,url)=>`<${mode} src=\"${url}\" controls></${mode}>`; const _applyMediaPlaybackPreferences=()=>{};\n"
+        "const api=(route)=>{ if(route==='/api/session/update'){ events.push({event:'api-update',generation:_workspaceOpenGeneration,src:$('previewImg').src}); return Promise.resolve({}); } return Promise.resolve({content:'# loaded'}); };\n"
+        "const bumpWorkspaceTreeGen=()=>{}; const closeWsDropdown=()=>{}; const syncTopbar=()=>{}; const getWorkspaceFriendlyName=(path)=>path; const _currentPanel='chat';\n"
+        "const _previewDirty=false; let _previewCurrentPath=''; let _previewOwner=null; let _previewPreserveArtifactPath=false; let _previewCurrentMode=''; let _previewServerEditable=null; let _previewSaveRoute=''; let _previewOfficeFormat=''; let _previewPreviewKind=''; let _previewRawContent=''; let _previewRawContentPath='';\n"
+        "const loadDir=async()=>{ events.push({event:'refresh-start',generation:_workspaceOpenGeneration,key:_workspaceSessionOwnerKey,owner:S.session&&{session_id:S.session.session_id,workspace:S.session.workspace},imageSrc:$('previewImg').src,pdfSrc:$('previewPdfFrame').src,htmlSrc:$('previewHtmlIframe').src,mediaHtml:$('previewMediaWrap').innerHTML,mediaChildren:$('previewMediaWrap').children.length}); await refreshWait; events.push({event:'refresh-done'}); };\n"
+        + helpers
+        + open_file
+        + switch_to_workspace
+        + "_installWorkspaceSessionOwnerFence();\n"
+        + "const clearNativePreviewSinks=_clearNativePreviewSinks; _clearNativePreviewSinks=(opts)=>{ events.push({event:'clear',bump:!opts||opts.bumpGeneration!==false,key:_workspaceSessionOwnerKey,owner:S.session&&{session_id:S.session.session_id,workspace:S.session.workspace},imageSrc:$('previewImg').src}); return clearNativePreviewSinks(opts); };\n"
+        + "async function run(){\n"
+        + "  const ownerA={session_id:'sid-same',workspace_root:'/workspace-a'}; const ownerB={session_id:'sid-same',workspace_root:'/workspace-b'};\n"
+        + "  await openFile('output/a.png',{owner:ownerA}); const staleImageError=$('previewImg').onerror;\n"
+        + "  const pdf=$('previewPdfFrame'); pdf.src='/raw/a.pdf'; pdf.onload=()=>status.push('stale-pdf-load');\n"
+        + "  const html=$('previewHtmlIframe'); html.src='/raw/a.html'; html.onload=()=>status.push('stale-html-load'); html.onerror=()=>status.push('stale-html-error');\n"
+        + "  const media=$('previewMediaWrap'); const audio=new Node('audio-a'); const video=new Node('video-a'); audio.src='/raw/a.mp3'; video.src='/raw/a.mp4'; audio.onloadeddata=()=>status.push('stale-audio'); video.oncanplay=()=>status.push('stale-video'); media.children=[audio,video]; media.innerHTML='<audio src=\"/raw/a.mp3\"></audio><video src=\"/raw/a.mp4\"></video>';\n"
+        + "  const before={generation:_workspaceOpenGeneration,imageSrc:$('previewImg').src,pdfSrc:pdf.src,htmlSrc:html.src,mediaChildren:media.children.length};\n"
+        + "  const switchTask=switchToWorkspace('/workspace-b','B'); await Promise.resolve();\n"
+        + "  const refresh=events.find(entry=>entry.event==='refresh-start'); const transitionClear=events.find(entry=>entry.event==='clear'&&entry.bump); const afterBeforeAwait={before,refresh,transitionClear,generation:_workspaceOpenGeneration,owner:{session_id:S.session.session_id,workspace:S.session.workspace},imageHandler:$('previewImg').onerror,pdfHandler:pdf.onload,htmlHandler:html.onload,mediaHtml:media.innerHTML,mediaChildren:media.children.length,audio:{src:audio.src,paused:audio.paused,onloadeddata:audio.onloadeddata},video:{src:video.src,paused:video.paused,oncanplay:video.oncanplay}};\n"
+        + "  staleImageError(); if(typeof pdf.onload==='function')pdf.onload(); if(typeof html.onload==='function')html.onload(); if(typeof html.onerror==='function')html.onerror(); if(typeof audio.onloadeddata==='function')audio.onloadeddata(); if(typeof video.oncanplay==='function')video.oncanplay();\n"
+        + "  refreshGate(); await switchTask; await openFile('output/b.pdf',{owner:ownerB}); const bAuthoritative={generation:_workspaceOpenGeneration,owner:_previewOwner,src:$('previewPdfFrame').src,path:_previewCurrentPath,status:status.slice()};\n"
+        + "  const sameGeneration=_workspaceOpenGeneration; const sameTask=switchToWorkspace('/workspace-b','B'); await sameTask; const sameOwner={generation:_workspaceOpenGeneration,unchanged:_workspaceOpenGeneration===sameGeneration,owner:{session_id:S.session.session_id,workspace:S.session.workspace}};\n"
+        + "  console.log(JSON.stringify({afterBeforeAwait,bAuthoritative,sameOwner,status}));\n"
+        + "} run().catch(error=>{console.error(error);process.exit(1)});"
+    )
+    assert output["afterBeforeAwait"]["refresh"]["generation"] > output["afterBeforeAwait"]["before"]["generation"]
+    assert output["afterBeforeAwait"]["transitionClear"]["key"] == "sid-same\u0000/workspace-a"
+    assert output["afterBeforeAwait"]["transitionClear"]["owner"] == {
+        "session_id": "sid-same",
+        "workspace": "/workspace-a",
+    }
+    assert output["afterBeforeAwait"]["refresh"]["key"] == "sid-same\u0000/workspace-b"
+    assert output["afterBeforeAwait"]["refresh"]["imageSrc"] == ""
+    assert output["afterBeforeAwait"]["refresh"]["pdfSrc"] == ""
+    assert output["afterBeforeAwait"]["refresh"]["htmlSrc"] == ""
+    assert output["afterBeforeAwait"]["refresh"]["mediaHtml"] == ""
+    assert output["afterBeforeAwait"]["refresh"]["mediaChildren"] == 0
+    assert output["afterBeforeAwait"]["owner"] == {"session_id": "sid-same", "workspace": "/workspace-b"}
+    assert output["afterBeforeAwait"]["imageHandler"] is None
+    assert output["afterBeforeAwait"]["pdfHandler"] is None
+    assert output["afterBeforeAwait"]["htmlHandler"] is None
+    assert output["afterBeforeAwait"]["audio"] == {"src": "", "paused": True, "onloadeddata": None}
+    assert output["afterBeforeAwait"]["video"] == {"src": "", "paused": True, "oncanplay": None}
+    assert output["status"] == []
+    assert output["bAuthoritative"]["owner"] == {
+        "session_id": "sid-same",
+        "workspace_root": "/workspace-b",
+    }
+    assert output["bAuthoritative"]["path"] == "output/b.pdf"
+    assert output["bAuthoritative"]["src"] == "/raw"
+    assert output["sameOwner"]["unchanged"] is True
 
 
 def test_artifact_open_aborts_stale_owner_async_sinks_and_image_error():

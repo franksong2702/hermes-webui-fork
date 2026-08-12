@@ -574,6 +574,8 @@ function _clearNativePreviewSinks(opts={}){
 // same synchronous turn, even before clearPreview()/openFile() gets a chance to
 // run. The data contract stays unchanged; this only fences browser resources.
 let _workspaceSessionOwnerKey = null;
+let _workspaceSessionOwnerSession = null;
+let _workspaceSessionOwnerFenceInstalled = false;
 function _workspaceSessionOwnerKeyFor(session){
   if(!session || typeof session !== 'object') return '';
   const sessionId = _artifactScalarString(session.session_id);
@@ -581,27 +583,57 @@ function _workspaceSessionOwnerKeyFor(session){
   const workspaceRoot = _artifactScalarString(session.workspace).replace(/\/+$/,'');
   return `${sessionId}\u0000${workspaceRoot}`;
 }
+function _workspaceSessionOwnerCurrent(){
+  if(_workspaceSessionOwnerFenceInstalled) return _workspaceSessionOwnerSession;
+  if(typeof S !== 'undefined' && S && typeof S === 'object') return S.session;
+  return null;
+}
+function _transitionActiveSessionWorkspaceOwner(nextSession, opts={}){
+  const current = _workspaceSessionOwnerCurrent();
+  const hasWorkspaceRoot = !!(
+    opts && typeof opts === 'object'
+    && Object.prototype.hasOwnProperty.call(opts, 'workspaceRoot')
+  );
+  const next = hasWorkspaceRoot
+    ? (current && typeof current === 'object'
+      ? {...current, workspace: opts.workspaceRoot}
+      : null)
+    : nextSession;
+  const nextKey = _workspaceSessionOwnerKeyFor(next);
+  // An empty key means that there is no active owner (for example the blank
+  // page). Do not bump for an initial owner bind, but do invalidate an existing
+  // owner when it is cleared or replaced in either tuple dimension.
+  if(_workspaceSessionOwnerKey && _workspaceSessionOwnerKey !== nextKey){
+    _clearNativePreviewSinks();
+  }
+  // The owner key is updated only after the old native sinks are fenced. The
+  // shared session object is then published through the getter installed below,
+  // so callers cannot observe a new root with the old generation.
+  _workspaceSessionOwnerKey = nextKey;
+  _workspaceSessionOwnerSession = next;
+  if(!_workspaceSessionOwnerFenceInstalled && typeof S !== 'undefined' && S && S.session !== next){
+    S.session = next;
+  }
+  return next;
+}
 function _installWorkspaceSessionOwnerFence(){
   if(typeof S === 'undefined' || !S || typeof S !== 'object') return;
   const descriptor=Object.getOwnPropertyDescriptor(S,'session');
   if(!descriptor || descriptor.configurable===false || descriptor.get || descriptor.set) return;
-  let current=descriptor.value;
-  _workspaceSessionOwnerKey=_workspaceSessionOwnerKeyFor(current);
+  _workspaceSessionOwnerSession=descriptor.value;
+  _workspaceSessionOwnerFenceInstalled=true;
+  _workspaceSessionOwnerKey=_workspaceSessionOwnerKeyFor(_workspaceSessionOwnerSession);
   try{
     Object.defineProperty(S,'session',{
       configurable:true,
       enumerable:descriptor.enumerable,
-      get(){ return current; },
+      get(){ return _workspaceSessionOwnerSession; },
       set(next){
-        const nextKey=_workspaceSessionOwnerKeyFor(next);
-        if(_workspaceSessionOwnerKey && _workspaceSessionOwnerKey!==nextKey){
-          _clearNativePreviewSinks();
-        }
-        current=next;
-        _workspaceSessionOwnerKey=nextKey;
+        _transitionActiveSessionWorkspaceOwner(next);
       },
     });
   }catch(_){
+    _workspaceSessionOwnerFenceInstalled=false;
     _workspaceSessionOwnerKey=null;
   }
 }
@@ -1072,7 +1104,14 @@ async function loadDir(path, opts={}){
     );
     if(!S.session||S.session.session_id!==sessionId||treeGen!==_wsTreeGen)return;
     if(data.workspace_recovered&&data.workspace){
-      S.session.workspace=String(data.workspace);
+      const recoveredWorkspace=String(data.workspace);
+      if(typeof _transitionActiveSessionWorkspaceOwner==='function'){
+        _transitionActiveSessionWorkspaceOwner(null,{workspaceRoot:recoveredWorkspace});
+      }else{
+        // Keep standalone loadDir() extraction tests usable; the production
+        // workspace script always installs the canonical owner helper first.
+        S.session={...S.session,workspace:recoveredWorkspace};
+      }
       S._dirCache={};
       _restoreExpandedDirs();
       if(typeof syncWorkspaceDisplays==='function')syncWorkspaceDisplays();
