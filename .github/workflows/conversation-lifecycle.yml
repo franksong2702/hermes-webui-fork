@@ -226,6 +226,7 @@ jobs:
             local classification_markers=(
               'MUTATION CANARY EXPECTED FAILURE: drop-anchor-persistence removed the transcript-backed Anchor scene before hard reload'
               'MUTATION CANARY EXPECTED FAILURE: drop-terminal-anchor-row removed the terminal row from the hard-reloaded Anchor scene'
+              'MUTATION CANARY EXPECTED FAILURE: blank-terminal-anchor-status changed the canonical terminal row status before hard reload'
               'NEGATIVE CANARY EXPECTED UNMARKED FAILURE: hard-reload final-text prerequisite failed before Anchor-scene classification'
               'NEGATIVE CANARY EXPECTED UNMARKED FAILURE: Worklog expansion failed after the reloaded Anchor group was present'
             )
@@ -288,6 +289,11 @@ jobs:
             'MUTATION CANARY EXPECTED FAILURE: drop-terminal-anchor-row removed the terminal row from the hard-reloaded Anchor scene' \
             env LIFECYCLE_SCENARIO=terminal-error \
             LIFECYCLE_TEST_BITE=drop-terminal-anchor-row \
+            python tests/browser_conversation_lifecycle.py
+          run_expected_failure terminal-error-status \
+            'MUTATION CANARY EXPECTED FAILURE: blank-terminal-anchor-status changed the canonical terminal row status before hard reload' \
+            env LIFECYCLE_SCENARIO=terminal-error \
+            LIFECYCLE_TEST_BITE=blank-terminal-anchor-status \
             python tests/browser_conversation_lifecycle.py
           run_unexpected_failure_without_marker anchor-final-text-prerequisite \
             'NEGATIVE CANARY EXPECTED UNMARKED FAILURE: hard-reload final-text prerequisite failed before Anchor-scene classification' \

@@ -51,6 +51,10 @@ EXPECTED_MUTATION_FAILURE_MARKERS = {
         "MUTATION CANARY EXPECTED FAILURE: drop-terminal-anchor-row removed "
         "the terminal row from the hard-reloaded Anchor scene"
     ),
+    "blank-terminal-anchor-status": (
+        "MUTATION CANARY EXPECTED FAILURE: blank-terminal-anchor-status changed "
+        "the canonical terminal row status before hard reload"
+    ),
 }
 NEGATIVE_MUTATION_FAILURE_MARKERS = {
     "fail-reload-final-text": (
@@ -553,10 +557,19 @@ def _activity_snapshot(page) -> dict:
           const groups = turn ? Array.from(turn.querySelectorAll('[data-anchor-scene-owner="1"]')) : [];
           const rows = turn ? Array.from(turn.querySelectorAll('[data-anchor-scene-row="1"]')) : [];
           const sceneRows = assistants.flatMap(message =>
-            message && message._anchor_activity_scene && Array.isArray(message._anchor_activity_scene.activity_rows)
+            message && message._anchor_activity_scene &&
+              message._anchor_activity_scene.version === 'activity_scene_v1' &&
+              Array.isArray(message._anchor_activity_scene.activity_rows)
               ? message._anchor_activity_scene.activity_rows
               : []
           );
+          const sceneRowForDomRow = row => {
+            const rowId = String(row.getAttribute('data-anchor-row-id') || '');
+            if (!rowId) return null;
+            return sceneRows.find(sceneRow =>
+              String(sceneRow && (sceneRow.row_id || sceneRow.local_id) || '') === rowId
+            ) || null;
+          };
           const visibleFinal = turn ? Array.from(turn.querySelectorAll('.assistant-segment .msg-body'))
             .filter(el => {
               const segment = el.closest('.assistant-segment');
@@ -585,21 +598,21 @@ def _activity_snapshot(page) -> dict:
               expanded: (group.querySelector('.tool-worklog-summary,.tool-call-group-summary') || {})
                 .getAttribute?.('aria-expanded') || '',
             })),
-            rows: rows.map(row => ({
-              role: row.getAttribute('data-anchor-row-role'),
-              rowId: row.getAttribute('data-anchor-row-id') || '',
-              toolCallId: (sceneRows.find(sceneRow =>
-                String(sceneRow && (sceneRow.row_id || sceneRow.local_id) || '') ===
-                String(row.getAttribute('data-anchor-row-id') || '')
-              ) || {}).tool_call_id || '',
-              source: row.getAttribute('data-anchor-source-event-type'),
-              status: row.getAttribute('data-anchor-row-status'),
-              tool: row.getAttribute('data-tool-name'),
-              label: ((row.querySelector('.agent-activity-status-label') || {}).textContent || '').trim(),
-              detail: ((row.querySelector('.agent-activity-status-detail') || {}).textContent || '').trim(),
-              text: row.innerText.trim(),
-              classes: row.className,
-            })),
+            rows: rows.map(row => {
+              const sceneRow = sceneRowForDomRow(row);
+              return {
+                role: row.getAttribute('data-anchor-row-role'),
+                rowId: row.getAttribute('data-anchor-row-id') || '',
+                toolCallId: sceneRow ? (sceneRow.tool_call_id || '') : '',
+                source: row.getAttribute('data-anchor-source-event-type'),
+                status: sceneRow ? (sceneRow.status ?? '') : null,
+                tool: row.getAttribute('data-tool-name'),
+                label: ((row.querySelector('.agent-activity-status-label') || {}).textContent || '').trim(),
+                detail: ((row.querySelector('.agent-activity-status-detail') || {}).textContent || '').trim(),
+                text: row.innerText.trim(),
+                classes: row.className,
+              };
+            }),
             visibleFinal,
             assistantMessage: lastAssistant ? {
               turnDuration: lastAssistant._turnDuration,
@@ -743,6 +756,7 @@ def _assert_settled(snapshot: dict, scenario: str) -> None:
         assert "terminal" in roles, snapshot
         terminal_rows = _terminal_rows(snapshot)
         assert terminal_rows, snapshot
+        assert all(str(row.get("status") or "").strip() for row in terminal_rows), snapshot
         assert all(_is_terminal_row_error(row) for row in terminal_rows), snapshot
         assert snapshot["assistantMessage"] is not None, snapshot
         turn_duration = snapshot["assistantMessage"].get("turnDuration")
@@ -906,10 +920,16 @@ def main() -> int:
             f"Unsupported LIFECYCLE_SCENARIO {scenario!r}; "
             "expected 'normal' or 'terminal-error'"
         )
-    if TEST_BITE not in {"", "drop-anchor-persistence", "drop-terminal-anchor-row"}:
+    if TEST_BITE not in {
+        "",
+        "drop-anchor-persistence",
+        "drop-terminal-anchor-row",
+        "blank-terminal-anchor-status",
+    }:
         raise ValueError(
             f"Unsupported LIFECYCLE_TEST_BITE {TEST_BITE!r}; "
-            "expected one of '', 'drop-anchor-persistence', 'drop-terminal-anchor-row'"
+            "expected one of '', 'drop-anchor-persistence', "
+            "'drop-terminal-anchor-row', 'blank-terminal-anchor-status'"
         )
     if NEGATIVE_BITE not in {
         "",
@@ -942,9 +962,12 @@ def main() -> int:
         raise ValueError(
             f"Unsupported LIFECYCLE_HEALTH_GUARD_KNOCKOUT {HEALTH_GUARD_KNOCKOUT!r}"
         )
-    if TEST_BITE == "drop-terminal-anchor-row" and scenario != "terminal-error":
+    if (
+        TEST_BITE in {"drop-terminal-anchor-row", "blank-terminal-anchor-status"}
+        and scenario != "terminal-error"
+    ):
         raise ValueError(
-            "drop-terminal-anchor-row is only valid for "
+            f"{TEST_BITE} is only valid for "
             "LIFECYCLE_SCENARIO=terminal-error"
         )
 
@@ -1048,6 +1071,40 @@ def main() -> int:
                                         "type": "mutation",
                                         "bite": "drop-terminal-anchor-row",
                                         "action": "removed-terminal-row",
+                                    })
+                                    return
+                    response = route.fetch()
+                    route.fulfill(response=response)
+                    return
+                if TEST_BITE == "blank-terminal-anchor-status":
+                    raw_payload = _safe_request_post_data(route.request)
+                    payload = _parse_json_payload(raw_payload)
+                    if isinstance(payload, dict):
+                        scene = payload.get("scene")
+                        if isinstance(scene, dict):
+                            rows = scene.get("activity_rows")
+                            if isinstance(rows, list):
+                                mutated_rows = []
+                                mutated = False
+                                for row in rows:
+                                    if isinstance(row, dict) and row.get("role") == "terminal":
+                                        next_row = dict(row)
+                                        next_row["status"] = ""
+                                        mutated_rows.append(next_row)
+                                        mutated = True
+                                    else:
+                                        mutated_rows.append(row)
+                                if mutated:
+                                    mutated_payload = dict(payload)
+                                    updated_scene = dict(scene)
+                                    updated_scene["activity_rows"] = mutated_rows
+                                    mutated_payload["scene"] = updated_scene
+                                    response = route.fetch(post_data=json.dumps(mutated_payload))
+                                    route.fulfill(response=response)
+                                    anchor_scene_requests.append({
+                                        "type": "mutation",
+                                        "bite": "blank-terminal-anchor-status",
+                                        "action": "blanked-terminal-status",
                                     })
                                     return
                     response = route.fetch()
@@ -1400,6 +1457,39 @@ def main() -> int:
                 )
             raise AssertionError(
                 EXPECTED_MUTATION_FAILURE_MARKERS["drop-terminal-anchor-row"]
+            )
+        if TEST_BITE == "blank-terminal-anchor-status":
+            if errors:
+                raise AssertionError(
+                    "unexpected browser errors before expected mutation failure: "
+                    f"{errors!r}"
+                )
+            if proc is not None and proc.poll() is not None:
+                raise AssertionError(
+                    "WebUI server exited before expected mutation failure: "
+                    f"{proc.returncode}"
+                )
+            terminal_rows = _terminal_rows(reloaded_snapshot)
+            if not terminal_rows:
+                raise AssertionError(
+                    "blank-terminal-anchor-status mutation removed the terminal row "
+                    "instead of only changing its canonical status"
+                )
+            if all(str(row.get("status") or "").strip() for row in terminal_rows):
+                raise AssertionError(
+                    "Mutation survived: blank-terminal-anchor-status still rendered "
+                    "a non-empty canonical terminal status after hard reload"
+                )
+            if not _mutation_event_observed(
+                anchor_scene_requests,
+                "blank-terminal-anchor-status",
+            ):
+                raise AssertionError(
+                    "blank-terminal-anchor-status mutation was not observed before "
+                    "the reloaded terminal status went missing"
+                )
+            raise AssertionError(
+                EXPECTED_MUTATION_FAILURE_MARKERS["blank-terminal-anchor-status"]
             )
         _assert_settled(reloaded_snapshot, scenario)
         if scenario == "terminal-error":
