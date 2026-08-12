@@ -284,6 +284,32 @@ def _live_supersedes_backup_by_clear_generation(session_path: Path, bak_path: Pa
     return True
 
 
+def _session_records_intentional_message_shrink(session_path: Path, bak_path: Path) -> bool:
+    """Return True when a live shrink generation supersedes an older backup.
+
+    The marker is deliberately narrow: an unreadable, malformed, or otherwise
+    invalid marker must leave the existing data-loss recovery path enabled.
+    """
+    try:
+        live = json.loads(session_path.read_text(encoding='utf-8'))
+        bak = json.loads(bak_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(live, dict) or not isinstance(bak, dict):
+        return False
+    live_generation = live.get('intentional_shrink_generation')
+    if not isinstance(live_generation, str) or not live_generation.strip():
+        return False
+    if 'intentional_shrink_generation' not in bak:
+        return True
+    backup_generation = bak.get('intentional_shrink_generation')
+    if backup_generation is None:
+        return True
+    if not isinstance(backup_generation, str) or not backup_generation.strip():
+        return False
+    return backup_generation != live_generation
+
+
 def inspect_session_recovery_status(session_path: Path) -> dict:
     """Return a status dict describing whether recovery is recommended.
 
@@ -326,6 +352,14 @@ def inspect_session_recovery_status(session_path: Path) -> dict:
                 "bak_messages": bak_count,
                 "recommend": "no_action",
                 "intentional_compress_shrink": True,
+            }
+        if _session_records_intentional_message_shrink(session_path, bak_path):
+            return {
+                "session_id": session_path.stem,
+                "live_messages": live_count,
+                "bak_messages": bak_count,
+                "recommend": "no_action",
+                "intentional_message_shrink": True,
             }
         return {
             "session_id": session_path.stem,
