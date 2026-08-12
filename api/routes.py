@@ -9212,17 +9212,145 @@ def _artifact_only_anchor_scene(message) -> dict:
     }
 
 
-def _attach_replayed_turn_artifacts_to_anchor_scenes(messages, paths_by_final_index, *, message_offset=0) -> list:
-    """Merge transcript-derived artifact evidence into the existing Anchor projection."""
+def _attach_replayed_turn_artifacts_to_anchor_scenes(
+    messages,
+    paths_by_final_index,
+    *,
+    message_offset=0,
+    replay_source_messages=None,
+    replay_session_id="",
+) -> list:
+    """Merge transcript-derived artifact evidence into the existing Anchor projection.
+
+    The normal replay pass derives descriptors against the session's current
+    workspace.  If that root changed since the artifact was persisted, retry
+    only the roots already present in the persisted scene and keep exact
+    transcript-backed matches.  ``source`` is deliberately not evidence here:
+    the full transcript must re-prove each descriptor under its historical root.
+    """
     if not isinstance(messages, list) or not isinstance(paths_by_final_index, dict):
         return messages
+
+    historical_paths_by_root: dict[str, dict[int, list[dict]]] = {}
+
+    def _canonical_root(value) -> str:
+        if not isinstance(value, str) or not value.strip():
+            return ""
+        try:
+            return str(Path(value.strip()).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            return value.strip().rstrip("/")
+
+    def _persisted_artifact_identity(artifact) -> dict | None:
+        if not isinstance(artifact, dict):
+            return None
+        artifact_type = artifact.get("type") or artifact.get("source_event_type")
+        if artifact_type != "artifact_reference":
+            return None
+        payload = artifact.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        values = {**artifact, **payload}
+        path = values.get("path")
+        raw_session_id = values.get("session_id")
+        raw_tool_name = values.get("tool_name")
+        raw_tool_call_id = values.get("tool_call_id")
+        workspace_root = _canonical_root(values.get("workspace_root"))
+        if not isinstance(path, str) or not path.strip() or not workspace_root:
+            return None
+        if not all(
+            isinstance(value, str)
+            for value in (raw_session_id, raw_tool_name, raw_tool_call_id)
+        ):
+            return None
+        session_id = raw_session_id.strip()
+        tool_name = normalize_tool_name(raw_tool_name)
+        tool_call_id = raw_tool_call_id.strip()
+        if not session_id or not tool_name or not tool_call_id:
+            return None
+        return {
+            # Typed artifact paths are exact identities.  Use strip only for
+            # the empty check above; trimming here could silently select a
+            # different sibling file during historical-root recovery.
+            "path": path,
+            "workspace_root": workspace_root,
+            "session_id": session_id,
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+        }
+
+    def _historical_descriptors_for_root(root: str) -> dict[int, list[dict]]:
+        cached = historical_paths_by_root.get(root)
+        if cached is not None:
+            return cached
+        if not isinstance(replay_source_messages, list):
+            historical_paths_by_root[root] = {}
+            return historical_paths_by_root[root]
+        cached = _final_turn_artifact_paths(
+            replay_source_messages,
+            workspace_root=root,
+            session_id=str(replay_session_id or "").strip(),
+        )
+        historical_paths_by_root[root] = cached
+        return cached
+
+    def _historical_descriptors_for_scene(scene, absolute_idx: int) -> list[dict]:
+        if not isinstance(scene, dict) or not isinstance(replay_source_messages, list):
+            return []
+        trusted_session_id = str(replay_session_id or "").strip()
+        if not trusted_session_id:
+            return []
+        persisted = []
+        roots = set()
+        for artifact in scene.get("artifacts") or []:
+            identity = _persisted_artifact_identity(artifact)
+            if identity is None or identity["session_id"] != trusted_session_id:
+                continue
+            persisted.append(identity)
+            roots.add(identity["workspace_root"])
+        # A settled assistant turn has one session/workspace owner.  Multiple
+        # historical roots cannot be authoritative for the same turn and would
+        # otherwise multiply the full-transcript replay cost, so fail closed.
+        if not persisted or len(roots) != 1:
+            return []
+        candidates_by_key = {}
+        for root in roots:
+            for descriptor in _historical_descriptors_for_root(root).get(absolute_idx) or []:
+                if not isinstance(descriptor, dict):
+                    continue
+                key = (
+                    descriptor.get("path"),
+                    _canonical_root(descriptor.get("workspace_root")),
+                    str(descriptor.get("session_id") or "").strip(),
+                    normalize_tool_name(descriptor.get("tool_name")),
+                    str(descriptor.get("tool_call_id") or "").strip(),
+                )
+                candidates_by_key[key] = descriptor
+        retained = []
+        seen = set()
+        for identity in persisted:
+            key = (
+                identity["path"],
+                identity["workspace_root"],
+                identity["session_id"],
+                identity["tool_name"],
+                identity["tool_call_id"],
+            )
+            descriptor = candidates_by_key.get(key)
+            if descriptor is None or key in seen:
+                continue
+            seen.add(key)
+            retained.append(descriptor)
+        return retained
 
     out = list(messages)
     for local_idx, message in enumerate(messages):
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        descriptors = paths_by_final_index.get(int(message_offset or 0) + local_idx) or []
+        absolute_idx = int(message_offset or 0) + local_idx
+        descriptors = paths_by_final_index.get(absolute_idx) or []
         scene = message.get("_anchor_activity_scene")
+        if not descriptors:
+            descriptors = _historical_descriptors_for_scene(scene, absolute_idx)
         if not descriptors and not (
             isinstance(scene, dict) and scene.get("version") == "activity_scene_v1"
         ):
@@ -13350,6 +13478,8 @@ def handle_get(handler, parsed) -> bool:
                     _truncated_msgs,
                     _final_turn_artifacts,
                     message_offset=_messages_offset,
+                    replay_source_messages=_all_msgs,
+                    replay_session_id=str(getattr(s, "session_id", "") or ""),
                 )
             else:
                 _truncated_msgs = []

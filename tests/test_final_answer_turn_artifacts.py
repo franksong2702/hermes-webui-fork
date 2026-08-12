@@ -1204,6 +1204,124 @@ def test_replay_discards_unbacked_and_forged_client_artifacts():
     }]
 
 
+def test_replay_preserves_only_transcript_backed_persisted_artifacts_after_workspace_move():
+    from api import routes
+
+    messages = [
+        {"role": "user", "content": "write the report"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call-1", "function": {"name": "patch"}},
+                {"id": "call-2", "function": {"name": "patch"}},
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "patch",
+            "content": json.dumps(
+                {
+                    "success": True,
+                    "files_modified": ["/workspace-a/output/report.md"],
+                }
+            ),
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-2",
+            "name": "patch",
+            "content": json.dumps(
+                {
+                    "success": True,
+                    "files_modified": ["/workspace-a/output/ exact report.md "],
+                }
+            ),
+        },
+        {"role": "assistant", "content": "final answer"},
+    ]
+    current_workspace_artifacts = routes._final_turn_artifact_paths(
+        messages,
+        workspace_root="/workspace-b",
+        session_id="sid-replay",
+    )
+    assert current_workspace_artifacts == {}
+
+    persisted_scene = {
+        "version": "activity_scene_v1",
+        "activity_rows": [{"type": "tool"}],
+        "artifacts": [
+            {
+                "type": "artifact_reference",
+                "payload": {
+                    "path": "output/report.md",
+                    "workspace_root": "/workspace-a",
+                    "session_id": "sid-replay",
+                    "tool_name": "patch",
+                    "tool_call_id": "call-1",
+                    "source": "live_tool_complete",
+                },
+            },
+            {
+                "type": "artifact_reference",
+                "payload": {
+                    "path": "output/ exact report.md ",
+                    "workspace_root": "/workspace-a",
+                    "session_id": "sid-replay",
+                    "tool_name": "patch",
+                    "tool_call_id": "call-2",
+                    "source": "live_tool_complete",
+                },
+            },
+            {
+                "type": "artifact_reference",
+                "payload": {
+                    "path": "output/forged.md",
+                    "workspace_root": "/workspace-a",
+                    "session_id": "sid-replay",
+                    "tool_name": "patch",
+                    "tool_call_id": "forged",
+                    "source": "live_tool_complete",
+                },
+            },
+        ],
+    }
+    window = [{**messages[-1], "_anchor_activity_scene": persisted_scene}]
+
+    hydrated = routes._attach_replayed_turn_artifacts_to_anchor_scenes(
+        window,
+        current_workspace_artifacts,
+        message_offset=4,
+        replay_source_messages=messages,
+        replay_session_id="sid-replay",
+    )
+
+    assert hydrated[0]["_anchor_activity_scene"]["artifacts"] == [
+        {
+            "type": "artifact_reference",
+            "payload": {
+                "path": "output/report.md",
+                "workspace_root": "/workspace-a",
+                "session_id": "sid-replay",
+                "tool_call_id": "call-1",
+                "tool_name": "patch",
+                "source": "transcript_replay",
+            },
+        },
+        {
+            "type": "artifact_reference",
+            "payload": {
+                "path": "output/ exact report.md ",
+                "workspace_root": "/workspace-a",
+                "session_id": "sid-replay",
+                "tool_call_id": "call-2",
+                "tool_name": "patch",
+                "source": "transcript_replay",
+            },
+        },
+    ]
+
+
 def test_replay_replaces_wrong_session_existing_anchor_artifacts_with_transcript_descriptors():
     from api import routes
 
