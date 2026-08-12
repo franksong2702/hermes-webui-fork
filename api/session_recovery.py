@@ -29,6 +29,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -43,6 +44,24 @@ from api.turn_journal import (
 )
 
 logger = logging.getLogger(__name__)
+
+_INTENTIONAL_SHRINK_GENERATION_RE = re.compile(
+    r"^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"
+)
+
+
+def _is_valid_intentional_shrink_generation(value) -> bool:
+    """Return whether *value* has the exact ``uuid.uuid4().hex`` shape.
+
+    ``session_ops`` stamps generations with ``uuid.uuid4().hex``.  Recovery
+    must not treat arbitrary non-empty strings as provenance, because a
+    malformed live/backup marker must leave the original restore safeguard
+    enabled.
+    """
+    return (
+        isinstance(value, str)
+        and _INTENTIONAL_SHRINK_GENERATION_RE.fullmatch(value) is not None
+    )
 
 
 def _msg_count(p: Path) -> int:
@@ -298,14 +317,18 @@ def _session_records_intentional_message_shrink(session_path: Path, bak_path: Pa
     if not isinstance(live, dict) or not isinstance(bak, dict):
         return False
     live_generation = live.get('intentional_shrink_generation')
-    if not isinstance(live_generation, str) or not live_generation.strip():
+    if not _is_valid_intentional_shrink_generation(live_generation):
         return False
     if 'intentional_shrink_generation' not in bak:
         return True
     backup_generation = bak.get('intentional_shrink_generation')
+    # Older backups persist the field as null (or omit it entirely) because
+    # the live session had not yet passed through a session_ops shrink. Keep
+    # that legacy provenance behavior; malformed non-empty values below must
+    # fail open to the original restore path.
     if backup_generation is None:
         return True
-    if not isinstance(backup_generation, str) or not backup_generation.strip():
+    if not _is_valid_intentional_shrink_generation(backup_generation):
         return False
     return backup_generation != live_generation
 

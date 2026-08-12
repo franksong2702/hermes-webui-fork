@@ -5,6 +5,9 @@ import json
 
 import pytest
 
+_VALID_GENERATION_A = "0123456789ab4cde8f0123456789abcd"
+_VALID_GENERATION_B = "fedcba9876544c21b0fedcba98765432"
+
 
 def _msg(role: str, content: str, ts: float, mid: str) -> dict:
     return {"id": mid, "role": role, "content": content, "timestamp": ts}
@@ -142,7 +145,7 @@ def test_truncate_chokepoint_shrink_is_not_revived_by_startup_recovery(monkeypat
 
 def test_generation_save_load_round_trip_is_in_metadata_prefix(monkeypatch, tmp_path):
     models, _session_dir = _seed_session_dir(monkeypatch, tmp_path)
-    generation = "generation-round-trip"
+    generation = _VALID_GENERATION_A
     session = models.Session(
         session_id="issue6911_round_trip",
         messages=_history(),
@@ -166,13 +169,13 @@ def test_no_actual_message_shrink_keeps_generation(monkeypatch, tmp_path):
     session = models.Session(
         session_id="issue6911_no_shrink",
         messages=_history(),
-        intentional_shrink_generation="already-stamped",
+        intentional_shrink_generation=_VALID_GENERATION_A,
     )
     session.save()
 
     truncate_session_at_keep(session, len(session.messages))
 
-    assert session.intentional_shrink_generation == "already-stamped"
+    assert session.intentional_shrink_generation == _VALID_GENERATION_A
     session.save()
     assert not session.path.with_suffix(".json.bak").exists()
 
@@ -182,7 +185,7 @@ def test_missing_or_invalid_live_generation_fails_open(tmp_path, invalid_generat
     from api.session_recovery import recover_session
 
     sid = f"issue6911_invalid_{type(invalid_generation).__name__}"
-    live, backup = _live_and_backup(sid, invalid_generation, "old-generation")
+    live, backup = _live_and_backup(sid, invalid_generation, _VALID_GENERATION_B)
     live_path = tmp_path / f"{sid}.json"
     bak_path = live_path.with_suffix(".json.bak")
     _write_json(live_path, live)
@@ -200,7 +203,7 @@ def test_same_generation_backup_from_real_save_remains_recoverable(monkeypatch, 
     from api.session_recovery import recover_all_sessions_on_startup
 
     sid = "issue6911_same_generation"
-    generation = "generation-1"
+    generation = _VALID_GENERATION_A
     session = models.Session(
         session_id=sid,
         messages=_history(),
@@ -233,7 +236,7 @@ def test_invalid_backup_generation_fails_open(tmp_path, invalid_generation):
     from api.session_recovery import recover_session
 
     sid = "issue6911_invalid_backup_generation"
-    live, backup = _live_and_backup(sid, "generation-new", invalid_generation)
+    live, backup = _live_and_backup(sid, _VALID_GENERATION_A, invalid_generation)
     live_path = tmp_path / f"{sid}.json"
     _write_json(live_path, live)
     _write_json(live_path.with_suffix(".json.bak"), backup)
@@ -248,7 +251,7 @@ def test_different_generation_backup_is_intentional_and_not_restored(tmp_path):
     from api.session_recovery import inspect_session_recovery_status, recover_session
 
     sid = "issue6911_different_generation"
-    live, backup = _live_and_backup(sid, "generation-new", "generation-old")
+    live, backup = _live_and_backup(sid, _VALID_GENERATION_A, _VALID_GENERATION_B)
     live_path = tmp_path / f"{sid}.json"
     _write_json(live_path, live)
     _write_json(live_path.with_suffix(".json.bak"), backup)
@@ -260,3 +263,38 @@ def test_different_generation_backup_is_intentional_and_not_restored(tmp_path):
     assert status["intentional_message_shrink"] is True
     assert result["restored"] is False
     assert json.loads(live_path.read_text(encoding="utf-8"))["messages"] == live["messages"]
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed_generation"),
+    [
+        ("live", "0123456789AB4CDE8F0123456789ABCD"),
+        ("backup", "0123456789AB4CDE8F0123456789ABCD"),
+        ("live", "0123456789ab4cde8f0123456789abcd0"),
+        ("backup", "0123456789ab4cde8f0123456789abcd0"),
+        ("live", "0123456789ab4cde8f0123456789abc"),
+        ("backup", "0123456789ab4cde8f0123456789abc"),
+        ("live", "0123456789ab5cde8f0123456789abcd"),
+        ("backup", "0123456789ab5cde8f0123456789abcd"),
+        ("live", "0123456789ab4cdecf0123456789abcd"),
+        ("backup", "0123456789ab4cdecf0123456789abcd"),
+    ],
+)
+def test_malformed_nonblank_generation_fails_open_to_restore(
+    tmp_path, field, malformed_generation,
+):
+    """Malformed nonblank UUID4 markers must not suppress recovery."""
+    from api.session_recovery import recover_session
+
+    sid = "issue6911_malformed_nonblank"
+    live_generation = malformed_generation if field == "live" else _VALID_GENERATION_A
+    backup_generation = malformed_generation if field == "backup" else _VALID_GENERATION_B
+    live, backup = _live_and_backup(sid, live_generation, backup_generation)
+    live_path = tmp_path / f"{sid}.json"
+    _write_json(live_path, live)
+    _write_json(live_path.with_suffix(".json.bak"), backup)
+
+    result = recover_session(live_path)
+
+    assert result["restored"] is True
+    assert json.loads(live_path.read_text(encoding="utf-8"))["messages"] == backup["messages"]
