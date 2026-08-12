@@ -3964,6 +3964,21 @@ def _session_index_prune_verified(sid: str) -> bool:
         return False
 
 
+def _delete_session_attachments_verified(sid: str) -> None:
+    """Remove one session's attachment inbox and verify no plaintext remains."""
+    from api.upload import _session_attachment_dir
+
+    attachment_dir = Path(_session_attachment_dir(sid))
+    try:
+        if attachment_dir.exists() or attachment_dir.is_symlink():
+            shutil.rmtree(attachment_dir)
+    except FileNotFoundError:
+        # A concurrent cleanup that already removed the directory is success.
+        pass
+    if attachment_dir.exists() or attachment_dir.is_symlink():
+        raise OSError(f"attachment cleanup left residual directory: {attachment_dir}")
+
+
 _ANCHOR_ACTIVITY_SCENE_MAX_BYTES = 256_000
 _ANCHOR_ACTIVITY_SCENE_MAX_ROWS = 1_000
 
@@ -5267,7 +5282,11 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
     except KeyError:
         pass
 
-    # Fallback: try to materialize from CLI/agent session metadata
+    # Fallback: try to materialize from CLI/agent session metadata. A durable
+    # delete tombstone retires this WebUI identity; only the explicit
+    # /api/session/import_cli transition may create a new incarnation.
+    if _session_deleted_tombstone_marks_was_webui(sid):
+        raise KeyError(sid)
     cli_meta = _lookup_cli_session_metadata(sid)
 
     # Delegated subagent children (#5307) are view-only: their transcript lives
@@ -15231,6 +15250,87 @@ def handle_post(handler, parsed) -> bool:
                     status=500,
                 )
             try:
+                _delete_session_attachments_verified(sid)
+            except Exception:
+                logger.debug(
+                    "Failed to delete attachments for session %s; preserving session for retry",
+                    sid,
+                    exc_info=True,
+                )
+                return j(
+                    handler,
+                    {
+                        "ok": False,
+                        "state_db_cleanup_failed": False,
+                        "run_journal_cleanup_failed": False,
+                        "attachment_cleanup_failed": True,
+                        "turn_journal_cleanup_failed": False,
+                        "session_artifact_cleanup_failed": False,
+                        **worktree_retained,
+                        "error": "Attachment cleanup failed; retry deletion",
+                    },
+                    status=500,
+                )
+            try:
+                from api.turn_journal import delete_turn_journal_verified
+
+                delete_turn_journal_verified(sid)
+            except Exception:
+                logger.debug(
+                    "Failed to delete turn journal for session %s; preserving session for retry",
+                    sid,
+                    exc_info=True,
+                )
+                return j(
+                    handler,
+                    {
+                        "ok": False,
+                        "state_db_cleanup_failed": False,
+                        "run_journal_cleanup_failed": False,
+                        "attachment_cleanup_failed": False,
+                        "turn_journal_cleanup_failed": True,
+                        "session_artifact_cleanup_failed": False,
+                        **worktree_retained,
+                        "error": "Turn journal cleanup failed; retry deletion",
+                    },
+                    status=500,
+                )
+            if not is_messaging_session:
+                try:
+                    from api.models import delete_cli_session
+
+                    if not delete_cli_session(sid):
+                        return j(
+                            handler,
+                            {
+                                "ok": False,
+                                "state_db_cleanup_failed": True,
+                                "run_journal_cleanup_failed": False,
+                                "attachment_cleanup_failed": False,
+                                "turn_journal_cleanup_failed": False,
+                                "session_artifact_cleanup_failed": False,
+                                **worktree_retained,
+                                "error": "State database cleanup failed; retry deletion",
+                            },
+                            status=500,
+                        )
+                except Exception:
+                    logger.warning("Failed to delete CLI session %s from state.db", sid, exc_info=True)
+                    return j(
+                        handler,
+                        {
+                            "ok": False,
+                            "state_db_cleanup_failed": True,
+                            "run_journal_cleanup_failed": False,
+                            "attachment_cleanup_failed": False,
+                            "turn_journal_cleanup_failed": False,
+                            "session_artifact_cleanup_failed": False,
+                            **worktree_retained,
+                            "error": "State database cleanup failed; retry deletion",
+                        },
+                        status=500,
+                    )
+            try:
                 p = (SESSION_DIR / f"{sid}.json").resolve()
                 p.relative_to(SESSION_DIR.resolve())
             except Exception:
@@ -15348,23 +15448,6 @@ def handle_post(handler, parsed) -> bool:
         # I/O and must not hold a per-session Session lock.
         from api.config import _evict_session_agent
         _evict_session_agent(sid)
-        try:
-            from api.upload import _session_attachment_dir
-
-            shutil.rmtree(_session_attachment_dir(sid), ignore_errors=True)
-        except Exception:
-            logger.debug("Failed to clean attachment dir for deleted session %s", sid)
-        # Remove the turn-journal shards and the run-journal directory so a
-        # deleted conversation is not recoverable from disk. The session JSON +
-        # state.db rows are cleared above, but these journals retain the user's
-        # messages (turn journal) and the full request/response payloads (run
-        # journal) in plaintext. (#3802)
-        try:
-            from api.turn_journal import delete_turn_journal
-
-            delete_turn_journal(sid)
-        except Exception:
-            logger.debug("Failed to delete turn journal for deleted session %s", sid)
         # The weak lock registry releases this entry automatically after all
         # holders and waiters drop their strong references.
         # Prune the completion-dedup entry too. The reaper sweeps it once the
@@ -15381,24 +15464,15 @@ def handle_post(handler, parsed) -> bool:
             close_terminal(sid)
         except Exception:
             logger.debug("Failed to close workspace terminal for deleted session %s", sid)
-        # Also delete from CLI state.db for CLI sessions shown in sidebar,
-        # but never erase external messaging channel memory via WebUI delete.
-        state_db_cleanup_failed = False
-        if not is_messaging_session:
-            try:
-                from api.models import delete_cli_session
-
-                state_db_cleanup_failed = not delete_cli_session(sid)
-            except Exception:
-                state_db_cleanup_failed = True
-                logger.warning("Failed to delete CLI session %s", sid, exc_info=True)
         _publish_session_list_changed("session_delete", profile=event_profile)
         return j(
             handler,
             {
                 "ok": True,
-                "state_db_cleanup_failed": state_db_cleanup_failed,
+                "state_db_cleanup_failed": False,
                 "run_journal_cleanup_failed": False,
+                "attachment_cleanup_failed": False,
+                "turn_journal_cleanup_failed": False,
                 "session_artifact_cleanup_failed": False,
                 **worktree_retained,
             },
@@ -16429,6 +16503,8 @@ def handle_post(handler, parsed) -> bool:
                 with LOCK:
                     SESSIONS[sid] = s
         except KeyError:
+            if _session_deleted_tombstone_marks_was_webui(sid):
+                return bad(handler, "Session not found", 404)
             cli_meta = _lookup_cli_session_metadata(sid)
             if not cli_meta:
                 return bad(handler, "Session not found", 404)
@@ -16441,52 +16517,59 @@ def handle_post(handler, parsed) -> bool:
             _arch_source_tag = (cli_meta.get("source_tag") or cli_meta.get("raw_source") or "").strip().lower()
             if _arch_source_tag == "subagent" or _is_subagent_child_session_id(sid):
                 return bad(handler, "Subagent sessions cannot be archived from WebUI", 400)
-            if _is_messaging_session_record(cli_meta):
-                s = Session(
-                    session_id=sid,
-                    title=cli_meta.get("title") or title_from(get_cli_session_messages(sid), "CLI Session"),
-                    workspace=get_last_workspace(),
-                    messages=[],
-                    model=cli_meta.get("model") or "unknown",
-                    created_at=cli_meta.get("created_at"),
-                    updated_at=cli_meta.get("updated_at"),
-                )
-                s.is_cli_session = is_cli_session_row(cli_meta)
-                s.source_tag = cli_meta.get("source_tag")
-                s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
-                s.session_source = cli_meta.get("session_source")
-                s.source_label = cli_meta.get("source_label")
-                s.user_id = cli_meta.get("user_id")
-                s.chat_id = cli_meta.get("chat_id")
-                s.chat_type = cli_meta.get("chat_type")
-                s.thread_id = cli_meta.get("thread_id")
-                s.session_key = cli_meta.get("session_key")
-                s.platform = cli_meta.get("platform")
-                s.save(touch_updated_at=False)
-            else:
-                msgs = get_cli_session_messages(sid)
-                if not msgs:
-                    return bad(handler, "Session not found", 404)
-                s = import_cli_session(
-                    sid,
-                    cli_meta.get("title") or title_from(msgs, "CLI Session"),
-                    msgs,
-                    cli_meta.get("model") or "unknown",
-                    profile=cli_meta.get("profile"),
-                    created_at=cli_meta.get("created_at"),
-                    updated_at=cli_meta.get("updated_at"),
-                )
-                s.is_cli_session = is_cli_session_row(cli_meta)
-                s.source_tag = cli_meta.get("source_tag")
-                s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
-                s.session_source = cli_meta.get("session_source")
-                s.source_label = cli_meta.get("source_label")
-                s.user_id = cli_meta.get("user_id")
-                s.chat_id = cli_meta.get("chat_id")
-                s.chat_type = cli_meta.get("chat_type")
-                s.thread_id = cli_meta.get("thread_id")
-                s.session_key = cli_meta.get("session_key")
-                s.platform = cli_meta.get("platform")
+            try:
+                if _is_messaging_session_record(cli_meta):
+                    s = Session(
+                        session_id=sid,
+                        title=cli_meta.get("title") or title_from(get_cli_session_messages(sid), "CLI Session"),
+                        workspace=get_last_workspace(),
+                        messages=[],
+                        model=cli_meta.get("model") or "unknown",
+                        created_at=cli_meta.get("created_at"),
+                        updated_at=cli_meta.get("updated_at"),
+                    )
+                    s.is_cli_session = is_cli_session_row(cli_meta)
+                    s.source_tag = cli_meta.get("source_tag")
+                    s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
+                    s.session_source = cli_meta.get("session_source")
+                    s.source_label = cli_meta.get("source_label")
+                    s.user_id = cli_meta.get("user_id")
+                    s.chat_id = cli_meta.get("chat_id")
+                    s.chat_type = cli_meta.get("chat_type")
+                    s.thread_id = cli_meta.get("thread_id")
+                    s.session_key = cli_meta.get("session_key")
+                    s.platform = cli_meta.get("platform")
+                    s.save(touch_updated_at=False)
+                else:
+                    msgs = get_cli_session_messages(sid)
+                    if not msgs:
+                        return bad(handler, "Session not found", 404)
+                    s = import_cli_session(
+                        sid,
+                        cli_meta.get("title") or title_from(msgs, "CLI Session"),
+                        msgs,
+                        cli_meta.get("model") or "unknown",
+                        profile=cli_meta.get("profile"),
+                        created_at=cli_meta.get("created_at"),
+                        updated_at=cli_meta.get("updated_at"),
+                    )
+                    s.is_cli_session = is_cli_session_row(cli_meta)
+                    s.source_tag = cli_meta.get("source_tag")
+                    s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
+                    s.session_source = cli_meta.get("session_source")
+                    s.source_label = cli_meta.get("source_label")
+                    s.user_id = cli_meta.get("user_id")
+                    s.chat_id = cli_meta.get("chat_id")
+                    s.chat_type = cli_meta.get("chat_type")
+                    s.thread_id = cli_meta.get("thread_id")
+                    s.session_key = cli_meta.get("session_key")
+                    s.platform = cli_meta.get("platform")
+            except KeyError:
+                # A delete may win after the tombstone check above but before
+                # this fallback materializes its CLI-owned sidecar. Preserve
+                # the existing archive 404 contract instead of leaking the
+                # lifecycle guard as an unhandled server error.
+                return bad(handler, "Session not found", 404)
         with _get_session_agent_lock(sid):
             s.archived = bool(body.get("archived", True))
             s.save(touch_updated_at=False)
@@ -27284,6 +27367,7 @@ def _handle_session_import_cli(handler, body):
         created_at=created_at,
         updated_at=updated_at,
         parent_session_id=cli_parent_session_id,
+        _allow_deleted_session_reactivation=True,
     )
     if cron_project_id:
         s.project_id = cron_project_id

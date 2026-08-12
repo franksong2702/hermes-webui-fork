@@ -517,6 +517,139 @@ def test_successful_delete_revokes_prelock_rename_owner(
     assert models_module.Session.load(sid) is None
 
 
+def test_state_backed_rename_materialization_cannot_recreate_deleted_sid(
+    models_module, monkeypatch, tmp_path
+):
+    """A paused CLI import must not clear a delete tombstone or recreate a sidecar."""
+    routes_module = pytest.importorskip("api.routes")
+    profiles_module = pytest.importorskip("api.profiles")
+    config_module = pytest.importorskip("api.config")
+    upload_module = pytest.importorskip("api.upload")
+    turn_journal_module = pytest.importorskip("api.turn_journal")
+    run_journal_module = pytest.importorskip("api.run_journal")
+    background_module = pytest.importorskip("api.background_process")
+    terminal_module = pytest.importorskip("api.terminal")
+
+    session_dir = tmp_path / "webui-sessions"
+    session_dir.mkdir()
+    index_file = session_dir / "_index.json"
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    state_db = hermes_home / "state.db"
+    sid = "state-backed-rename-race"
+    conn = sqlite3.connect(str(state_db))
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT,
+            model TEXT,
+            message_count INTEGER DEFAULT 0,
+            started_at REAL,
+            ended_at REAL,
+            title TEXT,
+            cwd TEXT,
+            parent_session_id TEXT,
+            model_config TEXT,
+            end_reason TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp REAL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO sessions "
+        "(id, source, model, message_count, started_at, title, cwd, parent_session_id, model_config) "
+        "VALUES (?, 'cli', 'MiniMax-M3', 2, 1781024055.0, 'CLI title', ?, NULL, NULL)",
+        (sid, str(tmp_path)),
+    )
+    conn.executemany(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+        [(sid, "user", "hi", 1781024055.0), (sid, "assistant", "hello", 1781024056.0)],
+    )
+    conn.commit()
+    conn.close()
+    (hermes_home / "sessions").mkdir()
+
+    monkeypatch.setattr(models_module, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models_module, "SESSION_INDEX_FILE", index_file)
+    monkeypatch.setattr(routes_module, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(routes_module, "SESSION_INDEX_FILE", index_file, raising=False)
+    monkeypatch.setattr(models_module, "_active_state_db_path", lambda: state_db)
+    monkeypatch.setattr(profiles_module, "get_active_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(profiles_module, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(models_module, "get_last_workspace", lambda: tmp_path)
+    models_module.SESSIONS.clear()
+    models_module.clear_cli_sessions_cache()
+
+    monkeypatch.setattr(routes_module, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(routes_module, "_session_is_subagent_view_only", lambda _sid: False)
+    monkeypatch.setattr(routes_module, "_is_messaging_session_id", lambda _sid: False)
+    monkeypatch.setattr(
+        routes_module, "_worktree_retained_payload_for_session_id", lambda _sid: {}
+    )
+    monkeypatch.setattr(routes_module, "_sync_session_title_to_insights", lambda _s: None)
+    monkeypatch.setattr(config_module, "_evict_session_agent", lambda _sid: None)
+    monkeypatch.setattr(
+        upload_module, "_session_attachment_dir", lambda _sid: tmp_path / "attachments" / _sid
+    )
+    monkeypatch.setattr(turn_journal_module, "delete_turn_journal", lambda _sid: None)
+    monkeypatch.setattr(run_journal_module, "delete_run_journal", lambda _sid: None)
+    monkeypatch.setattr(
+        background_module, "forget_bg_task_completion_dedup", lambda _sid: None
+    )
+    monkeypatch.setattr(terminal_module, "close_terminal", lambda _sid: None)
+
+    import_started = threading.Event()
+    allow_import = threading.Event()
+    original_import = routes_module.import_cli_session
+
+    def paused_import(*args, **kwargs):
+        assert args[0] == sid
+        import_started.set()
+        assert allow_import.wait(timeout=5)
+        return original_import(*args, **kwargs)
+
+    monkeypatch.setattr(routes_module, "import_cli_session", paused_import)
+    rename_result = {}
+
+    def rename():
+        handler = _DeleteJSONHandler({"session_id": sid, "title": "after"})
+        routes_module.handle_post(handler, SimpleNamespace(path="/api/session/rename"))
+        rename_result["status"] = handler.status
+
+    rename_thread = threading.Thread(target=rename)
+    rename_thread.start()
+    assert import_started.wait(timeout=5), "rename must reach real import_cli_session"
+
+    try:
+        assert _delete_via_route(routes_module, sid) == 200
+        assert sid in models_module._load_webui_deleted_session_tombstone()
+        assert not (session_dir / f"{sid}.json").exists()
+        assert not (session_dir / f"{sid}.json.bak").exists()
+    finally:
+        allow_import.set()
+        rename_thread.join(timeout=5)
+
+    assert not rename_thread.is_alive()
+    assert rename_result["status"] in {404, 409}
+    assert not (session_dir / f"{sid}.json").exists()
+    assert not (session_dir / f"{sid}.json.bak").exists()
+    assert not index_file.exists() or sid not in {
+        row.get("session_id") for row in json.loads(index_file.read_text(encoding="utf-8"))
+    }
+    assert sid in models_module._load_webui_deleted_session_tombstone()
+    models_module.SESSIONS.clear()
+    assert models_module.Session.load(sid) is None
+    with sqlite3.connect(str(state_db)) as conn:
+        assert conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone() is None
+
+
 def test_session_persistence_generation_registry_releases_unused_sid(
     models_module,
 ):
@@ -596,15 +729,72 @@ def test_successful_delete_revokes_delayed_session_save(
     }
     assert sid in models_module._load_webui_deleted_session_tombstone()
 
-    successor = models_module.Session(
-        session_id=sid,
-        workspace=str(tmp_path),
-        messages=[{"role": "user", "content": "explicit recreation"}],
+    monkeypatch.setattr(
+        routes_module,
+        "_resolve_cli_import_metadata",
+        lambda _sid, **_kwargs: {
+            "title": "explicit recreation",
+            "model": "unknown",
+            "source": "cli",
+            "source_tag": "cli",
+        },
     )
-    models_module.SESSIONS[sid] = successor
-    successor.save()
-    assert successor.path.exists()
+    monkeypatch.setattr(
+        routes_module,
+        "get_cli_session_messages",
+        lambda _sid, profile=None: [
+            {"role": "user", "content": "explicit recreation"},
+        ],
+    )
+    monkeypatch.setattr(
+        routes_module,
+        "_queue_generated_title_for_imported_session",
+        lambda *_args, **_kwargs: None,
+    )
+    import_handler = _DeleteJSONHandler({"session_id": sid})
+    routes_module.handle_post(
+        import_handler, SimpleNamespace(path="/api/session/import_cli")
+    )
+    assert import_handler.status == 200
+    import_payload = json.loads(import_handler.wfile.getvalue())
+    assert import_payload["imported"] is True
+    assert import_payload["session"]["session_id"] == sid
+    assert (session_dir / f"{sid}.json").exists()
     assert sid not in models_module._load_webui_deleted_session_tombstone()
+
+
+def test_archive_materialization_tombstone_race_returns_not_found(
+    models_module, monkeypatch, tmp_path
+):
+    """A delete winning during archive fallback keeps the archive 404 contract."""
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, _index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "archive-tombstone-race"
+    monkeypatch.setattr(
+        routes_module,
+        "_lookup_cli_session_metadata",
+        lambda _sid: {"title": "CLI archive", "model": "unknown", "source_tag": "cli"},
+    )
+    monkeypatch.setattr(
+        routes_module,
+        "get_cli_session_messages",
+        lambda _sid, profile=None: [{"role": "user", "content": "archive"}],
+    )
+    monkeypatch.setattr(
+        routes_module,
+        "import_cli_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyError(sid)),
+    )
+
+    handler = _DeleteJSONHandler({"session_id": sid})
+    routes_module.handle_post(handler, SimpleNamespace(path="/api/session/archive"))
+
+    assert handler.status == 404
+    payload = json.loads(handler.wfile.getvalue())
+    assert payload["error"] == "Session not found"
+    assert not (session_dir / f"{sid}.json").exists()
 
 
 def test_failed_delete_does_not_revoke_session_save(

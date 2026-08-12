@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -92,6 +93,48 @@ def _make_state_db(path, sid, *, source="telegram"):
     conn.close()
 
 
+def _make_delete_state_db(path, sid):
+    """Create the minimum current Agent schema needed by delete_cli_session()."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT,
+            model TEXT,
+            message_count INTEGER DEFAULT 0,
+            started_at REAL,
+            ended_at REAL,
+            title TEXT,
+            cwd TEXT,
+            parent_session_id TEXT,
+            model_config TEXT,
+            end_reason TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp REAL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO sessions "
+        "(id, source, model, message_count, started_at, title, cwd, parent_session_id, model_config) "
+        "VALUES (?, 'cli', 'MiniMax-M3', 2, 1781024055.0, 'CLI delete', ?, NULL, NULL)",
+        (sid, str(path.parent)),
+    )
+    conn.executemany(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+        [(sid, "user", "hi", 1781024055.0), (sid, "assistant", "hello", 1781024056.0)],
+    )
+    conn.commit()
+    conn.close()
+
+
 def test_delete_worktree_session_reports_retained_worktree_without_cleanup(tmp_path, monkeypatch):
     session_dir = _isolate_session_store(tmp_path, monkeypatch)
     session, worktree = _worktree_session(tmp_path, "wtdelete1")
@@ -112,7 +155,7 @@ def test_delete_worktree_session_reports_retained_worktree_without_cleanup(tmp_p
     assert worktree.exists(), "session delete must not remove the git worktree directory"
 
 
-def test_delete_session_records_tombstone_when_state_db_delete_fails(tmp_path, monkeypatch):
+def test_delete_session_state_db_failure_keeps_retryable_owner_without_tombstone(tmp_path, monkeypatch):
     session_dir = _isolate_session_store(tmp_path, monkeypatch)
     sid = "dbfaildelete1"
     session = Session(
@@ -133,12 +176,13 @@ def test_delete_session_records_tombstone_when_state_db_delete_fails(tmp_path, m
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
 
-    assert captured["status"] == 200
-    assert captured["payload"]["ok"] is True
+    assert captured["status"] == 500
+    assert captured["payload"]["ok"] is False
     assert captured["payload"]["state_db_cleanup_failed"] is True
-    assert not (session_dir / f"{sid}.json").exists()
-    assert not (session_dir / f"{sid}.json.bak").exists()
-    assert sid in models._load_webui_deleted_session_tombstone()
+    assert (session_dir / f"{sid}.json").exists()
+    assert (session_dir / f"{sid}.json.bak").exists()
+    assert sid in models.SESSIONS
+    assert sid not in models._load_webui_deleted_session_tombstone()
 
 
 def test_delete_session_reports_run_journal_cleanup_failure(tmp_path, monkeypatch):
@@ -245,7 +289,7 @@ def test_delete_session_reports_durable_artifact_cleanup_failure(
     assert captured["payload"]["run_journal_cleanup_failed"] is False
     assert (session_dir / f"{sid}{blocked_suffix}").exists()
     assert sid in SESSIONS
-    assert state_db_delete_calls == []
+    assert state_db_delete_calls == [sid]
     assert published == []
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
@@ -255,8 +299,156 @@ def test_delete_session_reports_durable_artifact_cleanup_failure(
     assert not (session_dir / f"{sid}.json").exists()
     assert not backup.exists()
     assert sid not in SESSIONS
-    assert state_db_delete_calls == [sid]
+    assert state_db_delete_calls == [sid, sid]
     assert [event for event, _kwargs in published] == ["session_delete"]
+
+
+@pytest.mark.parametrize(
+    "cleanup_failure",
+    ["attachments", "turn_journal", "state_db"],
+    ids=["attachment-cleanup", "turn-journal-shard", "state-db-delete"],
+)
+def test_delete_non_terminal_cleanup_failure_keeps_retryable_owner(
+    tmp_path, monkeypatch, cleanup_failure
+):
+    """Every post-sidecar cleanup boundary must fail closed and remain retryable."""
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = f"nonterminal-{cleanup_failure}"
+    owner = Session(
+        session_id=sid,
+        title="Retryable cleanup",
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "keep me"}],
+    )
+    models.SESSIONS[sid] = owner
+    owner.save()
+    sidecar = session_dir / f"{sid}.json"
+    backup = session_dir / f"{sid}.json.bak"
+    backup.write_text(sidecar.read_text(encoding="utf-8"), encoding="utf-8")
+    capability = owner._persistence_generation
+
+    config_module = pytest.importorskip("api.config")
+    upload_module = pytest.importorskip("api.upload")
+    turn_journal_module = pytest.importorskip("api.turn_journal")
+    run_journal_module = pytest.importorskip("api.run_journal")
+    background_module = pytest.importorskip("api.background_process")
+    terminal_module = pytest.importorskip("api.terminal")
+    profiles_module = pytest.importorskip("api.profiles")
+
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda _sid: {})
+    monkeypatch.setattr(routes, "_is_messaging_session_id", lambda _sid: False)
+    monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(routes, "_worktree_retained_payload_for_session_id", lambda _sid: {})
+    monkeypatch.setattr(routes, "_sync_session_title_to_insights", lambda _s: None)
+    monkeypatch.setattr(config_module, "_evict_session_agent", lambda _sid: None)
+    monkeypatch.setattr(run_journal_module, "delete_run_journal", lambda _sid: None)
+    monkeypatch.setattr(background_module, "forget_bg_task_completion_dedup", lambda _sid: None)
+    monkeypatch.setattr(terminal_module, "close_terminal", lambda _sid: None)
+
+    attachment_dir = tmp_path / "attachments" / sid
+    attachment_plaintext = attachment_dir / "secret.txt"
+    attachment_dir.mkdir(parents=True)
+    attachment_plaintext.write_text("attachment secret", encoding="utf-8")
+    monkeypatch.setattr(upload_module, "_session_attachment_dir", lambda _sid: attachment_dir)
+
+    turn_journal_dir = session_dir / "_turn_journal"
+    turn_shard = turn_journal_dir / f"{sid}~test.jsonl"
+    turn_journal_dir.mkdir()
+    turn_shard.write_text('{"event":"submitted","content":"turn secret"}\n', encoding="utf-8")
+
+    hermes_home = tmp_path / "hermes-home"
+    state_db = hermes_home / "state.db"
+    state_artifact = hermes_home / "sessions" / f"{sid}.json"
+    if cleanup_failure == "state_db":
+        _make_delete_state_db(state_db, sid)
+        state_artifact.parent.mkdir(parents=True)
+        state_artifact.write_text('{"secret":"agent artifact"}', encoding="utf-8")
+        monkeypatch.setattr(profiles_module, "get_active_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(models, "_active_state_db_path", lambda: state_db)
+
+    published = []
+    monkeypatch.setattr(
+        routes,
+        "_publish_session_list_changed",
+        lambda event, **kwargs: published.append((event, kwargs)),
+    )
+
+    if cleanup_failure == "attachments":
+        real_rmtree = routes.shutil.rmtree
+        blocked = True
+
+        def fail_attachment_cleanup(path, *args, **kwargs):
+            nonlocal blocked
+            if blocked and Path(path).resolve() == attachment_dir.resolve():
+                blocked = False
+                raise OSError("attachment cleanup locked")
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(routes.shutil, "rmtree", fail_attachment_cleanup)
+        monkeypatch.setattr(models, "delete_cli_session", lambda _sid: True)
+    elif cleanup_failure == "turn_journal":
+        real_delete_turn_journal = turn_journal_module.delete_turn_journal
+        blocked = True
+
+        def fail_turn_journal(candidate_sid, *args, **kwargs):
+            nonlocal blocked
+            if blocked and candidate_sid == sid:
+                blocked = False
+                raise OSError("turn journal shard locked")
+            return real_delete_turn_journal(candidate_sid, *args, **kwargs)
+
+        monkeypatch.setattr(turn_journal_module, "delete_turn_journal", fail_turn_journal)
+        monkeypatch.setattr(models, "delete_cli_session", lambda _sid: True)
+    else:
+        real_delete_cli_session = models.delete_cli_session
+        delete_calls = []
+
+        def fail_state_db_once(candidate_sid):
+            delete_calls.append(candidate_sid)
+            if len(delete_calls) == 1:
+                return False
+            return real_delete_cli_session(candidate_sid)
+
+        monkeypatch.setattr(models, "delete_cli_session", fail_state_db_once)
+
+    captured = _capture_post(monkeypatch, {"session_id": sid})
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
+
+    assert captured["status"] >= 400
+    assert captured["payload"]["ok"] is False
+    assert not published, "a failed cleanup must not publish session_delete"
+    assert models.SESSIONS[sid] is owner
+    assert sidecar.exists()
+    assert backup.exists()
+    assert sid in {
+        row.get("session_id")
+        for row in json.loads((session_dir / "_index.json").read_text(encoding="utf-8"))
+    }
+    assert capability.revoked is False
+    assert models._SESSION_PERSISTENCE_GENERATIONS.get(sid) is capability
+    owner.title = "retry handle remains writable"
+    owner.save()
+
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
+    assert captured["status"] == 200
+    assert captured["payload"]["ok"] is True
+    assert published == [("session_delete", {"profile": None})]
+    assert not sidecar.exists()
+    assert not backup.exists()
+    assert not (session_dir / "_index.json").exists() or sid not in {
+        row.get("session_id")
+        for row in json.loads((session_dir / "_index.json").read_text(encoding="utf-8"))
+    }
+    assert not attachment_dir.exists()
+    assert not turn_shard.exists()
+    assert sid in models._load_webui_deleted_session_tombstone()
+    assert sid not in models.SESSIONS
+    assert capability.revoked is True
+    assert models._SESSION_PERSISTENCE_GENERATIONS.get(sid) is None
+    if cleanup_failure == "state_db":
+        with sqlite3.connect(str(state_db)) as conn:
+            assert conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone() is None
+        assert not state_artifact.exists()
 
 
 def test_delete_messaging_session_reopens_read_only_without_deleted_webui_tombstone(

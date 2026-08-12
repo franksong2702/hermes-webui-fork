@@ -1618,6 +1618,21 @@ class Session:
                 f"Refusing to save revoked/deleted session {self.session_id!r}: "
                 "its persistence generation is no longer current"
             )
+        # A deleted WebUI SID is a retired identity, not an empty slot that a
+        # direct ``Session(session_id=...).save()`` may silently reclaim. Keep
+        # the compatibility path for a live sidecar whose tombstone is stale,
+        # while requiring an explicit import/restore transition to create a
+        # new incarnation after deletion.
+        sidecar_existed_before_save = self.path.exists()
+        if (
+            not sidecar_existed_before_save
+            and not getattr(self, "_allow_deleted_session_reactivation", False)
+            and self.session_id in _load_webui_deleted_session_tombstone()
+        ):
+            raise KeyError(
+                f"Refusing to recreate deleted session {self.session_id!r} "
+                "without an explicit import/restore transition"
+            )
         if touch_updated_at:
             self.updated_at = time.time()
         # Write metadata fields first so load_metadata_only() can read them
@@ -1757,20 +1772,18 @@ class Session:
         # #4985 belt-and-suspenders self-heal: a successful save with at
         # least one real message on the sidecar is unconditional proof the
         # row is alive (the #4985 "zero-message orphan" only ever exists
-        # when ``len(self.messages) == 0``). Clear the tombstone so the
-        # next ``/api/sessions`` poll does not need the prune helper to
-        # run before the row re-appears — useful when the message-commit
-        # happens on a poll that does not yet see state.db.messages rows
-        # (e.g. the WebUI's own sidecar commit lands before the agent's
-        # state.db append, or the helper is skipped via a different code
-        # path). Wrapped because a tombstone failure must never block a
-        # save. The helper's self-healing branch in
-        # ``_prune_orphaned_webui_zero_message_sessions`` is the primary
-        # fix; this is the belt.
+        # when ``len(self.messages) == 0``). A deleted-session tombstone is
+        # different: clear it only when this save updated an already-live
+        # sidecar, or when a caller explicitly authorized a new import/restore
+        # incarnation. Direct SID reuse must leave the tombstone in place.
         if self.messages:
             try:
                 _clear_webui_zero_message_orphan_tombstone(self.session_id)
-                _clear_webui_deleted_session_tombstone(self.session_id)
+                if (
+                    sidecar_existed_before_save
+                    or getattr(self, "_allow_deleted_session_reactivation", False)
+                ):
+                    _clear_webui_deleted_session_tombstone(self.session_id)
             except Exception:
                 logger.debug(
                     "Failed to clear webui tombstone for %s",
@@ -6913,6 +6926,8 @@ def import_cli_session(
     created_at=None,
     updated_at=None,
     parent_session_id=None,
+    *,
+    _allow_deleted_session_reactivation: bool = False,
 ):
     """Create a new WebUI session populated with CLI/agent messages.
 
@@ -6920,32 +6935,37 @@ def import_cli_session(
     keep their lineage in the WebUI store and sidebar instead of reappearing as
     detached orphan chats.
     """
-    s = Session(
-        session_id=session_id,
-        title=title,
-        workspace=get_last_workspace(),
-        model=model,
-        messages=messages,
-        profile=profile,
-        created_at=created_at,
-        updated_at=updated_at,
-        parent_session_id=parent_session_id,
-    )
-    # #4985: import_cli_session uses an explicit sid (the CLI sidecar's id).
-    # If that sid was previously tombstoned as a webui zero-message orphan,
-    # clear the tombstone entry so the freshly-imported session is visible
-    # on the next poll. Wrapped because a tombstone failure must never block
-    # an import.
-    try:
-        _clear_webui_zero_message_orphan_tombstone(s.session_id)
-        _clear_webui_deleted_session_tombstone(s.session_id)
-    except Exception:
-        logger.debug(
-            "Failed to clear webui tombstone for %s",
-            s.session_id,
-            exc_info=True,
-        )
-    s.save(touch_updated_at=False)
+    # Keep the explicit import/restore transition under the same SID lifecycle
+    # lock order as deletion (agent -> persistence). A concurrent delete that
+    # wins before this check leaves the retired tombstone intact and this
+    # materialization fails closed instead of recreating a sidecar.
+    from api.config import _get_session_agent_lock
+
+    agent_lock = _get_session_agent_lock(session_id)
+    with agent_lock:
+        with _get_session_persistence_lock(session_id):
+            sidecar_path = SESSION_DIR / f"{session_id}.json"
+            if (
+                not _allow_deleted_session_reactivation
+                and not sidecar_path.exists()
+                and session_id in _load_webui_deleted_session_tombstone()
+            ):
+                raise KeyError(session_id)
+            s = Session(
+                session_id=session_id,
+                title=title,
+                workspace=get_last_workspace(),
+                model=model,
+                messages=messages,
+                profile=profile,
+                created_at=created_at,
+                updated_at=updated_at,
+                parent_session_id=parent_session_id,
+            )
+            s._allow_deleted_session_reactivation = bool(
+                _allow_deleted_session_reactivation
+            )
+            s.save(touch_updated_at=False)
     return s
 
 
