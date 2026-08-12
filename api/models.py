@@ -9819,6 +9819,65 @@ def _cleanup_manifest_thread_lock(hermes_home):
 
 def delete_cli_session(sid) -> bool:
     """Delete a CLI session while serializing manifest and DB cleanup."""
+    return _delete_cli_session_with_scope(sid, require_all_stale_cleanup=True)
+
+
+def delete_cli_session_for_webui_delete(sid) -> bool:
+    """Delete one WebUI SID without charging unrelated stale cleanup to it.
+
+    The ordinary maintenance entry point reports failure while *any* older
+    cleanup manifest remains unsettled.  The WebUI route needs a narrower
+    contract: its retry handle owns only the requested SID, and must not become
+    undeletable because a different historical session left a retry manifest.
+    The requested SID's DB row and artifacts are still deleted and verified by
+    ``_delete_cli_session_locked``. A missing state.db is accepted only when no
+    state-only transcript or retry record for this SID exists; unreadable or
+    malformed authority still fails closed.
+    """
+    return _delete_cli_session_with_scope(sid, require_all_stale_cleanup=False)
+
+
+def _scoped_state_cleanup_absence_is_verified(sid: str, hermes_home: Path) -> bool:
+    """Prove that no state-only artifact or retry record owns *sid*.
+
+    ``{sid}.json`` is deliberately excluded: the WebUI delete route owns that
+    retry sidecar and removes it only after every earlier cleanup gate commits.
+    """
+    if not is_safe_session_id(sid):
+        return False
+    sessions_dir = hermes_home / "sessions"
+    if not sessions_dir.exists():
+        return True
+    try:
+        for manifest in sessions_dir.glob(".cleanup_manifest_*.json"):
+            try:
+                pending_ids = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                # This scoped route cannot attribute an unreadable historical
+                # retry record to the requested SID. Keep it untouched for the
+                # maintenance entry point.
+                continue
+            if not isinstance(pending_ids, list) or not all(
+                isinstance(item, str) for item in pending_ids
+            ):
+                continue
+            if sid in pending_ids:
+                return False
+        if (sessions_dir / f"{sid}.jsonl").exists():
+            return False
+        state_json = sessions_dir / f"{sid}.json"
+        webui_json = SESSION_DIR / f"{sid}.json"
+        if state_json.exists() and state_json.resolve() != webui_json.resolve():
+            return False
+        if any(sessions_dir.glob(f"request_dump_{sid}_*.json")):
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def _delete_cli_session_with_scope(sid, *, require_all_stale_cleanup: bool) -> bool:
+    """Run state cleanup with either maintenance-wide or requested-SID scope."""
     try:
         from api.profiles import get_active_hermes_home
         hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
@@ -9828,13 +9887,57 @@ def delete_cli_session(sid) -> bool:
     try:
         with _cleanup_manifest_thread_lock(hermes_home):
             with _cleanup_manifest_process_lock(hermes_home):
-                return _delete_cli_session_locked(sid, hermes_home)
+                if not require_all_stale_cleanup:
+                    db_path = hermes_home / "state.db"
+                    if not db_path.exists():
+                        return _scoped_state_cleanup_absence_is_verified(
+                            sid,
+                            hermes_home,
+                        )
+                    try:
+                        import sqlite3
+
+                        db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+                        with closing(sqlite3.connect(db_uri, uri=True)) as conn:
+                            has_sessions_table = conn.execute(
+                                "SELECT 1 FROM sqlite_master "
+                                "WHERE type = 'table' AND name = 'sessions'"
+                            ).fetchone() is not None
+                            state_row_exists = bool(
+                                has_sessions_table
+                                and conn.execute(
+                                    "SELECT 1 FROM sessions WHERE id = ?",
+                                    (sid,),
+                                ).fetchone() is not None
+                            )
+                    except Exception:
+                        logger.warning(
+                            "Failed to verify state.db ownership for WebUI delete %s",
+                            sid,
+                            exc_info=True,
+                        )
+                        return False
+                    if not state_row_exists:
+                        return _scoped_state_cleanup_absence_is_verified(
+                            sid,
+                            hermes_home,
+                        )
+                return _delete_cli_session_locked(
+                    sid,
+                    hermes_home,
+                    require_all_stale_cleanup=require_all_stale_cleanup,
+                )
     except Exception:
         logger.warning("Failed to delete CLI session %s from state.db", sid, exc_info=True)
         return False
 
 
-def _delete_cli_session_locked(sid, hermes_home) -> bool:
+def _delete_cli_session_locked(
+    sid,
+    hermes_home,
+    *,
+    require_all_stale_cleanup: bool = True,
+) -> bool:
     """Delete a CLI session from state.db using Hermes' session semantics.
 
     A scoped transaction implements the Agent invariant while giving branch and
@@ -9858,6 +9961,8 @@ def _delete_cli_session_locked(sid, hermes_home) -> bool:
 
     db_path = hermes_home / 'state.db'
     if not db_path.exists():
+        if not require_all_stale_cleanup:
+            return _scoped_state_cleanup_absence_is_verified(sid, hermes_home)
         return False
 
     try:
@@ -10130,6 +10235,15 @@ def _delete_cli_session_locked(sid, hermes_home) -> bool:
             # manifest from a failed commit never unlinks a live session's
             # artifacts.
             artifact_cleanup_failed = False
+            requested_cleanup_ids = set(all_removed_ids)
+
+            def _manifest_failure_is_in_scope(path, pending_ids=None):
+                if require_all_stale_cleanup or path == manifest_path:
+                    return True
+                return bool(
+                    isinstance(pending_ids, list)
+                    and requested_cleanup_ids.intersection(pending_ids)
+                )
 
             def _is_session_alive(conn, sid):
                 """True when *sid* still has a row in the sessions table.
@@ -10152,8 +10266,19 @@ def _delete_cli_session_locked(sid, hermes_home) -> bool:
                 if not is_safe_session_id(removed_id):
                     return False
                 ok = True
+                # The WebUI route owns and verifies {sid}.json only after all
+                # preceding cleanup gates commit. Removing it here would erase
+                # the retry handle if a later phase fails. The maintenance
+                # entry point retains its historical ownership of both files.
                 for suffix in (".json", ".jsonl"):
                     artifact = sessions_dir / f"{removed_id}{suffix}"
+                    if (
+                        not require_all_stale_cleanup
+                        and suffix == ".json"
+                        and artifact.resolve()
+                        == (SESSION_DIR / f"{removed_id}.json").resolve()
+                    ):
+                        continue
                     if not artifact.exists():
                         continue
                     try:
@@ -10195,12 +10320,14 @@ def _delete_cli_session_locked(sid, hermes_home) -> bool:
                 except (OSError, ValueError, TypeError):
                     # The IDs are unknown, so deleting the manifest would lose
                     # the only retry record for potentially orphaned artifacts.
-                    artifact_cleanup_failed = True
+                    if _manifest_failure_is_in_scope(mp):
+                        artifact_cleanup_failed = True
                     continue
                 if not isinstance(pending_ids, list) or not all(
                     isinstance(item, str) for item in pending_ids
                 ):
-                    artifact_cleanup_failed = True
+                    if _manifest_failure_is_in_scope(mp):
+                        artifact_cleanup_failed = True
                     continue
                 still_pending = []
                 for removed_id in pending_ids:
@@ -10223,11 +10350,15 @@ def _delete_cli_session_locked(sid, hermes_home) -> bool:
                         logger.warning(
                             "Failed to rewrite manifest %s", mp, exc_info=True,
                         )
-                    artifact_cleanup_failed = True
+                    if _manifest_failure_is_in_scope(mp, still_pending):
+                        artifact_cleanup_failed = True
                 else:
                     mp.unlink(missing_ok=True)
 
-            return stale_cleanup_complete and not artifact_cleanup_failed
+            return (
+                not artifact_cleanup_failed
+                and (stale_cleanup_complete or not require_all_stale_cleanup)
+            )
     except Exception:
         logger.warning("Failed to delete CLI session %s from state.db", sid, exc_info=True)
         return False

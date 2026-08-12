@@ -15297,9 +15297,9 @@ def handle_post(handler, parsed) -> bool:
                 )
             if not is_messaging_session:
                 try:
-                    from api.models import delete_cli_session
+                    from api.models import delete_cli_session_for_webui_delete
 
-                    if not delete_cli_session(sid):
+                    if not delete_cli_session_for_webui_delete(sid):
                         return j(
                             handler,
                             {

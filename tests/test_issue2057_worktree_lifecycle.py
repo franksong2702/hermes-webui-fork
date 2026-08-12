@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import api.models as models
+import api.profiles as profiles_module
 import api.run_journal as run_journal
 import api.routes as routes
 from api.models import SESSIONS, Session
@@ -141,7 +142,12 @@ def test_delete_worktree_session_reports_retained_worktree_without_cleanup(tmp_p
     captured = _capture_post(monkeypatch, {"session_id": session.session_id})
     monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda sid: {})
     monkeypatch.setattr(routes, "_is_messaging_session_id", lambda sid: False)
-    monkeypatch.setattr(models, "delete_cli_session", lambda sid: True)
+    state_db_delete_calls = []
+    monkeypatch.setattr(
+        models,
+        "delete_cli_session_for_webui_delete",
+        lambda sid: state_db_delete_calls.append(sid) or True,
+    )
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
 
@@ -152,6 +158,7 @@ def test_delete_worktree_session_reports_retained_worktree_without_cleanup(tmp_p
     assert captured["payload"]["worktree_path"] == str(worktree.resolve())
     assert captured["payload"]["worktree_branch"] == "hermes/wtdelete1"
     assert not (session_dir / "wtdelete1.json").exists()
+    assert state_db_delete_calls == [session.session_id]
     assert worktree.exists(), "session delete must not remove the git worktree directory"
 
 
@@ -172,7 +179,7 @@ def test_delete_session_state_db_failure_keeps_retryable_owner_without_tombstone
     def fail_delete(value):
         raise RuntimeError("state.db locked")
 
-    monkeypatch.setattr(models, "delete_cli_session", fail_delete)
+    monkeypatch.setattr(models, "delete_cli_session_for_webui_delete", fail_delete)
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
 
@@ -183,6 +190,64 @@ def test_delete_session_state_db_failure_keeps_retryable_owner_without_tombstone
     assert (session_dir / f"{sid}.json.bak").exists()
     assert sid in models.SESSIONS
     assert sid not in models._load_webui_deleted_session_tombstone()
+
+
+def test_delete_session_is_not_blocked_by_unrelated_stale_cli_cleanup(tmp_path, monkeypatch):
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "webuionlydelete1"
+    session = Session(
+        session_id=sid,
+        title="WebUI-only delete",
+        messages=[{"role": "user", "content": "delete only this session"}],
+    )
+    session.save()
+
+    hermes_home = tmp_path / "hermes-home"
+    state_db = hermes_home / "state.db"
+    _make_delete_state_db(state_db, sid)
+    agent_sessions = hermes_home / "sessions"
+    agent_sessions.mkdir(parents=True, exist_ok=True)
+    unrelated_manifest = agent_sessions / ".cleanup_manifest_unrelated.json"
+    unrelated_manifest.write_text("not-json", encoding="utf-8")
+    monkeypatch.setattr(profiles_module, "get_active_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda value: {})
+    monkeypatch.setattr(routes, "_is_messaging_session_id", lambda value: False)
+    captured = _capture_post(monkeypatch, {"session_id": sid})
+
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
+
+    assert captured["status"] == 200, captured
+    assert captured["payload"]["ok"] is True
+    assert captured["payload"]["state_db_cleanup_failed"] is False
+    assert not (session_dir / f"{sid}.json").exists()
+    assert sid in models._load_webui_deleted_session_tombstone()
+    assert unrelated_manifest.exists(), "another SID's retry record stays actionable"
+
+
+def test_scoped_state_cleanup_missing_db_requires_no_state_only_evidence(tmp_path, monkeypatch):
+    sid = "webuionlymissingdb1"
+    hermes_home = tmp_path / "hermes-home"
+    agent_sessions = hermes_home / "sessions"
+    agent_sessions.mkdir(parents=True)
+    (agent_sessions / f"{sid}.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(models, "SESSION_DIR", agent_sessions)
+    monkeypatch.setattr(profiles_module, "get_active_hermes_home", lambda: hermes_home)
+
+    assert models.delete_cli_session_for_webui_delete(sid) is True
+    assert (agent_sessions / f"{sid}.json").exists(), (
+        "the route, not state cleanup, owns the retry sidecar"
+    )
+
+    state_transcript = agent_sessions / f"{sid}.jsonl"
+    state_transcript.write_text('{"role":"user","content":"retain"}\n', encoding="utf-8")
+    assert models.delete_cli_session_for_webui_delete(sid) is False
+    state_transcript.unlink()
+
+    (agent_sessions / ".cleanup_manifest_pending.json").write_text(
+        json.dumps([sid]),
+        encoding="utf-8",
+    )
+    assert models.delete_cli_session_for_webui_delete(sid) is False
 
 
 def test_delete_session_reports_run_journal_cleanup_failure(tmp_path, monkeypatch):
@@ -196,7 +261,7 @@ def test_delete_session_reports_run_journal_cleanup_failure(tmp_path, monkeypatc
     state_db_delete_calls = []
     monkeypatch.setattr(
         models,
-        "delete_cli_session",
+        "delete_cli_session_for_webui_delete",
         lambda value: state_db_delete_calls.append(value) or True,
     )
     published = []
@@ -259,7 +324,7 @@ def test_delete_session_reports_durable_artifact_cleanup_failure(
     state_db_delete_calls = []
     monkeypatch.setattr(
         models,
-        "delete_cli_session",
+        "delete_cli_session_for_webui_delete",
         lambda value: state_db_delete_calls.append(value) or True,
     )
     published = []
@@ -385,7 +450,7 @@ def test_delete_non_terminal_cleanup_failure_keeps_retryable_owner(
             return real_rmtree(path, *args, **kwargs)
 
         monkeypatch.setattr(routes.shutil, "rmtree", fail_attachment_cleanup)
-        monkeypatch.setattr(models, "delete_cli_session", lambda _sid: True)
+        monkeypatch.setattr(models, "delete_cli_session_for_webui_delete", lambda _sid: True)
     elif cleanup_failure == "turn_journal":
         real_delete_turn_journal = turn_journal_module.delete_turn_journal
         blocked = True
@@ -398,9 +463,9 @@ def test_delete_non_terminal_cleanup_failure_keeps_retryable_owner(
             return real_delete_turn_journal(candidate_sid, *args, **kwargs)
 
         monkeypatch.setattr(turn_journal_module, "delete_turn_journal", fail_turn_journal)
-        monkeypatch.setattr(models, "delete_cli_session", lambda _sid: True)
+        monkeypatch.setattr(models, "delete_cli_session_for_webui_delete", lambda _sid: True)
     else:
-        real_delete_cli_session = models.delete_cli_session
+        real_delete_cli_session = models.delete_cli_session_for_webui_delete
         delete_calls = []
 
         def fail_state_db_once(candidate_sid):
@@ -409,7 +474,7 @@ def test_delete_non_terminal_cleanup_failure_keeps_retryable_owner(
                 return False
             return real_delete_cli_session(candidate_sid)
 
-        monkeypatch.setattr(models, "delete_cli_session", fail_state_db_once)
+        monkeypatch.setattr(models, "delete_cli_session_for_webui_delete", fail_state_db_once)
 
     captured = _capture_post(monkeypatch, {"session_id": sid})
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
@@ -471,7 +536,11 @@ def test_delete_messaging_session_reopens_read_only_without_deleted_webui_tombst
     monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda value: cli_meta)
     monkeypatch.setattr(routes, "_is_messaging_session_id", lambda value: True)
     delete_calls = []
-    monkeypatch.setattr(models, "delete_cli_session", lambda value: delete_calls.append(value))
+    monkeypatch.setattr(
+        models,
+        "delete_cli_session_for_webui_delete",
+        lambda value: delete_calls.append(value),
+    )
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
     sess, reason = routes._claim_or_synthesize_cli_session(sid)

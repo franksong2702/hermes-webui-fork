@@ -431,7 +431,11 @@ def _install_delete_route_test_harness(
     )
     monkeypatch.setattr(routes_module, "_sync_session_title_to_insights", lambda _s: None)
     monkeypatch.setattr(config_module, "_evict_session_agent", lambda _sid: None)
-    monkeypatch.setattr(models_module, "delete_cli_session", lambda _sid: True)
+    monkeypatch.setattr(
+        models_module,
+        "delete_cli_session_for_webui_delete",
+        lambda _sid: True,
+    )
     monkeypatch.setattr(
         upload_module,
         "_session_attachment_dir",
@@ -950,7 +954,11 @@ def test_delete_serializes_with_workspace_recovery_and_sidecar_stays_deleted(
         routes_module, "_publish_session_list_changed", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(config_module, "_evict_session_agent", lambda _sid: None)
-    monkeypatch.setattr(models_module, "delete_cli_session", lambda _sid: True)
+    monkeypatch.setattr(
+        models_module,
+        "delete_cli_session_for_webui_delete",
+        lambda _sid: True,
+    )
     monkeypatch.setattr(
         upload_module,
         "_session_attachment_dir",
@@ -1067,7 +1075,7 @@ def test_delete_returns_503_without_mutation_when_session_lock_is_busy(
     )
     monkeypatch.setattr(
         models_module,
-        "delete_cli_session",
+        "delete_cli_session_for_webui_delete",
         lambda _sid: observed["mutations"].append("state-db"),
     )
 

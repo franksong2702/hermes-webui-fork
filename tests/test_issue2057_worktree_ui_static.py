@@ -205,7 +205,7 @@ def test_worktree_archive_delete_api_responses_are_explicit():
     assert "def _worktree_retained_payload(session)" in src
     assert "def _worktree_retained_payload_for_session_id(sid: str)" in src
     assert '"worktree_retained": True' in src
-    assert '"state_db_cleanup_failed": state_db_cleanup_failed' in src
+    assert '"state_db_cleanup_failed": False' in src
     assert '"run_journal_cleanup_failed": True' in src
     assert '"run_journal_cleanup_failed": False' in src
     assert '"ok": True,' in src
