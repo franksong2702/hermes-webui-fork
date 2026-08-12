@@ -9212,6 +9212,9 @@ def _artifact_only_anchor_scene(message) -> dict:
     }
 
 
+_HISTORICAL_ARTIFACT_REPLAY_ROOT_BUDGET = 8
+
+
 def _attach_replayed_turn_artifacts_to_anchor_scenes(
     messages,
     paths_by_final_index,
@@ -9278,6 +9281,37 @@ def _attach_replayed_turn_artifacts_to_anchor_scenes(
             "tool_call_id": tool_call_id,
         }
 
+    trusted_replay_session_id = str(replay_session_id or "").strip()
+
+    def _trusted_persisted_artifacts_for_scene(scene) -> tuple[list[dict], set[str]]:
+        if not isinstance(scene, dict) or not trusted_replay_session_id:
+            return [], set()
+        persisted = []
+        roots = set()
+        for artifact in scene.get("artifacts") or []:
+            identity = _persisted_artifact_identity(artifact)
+            if identity is None or identity["session_id"] != trusted_replay_session_id:
+                continue
+            persisted.append(identity)
+            roots.add(identity["workspace_root"])
+        return persisted, roots
+
+    historical_candidate_roots: set[str] = set()
+    if isinstance(replay_source_messages, list) and trusted_replay_session_id:
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            persisted, roots = _trusted_persisted_artifacts_for_scene(
+                message.get("_anchor_activity_scene")
+            )
+            # A scene with multiple roots is already rejected below and is not
+            # a trusted candidate for response-wide historical replay.
+            if persisted and len(roots) == 1:
+                historical_candidate_roots.update(roots)
+    historical_replay_allowed = (
+        len(historical_candidate_roots) <= _HISTORICAL_ARTIFACT_REPLAY_ROOT_BUDGET
+    )
+
     def _historical_descriptors_for_root(root: str) -> dict[int, list[dict]]:
         cached = historical_paths_by_root.get(root)
         if cached is not None:
@@ -9296,17 +9330,7 @@ def _attach_replayed_turn_artifacts_to_anchor_scenes(
     def _historical_descriptors_for_scene(scene, absolute_idx: int) -> list[dict]:
         if not isinstance(scene, dict) or not isinstance(replay_source_messages, list):
             return []
-        trusted_session_id = str(replay_session_id or "").strip()
-        if not trusted_session_id:
-            return []
-        persisted = []
-        roots = set()
-        for artifact in scene.get("artifacts") or []:
-            identity = _persisted_artifact_identity(artifact)
-            if identity is None or identity["session_id"] != trusted_session_id:
-                continue
-            persisted.append(identity)
-            roots.add(identity["workspace_root"])
+        persisted, roots = _trusted_persisted_artifacts_for_scene(scene)
         # A settled assistant turn has one session/workspace owner.  Multiple
         # historical roots cannot be authoritative for the same turn and would
         # otherwise multiply the full-transcript replay cost, so fail closed.
@@ -9349,7 +9373,7 @@ def _attach_replayed_turn_artifacts_to_anchor_scenes(
         absolute_idx = int(message_offset or 0) + local_idx
         descriptors = paths_by_final_index.get(absolute_idx) or []
         scene = message.get("_anchor_activity_scene")
-        if not descriptors:
+        if not descriptors and historical_replay_allowed:
             descriptors = _historical_descriptors_for_scene(scene, absolute_idx)
         if not descriptors and not (
             isinstance(scene, dict) and scene.get("version") == "activity_scene_v1"

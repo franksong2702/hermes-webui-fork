@@ -1322,6 +1322,78 @@ def test_replay_preserves_only_transcript_backed_persisted_artifacts_after_works
     ]
 
 
+def test_historical_artifact_replay_fails_closed_before_work_when_response_root_budget_exceeded(
+    monkeypatch,
+):
+    """A many-root response must not multiply full-transcript replay work."""
+    from api import routes
+
+    session_id = "sid-many-roots"
+    messages = []
+    expected_by_root = {}
+    for idx in range(256):
+        root = f"/workspace-{idx}"
+        descriptor = {
+            "path": f"output/report-{idx}.md",
+            "workspace_root": root,
+            "session_id": session_id,
+            "tool_name": "patch",
+            "tool_call_id": f"call-{idx}",
+        }
+        expected_by_root[root] = {idx: [descriptor]}
+        messages.append(
+            {
+                "role": "assistant",
+                "content": f"final {idx}",
+                "_anchor_activity_scene": {
+                    "version": "activity_scene_v1",
+                    "activity_rows": [{"type": "tool"}],
+                    "artifacts": [
+                        {
+                            "type": "artifact_reference",
+                            "payload": {**descriptor, "source": "live_tool_complete"},
+                        }
+                    ],
+                },
+            }
+        )
+
+    replay_calls = []
+
+    def counted_replay(_messages, *, workspace_root, session_id=""):
+        replay_calls.append((workspace_root, session_id))
+        return expected_by_root.get(workspace_root, {})
+
+    monkeypatch.setattr(routes, "_final_turn_artifact_paths", counted_replay)
+
+    current_descriptor = {
+        "path": "output/current.md",
+        "workspace_root": "/current-workspace",
+        "session_id": session_id,
+        "tool_name": "patch",
+        "tool_call_id": "call-current",
+    }
+
+    hydrated = routes._attach_replayed_turn_artifacts_to_anchor_scenes(
+        messages,
+        {0: [current_descriptor]},
+        replay_source_messages=messages,
+        replay_session_id=session_id,
+    )
+
+    assert replay_calls == []
+    assert hydrated[0]["_anchor_activity_scene"]["artifacts"] == [
+        {
+            "type": "artifact_reference",
+            "payload": {**current_descriptor, "source": "transcript_replay"},
+        }
+    ]
+    assert all(
+        message["_anchor_activity_scene"]["artifacts"] == []
+        for message in hydrated[1:]
+    )
+
+
 def test_replay_replaces_wrong_session_existing_anchor_artifacts_with_transcript_descriptors():
     from api import routes
 
