@@ -12364,6 +12364,28 @@ def cancel_stream(stream_id: str) -> bool:
                 _partial_msg = _build_partial_message(
                     _cancel_partial_text, _cancel_reasoning, _cancel_tool_calls,
                 )
+                if _partial_msg is None:
+                    # Live buffers can be empty after the worker has already
+                    # emitted visible SSE frames. Recover only this stream's
+                    # durable work journal, label newly-created rows as
+                    # partial, and keep the existing cancel marker path below.
+                    try:
+                        from api.models import _append_journaled_partial_output
+
+                        _append_journaled_partial_output(
+                            _cs,
+                            stream_id,
+                            dedupe_existing=True,
+                            mark_partial=True,
+                        )
+                    except Exception:
+                        # Cancellation must remain fail-soft if the journal is
+                        # missing, malformed, or temporarily unreadable.
+                        logger.debug(
+                            "Failed to recover journaled partial output on cancel for %s",
+                            _cancel_session_id,
+                            exc_info=True,
+                        )
                 _cancel_marker_exists = _session_has_cancel_marker(_cs)
                 _cancel_marker_idx = len(_cs.messages)
                 if _cancel_marker_exists:

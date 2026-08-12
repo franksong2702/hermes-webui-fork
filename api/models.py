@@ -2756,6 +2756,7 @@ def _append_journaled_partial_output(
     stream_id: str | None,
     *,
     dedupe_existing: bool = False,
+    mark_partial: bool = False,
 ) -> bool:
     """Recover already-emitted visible output from a dead stream journal.
 
@@ -2764,6 +2765,11 @@ def _append_journaled_partial_output(
     already been emitted over SSE before the WebUI process died. Restored
     reasoning stays out of ``context_messages`` so it cannot become provider-
     facing history. The repair does not try to continue execution.
+
+    ``mark_partial`` is an opt-in label for callers recovering work during a
+    live cancellation.  It marks only rows newly created by this invocation;
+    an existing assistant row matched by ``dedupe_existing`` is never
+    retroactively changed.  The default remains the historical recovery shape.
     """
     if not stream_id:
         return False
@@ -2780,7 +2786,23 @@ def _append_journaled_partial_output(
         )
         return False
 
-    events = [event for event in journal.get('events') or [] if isinstance(event, dict)]
+    if not isinstance(journal, dict):
+        return False
+    raw_events = journal.get('events')
+    if not isinstance(raw_events, list):
+        return False
+    events = [event for event in raw_events if isinstance(event, dict)]
+    if mark_partial:
+        # Cancellation recovery is scoped to the exact durable run identity.
+        # The historical crash-recovery caller intentionally keeps its
+        # existing permissive event handling, while this live fallback must
+        # fail closed on a foreign or malformed event row.
+        events = [
+            event for event in events
+            if _run_journal_event_owns_run(
+                event, session.session_id, stream_id,
+            )
+        ]
     if not events:
         return False
 
@@ -2908,6 +2930,8 @@ def _append_journaled_partial_output(
             '_recovered_from_run_journal': True,
             '_recovered_stream_id': stream_id,
         }
+        if mark_partial:
+            recovered_assistant['_partial'] = True
         attach_display_reasoning(recovered_assistant, reasoning)
         session.messages.append(recovered_assistant)
         append_context_projection(recovered_assistant)
@@ -2949,13 +2973,16 @@ def _append_journaled_partial_output(
             ):
                 current_assistant_idx = _existing_idx
                 return _existing_idx
-        session.messages.append({
+        recovered_anchor = {
             'role': 'assistant',
             'content': '',
             'timestamp': int(created_at or time.time()),
             '_recovered_from_run_journal': True,
             '_recovered_stream_id': stream_id,
-        })
+        }
+        if mark_partial:
+            recovered_anchor['_partial'] = True
+        session.messages.append(recovered_anchor)
         current_assistant_idx = len(session.messages) - 1
         appended_any = True
         return current_assistant_idx
@@ -3007,7 +3034,7 @@ def _append_journaled_partial_output(
             ):
                 current_assistant_idx = anchor_idx
                 continue
-            recovered_tool_calls.append({
+            recovered_tool_call = {
                 'name': name,
                 'preview': preview,
                 'snippet': preview,
@@ -3017,7 +3044,10 @@ def _append_journaled_partial_output(
                 'done': False,
                 '_recovered_from_run_journal': True,
                 '_recovered_stream_id': stream_id,
-            })
+            }
+            if mark_partial:
+                recovered_tool_call['_partial'] = True
+            recovered_tool_calls.append(recovered_tool_call)
             appended_any = True
             current_assistant_idx = anchor_idx
             continue
