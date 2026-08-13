@@ -9890,6 +9890,10 @@ def _delete_cli_session_with_scope(sid, *, require_all_stale_cleanup: bool) -> b
                 if not require_all_stale_cleanup:
                     db_path = hermes_home / "state.db"
                     if not db_path.exists():
+                        _process_stale_cleanup_manifests(
+                            hermes_home,
+                            scoped_sid=str(sid),
+                        )
                         return _scoped_state_cleanup_absence_is_verified(
                             sid,
                             hermes_home,
@@ -9918,6 +9922,10 @@ def _delete_cli_session_with_scope(sid, *, require_all_stale_cleanup: bool) -> b
                         )
                         return False
                     if not state_row_exists:
+                        _process_stale_cleanup_manifests(
+                            hermes_home,
+                            scoped_sid=str(sid),
+                        )
                         return _scoped_state_cleanup_absence_is_verified(
                             sid,
                             hermes_home,
@@ -9957,7 +9965,13 @@ def _delete_cli_session_locked(
     # This runs before the DB-existence check so pending artifact
     # removals get another chance even when the current session ID
     # is unrelated.
-    stale_cleanup_complete = _process_stale_cleanup_manifests(hermes_home)
+    if require_all_stale_cleanup:
+        stale_cleanup_complete = _process_stale_cleanup_manifests(hermes_home)
+    else:
+        stale_cleanup_complete = _process_stale_cleanup_manifests(
+            hermes_home,
+            scoped_sid=str(sid),
+        )
 
     db_path = hermes_home / 'state.db'
     if not db_path.exists():
@@ -10369,7 +10383,11 @@ def _delete_cli_session_locked(
 # post-commit cleanup remain one critical section without blocking unrelated
 # profiles.
 # ---------------------------------------------------------------------------
-def _process_stale_cleanup_manifests(hermes_home) -> bool:
+def _process_stale_cleanup_manifests(
+    hermes_home,
+    *,
+    scoped_sid: str | None = None,
+) -> bool:
     """Process any leftover cleanup manifests outside a DB transaction.
 
     Called at the start of each delete_cli_session run, before the
@@ -10379,9 +10397,15 @@ def _process_stale_cleanup_manifests(hermes_home) -> bool:
 
     Serialized by the caller's per-profile thread and process locks so that the
     manifest read → DB transaction → post-commit cleanup triad is
-    never interleaved across concurrent delete calls. Returns ``True`` only
-    when every discovered retry record was processed completely.
+    never interleaved across concurrent delete calls. With no ``scoped_sid``
+    (the maintenance path), returns ``True`` only when every discovered retry
+    record was processed completely. With ``scoped_sid``, only manifest entries
+    attributable to that SID are settled; unrelated or un-attributable
+    manifests remain on disk and do not widen the requested cleanup scope.
     """
+    if scoped_sid is not None and not is_safe_session_id(str(scoped_sid)):
+        return False
+    scoped_sid = str(scoped_sid) if scoped_sid is not None else None
     try:
         import sqlite3
     except ImportError:
@@ -10415,9 +10439,12 @@ def _process_stale_cleanup_manifests(hermes_home) -> bool:
             cleanup_complete = False
             continue
         pending_ids = list(pending_ids)
+        if scoped_sid is not None and scoped_sid not in pending_ids:
+            continue
         if not pending_ids:
             mp.unlink(missing_ok=True)
             continue
+        query_ids = [scoped_sid] if scoped_sid is not None else pending_ids
         # Require a successful read-only query to prove absence. Opening via a
         # read-only URI also prevents SQLite from creating a fresh empty DB if
         # state.db disappears between the existence check and connect().
@@ -10426,9 +10453,9 @@ def _process_stale_cleanup_manifests(hermes_home) -> bool:
             with closing(sqlite3.connect(db_uri, uri=True)) as conn:
                 cursor = conn.execute(
                     "SELECT id FROM sessions WHERE id IN ({})".format(
-                        ",".join("?" * len(pending_ids))
+                        ",".join("?" * len(query_ids))
                     ),
-                    pending_ids,
+                    query_ids,
                 )
                 alive = {row[0] for row in cursor.fetchall()}
         except Exception:
@@ -10438,8 +10465,12 @@ def _process_stale_cleanup_manifests(hermes_home) -> bool:
             cleanup_complete = False
             continue
 
-        still_pending = []
-        for removed_id in pending_ids:
+        still_pending = (
+            [removed_id for removed_id in pending_ids if removed_id != scoped_sid]
+            if scoped_sid is not None
+            else []
+        )
+        for removed_id in query_ids:
             if removed_id in alive:
                 # Session still exists — the previous commit never
                 # reached the DB, so this manifest entry is stale.
@@ -10447,7 +10478,11 @@ def _process_stale_cleanup_manifests(hermes_home) -> bool:
                 # into the post-commit cleanup loop where it would
                 # cause the current call to report a false failure.
                 continue
-            if not _clean_pending_artifact(sessions_dir, removed_id):
+            if not _clean_pending_artifact(
+                sessions_dir,
+                removed_id,
+                preserve_webui_sidecar=scoped_sid == removed_id,
+            ):
                 still_pending.append(removed_id)
         if still_pending:
             tmp = mp.with_suffix(".tmp")
@@ -10464,7 +10499,12 @@ def _process_stale_cleanup_manifests(hermes_home) -> bool:
     return cleanup_complete
 
 
-def _clean_pending_artifact(sessions_dir, removed_id):
+def _clean_pending_artifact(
+    sessions_dir,
+    removed_id,
+    *,
+    preserve_webui_sidecar: bool = False,
+):
     """Remove on-disk transcript files for one session ID, outside a
     DB transaction.  Returns True when every artifact is gone (or absent).
     """
@@ -10473,6 +10513,12 @@ def _clean_pending_artifact(sessions_dir, removed_id):
     ok = True
     for suffix in (".json", ".jsonl"):
         artifact = sessions_dir / f"{removed_id}{suffix}"
+        if (
+            preserve_webui_sidecar
+            and suffix == ".json"
+            and artifact.resolve() == (SESSION_DIR / f"{removed_id}.json").resolve()
+        ):
+            continue
         if not artifact.exists():
             continue
         try:

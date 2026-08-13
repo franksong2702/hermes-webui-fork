@@ -250,6 +250,130 @@ def test_scoped_state_cleanup_missing_db_requires_no_state_only_evidence(tmp_pat
     assert models.delete_cli_session_for_webui_delete(sid) is False
 
 
+def test_delete_retry_preserves_colocated_sidecar_during_stale_manifest_cleanup(
+    tmp_path, monkeypatch
+):
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "colocated-stale-delete1"
+    owner = Session(
+        session_id=sid,
+        title="Colocated retry owner",
+        messages=[{"role": "user", "content": "keep retry handle"}],
+    )
+    models.SESSIONS[sid] = owner
+    owner.save()
+    sidecar = session_dir / f"{sid}.json"
+
+    # A previous post-commit artifact cleanup left a durable retry record.
+    # Simulate the state owner disappearing after the scoped entry check but
+    # before the stale-manifest prepass (for example, an Agent-side delete that
+    # does not participate in the WebUI process lock).
+    state_db = tmp_path / "state.db"
+    _make_delete_state_db(state_db, sid)
+    stale_manifest = session_dir / ".cleanup_manifest_colocated-stale.json"
+    stale_manifest.write_text(json.dumps([sid]), encoding="utf-8")
+    state_transcript = session_dir / f"{sid}.jsonl"
+    state_transcript.write_text('{"role":"user","content":"private"}\n', encoding="utf-8")
+    request_dump = session_dir / f"request_dump_{sid}_1.json"
+    request_dump.write_text('{"secret":"private"}', encoding="utf-8")
+
+    monkeypatch.setattr(profiles_module, "get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda _sid: {})
+    monkeypatch.setattr(routes, "_is_messaging_session_id", lambda _sid: False)
+    captured = _capture_post(monkeypatch, {"session_id": sid})
+
+    real_unlink = Path.unlink
+    block_route_sidecar = True
+    state_cleanup_finished = False
+
+    def fail_route_sidecar_cleanup(path, *args, **kwargs):
+        if (
+            block_route_sidecar
+            and state_cleanup_finished
+            and Path(path).resolve() == sidecar.resolve()
+        ):
+            raise PermissionError("route-owned sidecar locked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_route_sidecar_cleanup)
+
+    real_delete_locked = models._delete_cli_session_locked
+    remove_state_row_once = True
+
+    def delete_after_external_state_commit(
+        candidate_sid, hermes_home, *, require_all_stale_cleanup=True
+    ):
+        nonlocal remove_state_row_once, state_cleanup_finished
+        if remove_state_row_once:
+            remove_state_row_once = False
+            with sqlite3.connect(str(state_db)) as conn:
+                conn.execute("DELETE FROM messages WHERE session_id = ?", (candidate_sid,))
+                conn.execute("DELETE FROM sessions WHERE id = ?", (candidate_sid,))
+                conn.commit()
+        result = real_delete_locked(
+            candidate_sid,
+            hermes_home,
+            require_all_stale_cleanup=require_all_stale_cleanup,
+        )
+        state_cleanup_finished = True
+        return result
+
+    monkeypatch.setattr(models, "_delete_cli_session_locked", delete_after_external_state_commit)
+
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
+
+    assert captured["status"] == 500
+    assert captured["payload"]["ok"] is False
+    assert captured["payload"]["state_db_cleanup_failed"] is False
+    assert captured["payload"]["session_artifact_cleanup_failed"] is True
+    assert sidecar.exists(), "failed deletion must retain the colocated retry sidecar"
+    assert not state_transcript.exists()
+    assert not request_dump.exists()
+    assert not stale_manifest.exists()
+    assert models.SESSIONS[sid] is owner
+
+    block_route_sidecar = False
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
+
+    assert captured["status"] == 200, captured
+    assert captured["payload"]["ok"] is True
+    assert not sidecar.exists()
+    assert not state_transcript.exists()
+    assert not request_dump.exists()
+    assert not list(session_dir.glob(".cleanup_manifest_*.json"))
+    assert sid not in models.SESSIONS
+
+
+def test_scoped_stale_cleanup_preserves_unrelated_manifest_entries(tmp_path, monkeypatch):
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "scoped-manifest-target1"
+    unrelated_sid = "scoped-manifest-unrelated1"
+    sidecar = session_dir / f"{sid}.json"
+    sidecar.write_text('{"title":"retry owner"}', encoding="utf-8")
+    state_transcript = session_dir / f"{sid}.jsonl"
+    state_transcript.write_text('{"role":"user"}\n', encoding="utf-8")
+    request_dump = session_dir / f"request_dump_{sid}_1.json"
+    request_dump.write_text('{"secret":"target"}', encoding="utf-8")
+    unrelated_json = session_dir / f"{unrelated_sid}.json"
+    unrelated_json.write_text('{"secret":"unrelated"}', encoding="utf-8")
+    unrelated_jsonl = session_dir / f"{unrelated_sid}.jsonl"
+    unrelated_jsonl.write_text('{"role":"user"}\n', encoding="utf-8")
+    manifest = session_dir / ".cleanup_manifest_mixed.json"
+    manifest.write_text(json.dumps([sid, unrelated_sid]), encoding="utf-8")
+
+    _make_delete_state_db(tmp_path / "state.db", "unrelated-live-placeholder")
+    monkeypatch.setattr(profiles_module, "get_active_hermes_home", lambda: tmp_path)
+
+    assert models.delete_cli_session_for_webui_delete(sid) is True
+
+    assert sidecar.exists(), "the WebUI route still owns its retry sidecar"
+    assert not state_transcript.exists()
+    assert not request_dump.exists()
+    assert unrelated_json.exists()
+    assert unrelated_jsonl.exists()
+    assert json.loads(manifest.read_text(encoding="utf-8")) == [unrelated_sid]
+
+
 def test_delete_session_reports_run_journal_cleanup_failure(tmp_path, monkeypatch):
     session_dir = _isolate_session_store(tmp_path, monkeypatch)
     sid = "runjournaldelete1"
