@@ -3966,6 +3966,74 @@ def _session_index_prune_verified(sid: str) -> bool:
         return False
 
 
+def _restore_deleted_session_retry_persistence(
+    sid: str,
+    *,
+    sidecar_snapshot: dict,
+    backup_snapshot: dict,
+    owner=None,
+) -> bool:
+    """Restore the durable delete-retry authority after a late gate failure.
+
+    The delete route has already removed the sidecar and backup by the time the
+    index/tombstone gates run.  Keep the exact pre-delete file images rather
+    than serializing the live owner again: this avoids changing its generation,
+    timestamp, or index row while preserving a cold-loadable retry handle.
+    """
+    # Clear a partially published tombstone before attempting any restore so a
+    # later restore error cannot leave a retired marker shadowing the retry SID.
+    try:
+        _clear_webui_deleted_session_tombstone(sid)
+    except Exception:
+        logger.exception("Failed to clear partial deleted-session tombstone for %s", sid)
+    snapshots = (sidecar_snapshot, backup_snapshot)
+    if any(
+        not isinstance(snapshot, dict) or snapshot.get("error")
+        for snapshot in snapshots
+    ):
+        logger.warning(
+            "Cannot restore delete-retry persistence for %s: pre-delete snapshot unavailable",
+            sid,
+        )
+        return False
+    try:
+        # A live sidecar may have been absent before this delete (for example,
+        # an unsaved in-memory owner).  In that case use the exact owner that
+        # the route kept in SESSIONS as the durable retry authority.
+        if sidecar_snapshot.get("exists"):
+            _restore_chat_start_file(sidecar_snapshot)
+        elif owner is not None:
+            owner.save(touch_updated_at=False, skip_index=True)
+        else:
+            logger.warning(
+                "Cannot restore delete-retry sidecar for %s: no pre-delete sidecar or owner",
+                sid,
+            )
+            return False
+        _restore_chat_start_file(backup_snapshot)
+    except Exception:
+        logger.exception("Failed to restore delete-retry persistence for %s", sid)
+        return False
+
+    sidecar = SESSION_DIR / f"{sid}.json"
+    try:
+        if not sidecar.exists():
+            return False
+        # A tombstone can have been partially published before its gate raised
+        # (or before verification observed it).  It must not shadow this live
+        # retry sidecar on a cold read.
+        if sid in _load_webui_deleted_session_tombstone():
+            logger.warning(
+                "Deleted-session tombstone still blocks retry sidecar for %s",
+                sid,
+            )
+            return False
+    except Exception:
+        logger.exception("Failed to verify delete-retry persistence for %s", sid)
+        return False
+    return True
+
+
 def _delete_session_attachments_verified(sid: str) -> None:
     """Remove one session's attachment inbox and verify no plaintext remains."""
     from api.upload import _session_attachment_dir
@@ -9716,6 +9784,7 @@ from api.models import (
     _clear_webui_zero_message_orphan_tombstone,
     _load_webui_deleted_session_tombstone,
     _record_webui_deleted_session_tombstone,
+    _clear_webui_deleted_session_tombstone,
     ensure_cron_project,
     _profile_has_user_projects,
     is_cron_session,
@@ -15241,6 +15310,11 @@ def handle_post(handler, parsed) -> bool:
         persistence_lock = _get_session_persistence_lock(sid)
         persistence_lock.acquire()
         try:
+            # Keep the exact in-memory owner for the late-gate compensation
+            # path.  The successful-delete path below remains the only place
+            # that removes this owner or advances its persistence capability.
+            with LOCK:
+                retry_owner = SESSIONS.get(sid)
             # The run journal contains the full plaintext request/response and
             # its retired authority is the durable delete-retry marker. Do not
             # remove the canonical session owner or publish session_delete
@@ -15355,6 +15429,8 @@ def handle_post(handler, parsed) -> bool:
             except Exception:
                 return bad(handler, "Invalid session_id", 400)
             backup = p.with_suffix('.json.bak')
+            retry_sidecar_snapshot = _snapshot_chat_start_file(p)
+            retry_backup_snapshot = _snapshot_chat_start_file(backup)
             residual_artifacts = []
             for artifact in (p, backup):
                 try:
@@ -15389,6 +15465,12 @@ def handle_post(handler, parsed) -> bool:
                 prune_session_from_index(sid)
             except Exception:
                 logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
+                retry_state_restored = _restore_deleted_session_retry_persistence(
+                    sid,
+                    sidecar_snapshot=retry_sidecar_snapshot,
+                    backup_snapshot=retry_backup_snapshot,
+                    owner=retry_owner,
+                )
                 return j(
                     handler,
                     {
@@ -15397,13 +15479,24 @@ def handle_post(handler, parsed) -> bool:
                         "run_journal_cleanup_failed": False,
                         "session_artifact_cleanup_failed": False,
                         "session_index_cleanup_failed": True,
+                        "retry_state_restored": retry_state_restored,
                         **worktree_retained,
-                        "error": "Session index cleanup failed; retry deletion",
+                        "error": (
+                            "Session index cleanup failed; retry deletion"
+                            if retry_state_restored
+                            else "Delete retry state restoration failed; manual recovery required"
+                        ),
                     },
                     status=500,
                 )
             if not _session_index_prune_verified(sid):
                 logger.warning("Session index row was not settled for %s", sid)
+                retry_state_restored = _restore_deleted_session_retry_persistence(
+                    sid,
+                    sidecar_snapshot=retry_sidecar_snapshot,
+                    backup_snapshot=retry_backup_snapshot,
+                    owner=retry_owner,
+                )
                 return j(
                     handler,
                     {
@@ -15412,8 +15505,13 @@ def handle_post(handler, parsed) -> bool:
                         "run_journal_cleanup_failed": False,
                         "session_artifact_cleanup_failed": False,
                         "session_index_cleanup_failed": True,
+                        "retry_state_restored": retry_state_restored,
                         **worktree_retained,
-                        "error": "Session index cleanup failed; retry deletion",
+                        "error": (
+                            "Session index cleanup failed; retry deletion"
+                            if retry_state_restored
+                            else "Delete retry state restoration failed; manual recovery required"
+                        ),
                     },
                     status=500,
                 )
@@ -15422,6 +15520,12 @@ def handle_post(handler, parsed) -> bool:
                     _record_webui_deleted_session_tombstone(sid)
                 except Exception:
                     logger.debug("Failed to tombstone deleted WebUI session %s", sid, exc_info=True)
+                    retry_state_restored = _restore_deleted_session_retry_persistence(
+                        sid,
+                        sidecar_snapshot=retry_sidecar_snapshot,
+                        backup_snapshot=retry_backup_snapshot,
+                        owner=retry_owner,
+                    )
                     return j(
                         handler,
                         {
@@ -15431,13 +15535,24 @@ def handle_post(handler, parsed) -> bool:
                             "session_artifact_cleanup_failed": False,
                             "session_index_cleanup_failed": False,
                             "deleted_session_tombstone_cleanup_failed": True,
+                            "retry_state_restored": retry_state_restored,
                             **worktree_retained,
-                            "error": "Deleted-session tombstone failed; retry deletion",
+                            "error": (
+                                "Deleted-session tombstone failed; retry deletion"
+                                if retry_state_restored
+                                else "Delete retry state restoration failed; manual recovery required"
+                            ),
                         },
                         status=500,
                     )
                 if sid not in _load_webui_deleted_session_tombstone():
                     logger.warning("Deleted-session tombstone was not published for %s", sid)
+                    retry_state_restored = _restore_deleted_session_retry_persistence(
+                        sid,
+                        sidecar_snapshot=retry_sidecar_snapshot,
+                        backup_snapshot=retry_backup_snapshot,
+                        owner=retry_owner,
+                    )
                     return j(
                         handler,
                         {
@@ -15447,8 +15562,13 @@ def handle_post(handler, parsed) -> bool:
                             "session_artifact_cleanup_failed": False,
                             "session_index_cleanup_failed": False,
                             "deleted_session_tombstone_cleanup_failed": True,
+                            "retry_state_restored": retry_state_restored,
                             **worktree_retained,
-                            "error": "Deleted-session tombstone failed; retry deletion",
+                            "error": (
+                                "Deleted-session tombstone failed; retry deletion"
+                                if retry_state_restored
+                                else "Delete retry state restoration failed; manual recovery required"
+                            ),
                         },
                         status=500,
                     )

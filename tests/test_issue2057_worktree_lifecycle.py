@@ -640,6 +640,142 @@ def test_delete_non_terminal_cleanup_failure_keeps_retryable_owner(
         assert not state_artifact.exists()
 
 
+@pytest.mark.parametrize(
+    "late_failure",
+    ["session_index", "deleted_tombstone"],
+)
+def test_delete_late_gate_failure_restores_restartable_retry_owner(
+    tmp_path, monkeypatch, late_failure
+):
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = f"late-delete-{late_failure}"
+    owner = Session(
+        session_id=sid,
+        title="Late delete retry",
+        messages=[{"role": "user", "content": "survive restart"}],
+    )
+    models.SESSIONS[sid] = owner
+    owner.save()
+    sidecar = session_dir / f"{sid}.json"
+    backup = session_dir / f"{sid}.json.bak"
+    backup.write_text(sidecar.read_text(encoding="utf-8"), encoding="utf-8")
+    capability = owner._persistence_generation
+
+    run_journal_module = pytest.importorskip("api.run_journal")
+    turn_journal_module = pytest.importorskip("api.turn_journal")
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda _sid: {})
+    monkeypatch.setattr(routes, "_is_messaging_session_id", lambda _sid: False)
+    monkeypatch.setattr(routes, "_worktree_retained_payload_for_session_id", lambda _sid: {})
+    monkeypatch.setattr(routes, "_delete_session_attachments_verified", lambda _sid: None)
+    monkeypatch.setattr(run_journal_module, "delete_run_journal", lambda _sid: None)
+    monkeypatch.setattr(turn_journal_module, "delete_turn_journal_verified", lambda _sid: None)
+    monkeypatch.setattr(models, "delete_cli_session_for_webui_delete", lambda _sid: True)
+    monkeypatch.setattr(routes, "_publish_session_list_changed", lambda *_args, **_kwargs: None)
+
+    if late_failure == "session_index":
+        real_gate = routes.prune_session_from_index
+        failed_once = False
+
+        def fail_gate_once(candidate_sid):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise OSError("session index locked")
+            return real_gate(candidate_sid)
+
+        monkeypatch.setattr(routes, "prune_session_from_index", fail_gate_once)
+        expected_flag = "session_index_cleanup_failed"
+    else:
+        real_gate = routes._record_webui_deleted_session_tombstone
+        failed_once = False
+
+        def fail_gate_once(candidate_sid):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise OSError("deleted tombstone locked")
+            return real_gate(candidate_sid)
+
+        monkeypatch.setattr(routes, "_record_webui_deleted_session_tombstone", fail_gate_once)
+        expected_flag = "deleted_session_tombstone_cleanup_failed"
+
+    captured = _capture_post(monkeypatch, {"session_id": sid})
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
+
+    assert captured["status"] == 500
+    assert captured["payload"]["ok"] is False
+    assert captured["payload"][expected_flag] is True
+    assert captured["payload"]["retry_state_restored"] is True
+    assert sidecar.exists(), "a truthful retryable 500 needs durable restart authority"
+    assert models.SESSIONS[sid] is owner
+    assert capability.revoked is False
+
+    # Model a process restart: only the durable sidecar may recover the owner.
+    models.SESSIONS.clear()
+    restarted_owner = Session.load(sid)
+    assert restarted_owner is not None
+    assert restarted_owner.messages[0]["content"] == "survive restart"
+
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
+    assert captured["status"] == 200
+    assert captured["payload"]["ok"] is True
+    assert not sidecar.exists()
+    assert not backup.exists()
+    assert sid in models._load_webui_deleted_session_tombstone()
+    assert sid not in models.SESSIONS
+
+
+def test_delete_late_gate_restore_failure_does_not_claim_retryable_state(
+    tmp_path, monkeypatch
+):
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "late-delete-restore-failed"
+    owner = Session(
+        session_id=sid,
+        title="Late delete restore failure",
+        messages=[{"role": "user", "content": "manual recovery"}],
+    )
+    models.SESSIONS[sid] = owner
+    owner.save()
+
+    run_journal_module = pytest.importorskip("api.run_journal")
+    turn_journal_module = pytest.importorskip("api.turn_journal")
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda _sid: {})
+    monkeypatch.setattr(routes, "_is_messaging_session_id", lambda _sid: False)
+    monkeypatch.setattr(routes, "_worktree_retained_payload_for_session_id", lambda _sid: {})
+    monkeypatch.setattr(routes, "_delete_session_attachments_verified", lambda _sid: None)
+    monkeypatch.setattr(run_journal_module, "delete_run_journal", lambda _sid: None)
+    monkeypatch.setattr(turn_journal_module, "delete_turn_journal_verified", lambda _sid: None)
+    monkeypatch.setattr(models, "delete_cli_session_for_webui_delete", lambda _sid: True)
+    monkeypatch.setattr(routes, "_publish_session_list_changed", lambda *_args, **_kwargs: None)
+
+    def fail_index_prune(_sid):
+        raise OSError("session index locked")
+
+    monkeypatch.setattr(
+        routes,
+        "prune_session_from_index",
+        fail_index_prune,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_restore_deleted_session_retry_persistence",
+        lambda *_args, **_kwargs: False,
+    )
+
+    captured = _capture_post(monkeypatch, {"session_id": sid})
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/delete")) is True
+
+    assert captured["status"] == 500
+    assert captured["payload"]["ok"] is False
+    assert captured["payload"]["session_index_cleanup_failed"] is True
+    assert captured["payload"]["retry_state_restored"] is False
+    assert captured["payload"]["error"] == (
+        "Delete retry state restoration failed; manual recovery required"
+    )
+    assert "retry deletion" not in captured["payload"]["error"]
+
+
 def test_delete_messaging_session_reopens_read_only_without_deleted_webui_tombstone(
     tmp_path, monkeypatch
 ):
