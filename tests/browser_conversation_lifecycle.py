@@ -881,6 +881,31 @@ def _raise_rejected_crash_discriminator(
     ) from cause
 
 
+def _close_page_for_negative_canary(page) -> None:
+    """Close the injected page deterministically before testing the guard.
+
+    Hosted Chromium can acknowledge ``page.close()`` before Playwright's page
+    object observes the closed state.  Falling back to this test's isolated
+    browser context keeps the injected fault exact without weakening the
+    subsequent shared-health assertion.
+    """
+    close_error = None
+    try:
+        page.close()
+    except Exception as exc:
+        close_error = exc
+    if not page.is_closed():
+        try:
+            page.context.close()
+        except Exception as exc:
+            if close_error is None:
+                close_error = exc
+    if not page.is_closed():
+        raise AssertionError(
+            "page-close negative canary could not establish a closed page"
+        ) from close_error
+
+
 def _semantic_activity(snapshot: dict) -> list[dict]:
     """Canonical user-visible activity, independent of renderer row ordering."""
     semantic = []
@@ -1391,7 +1416,7 @@ def main() -> int:
         if NEGATIVE_BITE == "close-reload-final-text":
             if HEALTH_GUARD_KNOCKOUT == "page-closed-with-browser-error":
                 errors.append(("console", "synthetic competing browser error"))
-            page.close()
+            _close_page_for_negative_canary(page)
         elif NEGATIVE_BITE == "server-death-reload-final-text":
             _terminate_process(proc)
         try:
@@ -1438,7 +1463,7 @@ def main() -> int:
             if NEGATIVE_BITE == "close-reloaded-anchor-group":
                 if HEALTH_GUARD_KNOCKOUT == "page-closed-with-browser-error":
                     errors.append(("console", "synthetic competing browser error"))
-                page.close()
+                _close_page_for_negative_canary(page)
             elif NEGATIVE_BITE == "server-death-reloaded-anchor-group":
                 _terminate_process(proc)
                 page.evaluate(
