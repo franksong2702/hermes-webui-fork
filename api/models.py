@@ -2395,6 +2395,8 @@ def _find_existing_assistant_for_journal_content(
     content: str,
     *,
     max_index: int | None = None,
+    min_index: int | None = None,
+    recovered_stream_id: str | None = None,
     excluded_indexes: set[int] | None = None,
 ) -> int | None:
     candidate = _normalize_journal_recovery_text(content)
@@ -2402,6 +2404,10 @@ def _find_existing_assistant_for_journal_content(
         return None
     messages = session.messages or []
     stop = len(messages) if max_index is None else min(len(messages), max_index)
+    lower_bound = 0
+    if isinstance(min_index, int):
+        lower_bound = max(0, min(min_index, stop))
+    recovered_stream = str(recovered_stream_id) if recovered_stream_id else None
     substring_match = None
     for idx in range(stop):
         if excluded_indexes and idx in excluded_indexes:
@@ -2410,6 +2416,15 @@ def _find_existing_assistant_for_journal_content(
         if not isinstance(message, dict) or message.get('role') != 'assistant':
             continue
         if message.get('_error'):
+            continue
+        # During cancellation, untagged content matches are scoped to the
+        # current pending user turn.  A row already recovered for this exact
+        # stream remains globally eligible so repeated journal reads stay
+        # idempotent even when the row predates that turn's lower bound.
+        if idx < lower_bound and (
+            recovered_stream is None
+            or message.get('_recovered_stream_id') != recovered_stream
+        ):
             continue
         existing = _normalize_journal_recovery_text(message.get('content'))
         if not existing:
@@ -2757,6 +2772,7 @@ def _append_journaled_partial_output(
     *,
     dedupe_existing: bool = False,
     mark_partial: bool = False,
+    current_turn_start: int | None = None,
 ) -> bool:
     """Recover already-emitted visible output from a dead stream journal.
 
@@ -2770,6 +2786,12 @@ def _append_journaled_partial_output(
     live cancellation.  It marks only rows newly created by this invocation;
     an existing assistant row matched by ``dedupe_existing`` is never
     retroactively changed.  The default remains the historical recovery shape.
+
+    ``current_turn_start`` is an optional message index captured before a
+    cancellation clears the pending-turn fields.  When supplied, untagged
+    assistant content dedupe starts immediately after that user row; an
+    existing row carrying the same ``_recovered_stream_id`` remains eligible
+    globally for retry idempotence.  Crash-recovery callers omit this bound.
     """
     if not stream_id:
         return False
@@ -2886,6 +2908,12 @@ def _append_journaled_partial_output(
                     session,
                     content,
                     max_index=initial_message_count,
+                    min_index=(
+                        current_turn_start + 1
+                        if isinstance(current_turn_start, int)
+                        else None
+                    ),
+                    recovered_stream_id=stream_id,
                     excluded_indexes=search_excluded,
                 )
                 if candidate_idx is None:

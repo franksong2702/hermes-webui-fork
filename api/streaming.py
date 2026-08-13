@@ -12082,6 +12082,10 @@ def cancel_stream(stream_id: str) -> bool:
     _snap_agent = None
     _snap_owner_session_id = None
     _cancel_session_payload = None
+    # Stable lower bound for journal content dedupe.  cancel_stream clears the
+    # mutable pending-turn fields before reading the journal, so capture the
+    # owning user-row index while that identity is still available.
+    _cancel_turn_start = None
 
     with streams_lock:
         stream_present = stream_id in streams
@@ -12300,9 +12304,12 @@ def cancel_stream(stream_id: str) -> bool:
                     _msgs_for_recovery = _cs.messages if isinstance(_cs.messages, list) else None
                     if _pending_user and _msgs_for_recovery is not None:
                         _last_user = None
-                        for _m in reversed(_msgs_for_recovery):
+                        _last_user_idx = None
+                        for _idx in range(len(_msgs_for_recovery) - 1, -1, -1):
+                            _m = _msgs_for_recovery[_idx]
                             if isinstance(_m, dict) and _m.get('role') == 'user':
                                 _last_user = _m
+                                _last_user_idx = _idx
                                 break
                         _already_persisted = False
                         if _last_user is not None:
@@ -12331,6 +12338,9 @@ def cancel_stream(stream_id: str) -> bool:
                             if _pending_atts:
                                 _user_turn['attachments'] = _pending_atts
                             _msgs_for_recovery.append(_user_turn)
+                            _cancel_turn_start = len(_msgs_for_recovery) - 1
+                        else:
+                            _cancel_turn_start = _last_user_idx
                 except Exception:
                     logger.debug(
                         "Failed to recover pending user message on cancel for %s",
@@ -12377,6 +12387,7 @@ def cancel_stream(stream_id: str) -> bool:
                             stream_id,
                             dedupe_existing=True,
                             mark_partial=True,
+                            current_turn_start=_cancel_turn_start,
                         )
                     except Exception:
                         # Cancellation must remain fail-soft if the journal is

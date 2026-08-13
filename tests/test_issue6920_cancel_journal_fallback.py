@@ -287,3 +287,59 @@ def test_repeated_journal_fallback_dedupes_rows_and_does_not_mark_history_partia
     partial_rows = [row for row in _assistant_rows(session) if row.get("_partial")]
     assert len(partial_rows) == first_partial_count
     assert partial_rows[0]["content"] == "One durable partial."
+
+
+def test_cancel_journal_dedupe_does_not_claim_same_text_from_an_older_turn():
+    """Current cancelled work must stay after its owning user turn."""
+    sid = "issue6920_turn_scoped_dedupe"
+    stream_id = "stream-turn-scoped-dedupe"
+    session = _session(sid, stream_id)
+    session.messages = [
+        {
+            "role": "user",
+            "content": "Earlier question",
+            "timestamp": 1,
+        },
+        {
+            "role": "assistant",
+            "content": "Repeated answer",
+            "timestamp": 2,
+        },
+    ]
+    session.context_messages = [dict(message) for message in session.messages]
+    session.pending_started_at = 10
+    session.save()
+    _start_cancel_state(sid, stream_id)
+    RunJournalWriter(sid, stream_id).append_sse_event(
+        "token", {"text": "Repeated answer"},
+    )
+
+    assert cancel_stream(stream_id) is True
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    assert reloaded.messages[1] == {
+        "role": "assistant",
+        "content": "Repeated answer",
+        "timestamp": 2,
+    }
+    current_user_index = next(
+        index
+        for index, message in enumerate(reloaded.messages)
+        if message.get("role") == "user"
+        and message.get("content") == "Continue this cancelled turn"
+    )
+    current_partial_index = next(
+        index
+        for index, message in enumerate(reloaded.messages)
+        if message.get("role") == "assistant"
+        and message.get("content") == "Repeated answer"
+        and message.get("_partial") is True
+    )
+    marker_index = next(
+        index
+        for index, message in enumerate(reloaded.messages)
+        if message.get("role") == "assistant" and message.get("_error") is True
+    )
+    assert current_user_index < current_partial_index < marker_index
+    assert marker_index == len(reloaded.messages) - 1
