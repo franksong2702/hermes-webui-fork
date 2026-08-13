@@ -728,7 +728,7 @@ def test_delete_late_gate_failure_restores_restartable_retry_owner(
 def test_delete_late_gate_restore_failure_does_not_claim_retryable_state(
     tmp_path, monkeypatch
 ):
-    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    _isolate_session_store(tmp_path, monkeypatch)
     sid = "late-delete-restore-failed"
     owner = Session(
         session_id=sid,
