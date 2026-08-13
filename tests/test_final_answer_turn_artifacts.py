@@ -1187,6 +1187,13 @@ def test_replay_discards_unbacked_and_forged_client_artifacts():
     assert routes._attach_replayed_turn_artifacts_to_anchor_scenes([message], {0: []})[0][
         "_anchor_activity_scene"
     ]["artifacts"] == []
+    foreign_session_hydrated = routes._attach_replayed_turn_artifacts_to_anchor_scenes(
+        [message],
+        {0: []},
+        replay_source_messages=[message],
+        replay_session_id="sid-server",
+    )
+    assert foreign_session_hydrated[0]["_anchor_activity_scene"]["artifacts"] == []
 
     canonical = {
         "path": "output/report.md",
@@ -1320,6 +1327,65 @@ def test_replay_preserves_only_transcript_backed_persisted_artifacts_after_works
             },
         },
     ]
+
+
+def test_replay_keeps_persisted_artifacts_when_historical_descriptors_are_unavailable(
+    monkeypatch,
+):
+    """A replay miss must not erase the last trusted artifact projection."""
+    from api import routes
+
+    session_id = "sid-replay"
+    messages = [
+        {"role": "user", "content": "write the report"},
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "call-1", "function": {"name": "patch"}}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "patch",
+            "content": json.dumps(
+                {"success": True, "files_modified": ["/old-workspace/output/report.md"]}
+            ),
+        },
+        {"role": "assistant", "content": "final answer"},
+    ]
+    persisted_artifacts = [
+        {
+            "type": "artifact_reference",
+            "payload": {
+                "path": "output/report.md",
+                "workspace_root": "/old-workspace",
+                "session_id": session_id,
+                "tool_name": "patch",
+                "tool_call_id": "call-1",
+                "source": "live_tool_complete",
+            },
+        }
+    ]
+    window = [
+        {
+            **messages[-1],
+            "_anchor_activity_scene": {
+                "version": "activity_scene_v1",
+                "activity_rows": [{"type": "tool"}],
+                "artifacts": persisted_artifacts,
+            },
+        }
+    ]
+    monkeypatch.setattr(routes, "_final_turn_artifact_paths", lambda *_args, **_kwargs: {})
+
+    hydrated = routes._attach_replayed_turn_artifacts_to_anchor_scenes(
+        window,
+        {},
+        message_offset=3,
+        replay_source_messages=messages,
+        replay_session_id=session_id,
+    )
+
+    assert hydrated[0]["_anchor_activity_scene"]["artifacts"] == persisted_artifacts
 
 
 def test_historical_artifact_replay_fails_closed_before_work_when_response_root_budget_exceeded(

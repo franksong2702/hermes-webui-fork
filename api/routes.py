@@ -9375,6 +9375,15 @@ def _attach_replayed_turn_artifacts_to_anchor_scenes(
         scene = message.get("_anchor_activity_scene")
         if not descriptors and historical_replay_allowed:
             descriptors = _historical_descriptors_for_scene(scene, absolute_idx)
+        if not descriptors and historical_replay_allowed:
+            # A historical replay miss is not evidence that a previously
+            # persisted, session-owned artifact list disappeared.  Keep that
+            # trusted projection intact; a forged or foreign-session scene has
+            # no same-session persisted identity and still follows the legacy
+            # clearing path below.
+            persisted, _ = _trusted_persisted_artifacts_for_scene(scene)
+            if persisted:
+                continue
         if not descriptors and not (
             isinstance(scene, dict) and scene.get("version") == "activity_scene_v1"
         ):
