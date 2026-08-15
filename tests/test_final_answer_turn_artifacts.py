@@ -1329,10 +1329,10 @@ def test_replay_preserves_only_transcript_backed_persisted_artifacts_after_works
     ]
 
 
-def test_replay_keeps_persisted_artifacts_when_historical_descriptors_are_unavailable(
+def test_replay_clears_same_session_persisted_artifacts_without_transcript_proof(
     monkeypatch,
 ):
-    """A replay miss must not erase the last trusted artifact projection."""
+    """A replay miss must erase even a same-session persisted artifact projection."""
     from api import routes
 
     session_id = "sid-replay"
@@ -1385,7 +1385,7 @@ def test_replay_keeps_persisted_artifacts_when_historical_descriptors_are_unavai
         replay_session_id=session_id,
     )
 
-    assert hydrated[0]["_anchor_activity_scene"]["artifacts"] == persisted_artifacts
+    assert hydrated[0]["_anchor_activity_scene"]["artifacts"] == []
 
 
 def test_historical_artifact_replay_fails_closed_before_work_when_response_root_budget_exceeded(
