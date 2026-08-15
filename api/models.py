@@ -2442,6 +2442,7 @@ def _journal_tool_already_present(
     preview: str,
     *,
     stream_id: str | None = None,
+    min_index: int | None = None,
 ) -> bool:
     """Return True when an equivalent tool card already exists.
 
@@ -2457,7 +2458,12 @@ def _journal_tool_already_present(
       stream-id tagging), the legacy name+preview match still wins.  This
       preserves the "core transcript already has this tool, don't duplicate
       it" invariant the original repair path established.
-    * When ``stream_id`` is omitted, the helper degrades cleanly to its
+    * When ``min_index`` is supplied (the cancellation path), untagged cards
+      are eligible only when their owning assistant row is in the current
+      turn.  A missing or invalid owner index is not enough to prove that and
+      is therefore rejected.  Cards carrying the same ``_recovered_stream_id``
+      remain eligible globally for exact-stream retry idempotence.
+    * When ``min_index`` is omitted, the helper degrades cleanly to its
       pre-fix session-wide behaviour.
     """
     candidate_name = str(name or '')
@@ -2475,12 +2481,37 @@ def _journal_tool_already_present(
             continue
         if candidate_stream is not None:
             existing_stream = tool_call.get('_recovered_stream_id')
-            # A tool card explicitly tagged with a recovered_stream_id that
-            # differs from ours belongs to another retry's turn — don't let
-            # it pre-empt this retry.  Untagged tool cards (live or carried
-            # over from the core transcript) still match.
-            if existing_stream and str(existing_stream) != candidate_stream:
-                continue
+            if existing_stream:
+                # A tool card explicitly tagged with a recovered_stream_id
+                # that differs from ours belongs to another retry's turn —
+                # don't let it pre-empt this retry.  A matching tag remains
+                # globally eligible so re-reading the same stream is
+                # idempotent.
+                if str(existing_stream) != candidate_stream:
+                    continue
+            elif min_index is not None:
+                # Cancellation dedupe is turn-local for untagged cards.  The
+                # owner index is the only durable evidence tying a legacy/live
+                # card to this turn; unknown ownership must not suppress a
+                # current tool call.
+                owner_index = tool_call.get('assistant_msg_idx')
+                messages = getattr(session, 'messages', None)
+                if (
+                    type(owner_index) is not int
+                    or owner_index < min_index
+                    or owner_index < 0
+                    or not isinstance(messages, list)
+                    or owner_index >= len(messages)
+                ):
+                    continue
+                owner = messages[owner_index]
+                if (
+                    not isinstance(owner, dict)
+                    or owner.get('role') != 'assistant'
+                    or owner.get('_error')
+                    or owner.get('type') == 'interrupted'
+                ):
+                    continue
         return True
     return False
 
@@ -3058,7 +3089,15 @@ def _append_journaled_partial_output(
             name = str(payload.get('name') or 'tool')
             preview = str(payload.get('preview') or '')
             if dedupe_existing and _journal_tool_already_present(
-                session, name, preview, stream_id=stream_id,
+                session,
+                name,
+                preview,
+                stream_id=stream_id,
+                min_index=(
+                    current_turn_start + 1
+                    if isinstance(current_turn_start, int)
+                    else None
+                ),
             ):
                 current_assistant_idx = anchor_idx
                 continue

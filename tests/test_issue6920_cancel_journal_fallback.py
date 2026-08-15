@@ -345,6 +345,155 @@ def test_cancel_journal_dedupe_does_not_claim_same_text_from_an_older_turn():
     assert marker_index == len(reloaded.messages) - 1
 
 
+def test_cancel_journal_tool_dedupe_is_turn_scoped():
+    """A repeated tool in an older turn must not suppress current recovery."""
+    sid = "issue6920_tool_turn_scope"
+    stream_id = "stream-tool-turn-scope"
+    session = _session(sid, stream_id)
+    session.messages = [
+        {
+            "role": "user",
+            "content": "Earlier question",
+            "timestamp": 1,
+        },
+        {
+            "role": "assistant",
+            "content": "Earlier answer",
+            "timestamp": 2,
+        },
+    ]
+    session.context_messages = [dict(message) for message in session.messages]
+    session.tool_calls = [
+        {
+            "name": "terminal",
+            "preview": "ls",
+            "snippet": "ls",
+            "tid": "old-tool",
+            "assistant_msg_idx": 1,
+            "done": True,
+        }
+    ]
+    session.pending_started_at = 10
+    session.save()
+    _start_cancel_state(sid, stream_id)
+    RunJournalWriter(sid, stream_id).append_sse_event(
+        "tool",
+        {
+            "name": "terminal",
+            "preview": "ls",
+            "args": {"cmd": "ls"},
+        },
+    )
+
+    assert cancel_stream(stream_id) is True
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    current_user_index = next(
+        index
+        for index, message in enumerate(reloaded.messages)
+        if message.get("role") == "user"
+        and message.get("content") == "Continue this cancelled turn"
+    )
+    current_assistant_index = next(
+        index
+        for index, message in enumerate(reloaded.messages)
+        if message.get("role") == "assistant"
+        and message.get("_recovered_stream_id") == stream_id
+    )
+    current_tools = [
+        tool_call
+        for tool_call in reloaded.tool_calls
+        if tool_call.get("_recovered_stream_id") == stream_id
+    ]
+    assert len(current_tools) == 1
+    assert current_tools[0]["assistant_msg_idx"] == current_assistant_index
+    assert current_user_index < current_assistant_index
+    assert reloaded.messages[current_assistant_index].get("_error") is not True
+    assert len(reloaded.tool_calls) == 2
+    assert reloaded.tool_calls[0].get("_recovered_stream_id") is None
+    assert reloaded.tool_calls[0]["assistant_msg_idx"] == 1
+
+    # Re-reading the same recovered stream remains idempotent.
+    from api.models import _append_journaled_partial_output
+
+    assert _append_journaled_partial_output(
+        reloaded,
+        stream_id,
+        dedupe_existing=True,
+        mark_partial=True,
+        current_turn_start=current_user_index,
+    ) is False
+    assert len(
+        [
+            tool_call
+            for tool_call in reloaded.tool_calls
+            if tool_call.get("_recovered_stream_id") == stream_id
+        ]
+    ) == 1
+
+    # Callers without the cancellation-only lower bound retain the legacy
+    # session-wide match for an untagged core-transcript tool card.
+    legacy_session = Session(
+        session_id="issue6920_tool_legacy",
+        messages=[{"role": "assistant", "content": "Earlier answer"}],
+        tool_calls=[{"name": "terminal", "preview": "ls", "snippet": "ls"}],
+    )
+    assert models._journal_tool_already_present(
+        legacy_session,
+        "terminal",
+        "ls",
+        stream_id="legacy-stream",
+    ) is True
+
+
+def test_cancel_journal_tool_dedupe_rejects_invalid_owner_rows():
+    """Malformed or marker owners must not suppress a current-turn tool."""
+    session = Session(
+        session_id="issue6920_tool_invalid_owner",
+        messages=[
+            {"role": "user", "content": "Current request"},
+            {"role": "assistant", "content": "Current progress"},
+            {
+                "role": "assistant",
+                "content": "Task cancelled.",
+                "_error": True,
+                "type": "interrupted",
+            },
+        ],
+    )
+    for owner_index in (999, 2):
+        session.tool_calls = [
+            {
+                "name": "terminal",
+                "preview": "ls",
+                "assistant_msg_idx": owner_index,
+            }
+        ]
+        assert models._journal_tool_already_present(
+            session,
+            "terminal",
+            "ls",
+            stream_id="current-stream",
+            min_index=1,
+        ) is False
+
+    session.tool_calls = [
+        {
+            "name": "terminal",
+            "preview": "ls",
+            "assistant_msg_idx": 1,
+        }
+    ]
+    assert models._journal_tool_already_present(
+        session,
+        "terminal",
+        "ls",
+        stream_id="current-stream",
+        min_index=1,
+    ) is True
+
+
 def test_cancel_journal_context_includes_owning_user():
     """Recovered assistant progress keeps its cancelled user turn in context."""
     sid = "issue6920_context_owner"
