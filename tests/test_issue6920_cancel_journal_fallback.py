@@ -343,3 +343,60 @@ def test_cancel_journal_dedupe_does_not_claim_same_text_from_an_older_turn():
     )
     assert current_user_index < current_partial_index < marker_index
     assert marker_index == len(reloaded.messages) - 1
+
+
+def test_cancel_journal_context_includes_owning_user():
+    """Recovered assistant progress keeps its cancelled user turn in context."""
+    sid = "issue6920_context_owner"
+    stream_id = "stream-context-owner"
+    session = _session(sid, stream_id)
+    session.messages = [
+        {
+            "role": "user",
+            "content": "Earlier question",
+            "timestamp": 1,
+        },
+        {
+            "role": "assistant",
+            "content": "Earlier answer",
+            "timestamp": 2,
+        },
+    ]
+    session.context_messages = [dict(message) for message in session.messages]
+    session.pending_started_at = 10
+    session.save()
+    _start_cancel_state(sid, stream_id)
+    writer = RunJournalWriter(sid, stream_id)
+    writer.append_sse_event(
+        "token", {"text": "Recovered assistant progress."},
+    )
+    writer.append_sse_event(
+        "reasoning", {"text": "Display-only reasoning must stay hidden."},
+    )
+
+    assert cancel_stream(stream_id) is True
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    context = reloaded.context_messages
+    current_user_indexes = [
+        index
+        for index, message in enumerate(context)
+        if message.get("role") == "user"
+        and message.get("content") == "Continue this cancelled turn"
+    ]
+    recovered_indexes = [
+        index
+        for index, message in enumerate(context)
+        if message.get("role") == "assistant"
+        and message.get("content") == "Recovered assistant progress."
+    ]
+    assert len(current_user_indexes) == 1
+    assert len(recovered_indexes) == 1
+    assert recovered_indexes[0] == current_user_indexes[0] + 1
+    assert "Display-only reasoning" not in json.dumps(
+        context, ensure_ascii=False,
+    )
+    assert reloaded.pending_user_message is None
+    assert reloaded.pending_attachments == []
+    assert reloaded.pending_started_at is None

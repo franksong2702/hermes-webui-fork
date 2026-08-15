@@ -65,6 +65,7 @@ from api.todo_state import attach_todo_state, emit_todo_state
 from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
 from api.models import (
+    _append_recovered_turn_to_context,
     _is_empty_partial_activity_message,
     _evict_sessions_over_cap,
     clear_process_wakeup_pause,
@@ -12375,6 +12376,18 @@ def cancel_stream(stream_id: str) -> bool:
                         "Failed to recover pending user message on cancel for %s",
                         _cancel_session_id,
                     )
+                if isinstance(_cancel_turn_start, int):
+                    try:
+                        _append_recovered_turn_to_context(
+                            _cs,
+                            _cs.messages[_cancel_turn_start],
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to project cancelled user turn into context for %s",
+                            _cancel_session_id,
+                            exc_info=True,
+                        )
                 _cs.active_stream_id = None
                 _cs.pending_user_message = None
                 _cs.pending_attachments = []
