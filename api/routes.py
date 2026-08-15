@@ -9834,6 +9834,7 @@ from api.models import (
     _active_stream_ids,
     _evict_sessions_over_cap,
     _get_session_persistence_lock,
+    _INDEX_WRITE_LOCK,
     _advance_session_persistence_generation,
     _merge_session_display_metadata,
     _session_message_merge_key,
@@ -15375,6 +15376,7 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session busy, try again", 503)
         persistence_lock = _get_session_persistence_lock(sid)
         persistence_lock.acquire()
+        index_write_lock_held = False
         try:
             # Keep the exact in-memory owner for the late-gate compensation
             # path.  The successful-delete path below remains the only place
@@ -15530,69 +15532,150 @@ def handle_post(handler, parsed) -> bool:
                     },
                     status=500,
                 )
+            # Keep the index writer fence continuously held from target-row
+            # prune through readback, tombstone publication/verification, and
+            # exact-owner retirement.  A missing-index rebuild takes this same
+            # lock while it snapshots in-memory owners, so it either publishes
+            # before this transaction (and is pruned here) or starts after the
+            # owner has been removed.
+            _INDEX_WRITE_LOCK.acquire()
+            index_write_lock_held = True
             try:
-                prune_session_from_index(sid)
-            except Exception:
-                logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
-                retry_state_restored = _restore_deleted_session_retry_persistence(
-                    sid,
-                    sidecar_snapshot=retry_sidecar_snapshot,
-                    backup_snapshot=retry_backup_snapshot,
-                    index_row_snapshot=retry_index_row_snapshot,
-                    index_snapshot_valid=retry_index_snapshot_valid,
-                    owner=retry_owner,
-                )
-                return j(
-                    handler,
-                    {
-                        "ok": False,
-                        "state_db_cleanup_failed": False,
-                        "run_journal_cleanup_failed": False,
-                        "session_artifact_cleanup_failed": False,
-                        "session_index_cleanup_failed": True,
-                        "retry_state_restored": retry_state_restored,
-                        **worktree_retained,
-                        "error": (
-                            "Session index cleanup failed; retry deletion"
-                            if retry_state_restored
-                            else "Delete retry state restoration failed; manual recovery required"
-                        ),
-                    },
-                    status=500,
-                )
-            if not _session_index_prune_verified(sid):
-                logger.warning("Session index row was not settled for %s", sid)
-                retry_state_restored = _restore_deleted_session_retry_persistence(
-                    sid,
-                    sidecar_snapshot=retry_sidecar_snapshot,
-                    backup_snapshot=retry_backup_snapshot,
-                    index_row_snapshot=retry_index_row_snapshot,
-                    index_snapshot_valid=retry_index_snapshot_valid,
-                    owner=retry_owner,
-                )
-                return j(
-                    handler,
-                    {
-                        "ok": False,
-                        "state_db_cleanup_failed": False,
-                        "run_journal_cleanup_failed": False,
-                        "session_artifact_cleanup_failed": False,
-                        "session_index_cleanup_failed": True,
-                        "retry_state_restored": retry_state_restored,
-                        **worktree_retained,
-                        "error": (
-                            "Session index cleanup failed; retry deletion"
-                            if retry_state_restored
-                            else "Delete retry state restoration failed; manual recovery required"
-                        ),
-                    },
-                    status=500,
-                )
-            if not is_messaging_session:
                 try:
-                    _record_webui_deleted_session_tombstone(sid)
+                    prune_session_from_index(sid)
                 except Exception:
-                    logger.debug("Failed to tombstone deleted WebUI session %s", sid, exc_info=True)
+                    logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
+                    retry_state_restored = _restore_deleted_session_retry_persistence(
+                        sid,
+                        sidecar_snapshot=retry_sidecar_snapshot,
+                        backup_snapshot=retry_backup_snapshot,
+                        index_row_snapshot=retry_index_row_snapshot,
+                        index_snapshot_valid=retry_index_snapshot_valid,
+                        owner=retry_owner,
+                    )
+                    return j(
+                        handler,
+                        {
+                            "ok": False,
+                            "state_db_cleanup_failed": False,
+                            "run_journal_cleanup_failed": False,
+                            "session_artifact_cleanup_failed": False,
+                            "session_index_cleanup_failed": True,
+                            "retry_state_restored": retry_state_restored,
+                            **worktree_retained,
+                            "error": (
+                                "Session index cleanup failed; retry deletion"
+                                if retry_state_restored
+                                else "Delete retry state restoration failed; manual recovery required"
+                            ),
+                        },
+                        status=500,
+                    )
+                if not _session_index_prune_verified(sid):
+                    logger.warning("Session index row was not settled for %s", sid)
+                    retry_state_restored = _restore_deleted_session_retry_persistence(
+                        sid,
+                        sidecar_snapshot=retry_sidecar_snapshot,
+                        backup_snapshot=retry_backup_snapshot,
+                        index_row_snapshot=retry_index_row_snapshot,
+                        index_snapshot_valid=retry_index_snapshot_valid,
+                        owner=retry_owner,
+                    )
+                    return j(
+                        handler,
+                        {
+                            "ok": False,
+                            "state_db_cleanup_failed": False,
+                            "run_journal_cleanup_failed": False,
+                            "session_artifact_cleanup_failed": False,
+                            "session_index_cleanup_failed": True,
+                            "retry_state_restored": retry_state_restored,
+                            **worktree_retained,
+                            "error": (
+                                "Session index cleanup failed; retry deletion"
+                                if retry_state_restored
+                                else "Delete retry state restoration failed; manual recovery required"
+                            ),
+                        },
+                        status=500,
+                    )
+                if not is_messaging_session:
+                    try:
+                        _record_webui_deleted_session_tombstone(sid)
+                    except Exception:
+                        logger.debug("Failed to tombstone deleted WebUI session %s", sid, exc_info=True)
+                        retry_state_restored = _restore_deleted_session_retry_persistence(
+                            sid,
+                            sidecar_snapshot=retry_sidecar_snapshot,
+                            backup_snapshot=retry_backup_snapshot,
+                            index_row_snapshot=retry_index_row_snapshot,
+                            index_snapshot_valid=retry_index_snapshot_valid,
+                            owner=retry_owner,
+                        )
+                        return j(
+                            handler,
+                            {
+                                "ok": False,
+                                "state_db_cleanup_failed": False,
+                                "run_journal_cleanup_failed": False,
+                                "session_artifact_cleanup_failed": False,
+                                "session_index_cleanup_failed": False,
+                                "deleted_session_tombstone_cleanup_failed": True,
+                                "retry_state_restored": retry_state_restored,
+                                **worktree_retained,
+                                "error": (
+                                    "Deleted-session tombstone failed; retry deletion"
+                                    if retry_state_restored
+                                    else "Delete retry state restoration failed; manual recovery required"
+                                ),
+                            },
+                            status=500,
+                        )
+                    if sid not in _load_webui_deleted_session_tombstone():
+                        logger.warning("Deleted-session tombstone was not published for %s", sid)
+                        retry_state_restored = _restore_deleted_session_retry_persistence(
+                            sid,
+                            sidecar_snapshot=retry_sidecar_snapshot,
+                            backup_snapshot=retry_backup_snapshot,
+                            index_row_snapshot=retry_index_row_snapshot,
+                            index_snapshot_valid=retry_index_snapshot_valid,
+                            owner=retry_owner,
+                        )
+                        return j(
+                            handler,
+                            {
+                                "ok": False,
+                                "state_db_cleanup_failed": False,
+                                "run_journal_cleanup_failed": False,
+                                "session_artifact_cleanup_failed": False,
+                                "session_index_cleanup_failed": False,
+                                "deleted_session_tombstone_cleanup_failed": True,
+                                "retry_state_restored": retry_state_restored,
+                                **worktree_retained,
+                                "error": (
+                                    "Deleted-session tombstone failed; retry deletion"
+                                    if retry_state_restored
+                                    else "Delete retry state restoration failed; manual recovery required"
+                                ),
+                            },
+                            status=500,
+                        )
+
+                # Validate and retire the exact admitted owner while holding
+                # LOCK.  Never pop or revoke a successor that replaced the
+                # owner while the durable delete gates were running.
+                owner_replaced = False
+                with LOCK:
+                    if SESSIONS.get(sid) is not retry_owner:
+                        owner_replaced = True
+                    else:
+                        SESSIONS.pop(sid, None)
+                        _advance_session_persistence_generation(sid)
+                if owner_replaced:
+                    logger.warning(
+                        "Refusing successful delete for %s: session owner changed",
+                        sid,
+                    )
                     retry_state_restored = _restore_deleted_session_retry_persistence(
                         sid,
                         sidecar_snapshot=retry_sidecar_snapshot,
@@ -15609,55 +15692,23 @@ def handle_post(handler, parsed) -> bool:
                             "run_journal_cleanup_failed": False,
                             "session_artifact_cleanup_failed": False,
                             "session_index_cleanup_failed": False,
-                            "deleted_session_tombstone_cleanup_failed": True,
+                            "deleted_session_tombstone_cleanup_failed": False,
                             "retry_state_restored": retry_state_restored,
                             **worktree_retained,
                             "error": (
-                                "Deleted-session tombstone failed; retry deletion"
+                                "Session owner changed; retry deletion"
                                 if retry_state_restored
                                 else "Delete retry state restoration failed; manual recovery required"
                             ),
                         },
                         status=500,
                     )
-                if sid not in _load_webui_deleted_session_tombstone():
-                    logger.warning("Deleted-session tombstone was not published for %s", sid)
-                    retry_state_restored = _restore_deleted_session_retry_persistence(
-                        sid,
-                        sidecar_snapshot=retry_sidecar_snapshot,
-                        backup_snapshot=retry_backup_snapshot,
-                        index_row_snapshot=retry_index_row_snapshot,
-                        index_snapshot_valid=retry_index_snapshot_valid,
-                        owner=retry_owner,
-                    )
-                    return j(
-                        handler,
-                        {
-                            "ok": False,
-                            "state_db_cleanup_failed": False,
-                            "run_journal_cleanup_failed": False,
-                            "session_artifact_cleanup_failed": False,
-                            "session_index_cleanup_failed": False,
-                            "deleted_session_tombstone_cleanup_failed": True,
-                            "retry_state_restored": retry_state_restored,
-                            **worktree_retained,
-                            "error": (
-                                "Deleted-session tombstone failed; retry deletion"
-                                if retry_state_restored
-                                else "Delete retry state restoration failed; manual recovery required"
-                            ),
-                        },
-                        status=500,
-                    )
-            # Keep the cache and generation transition behind the durable
-            # cleanup fence.  The index helper above already obeys
-            # persistence -> index -> global LOCK; this final cache pop does
-            # not acquire an index lock and therefore cannot reverse that
-            # ordering.
-            with LOCK:
-                SESSIONS.pop(sid, None)
-            _advance_session_persistence_generation(sid)
+            finally:
+                _INDEX_WRITE_LOCK.release()
+                index_write_lock_held = False
         finally:
+            if index_write_lock_held:
+                _INDEX_WRITE_LOCK.release()
             persistence_lock.release()
             session_lock.release()
         # Evict outside the mutation lock: lifecycle commit may perform provider

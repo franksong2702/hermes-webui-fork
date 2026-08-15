@@ -1265,6 +1265,148 @@ def test_delete_returns_503_without_mutation_when_session_lock_is_busy(
     assert routes_module.SESSIONS[sid] is cached_session
 
 
+def test_successful_delete_linearizes_missing_index_rebuild_with_owner_retirement(
+    models_module, monkeypatch, tmp_path
+):
+    """A queued real full-index rebuild cannot republish a successful delete."""
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "delete-rebuild-owner-fence"
+    sibling_sid = f"{sid}-sibling"
+    owner = models_module.Session(
+        session_id=sid,
+        title="delete target",
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "delete me"}],
+    )
+    sibling = models_module.Session(
+        session_id=sibling_sid,
+        title="keep sibling",
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "keep me"}],
+    )
+    models_module.SESSIONS[sid] = owner
+    models_module.SESSIONS[sibling_sid] = sibling
+    owner.save()
+    sibling.save()
+    index_file.unlink()
+
+    stale_rebuild = getattr(models_module, "_SESSION_INDEX_REBUILD_THREAD", None)
+    if stale_rebuild is not None:
+        stale_rebuild.join(timeout=5)
+    models_module._SESSION_INDEX_REBUILD_THREAD = None
+    models_module._SESSION_INDEX_REBUILD_THREAD_TARGET = None
+
+    rebuild_captured = threading.Event()
+    allow_rebuild_publish = threading.Event()
+    real_safe_replace = models_module._safe_replace
+
+    def pause_real_rebuild_publish(source, target):
+        if (
+            target == index_file
+            and threading.current_thread().name == "session-index-rebuild"
+        ):
+            rebuild_captured.set()
+            assert allow_rebuild_publish.wait(timeout=5)
+        return real_safe_replace(source, target)
+
+    monkeypatch.setattr(models_module, "_safe_replace", pause_real_rebuild_publish)
+    real_record_tombstone = routes_module._record_webui_deleted_session_tombstone
+
+    def queue_real_rebuild_before_tombstone(candidate_sid):
+        models_module._start_session_index_rebuild_thread()
+        return real_record_tombstone(candidate_sid)
+
+    monkeypatch.setattr(
+        routes_module,
+        "_record_webui_deleted_session_tombstone",
+        queue_real_rebuild_before_tombstone,
+    )
+
+    delete_result = {}
+
+    def delete():
+        delete_result["status"], delete_result["payload"] = _delete_result_via_route(
+            routes_module, sid
+        )
+
+    delete_thread = threading.Thread(target=delete, name="delete-target")
+    delete_thread.start()
+    assert rebuild_captured.wait(timeout=5), (
+        "the real missing-index rebuild must capture the retained owner "
+        "before its publication fence"
+    )
+    delete_thread.join(timeout=5)
+    assert not delete_thread.is_alive()
+    assert delete_result["status"] == 200
+
+    allow_rebuild_publish.set()
+    rebuild_thread = getattr(models_module, "_SESSION_INDEX_REBUILD_THREAD", None)
+    if rebuild_thread is not None:
+        rebuild_thread.join(timeout=5)
+        assert not rebuild_thread.is_alive()
+
+    rows = json.loads(index_file.read_text(encoding="utf-8"))
+    row_ids = {row.get("session_id") for row in rows}
+    assert sid not in row_ids
+    assert sibling_sid in row_ids
+    assert sid in models_module._load_webui_deleted_session_tombstone()
+    assert not (session_dir / f"{sid}.json").exists()
+    assert not (session_dir / f"{sid}.json.bak").exists()
+    assert (session_dir / f"{sibling_sid}.json").exists()
+    assert sid not in models_module.SESSIONS
+    assert models_module.SESSIONS[sibling_sid] is sibling
+    assert not models_module._session_persistence_generation_is_current(owner)
+    assert models_module.Session.load(sid) is None
+
+
+def test_delete_finalization_refuses_replaced_cache_owner(
+    models_module, monkeypatch, tmp_path
+):
+    """A same-SID cache replacement is preserved and never revoked by delete."""
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "delete-replaced-cache-owner"
+    owner = models_module.Session(
+        session_id=sid,
+        title="original owner",
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "original"}],
+    )
+    successor = models_module.Session(
+        session_id=sid,
+        title="successor owner",
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "successor"}],
+    )
+    models_module.SESSIONS[sid] = owner
+    owner.save()
+    real_record_tombstone = routes_module._record_webui_deleted_session_tombstone
+
+    def replace_owner_then_record(candidate_sid):
+        with models_module.LOCK:
+            models_module.SESSIONS[candidate_sid] = successor
+        return real_record_tombstone(candidate_sid)
+
+    monkeypatch.setattr(
+        routes_module,
+        "_record_webui_deleted_session_tombstone",
+        replace_owner_then_record,
+    )
+
+    status, _payload = _delete_result_via_route(routes_module, sid)
+
+    assert status >= 400
+    assert models_module.SESSIONS[sid] is successor
+    assert not successor._persistence_generation.revoked
+    assert not owner._persistence_generation.revoked
+    assert index_file.exists()
+
+
 def test_session_lock_registry_reuses_live_lock_and_reclaims_unused_entry():
     config_module = pytest.importorskip("api.config")
     sid = "weak-session-lock"
