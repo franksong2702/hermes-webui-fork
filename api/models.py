@@ -2379,6 +2379,13 @@ def _collapse_adjacent_duplicate_partials(messages) -> tuple[list, bool]:
     previous_partial_sig = None
     for message in messages:
         if isinstance(message, dict) and message.get('_partial'):
+            if message.get('_recovered_from_run_journal'):
+                # Each journal segment is a distinct durable event.  The
+                # legacy payload-only collapse is for repeated cancellation
+                # markers and must not merge legitimate recovered rows.
+                previous_partial_sig = None
+                collapsed.append(message)
+                continue
             sig = _partial_message_signature(message)
             if previous_partial_sig == sig:
                 changed = True

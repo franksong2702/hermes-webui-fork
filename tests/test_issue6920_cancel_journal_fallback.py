@@ -494,6 +494,89 @@ def test_cancel_journal_tool_dedupe_rejects_invalid_owner_rows():
     ) is True
 
 
+def test_recovered_journal_segments_bypass_legacy_partial_collapse():
+    """Distinct recovered rows survive the save/load partial cleanup pass."""
+    sid = "issue6920_recovered_partial_collapse"
+    stream_id = "stream-recovered-partials"
+    session = Session(
+        session_id=sid,
+        messages=[
+            {"role": "user", "content": "Continue this cancelled turn", "timestamp": 1},
+            {
+                "role": "assistant",
+                "content": "Repeated recovered progress.",
+                "timestamp": 2,
+                "_partial": True,
+                "_recovered_from_run_journal": True,
+                "_recovered_stream_id": stream_id,
+            },
+            {
+                "role": "assistant",
+                "content": "Repeated recovered progress.",
+                "timestamp": 3,
+                "_partial": True,
+                "_recovered_from_run_journal": True,
+                "_recovered_stream_id": stream_id,
+            },
+            {
+                "role": "assistant",
+                "content": "Task cancelled.",
+                "timestamp": 4,
+                "_error": True,
+            },
+        ],
+        tool_calls=[
+            {
+                "name": "terminal",
+                "preview": "ls",
+                "snippet": "ls",
+                "tid": "journal-tool-1",
+                "assistant_msg_idx": 2,
+                "_partial": True,
+                "_recovered_from_run_journal": True,
+                "_recovered_stream_id": stream_id,
+            },
+        ],
+    )
+    session.save()
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    recovered = [
+        row for row in _assistant_rows(reloaded)
+        if row.get("_recovered_from_run_journal")
+    ]
+    assert [row.get("content") for row in recovered] == [
+        "Repeated recovered progress.",
+        "Repeated recovered progress.",
+    ]
+    assert len(recovered) == 2
+    assert len(reloaded.messages) == 4
+    assert reloaded.tool_calls[0]["assistant_msg_idx"] == 2
+    assert reloaded.messages[reloaded.tool_calls[0]["assistant_msg_idx"]].get(
+        "_recovered_stream_id"
+    ) == stream_id
+    assert reloaded.messages[reloaded.tool_calls[0]["assistant_msg_idx"]].get(
+        "_error"
+    ) is not True
+
+    legacy = Session(
+        session_id="issue6920_legacy_partial_collapse",
+        messages=[
+            {"role": "assistant", "content": "Legacy duplicate.", "_partial": True},
+            {"role": "assistant", "content": "Legacy duplicate.", "_partial": True},
+        ],
+    )
+    legacy.save()
+    legacy_reloaded = Session.load(legacy.session_id)
+    assert legacy_reloaded is not None
+    assert [
+        row for row in _assistant_rows(legacy_reloaded) if row.get("_partial")
+    ] == [
+        {"role": "assistant", "content": "Legacy duplicate.", "_partial": True},
+    ]
+
+
 def test_cancel_journal_context_includes_owning_user():
     """Recovered assistant progress keeps its cancelled user turn in context."""
     sid = "issue6920_context_owner"
