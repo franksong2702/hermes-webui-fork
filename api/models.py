@@ -869,6 +869,92 @@ def _append_recovered_context_projection(
     context_messages: list,
     recovered: dict,
 ) -> None:
+    def _recovered_identity(message):
+        if not isinstance(message, dict):
+            return None
+        for field in (
+            '_recovered_event_id',
+            '_recovered_segment_id',
+            '_journal_event_id',
+        ):
+            value = message.get(field)
+            if value is not None and str(value).strip():
+                return str(value)
+        return None
+
+    def _user_identity(message):
+        if not isinstance(message, dict) or message.get('role') != 'user':
+            return None
+        token = message.get('_active_turn_token')
+        if token:
+            return ('token', str(token))
+        timestamp = message.get('timestamp')
+        if timestamp is None:
+            timestamp = message.get('_ts')
+        attachments = message.get('attachments') or []
+        try:
+            attachments_key = json.dumps(
+                attachments, ensure_ascii=False, sort_keys=True, default=str,
+            )
+        except Exception:
+            attachments_key = str(attachments)
+        return (
+            'user',
+            _normalize_journal_recovery_text(message.get('content')),
+            timestamp,
+            message.get('_source') or 'webui',
+            attachments_key,
+        )
+
+    def _owner_identity(messages, message_index):
+        if not isinstance(message_index, int):
+            return None
+        for owner_index in range(min(message_index, len(messages) - 1), -1, -1):
+            owner = messages[owner_index]
+            if isinstance(owner, dict) and owner.get('role') == 'user':
+                return _user_identity(owner)
+        return None
+
+    def _recovered_owner_identity(message):
+        if not isinstance(message, dict) or message.get('role') == 'user':
+            return _user_identity(message)
+        messages = getattr(session, 'messages', None) or []
+        target_index = None
+        recovered_event_id = _recovered_identity(message)
+        recovered_stream_id = message.get('_recovered_stream_id')
+        recovered_text = _normalize_journal_recovery_text(message.get('content'))
+        for candidate_index in range(len(messages) - 1, -1, -1):
+            candidate = messages[candidate_index]
+            if not isinstance(candidate, dict) or candidate.get('role') != 'assistant':
+                continue
+            if candidate is message:
+                target_index = candidate_index
+                break
+            if (
+                recovered_event_id
+                and _recovered_identity(candidate) == recovered_event_id
+            ):
+                target_index = candidate_index
+                break
+            if (
+                recovered_stream_id
+                and candidate.get('_recovered_stream_id') == recovered_stream_id
+                and _normalize_journal_recovery_text(candidate.get('content')) == recovered_text
+            ):
+                target_index = candidate_index
+                break
+        if target_index is None and message.get('_partial'):
+            for candidate_index in range(len(messages) - 1, -1, -1):
+                candidate = messages[candidate_index]
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get('role') == 'assistant'
+                    and _normalize_journal_recovery_text(candidate.get('content')) == recovered_text
+                ):
+                    target_index = candidate_index
+                    break
+        return _owner_identity(messages, target_index)
+
     recovered_text = _normalize_journal_recovery_text(recovered.get('content'))
     if recovered_text:
         if recovered.get('role') == 'user':
@@ -881,10 +967,42 @@ def _append_recovered_context_projection(
             ):
                 return
         else:
-            for existing in reversed(context_messages[-8:]):
+            for existing_index in range(
+                len(context_messages) - 1,
+                max(-1, len(context_messages) - 9),
+                -1,
+            ):
+                existing = context_messages[existing_index]
                 if not isinstance(existing, dict) or existing.get('role') != recovered.get('role'):
                     continue
                 if _normalize_journal_recovery_text(existing.get('content')) == recovered_text:
+                    recovered_owner = _recovered_owner_identity(recovered)
+                    existing_owner = _owner_identity(
+                        context_messages,
+                        existing_index,
+                    )
+                    if recovered_owner is None or existing_owner is None:
+                        # Preserve the historical payload-only reconciliation
+                        # for untagged legacy rows.  Journal/partial rows,
+                        # however, carry a current-turn recovery claim; unknown
+                        # ownership is not proof of equivalence for those rows.
+                        if (
+                            recovered.get('_recovered_from_run_journal')
+                            or recovered.get('_partial')
+                        ):
+                            continue
+                        return
+                    if recovered_owner != existing_owner:
+                        continue
+                    recovered_identity = _recovered_identity(recovered)
+                    existing_identity = _recovered_identity(existing)
+                    if (
+                        recovered_identity is not None
+                        or existing_identity is not None
+                    ) and recovered_identity != existing_identity:
+                        # Equal prose from distinct durable journal segments is
+                        # still two provider-facing rows.
+                        continue
                     return
     context_messages.append(dict(recovered))
 
@@ -2404,6 +2522,7 @@ def _find_existing_assistant_for_journal_content(
     max_index: int | None = None,
     min_index: int | None = None,
     recovered_stream_id: str | None = None,
+    recovered_event_id: str | None = None,
     excluded_indexes: set[int] | None = None,
 ) -> int | None:
     candidate = _normalize_journal_recovery_text(content)
@@ -2424,6 +2543,11 @@ def _find_existing_assistant_for_journal_content(
             continue
         if message.get('_error'):
             continue
+        if (
+            recovered_event_id
+            and message.get('_recovered_event_id') == recovered_event_id
+        ):
+            return idx
         # During cancellation, untagged content matches are scoped to the
         # current pending user turn.  A row already recovered for this exact
         # stream remains globally eligible so repeated journal reads stay
@@ -2870,6 +2994,7 @@ def _append_journaled_partial_output(
     assistant_parts: list[str] = []
     reasoning_parts: list[str] = []
     assistant_started_at: float | None = None
+    assistant_segment_event_id: str | None = None
     current_assistant_idx: int | None = None
     recovered_tool_calls: list[dict] = []
     initial_message_count = len(session.messages or [])
@@ -2944,11 +3069,13 @@ def _append_journaled_partial_output(
 
     def flush_assistant() -> int | None:
         nonlocal appended_any, assistant_parts, reasoning_parts
-        nonlocal assistant_started_at, current_assistant_idx
+        nonlocal assistant_started_at, assistant_segment_event_id, current_assistant_idx
         content = ''.join(assistant_parts).strip()
         reasoning = ''.join(reasoning_parts).strip()
+        segment_event_id = assistant_segment_event_id
         assistant_parts = []
         reasoning_parts = []
+        assistant_segment_event_id = None
         if not content and not reasoning:
             return current_assistant_idx
         if dedupe_existing and content:
@@ -2961,6 +3088,7 @@ def _append_journaled_partial_output(
                     max_index=initial_message_count,
                     min_index=dedupe_min_index,
                     recovered_stream_id=stream_id,
+                    recovered_event_id=segment_event_id,
                     excluded_indexes=search_excluded,
                 )
                 if candidate_idx is None:
@@ -3007,6 +3135,8 @@ def _append_journaled_partial_output(
         }
         if mark_partial:
             recovered_assistant['_partial'] = True
+        if segment_event_id:
+            recovered_assistant['_recovered_event_id'] = segment_event_id
         attach_display_reasoning(recovered_assistant, reasoning)
         session.messages.append(recovered_assistant)
         append_context_projection(recovered_assistant)
@@ -3015,7 +3145,10 @@ def _append_journaled_partial_output(
         appended_any = True
         return current_assistant_idx
 
-    def ensure_assistant_anchor(created_at: float | None = None) -> int:
+    def ensure_assistant_anchor(
+        created_at: float | None = None,
+        event_id: str | None = None,
+    ) -> int:
         nonlocal appended_any, current_assistant_idx
         idx = flush_assistant()
         if idx is not None:
@@ -3057,6 +3190,8 @@ def _append_journaled_partial_output(
         }
         if mark_partial:
             recovered_anchor['_partial'] = True
+        if event_id:
+            recovered_anchor['_recovered_event_id'] = event_id
         session.messages.append(recovered_anchor)
         current_assistant_idx = len(session.messages) - 1
         appended_any = True
@@ -3066,6 +3201,10 @@ def _append_journaled_partial_output(
         event_name = str(event.get('event') or event.get('type') or '')
         payload = event.get('payload') if isinstance(event.get('payload'), dict) else {}
         created_at = event.get('created_at') if isinstance(event.get('created_at'), (int, float)) else None
+        event_id = event.get('event_id')
+        if not event_id and isinstance(event.get('seq'), int) and event.get('seq') > 0:
+            event_id = f'{stream_id}:{event["seq"]}'
+        event_id = str(event_id) if event_id else None
         if event_name == 'reasoning':
             text = str(
                 payload.get('text') or payload.get('reasoning') or payload.get('thinking') or ''
@@ -3074,6 +3213,7 @@ def _append_journaled_partial_output(
                 continue
             if not assistant_parts and not reasoning_parts and assistant_started_at is None:
                 assistant_started_at = created_at or time.time()
+                assistant_segment_event_id = event_id
             reasoning_parts.append(text)
             continue
         if event_name == 'token':
@@ -3082,6 +3222,7 @@ def _append_journaled_partial_output(
                 continue
             if not assistant_parts and assistant_started_at is None:
                 assistant_started_at = created_at or time.time()
+                assistant_segment_event_id = event_id
             assistant_parts.append(text)
             continue
         if event_name == 'interim_assistant':
@@ -3093,6 +3234,7 @@ def _append_journaled_partial_output(
                 continue
             if not assistant_parts and assistant_started_at is None:
                 assistant_started_at = created_at or time.time()
+                assistant_segment_event_id = event_id
             if assistant_parts and not ''.join(assistant_parts).endswith(('\n', ' ')):
                 assistant_parts.append('\n\n')
             assistant_parts.append(text)
@@ -3101,7 +3243,7 @@ def _append_journaled_partial_output(
         if event_name == 'tool':
             anchor_idx = flush_assistant()
             if anchor_idx is None:
-                anchor_idx = ensure_assistant_anchor(created_at)
+                anchor_idx = ensure_assistant_anchor(created_at, event_id)
             name = str(payload.get('name') or 'tool')
             preview = str(payload.get('preview') or '')
             if dedupe_existing and _journal_tool_already_present(
@@ -3124,6 +3266,12 @@ def _append_journaled_partial_output(
                 '_recovered_from_run_journal': True,
                 '_recovered_stream_id': stream_id,
             }
+            if event_id:
+                recovered_tool_call['_recovered_event_id'] = event_id
+                if 0 <= anchor_idx < len(session.messages):
+                    owner_event_id = session.messages[anchor_idx].get('_recovered_event_id')
+                    if owner_event_id:
+                        recovered_tool_call['_recovered_assistant_event_id'] = owner_event_id
             if mark_partial:
                 recovered_tool_call['_partial'] = True
             recovered_tool_calls.append(recovered_tool_call)

@@ -5622,6 +5622,20 @@ def _restore_reasoning_metadata(previous_messages, updated_messages):
         if isinstance(prev_msg, dict) and isinstance(cur_msg, dict) and _safe_projection(prev_msg) == _safe_projection(cur_msg):
             if prev_msg.get('role') == 'assistant' and prev_msg.get('reasoning') and not cur_msg.get('reasoning'):
                 cur_msg['reasoning'] = prev_msg['reasoning']
+            # The provider-facing history intentionally strips WebUI recovery
+            # bookkeeping. Restore it by the same API-safe position used for
+            # reasoning/timestamps so equal-text journal segments keep their
+            # durable identities across the normal agent-result boundary.
+            for field in (
+                '_partial',
+                '_recovered_from_run_journal',
+                '_recovered_stream_id',
+                '_recovered_event_id',
+                '_recovered_segment_id',
+                '_journal_event_id',
+            ):
+                if field not in cur_msg and field in prev_msg:
+                    cur_msg[field] = copy.deepcopy(prev_msg[field])
             # Carry the stable per-message id (#context-message-stable-id) forward
             # the same way timestamp is carried. The agent rebuilds result rows
             # without our id every turn; without this, historical context rows
@@ -5699,19 +5713,43 @@ def _message_identity(msg):
         # so the merge can dedup identical empty partials.
         if msg.get('_partial'):
             reasoning_key = " ".join(str(msg.get('reasoning') or '').split())[:200]
-            return (
+            identity = (
                 role,
                 '',  # empty text
                 '',  # no tool_call_id
                 '__partial__' + reasoning_key,
             )
+            if msg.get('_recovered_from_run_journal'):
+                for field in (
+                    '_recovered_event_id',
+                    '_recovered_segment_id',
+                    '_journal_event_id',
+                ):
+                    value = msg.get(field)
+                    if value is not None and str(value).strip():
+                        return (*identity, f'{field}:{value}')
+            return identity
         return None
-    return (
+    identity = (
         role,
         " ".join(str(text or '').split())[:500],
         str(msg.get('tool_call_id') or ''),
         json.dumps(msg.get('tool_calls') or [], sort_keys=True, ensure_ascii=False),
     )
+    # A journal-recovered partial can legitimately repeat the same visible
+    # prose in one cancelled turn.  Its durable event identity, when present,
+    # is authoritative over payload text for replay/settlement dedupe.  Keep
+    # identity-less legacy rows on the historical payload-only key.
+    if isinstance(msg, dict) and msg.get('_recovered_from_run_journal'):
+        for field in (
+            '_recovered_event_id',
+            '_recovered_segment_id',
+            '_journal_event_id',
+        ):
+            value = msg.get(field)
+            if value is not None and str(value).strip():
+                return (*identity, f'{field}:{value}')
+    return identity
 
 
 def _messages_have_prefix(messages, prefix, *, key_fn=None):
@@ -7096,6 +7134,61 @@ def _nearest_assistant_msg_idx(messages, msg_idx: int) -> int:
     return -1
 
 
+def _recovered_tool_identity(tool_call):
+    if not isinstance(tool_call, dict):
+        return None
+    for field in ('_recovered_event_id', '_recovered_tool_id', 'tid'):
+        value = tool_call.get(field)
+        if value is not None and str(value).strip():
+            return (field, str(value))
+    return None
+
+
+def _rebase_recovered_tool_owner(tool_call, messages):
+    """Copy one recovered tool summary and resolve its assistant owner."""
+    if not isinstance(tool_call, dict) or not tool_call.get('_recovered_from_run_journal'):
+        return None
+    rebased = copy.deepcopy(tool_call)
+    owner_event_id = rebased.get('_recovered_assistant_event_id')
+    owner_index = None
+    if owner_event_id:
+        for idx, message in enumerate(messages or []):
+            if (
+                isinstance(message, dict)
+                and message.get('role') == 'assistant'
+                and message.get('_recovered_event_id') == owner_event_id
+            ):
+                owner_index = idx
+                break
+    raw_owner_index = rebased.get('assistant_msg_idx')
+    if owner_index is None and type(raw_owner_index) is int:
+        if 0 <= raw_owner_index < len(messages or []):
+            owner = messages[raw_owner_index]
+            if (
+                isinstance(owner, dict)
+                and owner.get('role') == 'assistant'
+                and (
+                    not rebased.get('_recovered_stream_id')
+                    or owner.get('_recovered_stream_id') == rebased.get('_recovered_stream_id')
+                )
+            ):
+                owner_index = raw_owner_index
+    if owner_index is None and rebased.get('_recovered_stream_id'):
+        for idx, message in enumerate(messages or []):
+            if (
+                isinstance(message, dict)
+                and message.get('role') == 'assistant'
+                and message.get('_recovered_stream_id') == rebased.get('_recovered_stream_id')
+            ):
+                owner_index = idx
+                break
+    if owner_index is None:
+        # Unknown ownership is not safe to publish as a durable tool card.
+        return None
+    rebased['assistant_msg_idx'] = owner_index
+    return rebased
+
+
 def _extract_tool_calls_from_messages(messages, live_tool_calls=None):
     """Build persisted tool-call summaries from final messages plus live progress fallback."""
     tool_calls = []
@@ -7164,6 +7257,29 @@ def _extract_tool_calls_from_messages(messages, live_tool_calls=None):
                 'assistant_msg_idx': _nearest_assistant_msg_idx(messages, seq.get('msg_idx', -1)),
                 'args': _truncate_tool_args(live_tc.get('args', {}), limit=4),
             })
+
+        # Journal recovery stores some completed tool activity only in the
+        # session sidecar.  Preserve those summaries when a successful-turn
+        # rebuild receives the existing sidecar through ``live_tool_calls``;
+        # ordinary live fallback entries remain governed by the unresolved
+        # tool-row pairing above.
+        seen_recovered = {
+            _recovered_tool_identity(tool_call)
+            for tool_call in tool_calls
+            if _recovered_tool_identity(tool_call) is not None
+        }
+        for live_tc in live:
+            if not live_tc.get('_recovered_from_run_journal'):
+                continue
+            recovered = _rebase_recovered_tool_owner(live_tc, messages or [])
+            if recovered is None:
+                continue
+            identity = _recovered_tool_identity(recovered)
+            if identity is not None and identity in seen_recovered:
+                continue
+            tool_calls.append(recovered)
+            if identity is not None:
+                seen_recovered.add(identity)
 
     return tool_calls
 
@@ -10727,9 +10843,14 @@ def _run_agent_streaming(
                     s.cache_write_tokens = cache_write_tokens
                 # Persist tool-call summaries even when the final message history only
                 # kept bare tool rows and omitted explicit assistant tool_call IDs.
+                _recovered_tool_sidecars = [
+                    _tool_call for _tool_call in (getattr(s, 'tool_calls', None) or [])
+                    if isinstance(_tool_call, dict)
+                    and _tool_call.get('_recovered_from_run_journal')
+                ]
                 tool_calls = _extract_tool_calls_from_messages(
                     s.messages,
-                    live_tool_calls=_live_tool_calls,
+                    live_tool_calls=[*_live_tool_calls, *_recovered_tool_sidecars],
                 )
                 s.tool_calls = tool_calls
                 s.active_stream_id = None
@@ -12461,6 +12582,20 @@ def cancel_stream(stream_id: str) -> bool:
                         before_idx=_cancel_marker_idx,
                     ):
                         _cs.messages.insert(_cancel_marker_idx, _partial_msg)
+                    # A live-buffer partial is already the authoritative
+                    # display row, so it does not take the journal fallback
+                    # branch below. Project the same visible assistant segment
+                    # into provider context while the owning cancelled user row
+                    # is still the current turn; display-only reasoning is
+                    # stripped by the model-context projection helper.
+                    try:
+                        _append_recovered_turn_to_context(_cs, _partial_msg)
+                    except Exception:
+                        logger.debug(
+                            "Failed to project live partial into context on cancel for %s",
+                            _cancel_session_id,
+                            exc_info=True,
+                        )
                 # Cancel marker — flagged _error=True so it is stripped from conversation
                 # history on the next turn (prevents model from seeing "Task cancelled."
                 # as a prior assistant reply).
