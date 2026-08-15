@@ -137,6 +137,7 @@ var _clarifySessionId = null;
 // Module-scope state loadSession() touches.
 var _loadingSessionId = null;
 var _loadSessionGeneration = 0;
+var _paneNavigationGeneration = 0;
 var _pendingCarryForwardSnapshot = null;
 var _messagesTruncated = false;
 var _oldestIdx = 0;
