@@ -3966,11 +3966,34 @@ def _session_index_prune_verified(sid: str) -> bool:
         return False
 
 
+def _snapshot_deleted_session_index_row(sid: str) -> tuple[bool, dict | None]:
+    """Capture the exact pre-delete index row without retaining siblings."""
+    from api.models import _INDEX_WRITE_LOCK
+
+    with _INDEX_WRITE_LOCK:
+        try:
+            if not SESSION_INDEX_FILE.exists():
+                return True, None
+            rows = json.loads(SESSION_INDEX_FILE.read_bytes())
+        except Exception:
+            logger.debug("Failed to snapshot deleted session index row for %s", sid, exc_info=True)
+            return False, None
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return False, None
+        matches = [row for row in rows if row.get("session_id") == sid]
+        if len(matches) > 1:
+            logger.warning("Cannot snapshot duplicate deleted session index rows for %s", sid)
+            return False, None
+        return True, copy.deepcopy(matches[0]) if matches else None
+
+
 def _restore_deleted_session_retry_persistence(
     sid: str,
     *,
     sidecar_snapshot: dict,
     backup_snapshot: dict,
+    index_row_snapshot: dict | None = None,
+    index_snapshot_valid: bool = True,
     owner=None,
 ) -> bool:
     """Restore the durable delete-retry authority after a late gate failure.
@@ -3980,12 +4003,15 @@ def _restore_deleted_session_retry_persistence(
     than serializing the live owner again: this avoids changing its generation,
     timestamp, or index row while preserving a cold-loadable retry handle.
     """
+    from api.models import _INDEX_WRITE_LOCK, _settle_session_index_row_locked
+
     # Clear a partially published tombstone before attempting any restore so a
     # later restore error cannot leave a retired marker shadowing the retry SID.
     try:
         _clear_webui_deleted_session_tombstone(sid)
     except Exception:
         logger.exception("Failed to clear partial deleted-session tombstone for %s", sid)
+        return False
     snapshots = (sidecar_snapshot, backup_snapshot)
     if any(
         not isinstance(snapshot, dict) or snapshot.get("error")
@@ -3996,41 +4022,81 @@ def _restore_deleted_session_retry_persistence(
             sid,
         )
         return False
-    try:
-        # A live sidecar may have been absent before this delete (for example,
-        # an unsaved in-memory owner).  In that case use the exact owner that
-        # the route kept in SESSIONS as the durable retry authority.
-        if sidecar_snapshot.get("exists"):
-            _restore_chat_start_file(sidecar_snapshot)
-        elif owner is not None:
-            owner.save(touch_updated_at=False, skip_index=True)
-        else:
-            logger.warning(
-                "Cannot restore delete-retry sidecar for %s: no pre-delete sidecar or owner",
-                sid,
-            )
-            return False
-        _restore_chat_start_file(backup_snapshot)
-    except Exception:
-        logger.exception("Failed to restore delete-retry persistence for %s", sid)
+    if not index_snapshot_valid:
+        logger.warning("Cannot restore delete-retry index row for %s: pre-delete snapshot unavailable", sid)
         return False
 
-    sidecar = SESSION_DIR / f"{sid}.json"
-    try:
-        if not sidecar.exists():
-            return False
-        # A tombstone can have been partially published before its gate raised
-        # (or before verification observed it).  It must not shadow this live
-        # retry sidecar on a cold read.
-        if sid in _load_webui_deleted_session_tombstone():
-            logger.warning(
-                "Deleted-session tombstone still blocks retry sidecar for %s",
-                sid,
-            )
-            return False
-    except Exception:
-        logger.exception("Failed to verify delete-retry persistence for %s", sid)
-        return False
+    # The route already holds the per-SID persistence lock. Keep the exact
+    # owner, sidecar/backup images, and target index row fenced together while
+    # compensating. Sibling index rows are never replaced from a stale image.
+    with _INDEX_WRITE_LOCK:
+        with LOCK:
+            if owner is not None and SESSIONS.get(sid) is not owner:
+                logger.warning("Refusing delete-retry restore for %s: session owner changed", sid)
+                return False
+            try:
+                if SESSION_INDEX_FILE.exists():
+                    current_rows = json.loads(SESSION_INDEX_FILE.read_bytes())
+                else:
+                    current_rows = []
+                if not isinstance(current_rows, list) or any(
+                    not isinstance(row, dict) for row in current_rows
+                ):
+                    return False
+                current_matches = [
+                    row for row in current_rows if row.get("session_id") == sid
+                ]
+                if len(current_matches) > 1:
+                    return False
+                if current_matches and current_matches[0] != index_row_snapshot:
+                    logger.warning("Refusing delete-retry restore for %s: index owner changed", sid)
+                    return False
+
+                # A live sidecar may have been absent before this delete (for
+                # example, an unsaved in-memory owner). In that case use the
+                # exact owner retained by the route as the retry authority.
+                if sidecar_snapshot.get("exists"):
+                    _restore_chat_start_file(sidecar_snapshot)
+                elif owner is not None:
+                    owner.save(touch_updated_at=False, skip_index=True)
+                else:
+                    logger.warning(
+                        "Cannot restore delete-retry sidecar for %s: no pre-delete sidecar or owner",
+                        sid,
+                    )
+                    return False
+                _restore_chat_start_file(backup_snapshot)
+
+                sidecar = SESSION_DIR / f"{sid}.json"
+                if sidecar_snapshot.get("exists"):
+                    if not _chat_start_file_snapshots_equal(
+                        sidecar_snapshot, _snapshot_chat_start_file(sidecar)
+                    ):
+                        return False
+                elif not sidecar.exists():
+                    return False
+                if not _chat_start_file_snapshots_equal(
+                    backup_snapshot, _snapshot_chat_start_file(sidecar.with_suffix(".json.bak"))
+                ):
+                    return False
+                # A tombstone can have been partially published before its gate
+                # raised. It must not shadow this live retry sidecar on a cold
+                # read.
+                if sid in _load_webui_deleted_session_tombstone():
+                    logger.warning(
+                        "Deleted-session tombstone still blocks retry sidecar for %s",
+                        sid,
+                    )
+                    return False
+                if not _settle_session_index_row_locked(
+                    sid,
+                    expected=current_matches[0] if current_matches else None,
+                    replacement=index_row_snapshot,
+                ):
+                    return False
+            except Exception:
+                logger.exception("Failed to restore delete-retry persistence for %s", sid)
+                return False
     return True
 
 
@@ -15315,6 +15381,9 @@ def handle_post(handler, parsed) -> bool:
             # that removes this owner or advances its persistence capability.
             with LOCK:
                 retry_owner = SESSIONS.get(sid)
+            retry_index_snapshot_valid, retry_index_row_snapshot = (
+                _snapshot_deleted_session_index_row(sid)
+            )
             # The run journal contains the full plaintext request/response and
             # its retired authority is the durable delete-retry marker. Do not
             # remove the canonical session owner or publish session_delete
@@ -15469,6 +15538,8 @@ def handle_post(handler, parsed) -> bool:
                     sid,
                     sidecar_snapshot=retry_sidecar_snapshot,
                     backup_snapshot=retry_backup_snapshot,
+                    index_row_snapshot=retry_index_row_snapshot,
+                    index_snapshot_valid=retry_index_snapshot_valid,
                     owner=retry_owner,
                 )
                 return j(
@@ -15495,6 +15566,8 @@ def handle_post(handler, parsed) -> bool:
                     sid,
                     sidecar_snapshot=retry_sidecar_snapshot,
                     backup_snapshot=retry_backup_snapshot,
+                    index_row_snapshot=retry_index_row_snapshot,
+                    index_snapshot_valid=retry_index_snapshot_valid,
                     owner=retry_owner,
                 )
                 return j(
@@ -15524,6 +15597,8 @@ def handle_post(handler, parsed) -> bool:
                         sid,
                         sidecar_snapshot=retry_sidecar_snapshot,
                         backup_snapshot=retry_backup_snapshot,
+                        index_row_snapshot=retry_index_row_snapshot,
+                        index_snapshot_valid=retry_index_snapshot_valid,
                         owner=retry_owner,
                     )
                     return j(
@@ -15551,6 +15626,8 @@ def handle_post(handler, parsed) -> bool:
                         sid,
                         sidecar_snapshot=retry_sidecar_snapshot,
                         backup_snapshot=retry_backup_snapshot,
+                        index_row_snapshot=retry_index_row_snapshot,
+                        index_snapshot_valid=retry_index_snapshot_valid,
                         owner=retry_owner,
                     )
                     return j(

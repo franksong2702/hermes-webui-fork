@@ -456,6 +456,181 @@ def _delete_via_route(routes_module, sid: str) -> int:
     return handler.status
 
 
+def _delete_result_via_route(routes_module, sid: str) -> tuple[int, dict]:
+    handler = _DeleteJSONHandler({"session_id": sid})
+    routes_module.handle_post(handler, SimpleNamespace(path="/api/session/delete"))
+    return handler.status, json.loads(handler.wfile.getvalue())
+
+
+def _seed_late_delete_retry_case(
+    models_module, session_dir: Path, index_file: Path, tmp_path: Path, sid: str
+) -> dict:
+    owner = models_module.Session(
+        session_id=sid,
+        title="late delete owner",
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "retry me"}],
+    )
+    sibling = models_module.Session(
+        session_id=f"{sid}-sibling",
+        title="unaffected sibling",
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "keep me"}],
+    )
+    models_module.SESSIONS[sid] = owner
+    models_module.SESSIONS[sibling.session_id] = sibling
+    owner.save()
+    sibling.save()
+    sidecar = session_dir / f"{sid}.json"
+    backup = session_dir / f"{sid}.json.bak"
+    backup.write_bytes(sidecar.read_bytes())
+    expected_index = json.loads(index_file.read_text(encoding="utf-8"))
+    expected_by_sid = {row["session_id"]: row for row in expected_index}
+    return {
+        "owner": owner,
+        "sibling": sibling,
+        "sidecar": sidecar,
+        "backup": backup,
+        "sidecar_bytes": sidecar.read_bytes(),
+        "backup_bytes": backup.read_bytes(),
+        "index_by_sid": expected_by_sid,
+        "target_row": expected_by_sid[sid],
+    }
+
+
+def _assert_late_delete_retry_restored(
+    models_module,
+    index_file: Path,
+    case: dict,
+    sid: str,
+    payload: dict,
+    *,
+    expected_error: str = "Session index cleanup failed; retry deletion",
+) -> None:
+    assert payload["retry_state_restored"] is True
+    assert payload["error"] == expected_error
+    assert case["sidecar"].read_bytes() == case["sidecar_bytes"]
+    assert case["backup"].read_bytes() == case["backup_bytes"]
+    assert sid not in models_module._load_webui_deleted_session_tombstone()
+    restored_index = json.loads(index_file.read_text(encoding="utf-8"))
+    assert {row["session_id"]: row for row in restored_index} == case["index_by_sid"]
+
+    models_module.SESSIONS.clear()
+    sidebar_rows = models_module.all_sessions()
+    sidebar_ids = {row["session_id"] for row in sidebar_rows}
+    assert {sid, case["sibling"].session_id} <= sidebar_ids
+    recovered = models_module.get_session(sid)
+    assert recovered.compact() == case["target_row"]
+
+
+def test_delete_prune_then_raise_restores_exact_index_row_for_cold_retry(
+    models_module, monkeypatch, tmp_path
+):
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "late-delete-prune-raise"
+    case = _seed_late_delete_retry_case(
+        models_module, session_dir, index_file, tmp_path, sid
+    )
+    real_prune = routes_module.prune_session_from_index
+
+    def prune_then_raise(candidate_sid):
+        real_prune(candidate_sid)
+        raise OSError("late prune failure")
+
+    monkeypatch.setattr(routes_module, "prune_session_from_index", prune_then_raise)
+    status, payload = _delete_result_via_route(routes_module, sid)
+
+    assert status == 500
+    _assert_late_delete_retry_restored(
+        models_module, index_file, case, sid, payload,
+    )
+
+
+def test_delete_prune_readback_failure_restores_exact_index_row_for_cold_retry(
+    models_module, monkeypatch, tmp_path
+):
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "late-delete-prune-readback"
+    case = _seed_late_delete_retry_case(
+        models_module, session_dir, index_file, tmp_path, sid
+    )
+    monkeypatch.setattr(routes_module, "_session_index_prune_verified", lambda _sid: False)
+    status, payload = _delete_result_via_route(routes_module, sid)
+
+    assert status == 500
+    _assert_late_delete_retry_restored(
+        models_module, index_file, case, sid, payload,
+    )
+
+
+def test_delete_tombstone_failure_restores_exact_index_row_for_cold_retry(
+    models_module, monkeypatch, tmp_path
+):
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "late-delete-tombstone-failure"
+    case = _seed_late_delete_retry_case(
+        models_module, session_dir, index_file, tmp_path, sid
+    )
+    real_record = models_module._record_webui_deleted_session_tombstone
+
+    def tombstone_then_raise(candidate_sid):
+        real_record(candidate_sid)
+        raise OSError("late tombstone failure")
+
+    monkeypatch.setattr(routes_module, "_record_webui_deleted_session_tombstone", tombstone_then_raise)
+    status, payload = _delete_result_via_route(routes_module, sid)
+
+    assert status == 500
+    _assert_late_delete_retry_restored(
+        models_module,
+        index_file,
+        case,
+        sid,
+        payload,
+        expected_error="Deleted-session tombstone failed; retry deletion",
+    )
+
+
+def test_delete_index_compensation_failure_reports_manual_recovery(
+    models_module, monkeypatch, tmp_path
+):
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = "late-delete-index-compensation-failure"
+    case = _seed_late_delete_retry_case(
+        models_module, session_dir, index_file, tmp_path, sid
+    )
+    monkeypatch.setattr(
+        routes_module,
+        "_session_index_prune_verified",
+        lambda _sid: False,
+    )
+    monkeypatch.setattr(
+        models_module,
+        "_settle_session_index_row_locked",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("index write failed")),
+    )
+    status, payload = _delete_result_via_route(routes_module, sid)
+
+    assert status == 500
+    assert payload["retry_state_restored"] is False
+    assert payload["error"] == "Delete retry state restoration failed; manual recovery required"
+    assert sid not in models_module._load_webui_deleted_session_tombstone()
+    assert case["sidecar"].read_bytes() == case["sidecar_bytes"]
+    assert case["backup"].read_bytes() == case["backup_bytes"]
+
+
 def test_successful_delete_revokes_prelock_rename_owner(
     models_module, monkeypatch, tmp_path
 ):
