@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import queue
 import threading
@@ -632,3 +633,62 @@ def test_cancel_journal_context_includes_owning_user():
     assert reloaded.pending_user_message is None
     assert reloaded.pending_attachments == []
     assert reloaded.pending_started_at is None
+
+
+def test_btw_cancel_recovery_never_mutates_parent_history():
+    """A shallow-copied /btw transcript must isolate cancel recovery rows."""
+    parent = Session(
+        session_id="issue6920_btw_parent",
+        title="Parent",
+        messages=[
+            {"role": "user", "content": "Earlier question", "timestamp": 1},
+            {
+                "role": "assistant",
+                "content": "Repeated parent answer",
+                "timestamp": 2,
+            },
+        ],
+        context_messages=[],
+    )
+    parent.save()
+    parent_before = copy.deepcopy(parent.messages)
+
+    stream_id = "stream-btw-parent-isolation"
+    ephemeral = Session(
+        session_id="issue6920_btw_ephemeral",
+        title="btw: side question",
+        messages=list(parent.messages),
+        context_messages=[],
+        parent_session_id=parent.session_id,
+        session_source="btw",
+    )
+    writer = RunJournalWriter(ephemeral.session_id, stream_id)
+    writer.append_sse_event("token", {"text": "Repeated parent answer"})
+    writer.append_sse_event(
+        "reasoning", {"text": "New side-question reasoning"},
+    )
+
+    from api.models import _append_journaled_partial_output
+
+    assert _append_journaled_partial_output(
+        ephemeral,
+        stream_id,
+        dedupe_existing=True,
+        mark_partial=True,
+    ) is True
+    assert parent.messages == parent_before
+    assert len(ephemeral.messages) == len(parent_before) + 1
+    recovered = ephemeral.messages[-1]
+    assert recovered["content"] == "Repeated parent answer"
+    assert recovered["reasoning"] == "New side-question reasoning"
+    assert recovered["_partial"] is True
+    assert recovered["_recovered_stream_id"] == stream_id
+
+    assert _append_journaled_partial_output(
+        ephemeral,
+        stream_id,
+        dedupe_existing=True,
+        mark_partial=True,
+    ) is False
+    assert parent.messages == parent_before
+    assert len(ephemeral.messages) == len(parent_before) + 1

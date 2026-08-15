@@ -2873,6 +2873,19 @@ def _append_journaled_partial_output(
     current_assistant_idx: int | None = None
     recovered_tool_calls: list[dict] = []
     initial_message_count = len(session.messages or [])
+    dedupe_min_index = None
+    if mark_partial:
+        # Cancellation recovery must fail closed when the owning user turn is
+        # unknown (for example, an ephemeral /btw transcript).  Only rows
+        # appended during this recovery may match untagged content; a row
+        # carrying this stream's tag remains globally eligible for retry
+        # idempotence.  Crash recovery keeps its historical session-wide
+        # matching because it does not opt into ``mark_partial``.
+        dedupe_min_index = (
+            current_turn_start + 1
+            if isinstance(current_turn_start, int)
+            else initial_message_count
+        )
     claimed_existing_assistant_indexes: set[int] = set()
 
     def content_match_can_receive_reasoning(existing_idx: int) -> bool:
@@ -2946,11 +2959,7 @@ def _append_journaled_partial_output(
                     session,
                     content,
                     max_index=initial_message_count,
-                    min_index=(
-                        current_turn_start + 1
-                        if isinstance(current_turn_start, int)
-                        else None
-                    ),
+                    min_index=dedupe_min_index,
                     recovered_stream_id=stream_id,
                     excluded_indexes=search_excluded,
                 )
@@ -3100,11 +3109,7 @@ def _append_journaled_partial_output(
                 name,
                 preview,
                 stream_id=stream_id,
-                min_index=(
-                    current_turn_start + 1
-                    if isinstance(current_turn_start, int)
-                    else None
-                ),
+                min_index=dedupe_min_index,
             ):
                 current_assistant_idx = anchor_idx
                 continue
