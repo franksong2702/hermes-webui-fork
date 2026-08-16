@@ -3721,13 +3721,54 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return byIdx;
   }
+  function _anchorSceneRowDurableIdentity(row){
+    if(!row||typeof row!=='object') return '';
+    const identity=row.identity&&typeof row.identity==='object'?row.identity:{};
+    const payload=row.payload&&typeof row.payload==='object'?row.payload:{};
+    const sources=[row,identity,payload];
+    const isSyntheticRowId=value=>/^(?:settled|hydrated|activity):/i.test(value);
+    for(const field of ['event_id','row_id','local_id']){
+      for(const source of sources){
+        const raw=source&&source[field];
+        if(raw===undefined||raw===null) continue;
+        const value=String(raw).trim();
+        if(!value||field==='row_id'&&isSyntheticRowId(value)) continue;
+        return `${field}:${value}`;
+      }
+    }
+    return '';
+  }
   function _anchorSceneExistingRowKey(row){
     if(!row||typeof row!=='object') return '';
+    const durableIdentityForRow=(candidate)=>{
+      if(!candidate||typeof candidate!=='object') return '';
+      const identity=candidate.identity&&typeof candidate.identity==='object'?candidate.identity:{};
+      const payload=candidate.payload&&typeof candidate.payload==='object'?candidate.payload:{};
+      const sources=[candidate,identity,payload];
+      const isSyntheticRowId=value=>/^(?:settled|hydrated|activity):/i.test(value);
+      for(const field of ['event_id','row_id','local_id']){
+        for(const source of sources){
+          const raw=source&&source[field];
+          if(raw===undefined||raw===null) continue;
+          const value=String(raw).trim();
+          if(!value||field==='row_id'&&isSyntheticRowId(value)) continue;
+          return `${field}:${value}`;
+        }
+      }
+      return '';
+    };
+    const durableIdentity=typeof _anchorSceneRowDurableIdentity==='function'
+      ? _anchorSceneRowDurableIdentity(row)
+      : durableIdentityForRow(row);
     if(row.role==='tool'){
       const tool=row.tool&&typeof row.tool==='object'?row.tool:{};
       return `tool:${row.tool_call_id||tool.id||tool.tid||tool.tool_call_id||tool.tool_use_id||tool.call_id||row.row_id||''}`;
     }
-    if(row.role==='prose'||row.role==='thinking') return `${row.role}:${_anchorSceneTextKey(row.text)}`;
+    if(row.role==='prose'||row.role==='thinking'){
+      return durableIdentity
+        ? `${row.role}:identity:${durableIdentity}`
+        : `${row.role}:${_anchorSceneTextKey(row.text)}`;
+    }
     return `${row.role||row.kind}:${row.source_event_type||''}:${row.status||''}:${row.row_id||''}`;
   }
   function _anchorSceneRowHasLiveIdentity(row){
@@ -3837,9 +3878,29 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const finalKey=_anchorSceneTextKey(finalAnswer);
     const messageRows=_anchorSceneRowsByMessageIndex(messages,turnStart,lastAsstIndex,{includeFinal:true});
     const hasSettledThinking=_anchorSceneMessageRowsHaveThinking(messageRows);
+    const durableIdentityForRow=typeof _anchorSceneRowDurableIdentity==='function'
+      ? _anchorSceneRowDurableIdentity
+      : (candidate)=>{
+        if(!candidate||typeof candidate!=='object') return '';
+        const identity=candidate.identity&&typeof candidate.identity==='object'?candidate.identity:{};
+        const payload=candidate.payload&&typeof candidate.payload==='object'?candidate.payload:{};
+        const sources=[candidate,identity,payload];
+        const isSyntheticRowId=value=>/^(?:settled|hydrated|activity):/i.test(value);
+        for(const field of ['event_id','row_id','local_id']){
+          for(const source of sources){
+            const raw=source&&source[field];
+            if(raw===undefined||raw===null) continue;
+            const value=String(raw).trim();
+            if(!value||field==='row_id'&&isSyntheticRowId(value)) continue;
+            return `${field}:${value}`;
+          }
+        }
+        return '';
+      };
     const rows=[];
     const seen=new Set();
     const seenTextKeys=[];
+    const identitylessTextRows=[];
     const projectedRows=Array.isArray(base.activity_rows)?base.activity_rows:[];
     const projectedReasoningKey=_anchorSceneTextKey(projectedRows
       .filter(row=>row&&row.role==='thinking'&&_anchorSceneCleanText(row.text))
@@ -3894,17 +3955,37 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(rowIsLiveTokenFinalPrefix(row,textKey,finalSegmentEligible)) return;
       const isTextual=row.role==='prose'||row.role==='thinking';
       if(isTextual&&_anchorSceneRowLooksLikeFinalAnswer(textKey,finalKey)) return;
-      if(isTextual&&_anchorSceneRowTextOverlapsExisting(textKey,seenTextKeys)) return;
+      const durableIdentity=durableIdentityForRow(row);
+      if(isTextual&&!durableIdentity&&_anchorSceneRowTextOverlapsExisting(textKey,seenTextKeys)) return;
       const key=_anchorSceneExistingRowKey(row);
       if(key&&seen.has(key)) return;
+      let replaceTextIndex=-1;
+      if(isTextual&&durableIdentity&&textKey){
+        for(const entry of identitylessTextRows){
+          if(entry&&entry.role===row.role&&!entry.durableIdentity&&_anchorSceneRowTextOverlapsExisting(textKey,[entry.textKey])){
+            replaceTextIndex=entry.index;
+            break;
+          }
+        }
+      }
       if(key) seen.add(key);
       if(isTextual&&textKey) seenTextKeys.push(textKey);
-      rows.push({
+      const nextRow={
         ...row,
         display_hint:_anchorSceneRowDisplayHintForMode(row,sceneMode),
-        order_index:rows.length,
-        seq:rows.length,
-      });
+        order_index:replaceTextIndex>=0?replaceTextIndex:rows.length,
+        seq:replaceTextIndex>=0?replaceTextIndex:rows.length,
+      };
+      if(replaceTextIndex>=0&&replaceTextIndex<rows.length){
+        rows[replaceTextIndex]=nextRow;
+        for(const entry of identitylessTextRows){
+          if(entry&&entry.index===replaceTextIndex) entry.durableIdentity=durableIdentity;
+        }
+      }else{
+        const index=rows.length;
+        rows.push(nextRow);
+        if(isTextual&&!durableIdentity&&textKey) identitylessTextRows.push({role:row.role,textKey,index});
+      }
     };
     orderedRows.forEach((row)=>pushRow(row));
     const scene={
