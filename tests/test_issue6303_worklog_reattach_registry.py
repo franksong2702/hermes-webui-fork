@@ -306,7 +306,11 @@ _SESSIONS_HELPERS = [
 ]
 
 
-def _run_harness(setup_code: str, include_loadsession: bool = False) -> dict:
+def _run_harness(
+    setup_code: str,
+    include_loadsession: bool = False,
+    include_send: bool = False,
+) -> dict:
     """Assemble the REAL production functions + mocks + driver and run via Node.
 
     The script always includes:
@@ -324,10 +328,29 @@ def _run_harness(setup_code: str, include_loadsession: bool = False) -> dict:
     parts = [
         _MOCK_GLOBALS,
         _read(ANCHORS_JS),
+        *(
+            [
+                _function_source(_read(MESSAGES_JS), "_chatPayloadModel"),
+                _function_source(_read(MESSAGES_JS), "_chatPayloadModelProvider"),
+                _function_source(_read(MESSAGES_JS), "_composerTextWithPendingSelections"),
+                _function_source(_read(MESSAGES_JS), "_flushSelectionBlocksToComposer"),
+                _function_source(_read(MESSAGES_JS), "_chatPayloadModelState"),
+                _function_source(_read(MESSAGES_JS), "_clearStaleBusyStateBeforeSend"),
+                _function_source(_read(MESSAGES_JS), "_restoreComposerDraftAfterFailedSend"),
+                _function_source(_read(MESSAGES_JS), "_runOptionalPreStartUiStep"),
+                _function_source(_read(MESSAGES_JS), "_runOptionalPostStartUiStep"),
+                _function_source(_read(MESSAGES_JS), "applySessionTitleUpdate"),
+                _function_source(_read(MESSAGES_JS), "send"),
+            ]
+            if include_send
+            else []
+        ),
         _function_source(_read(MESSAGES_JS), "_extractInlineThinkingFromContent"),
         _function_source(_read(MESSAGES_JS), "_dispatchExtensionTurnLifecycle"),
         _function_source(_read(MESSAGES_JS), "closeLiveStream"),
+        _function_source(_read(MESSAGES_JS), "_releaseReplacedLiveAttachment"),
         _function_source(_read(MESSAGES_JS), "closeOtherLiveStreams"),
+        _function_source(_read(MESSAGES_JS), "_markLiveAttachmentOwnerReplaced"),
         _function_source(_read(MESSAGES_JS), "attachLiveStream"),
         _function_source(_read(UI_JS), "_projectLiveAnchorActivitySceneForStream"),
         _function_source(_read(UI_JS), "_renderLiveAnchorActivitySceneForStream"),
@@ -1272,3 +1295,1072 @@ def test_done_a_attach_done_release_b_blocks_a_delayed_tts_callback():
         "latestBIsReleased": True,
         "bGraceStillPresent": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Frozen S2 repair regressions: a terminal callback can release the active
+# pane before its persisted snapshot / deferred Anchor repair finishes.  These
+# drivers keep the real attachLiveStream() listener order and only fake browser
+# scheduling/network boundaries that are outside the ownership invariant.
+# ---------------------------------------------------------------------------
+
+
+def test_sessionless_cancel_cursor_preserves_released_partial_snapshot():
+    """A sessionless cancel keeps the canonical partial snapshot and marker.
+
+    The real cancel listener clears S.activeStreamId before its /api/session
+    fallback resolves.  The cursor listener is registered after that handler;
+    it must record the cursor for the still-admitted source without treating
+    the cleared pane id as permission to tear the source down.  A later
+    attachment generation must still reject the old callback.
+    """
+    setup = textwrap.dedent(
+        """\
+        const __results = {};
+        const SID = 'test-sid';
+        const STREAM_A = 'stream-a';
+        const STREAM_B = 'stream-b';
+        let resolveCancel;
+        let sessionApiCalls = 0;
+
+        window._liveAnchorRegistries = new Map();
+        S.session = { session_id: SID, message_count: 1 };
+        S.activeStreamId = STREAM_A;
+        S.messages = [{ role: 'user', content: 'request' }];
+        INFLIGHT[SID] = {
+          messages: [{
+            role: 'assistant', content: 'partial before cancel', _live: true,
+            _partial: true, reasoning: 'partial Worklog reasoning',
+          }],
+          uploaded: [], toolCalls: [], streamId: STREAM_A,
+          activityBurstAnchors: [], currentActivityBurstId: 0,
+          currentLiveSegmentSeq: 0,
+        };
+        __apiHandler = url => {
+          if (url.includes('/api/session?')) {
+            sessionApiCalls += 1;
+            return new Promise(resolve => { resolveCancel = resolve; });
+          }
+          return Promise.resolve({ active: true });
+        };
+
+        (async () => {
+          attachLiveStream(SID, STREAM_A, [], {});
+          const sourceA = __esCreated[0];
+
+          // No session_id: the real cancel path must use its active stream
+          // binding and wait for the canonical persisted session snapshot.
+          sourceA.dispatch('cancel', {
+            type: 'cancelled', status: 'cancelled', event_id: 'stream-a:7',
+          });
+          await Promise.resolve();
+          await Promise.resolve();
+          __results.activeStreamClearedBeforeFallback = S.activeStreamId === null;
+          __results.sourceAdmittedBeforeFallback = !!(
+            LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === sourceA
+          );
+
+          resolveCancel({ session: {
+            session_id: SID,
+            active_stream_id: null,
+            pending_user_message: null,
+            message_count: 3,
+            messages: [
+              { role: 'user', content: 'request' },
+              {
+                role: 'assistant', content: 'partial before cancel', _live: true,
+                _partial: true, reasoning: 'partial Worklog reasoning',
+                _partial_tool_calls: [{ id: 'tool-partial', name: 'shell' }],
+              },
+              {
+                role: 'assistant',
+                content: '**Task cancelled:** Task cancelled.',
+                provider_details: 'Task cancelled.',
+                provider_details_label: 'Cancellation details',
+                _error: true,
+              },
+            ],
+            tool_calls: [],
+          }});
+          await Promise.resolve();
+          await Promise.resolve();
+          await Promise.resolve();
+
+          __results.sessionApiCalls = sessionApiCalls;
+          const partial = S.messages.find(m => m && m._partial === true);
+          const cancelled = S.messages.find(m => m && m.provider_details_label === 'Cancellation details');
+          __results.partialWorklogRetained = !!(
+            partial && partial.content === 'partial before cancel' &&
+            partial.reasoning === 'partial Worklog reasoning' &&
+            Array.isArray(partial._partial_tool_calls)
+          );
+          __results.cancellationMarkerRetained = !!(
+            cancelled && String(cancelled.content || '').includes('Task cancelled')
+          );
+
+          // A newer attachment generation owns the pane now.  A late callback
+          // retained by source A must not overwrite generation B's transcript.
+          S.session = { session_id: SID, message_count: 1 };
+          S.activeStreamId = STREAM_B;
+          S.messages = [{ role: 'user', content: 'newer generation' }];
+          INFLIGHT[SID] = {
+            messages: S.messages.slice(), uploaded: [], toolCalls: [], streamId: STREAM_B,
+            activityBurstAnchors: [], currentActivityBurstId: 0,
+            currentLiveSegmentSeq: 0,
+          };
+          attachLiveStream(SID, STREAM_B, [], {});
+          const beforeNewer = JSON.stringify(S.messages);
+          sourceA.dispatch('cancel', {
+            type: 'cancelled', status: 'cancelled', event_id: 'stream-a:late',
+            session: {
+              session_id: SID,
+              messages: [{ role: 'assistant', content: 'STALE CANCEL SNAPSHOT' }],
+            },
+          });
+          await Promise.resolve();
+          __results.newerGenerationProtected = !!(
+            LIVE_STREAMS[SID] && LIVE_STREAMS[SID].streamId === STREAM_B &&
+            JSON.stringify(S.messages) === beforeNewer &&
+            S.activeStreamId === STREAM_B
+          );
+
+          process.stdout.write(JSON.stringify(__results) + '\\n', () => { process.exit(0); });
+        })().catch(err => {
+          console.error(err && err.stack ? err.stack : String(err));
+          process.exit(2);
+        });
+        """
+    )
+
+    result = _run_harness(setup)
+
+    assert result["partialWorklogRetained"] is True, (
+        "the persisted partial Worklog must survive the cursor callback"
+    )
+    assert result["cancellationMarkerRetained"] is True, (
+        "the canonical cancellation marker must survive the cursor callback"
+    )
+    assert result["activeStreamClearedBeforeFallback"] is True
+    assert result["sourceAdmittedBeforeFallback"] is True, (
+        "the source must remain admitted while its sessionless cancel fallback "
+        "is pending"
+    )
+    assert result["sessionApiCalls"] == 1
+    assert result["newerGenerationProtected"] is True
+
+
+def test_sessionless_cancel_fallback_cannot_replace_prestart_optimistic_owner():
+    """A late cancel fallback cannot consume a newer streamless turn owner."""
+    setup = textwrap.dedent(
+        """\
+        const __results = {};
+        const SID = 'test-sid';
+        const STREAM_A = 'stream-a';
+        let resolveCancel;
+        window._liveAnchorRegistries = new Map();
+        S.session = { session_id: SID, message_count: 1 };
+        S.activeStreamId = STREAM_A;
+        S.messages = [{ role: 'user', content: 'old request' }];
+        INFLIGHT[SID] = {
+          messages: S.messages.slice(), uploaded: [], toolCalls: [], streamId: STREAM_A,
+          activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+        };
+        __apiHandler = url => url.includes('/api/session?')
+          ? new Promise(resolve => { resolveCancel = resolve; })
+          : Promise.resolve({ active: true });
+
+        (async () => {
+          attachLiveStream(SID, STREAM_A, [], {});
+          const sourceA = __esCreated[0];
+          sourceA.dispatch('cancel', {
+            type: 'cancelled', status: 'cancelled', event_id: 'stream-a:7',
+          });
+          await Promise.resolve();
+          await Promise.resolve();
+          __results.recoveryPending = typeof resolveCancel === 'function';
+          __results.composerIdle = S.activeStreamId === null;
+
+          const optimisticOwner = {
+            messages: [
+              { role: 'user', content: 'old request' },
+              { role: 'user', content: 'new request while cancel is pending', _pending: true },
+            ],
+            uploaded: [], toolCalls: [], streamId: null,
+            activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+          };
+          S.messages = optimisticOwner.messages.slice();
+          INFLIGHT[SID] = optimisticOwner;
+          S.activeStreamId = null;
+
+          resolveCancel({ session: {
+            session_id: SID, active_stream_id: null, pending_user_message: null,
+            message_count: 2,
+            messages: [
+              { role: 'user', content: 'old request' },
+              { role: 'assistant', content: 'old settled recovery answer' },
+            ],
+            tool_calls: [],
+          }});
+          await Promise.resolve();
+          await Promise.resolve();
+          await Promise.resolve();
+
+          __results.optimisticMessageSurvived = S.messages.some(
+            m => m && m.content === 'new request while cancel is pending'
+          );
+          __results.optimisticOwnerStillCurrent = INFLIGHT[SID] === optimisticOwner;
+          __results.optimisticOwnerMarkedReattach = optimisticOwner.reattach === true;
+          process.stdout.write(JSON.stringify(__results) + '\\n', () => process.exit(0));
+        })().catch(err => {
+          console.error(err && err.stack ? err.stack : String(err));
+          process.exit(2);
+        });
+        """
+    )
+
+    result = _run_harness(setup)
+
+    assert result["recoveryPending"] is True
+    assert result["composerIdle"] is True
+    assert result["optimisticMessageSurvived"] is True
+    assert result["optimisticOwnerStillCurrent"] is True
+    assert result["optimisticOwnerMarkedReattach"] is False
+
+
+def test_sessionless_cancel_fallback_cannot_regain_authority_after_start_failure():
+    """A failed newer start leaves the released cancel owner stale.
+
+    The newer optimistic owner is removed by the real ``/api/chat/start``
+    failure cleanup before the old sessionless cancel fallback resolves.  An
+    absent ``INFLIGHT`` entry must not make the released attachment authoritative
+    again; its canonical snapshot must not replace the newer failed-turn error.
+    """
+    setup = textwrap.dedent(
+        """\
+        const __results = {};
+        const SID = 'test-sid';
+        const STREAM_A = 'stream-a';
+        let resolveCancel;
+        window._liveAnchorRegistries = new Map();
+        S.session = { session_id: SID, message_count: 1 };
+        S.activeStreamId = STREAM_A;
+        S.messages = [{ role: 'user', content: 'old request' }];
+        INFLIGHT[SID] = {
+          messages: S.messages.slice(), uploaded: [], toolCalls: [], streamId: STREAM_A,
+          activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+        };
+        __apiHandler = url => url.includes('/api/session?')
+          ? new Promise(resolve => { resolveCancel = resolve; })
+          : Promise.resolve({ active: true });
+
+        (async () => {
+          attachLiveStream(SID, STREAM_A, [], {});
+          const sourceA = __esCreated[0];
+          sourceA.dispatch('cancel', {
+            type: 'cancelled', status: 'cancelled', event_id: 'stream-a:7',
+          });
+          await Promise.resolve();
+          await Promise.resolve();
+          __results.recoveryPending = typeof resolveCancel === 'function';
+          __results.composerIdle = S.activeStreamId === null;
+
+          // Model a newer optimistic send and the real /api/chat/start failure
+          // cleanup: the replacement owner is deleted before the old fallback
+          // response arrives.
+          const failedOwner = {
+            messages: [
+              { role: 'user', content: 'old request' },
+              { role: 'user', content: 'new request that failed to start', _pending: true },
+              { role: 'assistant', content: '**Error:** provider unavailable', _error: true },
+            ],
+            uploaded: [], toolCalls: [], streamId: null,
+            activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+          };
+          S.messages = failedOwner.messages.slice();
+          _markLiveAttachmentOwnerReplaced(SID, failedOwner);
+          INFLIGHT[SID] = failedOwner;
+          S.activeStreamId = null;
+          delete INFLIGHT[SID];
+
+          resolveCancel({ session: {
+            session_id: SID, active_stream_id: null, pending_user_message: null,
+            message_count: 2,
+            messages: [
+              { role: 'user', content: 'old request' },
+              { role: 'assistant', content: 'STALE OLD CANCEL SNAPSHOT' },
+            ],
+            tool_calls: [],
+          }});
+          await Promise.resolve();
+          await Promise.resolve();
+          await Promise.resolve();
+
+          __results.failedTurnSurvived = S.messages.some(
+            m => m && m.content === '**Error:** provider unavailable'
+          );
+          __results.staleSnapshotRejected = !S.messages.some(
+            m => m && m.content === 'STALE OLD CANCEL SNAPSHOT'
+          );
+          __results.inflightRemainsCleared = !INFLIGHT[SID];
+          process.stdout.write(JSON.stringify(__results) + '\\n', () => process.exit(0));
+        })().catch(err => {
+          console.error(err && err.stack ? err.stack : String(err));
+          process.exit(2);
+        });
+        """
+    )
+
+    result = _run_harness(setup)
+
+    assert result["recoveryPending"] is True
+    assert result["composerIdle"] is True
+    assert result["failedTurnSurvived"] is True, (
+        "a late released cancel snapshot must not replace the newer failed turn"
+    )
+    assert result["staleSnapshotRejected"] is True
+    assert result["inflightRemainsCleared"] is True
+
+
+def test_recovery_apperror_filters_control_text_after_released_restore():
+    """Recovery filtering runs once after a valid released restore.
+
+    The first phase runs the real ``apperror`` -> ``_restoreSettledSession``
+    path with the source released before the GET resolves.  The second phase
+    leaves that GET pending, installs a newer generation, and proves the stale
+    restore cannot mutate the newer pane.
+    """
+    setup = textwrap.dedent(
+        """\
+        const __results = {};
+        const SID = 'test-sid';
+        const STREAM_A = 'stream-a';
+        const STREAM_B = 'stream-b';
+        const STREAM_C = 'stream-c';
+        const CONTROL = '[System: Continue exactly where you left off. Do not retry the same tool call.]';
+        let restoreB;
+        let sessionApiCalls = 0;
+
+        window._liveAnchorRegistries = new Map();
+        const settledA = {
+          session_id: SID, active_stream_id: null, pending_user_message: null,
+          message_count: 3,
+          messages: [
+            { role: 'user', content: 'request A' },
+            { role: 'assistant', content: CONTROL, recovery_control: true },
+            { role: 'assistant', content: 'visible settled answer A' },
+          ],
+          tool_calls: [],
+        };
+        __apiHandler = url => {
+          if (!url.includes('/api/session?')) return Promise.resolve({ active: true });
+          sessionApiCalls += 1;
+          if (sessionApiCalls === 1) return Promise.resolve({ session: settledA });
+          return new Promise(resolve => { restoreB = resolve; });
+        };
+
+        (async () => {
+          // Phase A: the valid released generation must still fetch and filter
+          // the canonical session after apperror clears activeStreamId.
+          S.session = { session_id: SID, message_count: 1 };
+          S.activeStreamId = STREAM_A;
+          S.messages = [
+            { role: 'user', content: 'request A' },
+            { role: 'assistant', content: CONTROL, recovery_control: true },
+          ];
+          INFLIGHT[SID] = {
+            messages: S.messages.slice(), uploaded: [], toolCalls: [], streamId: STREAM_A,
+            activityBurstAnchors: [], currentActivityBurstId: 0,
+            currentLiveSegmentSeq: 0,
+          };
+          attachLiveStream(SID, STREAM_A, [], {});
+          const sourceA = __esCreated[0];
+          sourceA.dispatch('apperror', {
+            type: 'interrupted', recovery_control: true, session_id: SID,
+            message: CONTROL,
+            session: {
+              session_id: SID,
+              messages: [
+                { role: 'user', content: 'request A' },
+                { role: 'assistant', content: CONTROL, recovery_control: true },
+              ],
+            },
+          });
+          await Promise.resolve();
+          await Promise.resolve();
+          await Promise.resolve();
+
+          __results.recoveryFetchRan = sessionApiCalls === 1;
+          __results.recoveryControlFiltered = !S.messages.some(m => String(m && m.content || '').includes('[System:'));
+          __results.recoveredAnswerRetained = S.messages.some(m => m && m.content === 'visible settled answer A');
+          __results.releasedSourceSettled = !LIVE_STREAMS[SID] && S.activeStreamId === null;
+
+          // Phase B: leave generation B's recovery GET pending, then replace
+          // it with generation C.  B's response must be ignored.
+          S.session = { session_id: SID, message_count: 1 };
+          S.activeStreamId = STREAM_B;
+          S.messages = [
+            { role: 'user', content: 'request B' },
+            { role: 'assistant', content: CONTROL, recovery_control: true },
+          ];
+          INFLIGHT[SID] = {
+            messages: S.messages.slice(), uploaded: [], toolCalls: [], streamId: STREAM_B,
+            activityBurstAnchors: [], currentActivityBurstId: 0,
+            currentLiveSegmentSeq: 0,
+          };
+          attachLiveStream(SID, STREAM_B, [], {});
+          const sourceB = __esCreated[1];
+          sourceB.dispatch('apperror', {
+            type: 'interrupted', recovery_control: true, session_id: SID,
+            message: CONTROL,
+            session: {
+              session_id: SID,
+              messages: [
+                { role: 'user', content: 'request B' },
+                { role: 'assistant', content: CONTROL, recovery_control: true },
+              ],
+            },
+          });
+          await Promise.resolve();
+          await Promise.resolve();
+
+          S.session = { session_id: SID, message_count: 1 };
+          S.activeStreamId = STREAM_C;
+          S.messages = [{ role: 'user', content: 'newer generation C' }];
+          INFLIGHT[SID] = {
+            messages: S.messages.slice(), uploaded: [], toolCalls: [], streamId: STREAM_C,
+            activityBurstAnchors: [], currentActivityBurstId: 0,
+            currentLiveSegmentSeq: 0,
+          };
+          attachLiveStream(SID, STREAM_C, [], {});
+          const beforeNewer = JSON.stringify(S.messages);
+          if (restoreB) restoreB({ session: {
+            session_id: SID, active_stream_id: null, pending_user_message: null,
+            message_count: 2,
+            messages: [
+              { role: 'user', content: 'request B' },
+              { role: 'assistant', content: CONTROL, recovery_control: true },
+            ],
+            tool_calls: [],
+          }});
+          await Promise.resolve();
+          await Promise.resolve();
+          __results.newerGenerationProtected = !!(
+            LIVE_STREAMS[SID] && LIVE_STREAMS[SID].streamId === STREAM_C &&
+            S.activeStreamId === STREAM_C && JSON.stringify(S.messages) === beforeNewer
+          );
+
+          process.stdout.write(JSON.stringify(__results) + '\\n', () => { process.exit(0); });
+        })().catch(err => {
+          console.error(err && err.stack ? err.stack : String(err));
+          process.exit(2);
+        });
+        """
+    )
+
+    result = _run_harness(setup)
+
+    assert result["recoveryControlFiltered"] is True, (
+        "internal recovery-control text must be removed from the settled view"
+    )
+    assert result["recoveredAnswerRetained"] is True
+    assert result["recoveryFetchRan"] is True
+    assert result["releasedSourceSettled"] is True
+    assert result["newerGenerationProtected"] is True
+
+
+def test_nonrecovery_apperror_retry_runs_after_source_release():
+    """A released generation may finish its zero-delay Anchor repair once.
+
+    The first phase runs the real non-recovery ``apperror`` path and invokes its
+    queued retry after ``closeLiveStream`` has released the source.  The second
+    phase installs a newer generation before the old retry fires; that callback
+    must not attach its scene to the newer turn.
+    """
+    setup = textwrap.dedent(
+        """\
+        const __results = {};
+        const SID = 'test-sid';
+        const STREAM_A = 'stream-a';
+        const STREAM_B = 'stream-b';
+        const STREAM_C = 'stream-c';
+        const timers = [];
+        setTimeout = (fn, delay) => {
+          const timer = { fn, delay: Number(delay) || 0, cancelled: false };
+          timers.push(timer);
+          return timer;
+        };
+        clearTimeout = timer => { if (timer) timer.cancelled = true; };
+        window._liveAnchorRegistries = new Map();
+
+        function state(streamId, prompt) {
+          S.session = { session_id: SID, message_count: 1 };
+          S.activeStreamId = streamId;
+          S.messages = [{ role: 'user', content: prompt }];
+          INFLIGHT[SID] = {
+            messages: S.messages.slice(), uploaded: [], toolCalls: [], streamId,
+            activityBurstAnchors: [], currentActivityBurstId: 0,
+            currentLiveSegmentSeq: 0,
+          };
+        }
+
+        (async () => {
+          // Phase A: create a real Anchor reasoning row, then run non-recovery
+          // apperror.  The queued retry fires after the source is released.
+          state(STREAM_A, 'request A');
+          attachLiveStream(SID, STREAM_A, [], {});
+          const sourceA = __esCreated[0];
+          sourceA.dispatch('reasoning', { text: 'partial Worklog reasoning' });
+          const timerStartA = timers.length;
+          sourceA.dispatch('apperror', {
+            type: 'error', session_id: SID, message: 'provider failed',
+            session: {
+              session_id: SID,
+              messages: [
+                { role: 'user', content: 'request A', id: 'user-a' },
+                { role: 'assistant', content: 'provider failed', id: 'error-a' },
+              ],
+            },
+          });
+          const retryTimersA = timers.slice(timerStartA).filter(t => t.delay === 0 && !t.cancelled);
+          __results.sourceReleasedBeforeRetry = !LIVE_STREAMS[SID] && S.activeStreamId === null;
+          // Simulate a settled-session projection replacing the target object
+          // before the zero-delay callback runs.  The retry must prove the same
+          // turn owner and attach the scene to this replacement object.
+          const targetA = S.messages[S.messages.length - 1];
+          S.messages = S.messages.map((message, index) => index === S.messages.length - 1
+            ? { ...message, _anchor_activity_scene: undefined, _anchor_stream_id: undefined,
+                _anchor_scene_persist_key: undefined }
+            : message);
+          __results.sceneBeforeRetry = !!(targetA && targetA._anchor_activity_scene);
+          retryTimersA.forEach(t => t.fn());
+          await Promise.resolve();
+          const repairedA = S.messages[S.messages.length - 1];
+          const sceneA = repairedA && repairedA._anchor_activity_scene;
+          __results.releasedRepairRuns = !!(
+            sceneA && Array.isArray(sceneA.activity_rows) &&
+            sceneA.activity_rows.some(row => row && row.source_event_type === 'reasoning')
+          );
+
+          // Phase B: keep B's retry queued while generation C replaces it.
+          state(STREAM_B, 'request B');
+          attachLiveStream(SID, STREAM_B, [], {});
+          const sourceB = __esCreated[1];
+          sourceB.dispatch('reasoning', { text: 'stale Worklog reasoning' });
+          const timerStartB = timers.length;
+          sourceB.dispatch('apperror', {
+            type: 'error', session_id: SID, message: 'provider failed B',
+            session: {
+              session_id: SID,
+              messages: [
+                { role: 'user', content: 'request B', id: 'user-b' },
+                { role: 'assistant', content: 'provider failed B', id: 'error-b' },
+              ],
+            },
+          });
+          const retryTimersB = timers.slice(timerStartB).filter(t => t.delay === 0 && !t.cancelled);
+          S.messages = S.messages.map((message, index) => index === S.messages.length - 1
+            ? { ...message, _anchor_activity_scene: undefined, _anchor_stream_id: undefined,
+                _anchor_scene_persist_key: undefined }
+            : message);
+
+          state(STREAM_C, 'newer request C');
+          attachLiveStream(SID, STREAM_C, [], {});
+          const beforeNewer = JSON.stringify(S.messages);
+          retryTimersB.forEach(t => t.fn());
+          await Promise.resolve();
+          __results.newerGenerationProtected = !!(
+            LIVE_STREAMS[SID] && LIVE_STREAMS[SID].streamId === STREAM_C &&
+            S.activeStreamId === STREAM_C && JSON.stringify(S.messages) === beforeNewer &&
+            !S.messages.some(m => m && m._anchor_activity_scene)
+          );
+
+          process.stdout.write(JSON.stringify(__results) + '\\n', () => { process.exit(0); });
+        })().catch(err => {
+          console.error(err && err.stack ? err.stack : String(err));
+          process.exit(2);
+        });
+        """
+    )
+
+    result = _run_harness(setup)
+
+    assert result["sourceReleasedBeforeRetry"] is True
+    assert result["sceneBeforeRetry"] is True
+    assert result["releasedRepairRuns"] is True, (
+        "the settled Anchor repair must run for the same released generation"
+    )
+    assert result["newerGenerationProtected"] is True
+
+
+def test_failed_optimistic_start_releases_replaced_attachment_owner():
+    """A failed newer optimistic start releases the superseded attachment.
+
+    The old source can already be transport-closed when a newer pre-start
+    optimistic turn fails.  The failure cleanup still has to remove the old
+    entry from ``LIVE_STREAMS`` and drop its generation's strong reference to
+    the prior INFLIGHT payload; otherwise the released generation remains a
+    live registry and retains the entire previous transcript.
+    """
+    setup = textwrap.dedent(
+        """\
+        const __results = {};
+        const SID = 'test-sid';
+        const STREAM_A = 'stream-a';
+        const input = { value: 'new request', focus() {}, dispatchEvent() {} };
+        $ = id => id === 'msg' ? input : null;
+        var _sendInProgress = false;
+        var _sendInProgressSid = null;
+        var _pendingSelections = [];
+        var _forcedSkillDirectivePending = null;
+        function _formatSelectedTextReplyQuote(value) { return String(value || ''); }
+        function _clearPendingSelections() { _pendingSelections = []; }
+        function uploadPendingFiles() { return Promise.resolve([]); }
+        function _clearComposerDraft() { return Promise.resolve(); }
+        function _saveComposerDraftNow() {}
+        function renderTray() {}
+        function renderSessionListFromCache() {}
+        function _fetchYoloState() {}
+        function clearOptimisticSessionStreaming() {}
+        function autoResize() {}
+        function updateSendBtn() {}
+        function applySessionTitleUpdate() {}
+
+        window._liveAnchorRegistries = new Map();
+        const oldMessages = [
+          { role: 'user', content: 'old request' },
+          { role: 'assistant', content: 'old partial answer', _live: true,
+            reasoning: 'old reasoning', _partial_tool_calls: [{ id: 'old-tool' }] },
+        ];
+        const oldOwner = {
+          messages: oldMessages, uploaded: ['old.txt'],
+          toolCalls: [{ id: 'old-tool', name: 'shell' }], streamId: STREAM_A,
+          activityBurstAnchors: [], currentActivityBurstId: 1,
+          currentLiveSegmentSeq: 2,
+        };
+        S.session = { session_id: SID, title: 'Existing', model: 'test-model' };
+        S.activeStreamId = null;
+        S.busy = false;
+        S.pendingFiles = [];
+        S.messages = oldMessages.slice();
+        INFLIGHT[SID] = oldOwner;
+        __apiHandler = url => url.includes('/api/chat/start')
+          ? Promise.reject(new Error('provider unavailable'))
+          : Promise.resolve({});
+
+        // The old generation has already released its transport, but the
+        // current source registry still points at it when the newer send starts.
+        attachLiveStream(SID, STREAM_A, [], {});
+        const sourceA = __esCreated[0];
+        sourceA.close();
+        const oldLive = LIVE_STREAMS[SID];
+        __results.sourceClosedBeforeFailure = sourceA.readyState === EventSource.CLOSED;
+        __results.oldOwnerCaptured = oldLive && oldLive.generation && oldLive.generation.ownerRef
+          ? oldLive.generation.ownerRef.value === oldOwner : false;
+
+        (async () => {
+          await send();
+          __results.liveRegistryReleased = !LIVE_STREAMS[SID];
+          __results.sourceClosedAfterFailure = sourceA.readyState === EventSource.CLOSED;
+          __results.ownerPayloadReleased = !!(
+            oldLive && oldLive.generation && oldLive.generation.ownerRef &&
+            oldLive.generation.ownerRef.value === null
+          );
+          process.stdout.write(JSON.stringify(__results) + '\\n', () => process.exit(0));
+        })().catch(err => {
+          console.error(err && err.stack ? err.stack : String(err));
+          process.exit(2);
+        });
+        """
+    )
+
+    result = _run_harness(setup, include_send=True)
+
+    assert result["sourceClosedBeforeFailure"] is True
+    assert result["oldOwnerCaptured"] is True
+    assert result["sourceClosedAfterFailure"] is True
+    assert result["liveRegistryReleased"] is True, (
+        "a failed newer start must release the superseded LIVE_STREAMS entry"
+    )
+    assert result["ownerPayloadReleased"] is True, (
+        "the released generation must not retain the prior INFLIGHT payload"
+    )
+
+
+def test_existing_active_stream_conflict_releases_replaced_terminal_source():
+    """An active-stream start conflict releases the superseded terminal source.
+
+    The real ``send()`` path marks the current attachment replaced before its
+    optimistic streamless owner is installed.  When ``/api/chat/start`` then
+    reports that the session already has an active stream, the attempted turn
+    is queued while the old attachment is no longer authoritative.  The
+    conflict branch must release the exact old source and owner payload before
+    returning; a later reattach must remain independently protected.
+    """
+    setup = textwrap.dedent(
+        """\
+        const __results = {};
+        const SID = 'test-sid';
+        const STREAM_A = 'stream-a';
+        const STREAM_B = 'stream-b';
+        const input = { value: 'new request', focus() {}, dispatchEvent() {} };
+        $ = id => id === 'msg' ? input : null;
+        var _sendInProgress = false;
+        var _sendInProgressSid = null;
+        var _pendingSelections = [];
+        var _forcedSkillDirectivePending = null;
+        var _pendingMoaConfig = null;
+        var _slashDisplayTextOverride = '';
+        var _queueDrainSid = null;
+        var _failedSendDraftText = '';
+        var _failedSendFilesSnapshot = [];
+        function _formatSelectedTextReplyQuote(value) { return String(value || ''); }
+        function _clearPendingSelections() { _pendingSelections = []; }
+        function uploadPendingFiles() { return Promise.resolve([]); }
+        function _clearComposerDraft() { return Promise.resolve(); }
+        function _saveComposerDraftNow() {}
+        function renderTray() {}
+        function renderSessionListFromCache() {}
+        function _fetchYoloState() {}
+        function clearOptimisticSessionStreaming() {}
+        function autoResize() {}
+        function updateSendBtn() {}
+        function applySessionTitleUpdate() {}
+        function updateQueueBadge() {}
+        function showToast() {}
+        const queued = [];
+        function queueSessionMessage(sid, payload) { queued.push({ sid, payload }); }
+        async function loadSession() {}
+
+        window._liveAnchorRegistries = new Map();
+        const oldMessages = [
+          { role: 'user', content: 'old request' },
+          { role: 'assistant', content: 'old terminal answer', _live: true,
+            reasoning: 'old reasoning', _partial_tool_calls: [{ id: 'old-tool' }] },
+        ];
+        const oldOwner = {
+          messages: oldMessages, uploaded: ['old.txt'],
+          toolCalls: [{ id: 'old-tool', name: 'shell' }], streamId: STREAM_A,
+          activityBurstAnchors: [], currentActivityBurstId: 1,
+          currentLiveSegmentSeq: 2,
+        };
+        S.session = { session_id: SID, title: 'Existing', model: 'test-model' };
+        S.activeStreamId = null;
+        S.busy = false;
+        S.pendingFiles = [];
+        S.messages = oldMessages.slice();
+        INFLIGHT[SID] = oldOwner;
+        __apiHandler = url => url.includes('/api/chat/start')
+          ? Promise.reject(new Error('Session already has an active stream'))
+          : Promise.resolve({});
+
+        (async () => {
+          attachLiveStream(SID, STREAM_A, [], {});
+          const sourceA = __esCreated[0];
+          const oldLive = LIVE_STREAMS[SID];
+          __results.oldSourceOpenBeforeConflict = sourceA.readyState === EventSource.OPEN;
+          __results.oldOwnerCaptured = !!(
+            oldLive && oldLive.generation && oldLive.generation.ownerRef &&
+            oldLive.generation.ownerRef.value === oldOwner
+          );
+
+          await send();
+
+          // Capture the conflict result before any newer reattach can itself
+          // close a stale source and hide a missing conflict cleanup.
+          __results.apiCalls = 1;
+          __results.queuedCount = queued.length;
+          __results.queuedText = queued[0] && queued[0].payload && queued[0].payload.text;
+          __results.oldSourceStillRegistered = LIVE_STREAMS[SID] === oldLive;
+          __results.oldSourceStillOpen = sourceA.readyState === EventSource.OPEN;
+          __results.oldOwnerPayloadRetained = !!(
+            oldLive && oldLive.generation && oldLive.generation.ownerRef &&
+            oldLive.generation.ownerRef.value === oldOwner
+          );
+          __results.oldOwnerMarkedReplaced = !!(
+            oldLive && oldLive.generation && oldLive.generation.ownerRef &&
+            oldLive.generation.ownerRef.replaced
+          );
+
+          // A newer attachment must be able to claim the session without the
+          // conflict cleanup touching its owner or transport.
+          const newerOwner = {
+            messages: [{ role: 'user', content: 'newer request' }],
+            uploaded: [], toolCalls: [], streamId: STREAM_B,
+            activityBurstAnchors: [], currentActivityBurstId: 0,
+            currentLiveSegmentSeq: 0,
+          };
+          S.messages = newerOwner.messages.slice();
+          S.activeStreamId = STREAM_B;
+          INFLIGHT[SID] = newerOwner;
+          attachLiveStream(SID, STREAM_B, [], {});
+          const sourceB = __esCreated[1];
+          sourceA.dispatch('token', { text: 'stale old token', event_id: 'old:late' });
+          __results.newerSourceProtected = !!(
+            LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === sourceB &&
+            LIVE_STREAMS[SID].streamId === STREAM_B &&
+            sourceB.readyState === EventSource.OPEN &&
+            LIVE_STREAMS[SID].ownerRef &&
+            LIVE_STREAMS[SID].ownerRef.value === newerOwner &&
+            LIVE_STREAMS[SID].ownerRef.replaced === false
+          );
+          process.stdout.write(JSON.stringify(__results) + '\\n', () => process.exit(0));
+        })().catch(err => {
+          console.error(err && err.stack ? err.stack : String(err));
+          process.exit(2);
+        });
+        """
+    )
+
+    result = _run_harness(setup, include_send=True)
+
+    assert result["oldSourceOpenBeforeConflict"] is True
+    assert result["oldOwnerCaptured"] is True
+    assert result["queuedCount"] == 1
+    assert result["queuedText"] == "new request"
+    assert result["oldSourceStillRegistered"] is False, (
+        "an existing-active-stream conflict must release the replaced source "
+        "before returning"
+    )
+    assert result["oldSourceStillOpen"] is False, (
+        "the replaced terminal EventSource must be closed on conflict"
+    )
+    assert result["oldOwnerPayloadRetained"] is False, (
+        "the released terminal generation must not retain its prior owner payload"
+    )
+    assert result["oldOwnerMarkedReplaced"] is True
+    assert result["newerSourceProtected"] is True
+
+
+def test_released_done_owner_cannot_regain_authority_after_failed_start():
+    """A released done generation stays stale after a failed replacement.
+
+    The real done listener releases the source before its terminal post-process
+    rAF runs.  A newer optimistic send then fails before it receives a stream
+    id; that failure must permanently supersede the released owner so the old
+    rAF cannot run after the newer turn has been removed.
+    """
+    setup = textwrap.dedent(
+        """\
+        const __results = {};
+        const SID = 'test-sid';
+        const STREAM_A = 'stream-a';
+        const rafs = [];
+        const input = { value: 'new request', focus() {}, dispatchEvent() {} };
+        const testBlocks = { querySelectorAll: () => [], appendChild() {} };
+        const testTurn = { _blocks: testBlocks };
+        const testEmptyState = { style: {} };
+        $ = id => id === 'msg' ? input
+          : (id === 'liveAssistantTurn' ? testTurn
+          : (id === 'emptyState' ? testEmptyState : null));
+        _assistantTurnBlocks = turn => turn && turn._blocks;
+        document.createElement = () => ({
+          className: '', style: {}, isConnected: true,
+          setAttribute() {}, appendChild() {}, querySelector: () => null,
+          classList: { add() {}, remove() {} },
+        });
+        renderMd = text => String(text || '');
+        esc = text => String(text || '');
+        scrollIfPinned = () => {};
+        requestAnimationFrame = fn => {
+          const frame = { fn, cancelled: false };
+          rafs.push(frame);
+          return rafs.length - 1;
+        };
+        cancelAnimationFrame = id => { if (rafs[id]) rafs[id].cancelled = true; };
+        var _sendInProgress = false;
+        var _sendInProgressSid = null;
+        var _pendingSelections = [];
+        var _forcedSkillDirectivePending = null;
+        var _pendingMoaConfig = null;
+        var _slashDisplayTextOverride = '';
+        var _queueDrainSid = null;
+        var _failedSendDraftText = '';
+        var _failedSendFilesSnapshot = [];
+        function _formatSelectedTextReplyQuote(value) { return String(value || ''); }
+        function _clearPendingSelections() { _pendingSelections = []; }
+        function uploadPendingFiles() { return Promise.resolve([]); }
+        function _clearComposerDraft() { return Promise.resolve(); }
+        function _saveComposerDraftNow() {}
+        function renderTray() {}
+        function renderSessionListFromCache() {}
+        function _fetchYoloState() {}
+        function clearOptimisticSessionStreaming() {}
+        function autoResize() {}
+        function updateSendBtn() {}
+        function applySessionTitleUpdate() {}
+
+        window._liveAnchorRegistries = new Map();
+        const oldMessages = [
+          { role: 'user', content: 'old request' },
+          { role: 'assistant', content: 'old answer', _live: true },
+        ];
+        S.session = { session_id: SID, title: 'Existing', model: 'test-model' };
+        S.activeStreamId = STREAM_A;
+        S.busy = true;
+        S.pendingFiles = [];
+        S.messages = oldMessages.slice();
+        INFLIGHT[SID] = {
+          messages: oldMessages.slice(), uploaded: [], toolCalls: [], streamId: STREAM_A,
+          activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+        };
+        let apiCalls = 0;
+        __apiHandler = url => {
+          if (url.includes('/api/chat/start')) {
+            apiCalls += 1;
+            return Promise.reject(new Error('provider unavailable'));
+          }
+          return Promise.resolve({});
+        };
+
+        (async () => {
+          attachLiveStream(SID, STREAM_A, [], {});
+          const sourceA = __esCreated[0];
+          sourceA.dispatch('token', { text: 'old live answer' });
+          rafs.length = 0;
+          sourceA.dispatch('done', {
+            stream_id: STREAM_A,
+            status: 'completed',
+            session: {
+              session_id: SID,
+              message_count: 2,
+              messages: [
+                { role: 'user', content: 'old request' },
+                { role: 'assistant', content: 'old answer' },
+              ],
+              tool_calls: [],
+            },
+          });
+          const terminalRafs = rafs.filter(frame => !frame.cancelled);
+          __results.sourceReleasedAfterDone = !LIVE_STREAMS[SID];
+          __results.terminalRafQueued = terminalRafs.length > 0;
+
+          S.activeStreamId = null;
+          S.busy = false;
+          await send();
+          __results.apiCalls = apiCalls;
+          __results.failedTurnVisible = S.messages.some(
+            m => m && m.content === '**Error:** provider unavailable'
+          );
+          __results.ownerReplaced = !!(
+            _LIVE_STREAM_ATTACHMENT_GENERATIONS[SID] &&
+            _LIVE_STREAM_ATTACHMENT_GENERATIONS[SID].ownerRef &&
+            _LIVE_STREAM_ATTACHMENT_GENERATIONS[SID].ownerRef.replaced
+          );
+          __results.inflightCleared = !INFLIGHT[SID];
+          for (const frame of terminalRafs) {
+            if (!frame.cancelled) frame.fn();
+          }
+          __results.highlightCallsAfterFailure = __highlightCalls;
+          __results.copyButtonCallsAfterFailure = __copyButtonCalls;
+          __results.katexCallsAfterFailure = __katexCalls;
+          process.stdout.write(JSON.stringify(__results) + '\\n', () => process.exit(0));
+        })().catch(err => {
+          console.error(err && err.stack ? err.stack : String(err));
+          process.exit(2);
+        });
+        """
+    )
+
+    result = _run_harness(setup, include_send=True)
+
+    assert result["sourceReleasedAfterDone"] is True
+    assert result["terminalRafQueued"] is True
+    assert result["apiCalls"] == 1, "the regression must exercise the real /api/chat/start rejection"
+    assert result["failedTurnVisible"] is True
+    assert result["ownerReplaced"] is True
+    assert result["inflightCleared"] is True
+    assert result["highlightCallsAfterFailure"] == 0
+    assert result["copyButtonCallsAfterFailure"] == 0
+    assert result["katexCallsAfterFailure"] == 0
+
+
+def test_released_recovery_cannot_replace_prestart_optimistic_turn():
+    """A pending released recovery cannot consume a newer pre-start turn.
+
+    The recovery callback clears the pane's active stream before its session
+    GET resolves.  A user can then submit a new optimistic turn while
+    ``/api/chat/start`` is still pending, so the new ``INFLIGHT`` entry has no
+    stream id yet.  The old callback must fail closed instead of deleting that
+    owner or replacing its visible user message with the old settled snapshot.
+    """
+    setup = textwrap.dedent(
+        """\
+        const __results = {};
+        const SID = 'test-sid';
+        const STREAM_A = 'stream-a';
+        const CONTROL = '[System: Continue exactly where you left off. Do not retry the same tool call.]';
+        let resolveRecovery;
+        window._liveAnchorRegistries = new Map();
+        S.session = { session_id: SID, message_count: 2 };
+        S.activeStreamId = STREAM_A;
+        S.messages = [
+          { role: 'user', content: 'old request' },
+          { role: 'assistant', content: CONTROL, recovery_control: true },
+        ];
+        INFLIGHT[SID] = {
+          messages: S.messages.slice(), uploaded: [], toolCalls: [], streamId: STREAM_A,
+          activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+        };
+        __apiHandler = url => url.includes('/api/session?')
+          ? new Promise(resolve => { resolveRecovery = resolve; })
+          : Promise.resolve({ active: true });
+        (async () => {
+          attachLiveStream(SID, STREAM_A, [], {});
+          const sourceA = __esCreated[0];
+          sourceA.dispatch('apperror', {
+            type: 'interrupted', recovery_control: true, session_id: SID,
+            message: CONTROL,
+          });
+          await Promise.resolve();
+          await Promise.resolve();
+          __results.recoveryPending = typeof resolveRecovery === 'function';
+          __results.composerIdle = S.activeStreamId === null;
+
+          // Model the real send pre-start window: the new user turn and its
+          // recovery owner exist before /api/chat/start returns a stream id.
+          S.messages = [
+            { role: 'user', content: 'old request' },
+            { role: 'user', content: 'new request while recovery is pending', _pending: true },
+          ];
+          INFLIGHT[SID] = {
+            messages: S.messages.slice(), uploaded: [], toolCalls: [], streamId: null,
+            activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+          };
+          S.activeStreamId = null;
+
+          resolveRecovery({ session: {
+            session_id: SID, active_stream_id: null, pending_user_message: null,
+            message_count: 2,
+            messages: [
+              { role: 'user', content: 'old request' },
+              { role: 'assistant', content: 'old settled recovery answer' },
+            ],
+            tool_calls: [],
+          }});
+          await Promise.resolve();
+          await Promise.resolve();
+          await Promise.resolve();
+
+          __results.newOptimisticTurnSurvived = S.messages.some(
+            m => m && m.content === 'new request while recovery is pending'
+          );
+          __results.newInflightSurvived = !!INFLIGHT[SID];
+          __results.finalMessages = S.messages.map(m => m && m.content);
+          process.stdout.write(JSON.stringify(__results) + '\\n', () => process.exit(0));
+        })().catch(err => {
+          console.error(err && err.stack ? err.stack : String(err));
+          process.exit(2);
+        });
+        """
+    )
+
+    result = _run_harness(setup)
+
+    assert result["recoveryPending"] is True
+    assert result["composerIdle"] is True
+    assert result["newOptimisticTurnSurvived"] is True, (
+        "a released recovery must not replace a newer optimistic user turn"
+    )
+    assert result["newInflightSurvived"] is True, (
+        "a released recovery must not delete a newer pre-start INFLIGHT owner"
+    )

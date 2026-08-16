@@ -1706,6 +1706,7 @@ async function send(){
       }
     });
     optimisticMessages=[...S.messages];
+    _markLiveAttachmentOwnerReplaced(activeSid);
     INFLIGHT[activeSid]={messages:optimisticMessages,uploaded:uploadedNames,toolCalls:[]};
     if(typeof saveInflightState==='function'){
       saveInflightState(activeSid,{streamId:null,messages:INFLIGHT[activeSid].messages,uploaded:uploadedNames,toolCalls:[]});
@@ -1754,6 +1755,7 @@ async function send(){
     try{console.warn('[webui] pre-start optimistic UI failed; continuing to /api/chat/start', message);}catch(_){ }
     if(!S.messages.includes(userMsg)) S.messages.push(userMsg);
     optimisticMessages=[...S.messages];
+    _markLiveAttachmentOwnerReplaced(activeSid);
     INFLIGHT[activeSid]={messages:optimisticMessages,uploaded:uploadedNames,toolCalls:[]};
     try{setBusy(true);}catch(_){S.busy=true;}
     if(S.session&&!S.session.pending_started_at) S.session.pending_started_at=Date.now()/1000;
@@ -1833,6 +1835,7 @@ async function send(){
       S.session=null;S.messages=[];
       setBusy(false);setComposerStatus('');
       if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
+      _releaseReplacedLiveAttachment(activeSid);
       if(typeof renderMessages==='function') renderMessages();
       if($('emptyState')) $('emptyState').style.display='';
       if($('msgInner')) $('msgInner').innerHTML='';
@@ -1843,6 +1846,11 @@ async function send(){
     if(conflictActiveStream){
       delete INFLIGHT[activeSid];
       if(typeof clearInflightState==='function') clearInflightState(activeSid);
+      // The optimistic owner was marked as replacing the terminal attachment
+      // before /api/chat/start.  A conflict is still a failed replacement: the
+      // queued turn must not leave that exact source registered/open while its
+      // generation rejects every continuation and retains the old payload.
+      _releaseReplacedLiveAttachment(activeSid);
       stopApprovalPolling();
       stopClarifyPolling();
       // Keep the user's attempted turn by queueing it for after the current run.
@@ -1860,6 +1868,7 @@ async function send(){
     }
 
     delete INFLIGHT[activeSid];
+    if(!conflictActiveStream) _releaseReplacedLiveAttachment(activeSid);
     stopApprovalPolling();
     stopClarifyPolling();
     // Only hide approval card if it belongs to the session that just finished
@@ -1954,6 +1963,25 @@ async function send(){
 }
 
 const LIVE_STREAMS={};
+// A pre-start optimistic send replaces the current attachment owner before it
+// has a stream id.  Record that replacement on the old attachment itself so a
+// later failure can delete the newer INFLIGHT entry without letting the old
+// released callback regain authority merely because the map is now empty.
+function _markLiveAttachmentOwnerReplaced(sessionId, replacementOwner=null){
+  const live=LIVE_STREAMS[sessionId];
+  const generation=typeof _LIVE_STREAM_ATTACHMENT_GENERATIONS!=='undefined'
+    ? _LIVE_STREAM_ATTACHMENT_GENERATIONS[sessionId]
+    : null;
+  const ownerRef=(live&&live.ownerRef)||(generation&&generation.ownerRef);
+  // A released generation intentionally drops its owner payload, so the
+  // default streamless replacement cannot compare object identity.  Once a
+  // replacement is admitted, keep the tombstone monotonic even if the newer
+  // INFLIGHT entry is later removed by a failed /api/chat/start.
+  if(!ownerRef||ownerRef.replaced) return false;
+  if(replacementOwner!==null&&ownerRef.value===replacementOwner) return false;
+  ownerRef.replaced=true;
+  return true;
+}
 // Opaque ownership token for each attachLiveStream() closure. Stream ids are
 // durable run identity, not transport identity: reconnects can race for the
 // same (session, stream), so every async continuation must also prove that its
@@ -2063,6 +2091,31 @@ function closeLiveStream(sessionId, streamId, source, generation){
       });
     }
   }
+  // Release the attachment's owner payload after the transport is detached.
+  // The generation tombstone remains for stale-callback identity checks, but it
+  // must not retain the full prior INFLIGHT transcript after a terminal release.
+  const ownerRef=live.ownerRef||(live.generation&&live.generation.ownerRef);
+  if(ownerRef) ownerRef.value=null;
+}
+
+function _releaseReplacedLiveAttachment(sessionId){
+  const live=LIVE_STREAMS[sessionId];
+  const generation=typeof _LIVE_STREAM_ATTACHMENT_GENERATIONS!=='undefined'
+    ? _LIVE_STREAM_ATTACHMENT_GENERATIONS[sessionId]
+    : null;
+  const ownerRef=(live&&live.ownerRef)||(generation&&generation.ownerRef);
+  if(!live&&!ownerRef) return false;
+  // A start request can outlive an unrelated reattach. Never tear down that
+  // newer owner; only the attachment explicitly marked as replaced by this
+  // optimistic send is eligible for failure cleanup.
+  if(ownerRef&&!ownerRef.replaced) return false;
+  if(live){
+    closeLiveStream(sessionId,live.streamId,live.source,live.generation);
+  }
+  // closeLiveStream() may be a no-op when a stale callback already replaced the
+  // registry; clear the tombstoned owner reference in either case.
+  if(ownerRef) ownerRef.value=null;
+  return true;
 }
 
 function closeOtherLiveStreams(activeSid){
@@ -2092,6 +2145,7 @@ function _dispatchExtensionTurnLifecycle(type,sessionId,streamId,details={}){
 function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(!activeSid||!streamId) return;
   const reconnecting=!!options.reconnecting;
+  let assistantText='';
   // Completion cooldowns are owned by the attachment that armed them. Keep
   // the store on window so independently extracted/replayed attach closures
   // share the same owner set; sessions.js still receives the legacy boolean
@@ -2138,6 +2192,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(uploaded.length) INFLIGHT[activeSid].uploaded=[...uploaded];
     if(!Array.isArray(INFLIGHT[activeSid].toolCalls)) INFLIGHT[activeSid].toolCalls=[];
   }
+  // A released recovery may await the settled session while the composer
+  // admits a newer optimistic turn.  Bind this attachment to the exact
+  // in-memory INFLIGHT owner it started with; a replacement object is a new
+  // local turn even before its /api/chat/start response supplies a stream id.
+  // Keep the owner binding mutable only for an explicit same-stream reattach:
+  // loadSession() may replace the INFLIGHT snapshot object while reusing this
+  // transport. A newer optimistic send never calls the same-stream reattach
+  // path, so its replacement remains unauthorized.
+  const _attachmentInflightOwnerRef={value:INFLIGHT[activeSid]||null,replaced:false};
   const _priorInflightStreamId=String(INFLIGHT[activeSid].streamId||'');
   if(_priorInflightStreamId&&_priorInflightStreamId!==streamId){
     INFLIGHT[activeSid].lastRunJournalSeq=0;
@@ -2147,7 +2210,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(!Array.isArray(INFLIGHT[activeSid].activityBurstAnchors)) INFLIGHT[activeSid].activityBurstAnchors=[];
   if(INFLIGHT[activeSid].currentActivityBurstId===undefined) INFLIGHT[activeSid].currentActivityBurstId=0;
   if(INFLIGHT[activeSid].currentLiveSegmentSeq===undefined) INFLIGHT[activeSid].currentLiveSegmentSeq=0;
-  let assistantText='';
   let reasoningText='';
   if(S.session&&S.session.session_id===activeSid&&S.activeStreamId===streamId&&typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
   const existingLive=LIVE_STREAMS[activeSid];
@@ -2160,6 +2222,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       existingLive.source.readyState===EventSource.OPEN||
       (!reconnecting&&existingLive.source.readyState===EventSource.CONNECTING))
   ){
+    if(reconnecting&&existingLive.ownerRef&&!existingLive.ownerRef.replaced){
+      existingLive.ownerRef.value=INFLIGHT[activeSid]||null;
+    }
     // Phase D: restore bottom run status on reattach after the Worklog shell
     // exists. There is no stale transport teardown in this branch.
     if(reconnecting && S.activeStreamId && typeof showLiveRunStatus==='function'){
@@ -2181,12 +2246,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   const _previousAttachmentGeneration=_LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid];
   const _previousAttachmentEpoch=Number(_previousAttachmentGeneration&&_previousAttachmentGeneration.epoch);
   const _attachmentEpoch=Number.isFinite(_previousAttachmentEpoch)?_previousAttachmentEpoch+1:1;
-  const _attachmentGeneration={epoch:_attachmentEpoch};
+  const _attachmentGeneration={epoch:_attachmentEpoch,ownerRef:_attachmentInflightOwnerRef};
   _LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid]=_attachmentGeneration;
   // Claim the generation before any reconnect status preflight can suspend.
   // source:null is an intentional pending-transport state; only this exact
   // generation may later construct and install its EventSource.
   LIVE_STREAMS[activeSid]={streamId,generation:_attachmentGeneration,source:null};
+  LIVE_STREAMS[activeSid].ownerRef=_attachmentInflightOwnerRef;
   if(!reconnecting&&typeof resetTurnWorkspaceMutations==='function') resetTurnWorkspaceMutations();
   if(!reconnecting&&typeof _resetStreamScrollFollow==='function') _resetStreamScrollFollow();
   // Phase D: restore bottom run status after closeLiveStream(); that helper
@@ -2277,6 +2343,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const live=LIVE_STREAMS[activeSid];
     return !!source&&_ownsAttachmentGeneration()&&live.source===source;
   }
+  function _ownsAttachmentTurnOwner(){
+    if(_attachmentInflightOwnerRef.replaced) return false;
+    const current=INFLIGHT[activeSid];
+    if(current&&current!==_attachmentInflightOwnerRef.value){
+      _attachmentInflightOwnerRef.replaced=true;
+      return false;
+    }
+    return true;
+  }
   function _ownsActiveStreamOrBackground(source){
     if(!_ownsAttachmentSource(source)) return false;
     return !_isActiveSession() || S.activeStreamId===streamId;
@@ -2288,6 +2363,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const latestGeneration=_LIVE_STREAM_ATTACHMENT_GENERATIONS[activeSid];
     const live=LIVE_STREAMS[activeSid];
     if(latestGeneration!==_attachmentGeneration||Number(latestGeneration&&latestGeneration.epoch)!==_attachmentEpoch) return false;
+    if(!_ownsAttachmentTurnOwner()) return false;
     if(!live) return true;
     return live.streamId===streamId&&live.generation===_attachmentGeneration&&live.source===source;
   }
@@ -2326,7 +2402,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   function _clearOwnerInflightState(source=null){
     if(source ? !_ownsAttachmentSource(source) : !_ownsAttachmentGeneration()) return false;
-    if(_isActiveSession() && S.activeStreamId!==streamId) return;
+    if(!_ownsAttachmentTurnOwner()) return false;
+    if(
+      _isActiveSession() &&
+      S.activeStreamId!==streamId &&
+      !_ownsAttachmentSourceOrReleasedGeneration(source)
+    ) return;
     delete INFLIGHT[activeSid];
     clearInflightState(activeSid);
     _clearActivePaneInflightIfOwner();
@@ -5823,6 +5904,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(_streamingKatexTimer){clearTimeout(_streamingKatexTimer);_streamingKatexTimer=null;}
     }
     LIVE_STREAMS[activeSid]={streamId,generation:_attachmentGeneration,source};
+    LIVE_STREAMS[activeSid].ownerRef=_attachmentInflightOwnerRef;
     _currentAttachmentSource=source;
 
     // EventSource.close() prevents future network delivery but callbacks that
@@ -6812,7 +6894,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           // Retry only for the exact terminal assistant and registry generation.
           // A refresh replacement must prove the same full turn and tool owner.
           setTimeout(()=>{
-            if(!_ownsAttachmentSource(source)) return;
+            if(!_ownsAttachmentSourceOrReleasedGeneration(source)) return;
             _retrySettledAnchorScene(_retryTarget,_retryIndex,_retryStreamId,_retryRegistry,_retryOwnerKey);
           },0);
         }
@@ -6820,7 +6902,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           _appErrorRecoveryPending=true;
           (async()=>{
             try{
-              if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
+              if(await _restoreSettledSession(source, {
+                preserveVisibleOnShorterTerminalSnapshot:true,
+                allowReleasedTerminalRecovery:true,
+              })) return;
               if(!_ownsAttachmentSource(source)) return;
               if(S.session&&S.session.session_id===activeSid){
                 S.messages=_filterRecoveryControlMessages(S.messages||[]);
@@ -6828,7 +6913,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
                 renderMessages({preserveScroll:true});
               }
             }finally{
-              if(_ownsAttachmentSource(source)) _closeSource(source);
+              if(_ownsAttachmentSource(source)){
+                if(_ownsAttachmentTurnOwner()) _closeSource(source);
+                else _closeTransportOnly(source);
+              }
             }
           })();
         } else {
@@ -7029,6 +7117,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
       const _applyCancelSessionPayload=(sessionPayload)=>{
         if(!_ownsAttachmentSource(source)) return false;
+        // The cancel snapshot is authoritative only for the INFLIGHT owner
+        // that admitted this attachment.  A newer optimistic send can replace
+        // that owner while the sessionless fallback GET is pending, before its
+        // /api/chat/start response provides a stream id.  Do not let the old
+        // cancel response replace the newer visible user turn.
+        if(!_ownsAttachmentTurnOwner()) return false;
         if(!sessionPayload||typeof sessionPayload!=='object'||!S.session||S.session.session_id!==activeSid) return false;
         // Belt-and-suspenders: the embedded cancel snapshot must be for THIS session.
         // The GET path guarantees it via the URL; the embedded path via the stream→session
@@ -7074,6 +7168,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(data&&data.session) _applyCancelSessionPayload(data.session);
         }catch(_){
           if(!_ownsAttachmentSource(source)) return;
+          if(!_ownsAttachmentTurnOwner()) return;
           // Fallback to local cancel message if API fails
           if(S.session&&S.session.session_id===activeSid){
             const _wasFollowingAtCancelFb=((typeof _isMessagePaneNearBottom==='function')
@@ -7095,7 +7190,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             status:_cancelData.status||_cancelData.type||'cancelled',
             endedAt:Date.now()/1000,
           });
-          if(_ownsAttachmentSource(source)) _closeSource(source);
+          if(_ownsAttachmentSource(source)){
+            if(_ownsAttachmentTurnOwner()) _closeSource(source);
+            else _closeTransportOnly(source);
+          }
         }
       })();
       renderSessionList();
@@ -7104,7 +7202,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','todo_state','approval','clarify','state_saved','title','title_status','context_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
       source.addEventListener(_runJournalEventName,e=>{
-        if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+        // Cursor bookkeeping is observational.  It must accept the source's
+        // own terminal event after a cancel/recovery handler clears
+        // S.activeStreamId, but it must never invoke terminal teardown or
+        // delete ownership on behalf of a stale/newer attachment.
+        if(!_ownsAttachmentSource(source)||!_ownsAttachmentTurnOwner()) return;
         _rememberRunJournalCursor(e);
       });
     }
@@ -7172,20 +7274,39 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   async function _restoreSettledSession(source, options=null){
     const returnStatus=!!(options&&options.status);
     const preserveVisibleOnShorterTerminalSnapshot=!!(options&&options.preserveVisibleOnShorterTerminalSnapshot);
+    const allowReleasedTerminalRecovery=!!(options&&options.allowReleasedTerminalRecovery);
     if(!_ownsAttachmentSource(source)){
       try{if(source&&source.readyState!==2) source.close();}catch(_){ }
       return returnStatus?'stale':false;
     }
-    if(_isActiveSession() && S.activeStreamId!==streamId){
-      _closeSource(source);
-      return returnStatus?'stale':false;
+    const _ownsReleasedGeneration=typeof _ownsAttachmentSourceOrReleasedGeneration==='function'
+      ? _ownsAttachmentSourceOrReleasedGeneration(source)
+      : _ownsAttachmentSource(source);
+    if(
+      _isActiveSession() &&
+      S.activeStreamId!==streamId &&
+      !(!S.activeStreamId&&_ownsReleasedGeneration)
+    ){
+      // A newer optimistic turn can replace INFLIGHT before its stream id is
+      // known. Close only this transport in that case; closeLiveStream()
+      // would mark or delete the newer turn's recovery owner.
+      if(_ownsReleasedGeneration) _closeSource(source);
+      else _closeTransportOnly(source);
+      return returnStatus?'stale':true;
     }
     try{
       const data=await api(`/api/session?session_id=${encodeURIComponent(activeSid)}`);
       if(!_ownsAttachmentSource(source)) return returnStatus?'stale':false;
+      const _ownsReleasedGenerationAfterAwait=typeof _ownsAttachmentSourceOrReleasedGeneration==='function'
+        ? _ownsAttachmentSourceOrReleasedGeneration(source)
+        : _ownsAttachmentSource(source);
+      if(!_ownsReleasedGenerationAfterAwait){
+        _closeTransportOnly(source);
+        return returnStatus?'stale':true;
+      }
       // Opus #2852 race-fix: if a late `done` event ran the finalize path while
       // we were awaiting the network roundtrip, bail out — done already settled.
-      if(_streamFinalized) return returnStatus?'restored':true;
+      if(_streamFinalized&&!allowReleasedTerminalRecovery) return returnStatus?'restored':true;
       const session=data&&data.session;
       if(!session) return returnStatus?'missing':false;
       if(session.active_stream_id||session.pending_user_message) return returnStatus?'active':false;
