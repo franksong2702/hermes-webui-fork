@@ -34,6 +34,7 @@ from api.config import (
     mark_stream_worker_done,
     mark_stream_success_committed,
     retire_stream_cancel_generation_after_success,
+    stream_cancel_generation_pending,
     coerce_reasoning_effort_for_model,
     gateway_approval_unavailable_reason,
     gateway_supports_approval,
@@ -1329,7 +1330,16 @@ def _run_gateway_chat_streaming(
             s.model = model
             s.model_provider = model_provider
 
-            def _restore_cancelled_success_writeback():
+            def _restore_cancelled_success_writeback(*, durable_success=False):
+                """Settle a cancelled success race without erasing durable WebUI output."""
+                if durable_success and pending_source == "webui":
+                    # The assistant answer is already on disk. A late Stop may
+                    # restore a process-wakeup pause, but it must not roll back
+                    # a completed WebUI transcript to the pre-turn snapshot.
+                    s.process_wakeup_pause = copy.deepcopy(success_previous_pause)
+                    s.save()
+                    put_gateway_event("cancel", {"message": "Cancelled by user"})
+                    return
                 s.messages = copy.deepcopy(success_previous_messages)
                 s.context_messages = copy.deepcopy(success_previous_context)
                 s.tool_calls = copy.deepcopy(success_previous_tools)
@@ -1338,13 +1348,11 @@ def _run_gateway_chat_streaming(
                 s.pending_attachments = copy.deepcopy(success_previous_pending_attachments)
                 s.pending_started_at = success_previous_pending_started
                 s.pending_user_source = success_previous_pending_source
-                if success_previous_pause:
-                    s.process_wakeup_pause = copy.deepcopy(success_previous_pause)
-                else:
-                    clear_process_wakeup_pause(s, reason="run_completed")
-                from api.streaming import _materialize_pending_user_turn_before_error
+                s.process_wakeup_pause = copy.deepcopy(success_previous_pause)
+                if pending_source != "process_wakeup":
+                    from api.streaming import _materialize_pending_user_turn_before_error
 
-                _materialize_pending_user_turn_before_error(s)
+                    _materialize_pending_user_turn_before_error(s)
                 s.save()
                 put_gateway_event("cancel", {"message": "Cancelled by user"})
 
@@ -1359,10 +1367,14 @@ def _run_gateway_chat_streaming(
                 return
             s.save()
             if cancel_event.is_set():
-                _restore_cancelled_success_writeback()
+                _restore_cancelled_success_writeback(
+                    durable_success=not stream_cancel_generation_pending(session_id, stream_id),
+                )
                 return
             if not mark_stream_success_committed(session_id, stream_id):
-                _restore_cancelled_success_writeback()
+                _restore_cancelled_success_writeback(
+                    durable_success=not stream_cancel_generation_pending(session_id, stream_id),
+                )
                 if mark_stream_worker_done(session_id, stream_id):
                     from api.streaming import _reconcile_cancelled_stream_generation
 

@@ -1831,16 +1831,17 @@ def _settle_result_messages(
         session.context_messages,
         active_turn_identity,
     )
+    session.messages = _merge_display_messages_after_agent_result(
+        previous_display_for_writeback,
+        previous_context_messages,
+        _restore_display_reasoning_metadata(previous_messages, result_messages),
+        msg_text,
+        source=source,
+        verification_nudge_provenance=verification_nudge_provenance,
+    )
     session.messages = _merge_display_messages_with_late_recovery(
         session,
-        _merge_display_messages_after_agent_result(
-            previous_display_for_writeback,
-            previous_context_messages,
-            _restore_display_reasoning_metadata(previous_messages, result_messages),
-            msg_text,
-            source=source,
-            verification_nudge_provenance=verification_nudge_provenance,
-        ),
+        session.messages,
         previous_messages,
         previous_context_messages,
         active_turn_identity,
@@ -2933,11 +2934,6 @@ def _reconcile_cancelled_stream_generation_under_lock(session_id, stream_id, cla
                     ]
                     context_old_index, context_target_index = _context_turn_bounds(
                         context_remaining,
-                    )
-                    context_old_user = (
-                        context_remaining[context_old_index]
-                        if context_old_index >= 0
-                        else None
                     )
                     context_target = (
                         context_remaining[context_target_index]
@@ -11851,7 +11847,7 @@ def _run_agent_streaming(
                     if _success_previous_pause:
                         s.process_wakeup_pause = copy.deepcopy(_success_previous_pause)
                     else:
-                        clear_process_wakeup_pause(s, reason='run_completed')
+                        s.process_wakeup_pause = {}
                     _materialize_pending_user_turn_before_error(s)
                     s.save()
 
