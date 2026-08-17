@@ -916,14 +916,24 @@ function renderSessionArtifacts(){
   }).join('');
 }
 
-async function _workspacePathExists(path, opts={}){
+function projectSessionArtifactsForOwner(sessionId){
+  if(!sessionId||!S.session||S.session.session_id!==sessionId) return false;
+  if(typeof _isSessionCurrentPane!=='function'||!_isSessionCurrentPane(sessionId)) return false;
+  renderSessionArtifacts();
+  return true;
+}
+
+async function _workspacePathExists(path){
+  if(!S.session||!path) return false;
+  const parts=String(path).replace(/\\/g,'/').split('/').filter(Boolean);
+  const opts=arguments.length>1 ? (arguments[1] || {}) : {};
   const owner = _artifactOwnerFromOptions(opts);
-  if(!owner||!path) return false;
+  if(!owner) return false;
   const normalizedPath=String(path).replace(/\\/g,'/');
-  const parts=normalizedPath.split('/').filter(Boolean);
-  const name=parts.pop();
+  const normalizedParts=parts;
+  const name=normalizedParts.pop();
   if(!name) return false;
-  const dir=parts.length?parts.join('/'):'.';
+  const dir=normalizedParts.length?normalizedParts.join('/'):'.';
   const route = _workspaceRouteForPathRel(dir,'list',{
     owner,
     _preserveArtifactPath: !!opts._preserveArtifactPath,
