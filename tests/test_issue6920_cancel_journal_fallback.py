@@ -36,6 +36,9 @@ def _isolate_state(tmp_path, monkeypatch):
         getattr(config, mapping_name).clear()
     config.ACTIVE_RUNS.clear()
     config.SESSION_AGENT_LOCKS.clear()
+    config.STREAM_SESSION_OWNERS.clear()
+    config.SESSION_WRITEBACK_OWNERS.clear()
+    config.STREAM_CANCEL_GENERATIONS.clear()
     yield
     models.SESSIONS.clear()
     for mapping_name in (
@@ -49,6 +52,9 @@ def _isolate_state(tmp_path, monkeypatch):
         getattr(config, mapping_name).clear()
     config.ACTIVE_RUNS.clear()
     config.SESSION_AGENT_LOCKS.clear()
+    config.STREAM_SESSION_OWNERS.clear()
+    config.SESSION_WRITEBACK_OWNERS.clear()
+    config.STREAM_CANCEL_GENERATIONS.clear()
 
 
 def _session(session_id: str, stream_id: str) -> Session:
@@ -76,11 +82,90 @@ def _start_cancel_state(session_id: str, stream_id: str):
     return agent
 
 
+def _seed_successor_progress(session, prompt: str, tool_name: str) -> None:
+    """Persist a progressed successor so the old splice must preserve its owner indexes."""
+    user = {
+        "role": "user",
+        "content": prompt,
+        "timestamp": 20,
+    }
+    assistant = {
+        "role": "assistant",
+        "content": f"{tool_name} successor answer",
+        "timestamp": 21,
+    }
+    session.messages.extend([user, assistant])
+    session.context_messages.extend([copy.deepcopy(user), copy.deepcopy(assistant)])
+    session.tool_calls = [
+        {
+            "name": tool_name,
+            "preview": f"{tool_name} successor result",
+            "assistant_msg_idx": len(session.messages) - 1,
+            "done": True,
+        },
+    ]
+    session.save()
+
+
+def _seed_historical_duplicate_prompt(session) -> None:
+    """Keep an older equal-text user turn to exercise boundary identity."""
+    historical_user = {
+        "role": "user",
+        "content": session.pending_user_message,
+        "timestamp": 0.5,
+    }
+    historical_assistant = {
+        "role": "assistant",
+        "content": "Historical answer before the cancelled turn.",
+        "timestamp": 0.75,
+    }
+    session.messages.extend([historical_user, historical_assistant])
+    session.context_messages.extend(
+        [copy.deepcopy(historical_user), copy.deepcopy(historical_assistant)]
+    )
+    session.save()
+
+
 def _assistant_rows(session):
     return [
         message for message in session.messages
         if isinstance(message, dict) and message.get("role") == "assistant"
     ]
+
+
+def _block_recovered_session_save(monkeypatch, recovered_text):
+    """Hold the final recovered save so ownership can be observed in-flight."""
+    original_save = Session.save
+    save_entered = threading.Event()
+    release_save = threading.Event()
+    save_returned = threading.Event()
+
+    def gated_save(session, *args, **kwargs):
+        recovered = any(
+            isinstance(row, dict)
+            and row.get("_recovered_from_run_journal") is True
+            and recovered_text in str(row.get("content") or "")
+            for row in getattr(session, "messages", [])
+        ) or any(
+            isinstance(tool, dict)
+            and tool.get("_recovered_from_run_journal") is True
+            and recovered_text in {
+                tool.get("preview"),
+                tool.get("summary"),
+            }
+            for tool in getattr(session, "tool_calls", [])
+        )
+        if recovered:
+            save_entered.set()
+            assert release_save.wait(timeout=5), "recovered Session.save was not released"
+            try:
+                return original_save(session, *args, **kwargs)
+            finally:
+                save_returned.set()
+        return original_save(session, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "save", gated_save)
+    return save_entered, release_save, save_returned
 
 
 def test_empty_live_buffers_recover_journal_prose_before_cancel_marker():
@@ -1019,3 +1104,1485 @@ def test_settlement_preserves_recovered_tool_owner_and_summary():
     assert isinstance(owner_index, int)
     assert reloaded.messages[owner_index].get("_recovered_event_id") == f"{stream_id}:4"
     assert reloaded.messages[owner_index].get("_recovered_from_run_journal") is True
+
+
+def test_local_cancel_before_flag_registration_stops_worker(tmp_path, monkeypatch):
+    """A cancel between queue capture and flag registration reaches the worker."""
+    sid = "issue6920_preflag_local"
+    stream_id = "stream-preflag-local"
+    late_text = "Late local callback must not run after preflight cancel."
+    session = _session(sid, stream_id)
+    config.register_stream_owner(stream_id, sid)
+    config.register_session_writeback_owner(sid, stream_id)
+    config.STREAMS[stream_id] = queue.Queue()
+
+    registration_entered = threading.Event()
+    release_registration = threading.Event()
+    provider_started = threading.Event()
+    callback_started = threading.Event()
+    register_original = streaming.register_stream_cancel_state
+
+    def gated_registration(session_id, current_stream_id, cancel_event):
+        registration_entered.set()
+        assert release_registration.wait(timeout=5), "worker flag registration was not released"
+        return register_original(session_id, current_stream_id, cancel_event)
+
+    monkeypatch.setattr(streaming, "register_stream_cancel_state", gated_registration)
+
+    class FakeAgent:
+        def __init__(self, *, interim_assistant_callback=None, session_id=None, **_kwargs):
+            provider_started.set()
+            self.session_id = session_id or sid
+            self.interim_assistant_callback = interim_assistant_callback
+            self.context_compressor = None
+            self.ephemeral_system_prompt = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            callback_started.set()
+            if self.interim_assistant_callback:
+                self.interim_assistant_callback(late_text)
+            return {
+                "completed": True,
+                "final_response": "",
+                "messages": list(kwargs.get("conversation_history") or []),
+            }
+
+        def interrupt(self, _message):
+            return None
+
+    monkeypatch.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
+    monkeypatch.setattr(streaming, "resolve_model_provider", lambda *args, **kwargs: (
+        "test-model",
+        "test-provider",
+        None,
+    ))
+    monkeypatch.setattr(streaming, "get_config", lambda: {})
+    monkeypatch.setattr(config, "get_config", lambda: {})
+    monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "reconciled_state_db_messages_for_session", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
+
+    errors = []
+
+    def run_worker():
+        try:
+            streaming._run_agent_streaming(
+                sid,
+                session.pending_user_message,
+                "test-model",
+                str(tmp_path),
+                stream_id,
+                [],
+                model_provider="test-provider",
+            )
+        except BaseException as exc:  # pragma: no cover - failure surface
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_worker, daemon=True)
+    worker.start()
+    assert registration_entered.wait(timeout=5), "local worker did not reach pre-flag seam"
+
+    assert streaming.cancel_stream(stream_id) is True
+    assert worker.is_alive(), "cancel_stream must return before worker registration resumes"
+    assert config.session_writeback_owner(sid) == stream_id
+
+    release_registration.set()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "local worker did not finish after preflight cancellation"
+    assert not errors
+    assert not provider_started.is_set()
+    assert not callback_started.is_set()
+    assert (sid, stream_id) not in config.STREAM_CANCEL_GENERATIONS
+    assert config.session_writeback_owner(sid) is None
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    assert reloaded.active_stream_id is None
+    assert reloaded.pending_user_message is None
+    assert sum(row.get("_error") is True for row in reloaded.messages) == 1
+    assert not any(late_text in str(row.get("content") or "") for row in reloaded.messages)
+
+
+def test_gateway_cancel_before_flag_registration_stops_worker(tmp_path, monkeypatch):
+    """Gateway observes the shared preflight cancellation barrier too."""
+    import api.gateway_chat as gateway_chat
+
+    sid = "issue6920_preflag_gateway"
+    stream_id = "stream-preflag-gateway"
+    late_text = "Late gateway callback must not run after preflight cancel."
+    session = _session(sid, stream_id)
+    config.register_stream_owner(stream_id, sid)
+    config.register_session_writeback_owner(sid, stream_id)
+    config.STREAMS[stream_id] = queue.Queue()
+
+    registration_entered = threading.Event()
+    release_registration = threading.Event()
+    provider_started = threading.Event()
+    callback_started = threading.Event()
+    register_original = gateway_chat.register_stream_cancel_state
+
+    def gated_registration(session_id, current_stream_id, cancel_event):
+        registration_entered.set()
+        assert release_registration.wait(timeout=5), "gateway worker flag registration was not released"
+        return register_original(session_id, current_stream_id, cancel_event)
+
+    monkeypatch.setattr(gateway_chat, "register_stream_cancel_state", gated_registration)
+    monkeypatch.setattr(config, "get_config", lambda: {})
+    monkeypatch.setattr(gateway_chat, "_gateway_base_url", lambda *_args, **_kwargs: "http://gateway.test")
+    monkeypatch.setattr(gateway_chat, "_gateway_api_key", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(gateway_chat, "_gateway_use_runs_api_enabled", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(gateway_chat, "_gateway_reasoning_effort_for_request", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(config, "_main_model_request_overrides", lambda *_args, **_kwargs: {})
+
+    def fake_runs_api(*_args, **kwargs):
+        provider_started.set()
+        callback_started.set()
+        kwargs["put_gateway_event"]("token", {"text": late_text})
+        return late_text, {"input_tokens": 1, "output_tokens": 1, "estimated_cost": 0}
+
+    monkeypatch.setattr(gateway_chat, "_run_gateway_runs_api_streaming", fake_runs_api)
+    errors = []
+
+    def run_worker():
+        try:
+            gateway_chat._run_gateway_chat_streaming(
+                sid,
+                session.pending_user_message,
+                "test-model",
+                str(tmp_path),
+                stream_id,
+                [],
+                model_provider="test-provider",
+            )
+        except BaseException as exc:  # pragma: no cover - failure surface
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_worker, daemon=True)
+    worker.start()
+    assert registration_entered.wait(timeout=5), "gateway worker did not reach pre-flag seam"
+
+    assert streaming.cancel_stream(stream_id) is True
+    assert worker.is_alive(), "cancel_stream must return before gateway registration resumes"
+    assert config.session_writeback_owner(sid) == stream_id
+
+    release_registration.set()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "gateway worker did not finish after preflight cancellation"
+    assert not errors
+    assert not provider_started.is_set()
+    assert not callback_started.is_set()
+    assert (sid, stream_id) not in config.STREAM_CANCEL_GENERATIONS
+    assert config.session_writeback_owner(sid) is None
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    assert reloaded.active_stream_id is None
+    assert reloaded.pending_user_message is None
+    assert sum(row.get("_error") is True for row in reloaded.messages) == 1
+    assert not any(late_text in str(row.get("content") or "") for row in reloaded.messages)
+
+
+def test_local_cancel_finalizer_defers_until_cancel_records_user_boundary(tmp_path, monkeypatch):
+    """A worker finalizer must not recover journal rows before cancel owns its user turn."""
+    sid = "issue6920_finalizer_boundary_local"
+    stream_id = "stream-finalizer-boundary-local"
+    late_text = "Late output recovered after the finalizer race."
+    session = _session(sid, stream_id)
+    cancelled_prompt = session.pending_user_message
+    config.register_stream_owner(stream_id, sid)
+    config.register_session_writeback_owner(sid, stream_id)
+    config.STREAMS[stream_id] = queue.Queue()
+
+    callback_done = threading.Event()
+    interrupt_entered = threading.Event()
+    release_interrupt = threading.Event()
+    cancel_returned = threading.Event()
+    cancel_result = []
+    errors = []
+
+    class FakeAgent:
+        def __init__(self, *, interim_assistant_callback=None, session_id=None, **_kwargs):
+            self.session_id = session_id or sid
+            self.interim_assistant_callback = interim_assistant_callback
+            self.context_compressor = None
+            self.ephemeral_system_prompt = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            if self.interim_assistant_callback:
+                self.interim_assistant_callback(late_text)
+            callback_done.set()
+            cancel_flag = config.CANCEL_FLAGS[stream_id]
+            while not cancel_flag.wait(0.01):
+                pass
+            return {
+                "completed": False,
+                "final_response": "",
+                "messages": list(kwargs.get("conversation_history") or []),
+            }
+
+        def interrupt(self, _message):
+            interrupt_entered.set()
+            release_interrupt.wait(timeout=5)
+
+    monkeypatch.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
+    monkeypatch.setattr(streaming, "resolve_model_provider", lambda *args, **kwargs: (
+        "test-model",
+        "test-provider",
+        None,
+    ))
+    monkeypatch.setattr(streaming, "get_config", lambda: {})
+    monkeypatch.setattr(config, "get_config", lambda: {})
+    monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "reconciled_state_db_messages_for_session", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
+
+    def run_worker():
+        try:
+            streaming._run_agent_streaming(
+                sid,
+                session.pending_user_message,
+                "test-model",
+                str(tmp_path),
+                stream_id,
+                [],
+                model_provider="test-provider",
+            )
+        except BaseException as exc:  # pragma: no cover - failure surface
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_worker, daemon=True)
+    worker.start()
+    assert callback_done.wait(timeout=5), "local worker did not publish its journal segment"
+
+    def run_cancel():
+        try:
+            cancel_result.append(streaming.cancel_stream(stream_id))
+        finally:
+            cancel_returned.set()
+
+    cancel_thread = threading.Thread(target=run_cancel, daemon=True)
+    cancel_thread.start()
+    assert interrupt_entered.wait(timeout=5), "cancel_stream did not reach the real agent interrupt"
+
+    # The worker finalizer wins the session lock while cancel_stream is still
+    # blocked in interrupt(). It must leave the exact generation pending rather
+    # than recovering journal output without a cancelled-user boundary.
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "local worker finalizer did not complete"
+    assert not cancel_returned.is_set()
+    assert not errors
+    assert config.STREAM_CANCEL_GENERATIONS[(sid, stream_id)]["worker_done"] is True
+    assert config.STREAM_CANCEL_GENERATIONS[(sid, stream_id)]["turn_start"] is None
+    blocked = Session.load(sid)
+    assert blocked is not None
+    assert not any(row.get("content") == late_text for row in blocked.messages)
+    assert not any(row.get("content") == cancelled_prompt for row in blocked.messages)
+
+    release_interrupt.set()
+    assert cancel_returned.wait(timeout=10), "cancel_stream did not finish after interrupt release"
+    cancel_thread.join(timeout=1)
+    assert cancel_result == [True]
+    assert (sid, stream_id) not in config.STREAM_CANCEL_GENERATIONS
+    assert config.session_writeback_owner(sid) is None
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    user_index = next(
+        index
+        for index, row in enumerate(reloaded.messages)
+        if row.get("role") == "user" and row.get("content") == cancelled_prompt
+    )
+    late_index = next(
+        index
+        for index, row in enumerate(reloaded.messages)
+        if row.get("content") == late_text
+        and row.get("_recovered_from_run_journal") is True
+    )
+    marker_index = next(
+        index for index, row in enumerate(reloaded.messages) if row.get("_error") is True
+    )
+    assert user_index < late_index < marker_index
+    assert sum(row.get("content") == late_text for row in reloaded.messages) == 1
+    context = _context_messages_for_new_turn(reloaded, "What happened?")
+    assert sum(row.get("content") == late_text for row in context) == 1
+
+
+def test_local_cancel_finalizes_late_admitted_journal_after_empty_snapshot(tmp_path, monkeypatch):
+    sid = "issue6920_late_empty_local"
+    stream_id = "stream-late-empty-local"
+    late_text = "Late local prose admitted before cancellation."
+    session = _session(sid, stream_id)
+    _seed_historical_duplicate_prompt(session)
+    cancelled_prompt = session.pending_user_message
+    successor_prompt = cancelled_prompt
+    config.register_stream_owner(stream_id, sid)
+    config.register_session_writeback_owner(sid, stream_id)
+    config.STREAMS[stream_id] = queue.Queue()
+
+    admitted = threading.Event()
+    release_append = threading.Event()
+    append_original = RunJournalWriter.append_sse_event
+
+    def gated_append(writer, event, data):
+        if event == "interim_assistant" and isinstance(data, dict) and data.get("text") == late_text:
+            admitted.set()
+            assert release_append.wait(timeout=5), "late journal append was not released"
+        return append_original(writer, event, data)
+
+    monkeypatch.setattr(RunJournalWriter, "append_sse_event", gated_append)
+    save_entered, release_save, save_returned = _block_recovered_session_save(
+        monkeypatch,
+        late_text,
+    )
+    successor_snapshot_ready = threading.Event()
+    release_successor_settle = threading.Event()
+    successor_finished = threading.Event()
+    agent_run_count = {'value': 0}
+    agent_run_lock = threading.Lock()
+    successor_provider_history = []
+
+    class FakeAgent:
+        def __init__(
+            self,
+            *,
+            stream_delta_callback=None,
+            reasoning_callback=None,
+            tool_progress_callback=None,
+            clarify_callback=None,
+            interim_assistant_callback=None,
+            tool_start_callback=None,
+            tool_complete_callback=None,
+            status_callback=None,
+            session_id=None,
+            **_kwargs,
+        ):
+            self.session_id = session_id or sid
+            self.stream_delta_callback = stream_delta_callback
+            self.reasoning_callback = reasoning_callback
+            self.tool_progress_callback = tool_progress_callback
+            self.interim_assistant_callback = interim_assistant_callback
+            self.tool_start_callback = tool_start_callback
+            self.tool_complete_callback = tool_complete_callback
+            self.status_callback = status_callback
+            self.context_compressor = None
+            self.ephemeral_system_prompt = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            with agent_run_lock:
+                agent_run_count['value'] += 1
+                run_number = agent_run_count['value']
+            if run_number == 1:
+                self.interim_assistant_callback(late_text)
+                return {
+                    "completed": True,
+                    "final_response": "",
+                    "messages": list(kwargs.get("conversation_history") or []),
+                }
+            history = copy.deepcopy(kwargs.get("conversation_history") or [])
+            successor_provider_history.append(history)
+            successor_snapshot_ready.set()
+            assert release_successor_settle.wait(timeout=10), (
+                "successor provider did not reach its settlement gate"
+            )
+            tool_id = "successor-tool-id"
+            tool_name = "local_empty_tool"
+            tool_args = {"command": "printf successor"}
+            if callable(self.tool_start_callback):
+                self.tool_start_callback(tool_id, tool_name, tool_args)
+            if callable(self.tool_complete_callback):
+                self.tool_complete_callback(
+                    tool_id,
+                    tool_name,
+                    tool_args,
+                    "local successor result",
+                )
+            successor_finished.set()
+            successor_user = {
+                "role": "user",
+                "content": kwargs.get("persist_user_message") or successor_prompt,
+            }
+            return {
+                "completed": True,
+                "final_response": "local_empty_tool successor answer",
+                "messages": history + [
+                    successor_user,
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": tool_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(tool_args),
+                            },
+                        }],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "content": "local successor result",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "local_empty_tool successor answer",
+                    },
+                ],
+            }
+
+        def interrupt(self, _message):
+            return None
+
+    monkeypatch.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
+    monkeypatch.setattr(streaming, "resolve_model_provider", lambda *args, **kwargs: (
+        "test-model",
+        "test-provider",
+        None,
+    ))
+    monkeypatch.setattr(streaming, "get_config", lambda: {})
+    monkeypatch.setattr(config, "get_config", lambda: {})
+    monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
+
+    def _reconciled_state_messages(current, *args, prefer_context=False, **kwargs):
+        field = "context_messages" if prefer_context else "messages"
+        return copy.deepcopy(getattr(current, field, None) or [])
+
+    monkeypatch.setattr(
+        streaming,
+        "reconciled_state_db_messages_for_session",
+        _reconciled_state_messages,
+    )
+    monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
+
+    errors = []
+
+    def run_worker():
+        try:
+            streaming._run_agent_streaming(
+                sid,
+                session.pending_user_message,
+                "test-model",
+                str(tmp_path),
+                stream_id,
+                [],
+                model_provider="test-provider",
+            )
+        except BaseException as exc:  # pragma: no cover - failure surface
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_worker, daemon=True)
+    worker.start()
+    assert admitted.wait(timeout=5), "real local event bridge did not admit the late event"
+
+    assert streaming.cancel_stream(stream_id) is True
+    assert worker.is_alive(), "cancel_stream must return before the provider worker completes"
+    assert config.session_writeback_owner(sid) == stream_id
+
+    # The production admission helper must be able to claim a successor while
+    # the old generation is still blocked inside its durable journal append.
+    import api.routes as routes
+
+    models.SESSIONS.pop(sid, None)
+    successor = Session.load(sid)
+    assert successor is not None
+    models.SESSIONS[sid] = successor
+    monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: "deferred")
+    response = routes._start_chat_stream_for_session(
+        successor,
+        msg=successor_prompt,
+        attachments=[],
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+        external_runtime_owned=False,
+    )
+    assert response["session_id"] == sid
+    successor_stream_id = response["stream_id"]
+    assert successor.active_stream_id == successor_stream_id
+    assert successor.pending_user_message == successor_prompt
+    assert config.session_writeback_owner(sid) == successor_stream_id
+    assert successor_snapshot_ready.wait(timeout=10), (
+        "real successor worker did not capture its provider snapshot"
+    )
+    assert successor_provider_history
+    assert not any(
+        row.get("content") == late_text
+        for row in successor_provider_history[0]
+        if isinstance(row, dict)
+    )
+    assert not release_append.is_set(), "successor settled before the old append was released"
+
+    release_append.set()
+    assert save_entered.wait(timeout=5), "final recovered Session.save did not block"
+    assert (sid, stream_id) in config.STREAM_CANCEL_GENERATIONS
+    assert config.STREAM_CANCEL_GENERATIONS[(sid, stream_id)]["reconcile_started"] is True
+    blocked = Session.load(sid)
+    assert blocked is not None
+    assert not any(
+        row.get("content") == late_text
+        and row.get("_recovered_from_run_journal") is True
+        for row in blocked.messages
+    )
+    assert config.session_writeback_owner(sid) == successor_stream_id
+    assert successor.active_stream_id == successor_stream_id
+    assert successor.pending_user_message == successor_prompt
+    assert not save_returned.is_set()
+    release_save.set()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "local worker did not reach its finalizer"
+    assert not errors
+    assert save_returned.is_set()
+    assert (sid, stream_id) not in config.STREAM_CANCEL_GENERATIONS
+    # The old finalizer must not clear the successor's writeback claim.
+    assert config.session_writeback_owner(sid) == successor_stream_id
+    assert successor.active_stream_id == successor_stream_id
+    assert successor.pending_user_message == successor_prompt
+
+    # The successor captured its provider request before old-generation
+    # reconciliation.  Let it settle only after that reconciliation has
+    # durably committed and retired the old ownership record.
+    assert (sid, stream_id) not in config.STREAM_CANCEL_GENERATIONS
+    release_successor_settle.set()
+    assert successor_finished.wait(timeout=10), "successor worker did not finish"
+    successor_thread = config.ACTIVE_RUNS.get(successor_stream_id)
+    if successor_thread is not None and hasattr(successor_thread, "join"):
+        successor_thread.join(timeout=10)
+    for _ in range(200):
+        if (
+            successor.active_stream_id is None
+            and config.session_writeback_owner(sid) is None
+        ):
+            break
+        threading.Event().wait(0.05)
+    assert config.session_writeback_owner(sid) is None
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    late_rows = [
+        (index, row)
+        for index, row in enumerate(reloaded.messages)
+        if row.get("role") == "assistant"
+        and row.get("content") == late_text
+        and row.get("_recovered_from_run_journal") is True
+    ]
+    assert len(late_rows) == 1
+    user_index = next(
+        index
+        for index, row in enumerate(reloaded.messages)
+        if (
+            row.get("role") == "user"
+            and row.get("content") == cancelled_prompt
+            and row.get("timestamp") == 1
+        )
+    )
+    marker_index = next(
+        index for index, row in enumerate(reloaded.messages) if row.get("_error") is True
+    )
+    assert user_index < late_rows[0][0] < marker_index
+    successor_user_index = next(
+        index
+        for index, row in enumerate(reloaded.messages)
+        if (
+            index > marker_index
+            and row.get("role") == "user"
+            and row.get("content") == successor_prompt
+        )
+    )
+    assert marker_index < successor_user_index
+    next_context = _context_messages_for_new_turn(reloaded, successor_prompt)
+    late_context_indices = [
+        index
+        for index, row in enumerate(next_context)
+        if row.get("content") == late_text
+    ]
+    assert len(late_context_indices) == 1
+    assert late_context_indices[0] < next(
+        index
+        for index, row in enumerate(next_context)
+        if row.get("content") == "local_empty_tool successor answer"
+    )
+    reloaded_successor_tool = next(
+        tool for tool in reloaded.tool_calls if tool.get("name") == "local_empty_tool"
+    )
+    successor_owner = reloaded.messages[reloaded_successor_tool["assistant_msg_idx"]]
+    assert successor_owner.get("role") == "assistant"
+    assert successor_owner.get("tool_calls", [])[0]["id"] == "successor-tool-id"
+    assert any(
+        row.get("content") == "local_empty_tool successor answer"
+        for row in reloaded.messages
+    )
+
+    assert sum(row.get("content") == late_text for row in successor.messages) == 1
+    assert successor.active_stream_id is None
+    assert successor.pending_user_message is None
+
+
+def test_local_cancel_finalizes_late_admitted_journal_after_live_partial(tmp_path, monkeypatch):
+    sid = "issue6920_late_live_local"
+    stream_id = "stream-late-live-local"
+    token_a = "Repeated prefix"
+    token_b = " token B"
+    live_text = f"{token_a}{token_b}"
+    late_segment = "Late local prose after the tool boundary."
+    late_text = f"{token_a} {late_segment}"
+    session = _session(sid, stream_id)
+    _seed_historical_duplicate_prompt(session)
+    historical_live_partial = {
+        "role": "assistant",
+        "content": "Unrelated historical live partial before the cancelled turn.",
+        "_partial": True,
+        "timestamp": 0.9,
+    }
+    session.messages.append(historical_live_partial)
+    session.context_messages.append(copy.deepcopy(historical_live_partial))
+    session.save()
+    cancelled_prompt = session.pending_user_message
+    successor_prompt = cancelled_prompt
+    config.register_stream_owner(stream_id, sid)
+    config.register_session_writeback_owner(sid, stream_id)
+    config.STREAMS[stream_id] = queue.Queue()
+
+    admitted = threading.Event()
+    release_append = threading.Event()
+    append_original = RunJournalWriter.append_sse_event
+
+    def gated_append(writer, event, data):
+        if event == "interim_assistant" and isinstance(data, dict) and data.get("text") == late_text:
+            admitted.set()
+            assert release_append.wait(timeout=5), "late journal append was not released"
+        return append_original(writer, event, data)
+
+    monkeypatch.setattr(RunJournalWriter, "append_sse_event", gated_append)
+    save_entered, release_save, save_returned = _block_recovered_session_save(
+        monkeypatch,
+        late_segment,
+    )
+
+    class FakeAgent:
+        def __init__(
+            self,
+            *,
+            stream_delta_callback=None,
+            reasoning_callback=None,
+            tool_progress_callback=None,
+            clarify_callback=None,
+            interim_assistant_callback=None,
+            tool_start_callback=None,
+            tool_complete_callback=None,
+            status_callback=None,
+            session_id=None,
+            **_kwargs,
+        ):
+            self.session_id = session_id or sid
+            self.stream_delta_callback = stream_delta_callback
+            self.reasoning_callback = reasoning_callback
+            self.tool_progress_callback = tool_progress_callback
+            self.interim_assistant_callback = interim_assistant_callback
+            self.tool_start_callback = tool_start_callback
+            self.tool_complete_callback = tool_complete_callback
+            self.status_callback = status_callback
+            self.context_compressor = None
+            self.ephemeral_system_prompt = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            # Drive the production token bridge so two ordered token segments
+            # overlap the aggregate live partial. Flush a tool round between
+            # them, then publish a later identity-distinct interim whose text
+            # shares token A's prefix but does not represent token B.
+            self.stream_delta_callback(token_a)
+            self.tool_start_callback(
+                "live-tool-id",
+                "terminal",
+                {"command": "printf live"},
+            )
+            self.tool_complete_callback(
+                "live-tool-id",
+                "terminal",
+                {"command": "printf live"},
+                "live tool result",
+            )
+            self.stream_delta_callback(token_b)
+            self.interim_assistant_callback(late_text)
+            return {
+                "completed": True,
+                "final_response": "",
+                "messages": list(kwargs.get("conversation_history") or []),
+            }
+
+        def interrupt(self, _message):
+            return None
+
+    monkeypatch.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
+    monkeypatch.setattr(streaming, "resolve_model_provider", lambda *args, **kwargs: (
+        "test-model",
+        "test-provider",
+        None,
+    ))
+    monkeypatch.setattr(streaming, "get_config", lambda: {})
+    monkeypatch.setattr(config, "get_config", lambda: {})
+    monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        streaming,
+        "reconciled_state_db_messages_for_session",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
+
+    errors = []
+
+    def run_worker():
+        try:
+            streaming._run_agent_streaming(
+                sid,
+                session.pending_user_message,
+                "test-model",
+                str(tmp_path),
+                stream_id,
+                [],
+                model_provider="test-provider",
+            )
+        except BaseException as exc:  # pragma: no cover - failure surface
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_worker, daemon=True)
+    worker.start()
+    assert admitted.wait(timeout=5), "real local event bridge did not admit the late event"
+
+    assert streaming.cancel_stream(stream_id) is True
+    assert worker.is_alive(), "cancel_stream must return before the provider worker completes"
+    assert config.session_writeback_owner(sid) == stream_id
+
+    # Admit the successor through the real chat-start helper before the late
+    # append is released.  The old generation must remain claimable without
+    # overwriting this successor's pending state.
+    import api.routes as routes
+
+    models.SESSIONS.pop(sid, None)
+    successor = Session.load(sid)
+    assert successor is not None
+    models.SESSIONS[sid] = successor
+    monkeypatch.setattr(routes, "_run_agent_streaming", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: "deferred")
+    response = routes._start_chat_stream_for_session(
+        successor,
+        msg=successor_prompt,
+        attachments=[],
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+        external_runtime_owned=False,
+    )
+    assert response["session_id"] == sid
+    successor_stream_id = response["stream_id"]
+    assert successor.active_stream_id == successor_stream_id
+    assert successor.pending_user_message == successor_prompt
+    assert config.session_writeback_owner(sid) == successor_stream_id
+    _seed_successor_progress(successor, successor_prompt, "local_live_tool")
+    successor_tool_before = next(
+        tool for tool in successor.tool_calls if tool.get("name") == "local_live_tool"
+    )
+    successor_owner_before = successor.messages[successor_tool_before["assistant_msg_idx"]]
+
+    release_append.set()
+    assert save_entered.wait(timeout=5), "final recovered Session.save did not block"
+    assert (sid, stream_id) in config.STREAM_CANCEL_GENERATIONS
+    assert config.STREAM_CANCEL_GENERATIONS[(sid, stream_id)]["reconcile_started"] is True
+    blocked = Session.load(sid)
+    assert blocked is not None
+    assert not any(
+        row.get("content") == late_text
+        and row.get("_recovered_from_run_journal") is True
+        for row in blocked.messages
+    )
+    assert config.session_writeback_owner(sid) == successor_stream_id
+    assert successor.active_stream_id == successor_stream_id
+    assert successor.pending_user_message == successor_prompt
+    blocked_tool = next(
+        tool for tool in successor.tool_calls if tool.get("name") == "local_live_tool"
+    )
+    assert successor.messages[blocked_tool["assistant_msg_idx"]]["content"] == (
+        "local_live_tool successor answer"
+    )
+    assert not save_returned.is_set()
+    release_save.set()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "local worker did not reach its finalizer"
+    assert not errors
+    assert save_returned.is_set()
+    assert (sid, stream_id) not in config.STREAM_CANCEL_GENERATIONS
+    assert config.session_writeback_owner(sid) == successor_stream_id
+    successor_tool = next(
+        tool for tool in successor.tool_calls if tool.get("name") == "local_live_tool"
+    )
+    successor_owner_index = successor_tool["assistant_msg_idx"]
+    assert successor.messages[successor_owner_index]["content"] == (
+        "local_live_tool successor answer"
+    )
+    assert successor.messages[successor_owner_index] is successor_owner_before
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    recovered = [
+        row for row in reloaded.messages
+        if row.get("role") == "assistant" and row.get("_partial") is True
+    ]
+    assert sum(row.get("content") == live_text for row in recovered) == 1
+    assert sum(row.get("content") == late_text for row in recovered) == 1, reloaded.messages
+    assert sum(token_b in str(row.get("content") or "") for row in recovered) == 1
+    user_index = next(
+        index
+        for index, row in enumerate(reloaded.messages)
+        if (
+            row.get("role") == "user"
+            and row.get("content") == cancelled_prompt
+            and row.get("timestamp") == 1
+        )
+    )
+    late_index = next(
+        index
+        for index, row in enumerate(reloaded.messages)
+        if row.get("content") == late_text
+    )
+    marker_index = next(
+        index for index, row in enumerate(reloaded.messages) if row.get("_error") is True
+    )
+    assert user_index < late_index < marker_index
+    successor_user_index = next(
+        index
+        for index, row in enumerate(reloaded.messages)
+        if row.get("role") == "user"
+        and row.get("content") == successor_prompt
+        and row.get("timestamp") == 20
+    )
+    assert marker_index < successor_user_index
+    next_context = _context_messages_for_new_turn(reloaded, successor_prompt)
+    assert sum(row.get("content") == live_text for row in next_context) == 1
+    assert sum(row.get("content") == late_text for row in next_context) == 1
+    assert sum(token_b in str(row.get("content") or "") for row in next_context) == 1
+    assert sum(late_segment in str(row.get("content") or "") for row in next_context) == 1
+    assert sum(row.get("content") == token_a for row in next_context) == 0
+    successor_context_user_index = next(
+        index
+        for index, row in enumerate(next_context)
+        if row.get("role") == "user"
+        and row.get("content") == successor_prompt
+        and row.get("timestamp") == 20
+    )
+    old_stream_context_rows = [
+        (index, row)
+        for index, row in enumerate(next_context)
+        if row.get("_recovered_from_run_journal") is True
+        and row.get("_recovered_stream_id") == stream_id
+    ]
+    assert old_stream_context_rows
+    assert all(index < successor_context_user_index for index, _row in old_stream_context_rows)
+    cancelled_context_index = next(
+        index
+        for index, row in enumerate(next_context)
+        if row.get("role") == "user"
+        and row.get("content") == cancelled_prompt
+        and row.get("timestamp") == 1
+    )
+    late_context_index = next(
+        index
+        for index, row in enumerate(next_context)
+        if row.get("content") == late_text
+    )
+    assert cancelled_context_index < late_context_index
+
+    assert successor.pending_user_message == successor_prompt
+    assert successor.active_stream_id == successor_stream_id
+    successor_tool = next(
+        tool for tool in successor.tool_calls if tool.get("name") == "local_live_tool"
+    )
+    assert successor.messages[successor_tool["assistant_msg_idx"]]["content"] == (
+        "local_live_tool successor answer"
+    )
+    config.STREAMS.pop(successor_stream_id, None)
+    config.unregister_stream_owner(successor_stream_id)
+    config.clear_session_writeback_owner_if_owned(sid, successor_stream_id)
+
+
+def test_gateway_cancel_finalizes_late_admitted_journal_before_owner_retirement(tmp_path, monkeypatch):
+    sid = "issue6920_late_gateway"
+    stream_id = "stream-late-gateway"
+    late_preview = "Late gateway tool output."
+    session = _session(sid, stream_id)
+    _seed_historical_duplicate_prompt(session)
+    cancelled_prompt = session.pending_user_message
+    successor_prompt = cancelled_prompt
+    config.register_stream_owner(stream_id, sid)
+    config.register_session_writeback_owner(sid, stream_id)
+    config.STREAMS[stream_id] = queue.Queue()
+
+    import api.gateway_chat as gateway_chat
+    real_runs_api = gateway_chat._run_gateway_runs_api_streaming
+
+    admitted = threading.Event()
+    release_append = threading.Event()
+    append_original = RunJournalWriter.append_sse_event
+
+    def gated_append(writer, event, data):
+        if event == "tool" and isinstance(data, dict) and data.get("preview") == late_preview:
+            admitted.set()
+            assert release_append.wait(timeout=5), "late gateway journal append was not released"
+        return append_original(writer, event, data)
+
+    monkeypatch.setattr(RunJournalWriter, "append_sse_event", gated_append)
+    save_entered, release_save, save_returned = _block_recovered_session_save(
+        monkeypatch,
+        late_preview,
+    )
+    monkeypatch.setattr(config, "get_config", lambda: {})
+    monkeypatch.setattr(gateway_chat, "_gateway_base_url", lambda *_args, **_kwargs: "http://gateway.test")
+    monkeypatch.setattr(gateway_chat, "_gateway_api_key", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(gateway_chat, "_gateway_use_runs_api_enabled", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(gateway_chat, "_gateway_reasoning_effort_for_request", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(config, "_main_model_request_overrides", lambda *_args, **_kwargs: {})
+
+    def fake_runs_api(*_args, **kwargs):
+        kwargs["put_gateway_event"](
+            "tool",
+            {
+                "name": "terminal",
+                "preview": late_preview,
+                "args": {"command": "printf late"},
+            },
+        )
+        return "gateway answer after cancellation", {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "estimated_cost": 0,
+        }
+
+    monkeypatch.setattr(gateway_chat, "_run_gateway_runs_api_streaming", fake_runs_api)
+    errors = []
+
+    def run_worker():
+        try:
+            gateway_chat._run_gateway_chat_streaming(
+                sid,
+                session.pending_user_message,
+                "test-model",
+                str(tmp_path),
+                stream_id,
+                [],
+                model_provider="test-provider",
+            )
+        except BaseException as exc:  # pragma: no cover - failure surface
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_worker, daemon=True)
+    worker.start()
+    assert admitted.wait(timeout=5), "real gateway event bridge did not admit the late event"
+
+    assert streaming.cancel_stream(stream_id) is True
+    assert worker.is_alive(), "cancel_stream must return before the gateway worker completes"
+    assert config.session_writeback_owner(sid) == stream_id
+
+    # Admit the successor through the production chat-start helper while the
+    # old gateway publication is still blocked in its journal append.
+    import api.routes as routes
+
+    models.SESSIONS.pop(sid, None)
+    successor = Session.load(sid)
+    assert successor is not None
+    models.SESSIONS[sid] = successor
+    monkeypatch.setattr(routes, "_run_gateway_chat_streaming", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: "deferred")
+    response = routes._start_chat_stream_for_session(
+        successor,
+        msg=successor_prompt,
+        attachments=[],
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+        external_runtime_owned=True,
+    )
+    assert response["session_id"] == sid
+    successor_stream_id = response["stream_id"]
+    assert successor.active_stream_id == successor_stream_id
+    assert successor.pending_user_message == successor_prompt
+    assert config.session_writeback_owner(sid) == successor_stream_id
+    _seed_successor_progress(successor, successor_prompt, "gateway_successor_tool")
+
+    release_append.set()
+    assert save_entered.wait(timeout=5), "final recovered Session.save did not block"
+    assert (sid, stream_id) in config.STREAM_CANCEL_GENERATIONS
+    assert config.STREAM_CANCEL_GENERATIONS[(sid, stream_id)]["reconcile_started"] is True
+    blocked = Session.load(sid)
+    assert blocked is not None
+    assert not any(
+        row.get("content") == late_preview
+        and row.get("_recovered_from_run_journal") is True
+        for row in blocked.messages
+    )
+    assert config.session_writeback_owner(sid) == successor_stream_id
+    assert successor.active_stream_id == successor_stream_id
+    assert successor.pending_user_message == successor_prompt
+    blocked_tool = next(
+        tool for tool in successor.tool_calls if tool.get("name") == "gateway_successor_tool"
+    )
+    assert successor.messages[blocked_tool["assistant_msg_idx"]]["content"] == (
+        "gateway_successor_tool successor answer"
+    )
+    assert not save_returned.is_set()
+    release_save.set()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "gateway worker did not reach its finalizer"
+    assert not errors
+    assert save_returned.is_set()
+    assert (sid, stream_id) not in config.STREAM_CANCEL_GENERATIONS
+    assert config.session_writeback_owner(sid) == successor_stream_id
+    successor_tool = next(
+        tool
+        for tool in successor.tool_calls
+        if tool.get("name") == "gateway_successor_tool"
+    )
+    successor_owner_index = successor_tool["assistant_msg_idx"]
+    assert successor.messages[successor_owner_index]["content"] == (
+        "gateway_successor_tool successor answer"
+    )
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    recovered_tools = [
+        tool for tool in reloaded.tool_calls
+        if tool.get("preview") == late_preview
+        and tool.get("_recovered_stream_id") == stream_id
+    ]
+    assert len(recovered_tools) == 1
+    owner_index = recovered_tools[0].get("assistant_msg_idx")
+    assert isinstance(owner_index, int)
+    user_index = next(
+        index
+        for index, row in enumerate(reloaded.messages)
+        if (
+            row.get("role") == "user"
+            and row.get("content") == cancelled_prompt
+            and row.get("timestamp") == 1
+        )
+    )
+    marker_index = next(
+        index for index, row in enumerate(reloaded.messages) if row.get("_error") is True
+    )
+    assert user_index < owner_index < marker_index
+    successor_user_index = next(
+        index
+        for index, row in enumerate(reloaded.messages)
+        if row.get("role") == "user"
+        and row.get("content") == successor_prompt
+        and row.get("timestamp") == 20
+    )
+    assert marker_index < successor_user_index
+
+    assert sum(tool.get("preview") == late_preview for tool in successor.tool_calls) == 1
+    assert successor.pending_user_message == successor_prompt
+    assert successor.active_stream_id == successor_stream_id
+    successor_tool = next(
+        tool for tool in successor.tool_calls if tool.get("name") == "gateway_successor_tool"
+    )
+    assert successor.messages[successor_tool["assistant_msg_idx"]]["content"] == (
+        "gateway_successor_tool successor answer"
+    )
+    next_context = _context_messages_for_new_turn(reloaded, successor_prompt)
+    cancelled_context_index = next(
+        index
+        for index, row in enumerate(next_context)
+        if row.get("role") == "user"
+        and row.get("content") == cancelled_prompt
+        and row.get("timestamp") == 1
+    )
+    successor_context_index = next(
+        index
+        for index, row in enumerate(next_context)
+        if row.get("role") == "user"
+        and row.get("content") == successor_prompt
+        and row.get("timestamp") == 20
+    )
+    assert cancelled_context_index < successor_context_index
+    assert all("tool_calls" not in row for row in next_context)
+    assert not any(
+        row.get("role") == "tool" and row.get("content") == late_preview
+        for row in next_context
+    )
+    assert any(
+        tool.get("preview") == late_preview
+        and tool.get("_recovered_stream_id") == stream_id
+        for tool in reloaded.tool_calls
+    )
+    provider_requests = []
+
+    class _GatewayResponse:
+        def __init__(self, body=b"", lines=()):
+            self._body = body
+            self._lines = tuple(lines)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, *_args):
+            return self._body
+
+        def __iter__(self):
+            return iter(self._lines)
+
+    def capture_provider_request(request, timeout=None):
+        del timeout
+        if request.full_url.endswith("/v1/runs"):
+            provider_requests.append(json.loads(request.data.decode("utf-8")))
+            return _GatewayResponse(body=b'{"run_id":"next-run"}')
+        return _GatewayResponse(lines=(b"data: [DONE]\n",))
+
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", capture_provider_request)
+    real_runs_api(
+        sid,
+        "next gateway prompt",
+        "test-model",
+        str(tmp_path),
+        "stream-next-gateway",
+        "http://gateway.test",
+        "",
+        [],
+        {},
+        put_gateway_event=lambda *_args, **_kwargs: None,
+        cancel_event=threading.Event(),
+        attachments=[],
+        cfg={},
+        session=reloaded,
+        active_provider="test-provider",
+    )
+    assert len(provider_requests) == 1
+    provider_history = provider_requests[0].get("conversation_history") or []
+    assert all("tool_calls" not in row for row in provider_history)
+    assert not any(row.get("role") == "tool" for row in provider_history)
+    reloaded_successor_tool = next(
+        tool for tool in reloaded.tool_calls if tool.get("name") == "gateway_successor_tool"
+    )
+    assert reloaded.messages[reloaded_successor_tool["assistant_msg_idx"]]["content"] == (
+        "gateway_successor_tool successor answer"
+    )
+    config.STREAMS.pop(successor_stream_id, None)
+    config.unregister_stream_owner(successor_stream_id)
+    config.clear_session_writeback_owner_if_owned(sid, successor_stream_id)
+
+
+def _run_success_commit_late_stop_worker(
+    *,
+    worker_target,
+    sid: str,
+    old_stream: str,
+    tmp_path,
+    monkeypatch,
+    configure_worker,
+    external_runtime_owned: bool,
+    success_text: str,
+):
+    """Exercise the real producer pre-commit success/cancel race."""
+    session = _session(sid, old_stream)
+    old_prompt = session.pending_user_message
+    config.register_stream_owner(old_stream, sid)
+    config.register_session_writeback_owner(sid, old_stream)
+    config.STREAMS[old_stream] = queue.Queue()
+
+    success_save_entered = threading.Event()
+    release_success_save = threading.Event()
+    save_original = Session.save
+
+    def gated_success_save(session, *args, **kwargs):
+        assembled = any(
+            isinstance(row, dict)
+            and row.get("role") == "assistant"
+            and row.get("content") == success_text
+            for row in getattr(session, "messages", [])
+        )
+        if (
+            not success_save_entered.is_set()
+            and assembled
+            and getattr(session, "active_stream_id", None) is None
+            and getattr(session, "pending_user_message", None) is None
+        ):
+            success_save_entered.set()
+            assert release_success_save.wait(timeout=5), "success Session.save was not released"
+        return save_original(session, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "save", gated_success_save)
+    configure_worker()
+    errors = []
+
+    def run_worker():
+        try:
+            worker_target(
+                sid,
+                old_prompt,
+                "test-model",
+                str(tmp_path),
+                old_stream,
+                [],
+                model_provider="test-provider",
+            )
+        except BaseException as exc:  # pragma: no cover - failure surface
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_worker, daemon=True)
+    worker.start()
+    assert success_save_entered.wait(timeout=5), "real worker did not block pre-commit success save"
+    assert config.STREAM_CANCEL_GENERATIONS[(sid, old_stream)]["success_committed"] is False
+
+    # Stop arrives after success assembly cleared active/pending fields but
+    # before the durable success generation is marked.  The real cancel path
+    # must settle one coherent terminal outcome and retire this exact owner.
+    cancel_result = []
+    cancel_returned = threading.Event()
+
+    def run_cancel():
+        try:
+            cancel_result.append(cancel_stream(old_stream))
+        finally:
+            cancel_returned.set()
+
+    cancel_thread = threading.Thread(target=run_cancel, daemon=True)
+    cancel_thread.start()
+    for _ in range(100):
+        record = config.STREAM_CANCEL_GENERATIONS.get((sid, old_stream))
+        if record and record.get("cancel_requested"):
+            break
+        threading.Event().wait(0.01)
+    record = config.STREAM_CANCEL_GENERATIONS.get((sid, old_stream))
+    assert record is not None and record.get("cancel_requested") is True
+    assert not cancel_returned.is_set()
+    assert worker.is_alive(), "success worker should remain blocked in Session.save"
+
+    release_success_save.set()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "success worker did not reach its finalizer"
+    assert cancel_returned.wait(timeout=10), "cancel_stream did not settle after save release"
+    cancel_thread.join(timeout=1)
+    assert cancel_result == [True]
+    assert (sid, old_stream) not in config.STREAM_CANCEL_GENERATIONS, config.STREAM_CANCEL_GENERATIONS.get((sid, old_stream))
+    assert config.session_writeback_owner(sid) is None
+
+    saved_outcome = Session.load(sid)
+    assert saved_outcome is not None
+    assert any(
+        row.get("role") == "assistant" and row.get("_error") is True
+        for row in saved_outcome.messages
+    )
+    assert not any(
+        row.get("role") == "assistant"
+        and row.get("content") == success_text
+        and not (
+            row.get("_partial") is True
+            or row.get("_recovered_from_run_journal") is True
+        )
+        for row in saved_outcome.messages
+    )
+
+    import api.routes as routes
+
+    models.SESSIONS.pop(sid, None)
+    successor = Session.load(sid)
+    assert successor is not None
+    models.SESSIONS[sid] = successor
+    if external_runtime_owned:
+        monkeypatch.setattr(routes, "_run_gateway_chat_streaming", lambda *_args, **_kwargs: None)
+    else:
+        monkeypatch.setattr(routes, "_run_agent_streaming", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: "deferred")
+    response = routes._start_chat_stream_for_session(
+        successor,
+        msg="successor prompt",
+        attachments=[],
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+        external_runtime_owned=external_runtime_owned,
+    )
+    assert response["session_id"] == sid
+    successor_stream_id = response["stream_id"]
+    assert successor.active_stream_id == successor_stream_id
+    assert successor.pending_user_message == "successor prompt"
+    assert config.session_writeback_owner(sid) == successor_stream_id
+    _seed_successor_progress(
+        successor,
+        "successor prompt",
+        "gateway_successor_tool" if external_runtime_owned else "local_successor_tool",
+    )
+
+    assert not errors
+    assert config.session_writeback_owner(sid) == successor_stream_id
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    assert reloaded.active_stream_id == successor_stream_id
+    assert reloaded.pending_user_message == "successor prompt"
+    assert any(row.get("content") == old_prompt for row in reloaded.messages)
+    assert any(row.get("content") == "successor prompt" for row in reloaded.messages)
+    successor_tool_name = "gateway_successor_tool" if external_runtime_owned else "local_successor_tool"
+    successor_tool = next(
+        tool for tool in reloaded.tool_calls if tool.get("name") == successor_tool_name
+    )
+    assert reloaded.messages[successor_tool["assistant_msg_idx"]]["content"] == (
+        f"{successor_tool_name} successor answer"
+    )
+    assert config.session_writeback_owner(sid) == successor_stream_id
+    config.STREAMS.pop(successor_stream_id, None)
+    config.unregister_stream_owner(successor_stream_id)
+    config.clear_session_writeback_owner_if_owned(sid, successor_stream_id)
+
+
+def test_local_success_commit_late_stop_retires_old_generation(tmp_path, monkeypatch):
+    sid = "issue6920_success_local"
+    old_stream = "stream-success-local"
+
+    class FakeAgent:
+        def __init__(self, *, stream_delta_callback=None, session_id=None, **_kwargs):
+            self.session_id = session_id or sid
+            self.stream_delta_callback = stream_delta_callback
+            self.context_compressor = None
+            self.ephemeral_system_prompt = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            answer = "successful answer"
+            self.stream_delta_callback(answer)
+            return {
+                "completed": True,
+                "final_response": answer,
+                "messages": list(kwargs.get("conversation_history") or []) + [
+                    {"role": "assistant", "content": answer},
+                ],
+            }
+
+        def interrupt(self, _message):
+            return None
+
+    def configure_worker():
+        monkeypatch.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
+        monkeypatch.setattr(streaming, "resolve_model_provider", lambda *args, **kwargs: (
+            "test-model",
+            "test-provider",
+            None,
+        ))
+        monkeypatch.setattr(streaming, "get_config", lambda: {})
+        monkeypatch.setattr(config, "get_config", lambda: {})
+        monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
+        monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(
+            streaming,
+            "reconciled_state_db_messages_for_session",
+            lambda *_args, **_kwargs: [],
+        )
+        monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
+
+    _run_success_commit_late_stop_worker(
+        worker_target=streaming._run_agent_streaming,
+        sid=sid,
+        old_stream=old_stream,
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        configure_worker=configure_worker,
+        external_runtime_owned=False,
+        success_text="successful answer",
+    )
+
+
+def test_gateway_success_commit_late_stop_retires_old_generation(tmp_path, monkeypatch):
+    import api.gateway_chat as gateway_chat
+
+    sid = "issue6920_success_gateway"
+    old_stream = "stream-success-gateway"
+
+    def configure_worker():
+        monkeypatch.setattr(config, "get_config", lambda: {})
+        monkeypatch.setattr(gateway_chat, "_gateway_base_url", lambda *_args, **_kwargs: "http://gateway.test")
+        monkeypatch.setattr(gateway_chat, "_gateway_api_key", lambda *_args, **_kwargs: "")
+        monkeypatch.setattr(gateway_chat, "_gateway_use_runs_api_enabled", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(gateway_chat, "_gateway_reasoning_effort_for_request", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(config, "_main_model_request_overrides", lambda *_args, **_kwargs: {})
+
+        def fake_runs_api(*_args, **kwargs):
+            kwargs["put_gateway_event"]("token", {"text": "successful answer"})
+            return "successful answer", {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "estimated_cost": 0,
+            }
+
+        monkeypatch.setattr(gateway_chat, "_run_gateway_runs_api_streaming", fake_runs_api)
+
+    _run_success_commit_late_stop_worker(
+        worker_target=gateway_chat._run_gateway_chat_streaming,
+        sid=sid,
+        old_stream=old_stream,
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        configure_worker=configure_worker,
+        external_runtime_owned=True,
+        success_text="successful answer",
+    )
