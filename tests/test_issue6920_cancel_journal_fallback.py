@@ -1106,6 +1106,201 @@ def test_settlement_preserves_recovered_tool_owner_and_summary():
     assert reloaded.messages[owner_index].get("_recovered_from_run_journal") is True
 
 
+def test_settlement_preserves_late_recovery_before_media_snapshot_annotation(monkeypatch):
+    """Annotate the finalized display after late recovery and before compaction."""
+    sid = "issue6920_settlement_media_annotation"
+    old_stream_id = "stream-settlement-media-old"
+    late_assistant_event_id = f"{old_stream_id}:assistant-7"
+    late_tool_event_id = f"{old_stream_id}:tool-8"
+    late_text = "Late recovered cancellation prose."
+    cancelled_prompt = "Continue this cancelled turn"
+    successor_prompt = "Continue after cancellation"
+    old_user = {
+        "role": "user",
+        "content": cancelled_prompt,
+        "timestamp": 1,
+    }
+    late_assistant = {
+        "role": "assistant",
+        "content": late_text,
+        "timestamp": 3,
+        "_partial": True,
+        "_recovered_from_run_journal": True,
+        "_recovered_stream_id": old_stream_id,
+        "_recovered_event_id": late_assistant_event_id,
+    }
+    cancel_marker = {
+        "role": "assistant",
+        "content": "**Task cancelled:** provider stopped.\n\n"
+        "*The run was cancelled by the user before Hermes finished. No provider failure occurred.*",
+        "_error": True,
+        "provider_details": "provider stopped",
+        "timestamp": 4,
+    }
+    successor_user = {
+        "role": "user",
+        "content": successor_prompt,
+        "timestamp": 5,
+    }
+    successor_assistant = {
+        "role": "assistant",
+        "content": "Successor answer",
+        "tool_calls": [{
+            "id": "successor-tool-id",
+            "type": "function",
+            "function": {
+                "name": "successor_tool",
+                "arguments": '{"command": "printf successor"}',
+            },
+        }],
+        "timestamp": 6,
+    }
+    successor_tool_message = {
+        "role": "tool",
+        "tool_call_id": "successor-tool-id",
+        "content": "successor result",
+        "timestamp": 7,
+    }
+    canonical_messages = [
+        old_user,
+        late_assistant,
+        cancel_marker,
+        successor_user,
+        successor_assistant,
+        successor_tool_message,
+    ]
+    late_tool = {
+        "name": "terminal",
+        "preview": "late tool output",
+        "snippet": "late tool output",
+        "summary": "late tool output",
+        "tid": late_tool_event_id,
+        "assistant_msg_idx": 1,
+        "done": True,
+        "_recovered_from_run_journal": True,
+        "_recovered_stream_id": old_stream_id,
+        "_recovered_event_id": late_tool_event_id,
+        "_recovered_assistant_event_id": late_assistant_event_id,
+    }
+    successor_tool = {
+        "name": "successor_tool",
+        "preview": "successor result",
+        "snippet": "successor result",
+        "summary": "successor result",
+        "tid": "successor-tool-id",
+        "assistant_msg_idx": 4,
+        "done": True,
+    }
+    session = Session(
+        session_id=sid,
+        title="Settlement media annotation",
+        messages=copy.deepcopy(canonical_messages),
+        context_messages=copy.deepcopy(canonical_messages),
+        tool_calls=[copy.deepcopy(late_tool), copy.deepcopy(successor_tool)],
+    )
+    # The detached late reconciler's canonical state is durable while the
+    # successor settlement owns the in-memory session object.
+    session.save()
+    previous_messages = copy.deepcopy([old_user, cancel_marker])
+    previous_context = copy.deepcopy(previous_messages)
+    result_messages = copy.deepcopy(previous_context) + [
+        successor_user,
+        successor_assistant,
+        successor_tool_message,
+    ]
+
+    call_order = []
+    preserve_original = streaming._preserve_late_recovered_rows_across_settlement
+
+    def record_preservation(*args, **kwargs):
+        result = preserve_original(*args, **kwargs)
+        call_order.append("preserve")
+        return result
+
+    monkeypatch.setattr(
+        streaming,
+        "_preserve_late_recovered_rows_across_settlement",
+        record_preservation,
+    )
+
+    def record_annotation(messages):
+        call_order.append("annotate")
+        assert messages is session.messages
+        assert call_order == ["preserve", "annotate"]
+        late_rows = [
+            row
+            for row in messages
+            if row.get("_recovered_event_id") == late_assistant_event_id
+        ]
+        assert len(late_rows) == 1
+        late_index = messages.index(late_rows[0])
+        marker_index = next(
+            index
+            for index, row in enumerate(messages)
+            if row.get("_error") is True and row.get("provider_details") == "provider stopped"
+        )
+        successor_user_index = next(
+            index
+            for index, row in enumerate(messages)
+            if row.get("role") == "user" and row.get("content") == successor_prompt
+        )
+        assert late_index < marker_index < successor_user_index
+        assert sum(row.get("content") == late_text for row in messages) == 1
+        assert sum(row.get("content") == successor_prompt for row in messages) == 1
+        assert any(
+            row.get("role") == "assistant"
+            and row.get("content") == "Successor answer"
+            for row in messages
+        )
+        late_context_rows = [
+            row
+            for row in session.context_messages
+            if row.get("_recovered_event_id") == late_assistant_event_id
+        ]
+        assert len(late_context_rows) == 1
+        assert sum(
+            row.get("role") == "user" and row.get("content") == successor_prompt
+            for row in session.context_messages
+        ) == 1
+        assert sum(
+            row.get("role") == "assistant" and row.get("content") == "Successor answer"
+            for row in session.context_messages
+        ) == 1
+
+        recovered_tools = [
+            tool for tool in session.tool_calls if tool.get("_recovered_event_id") == late_tool_event_id
+        ]
+        assert len(recovered_tools) == 1
+        assert messages[recovered_tools[0]["assistant_msg_idx"]].get(
+            "_recovered_event_id"
+        ) == late_assistant_event_id
+        successor_tools = [tool for tool in session.tool_calls if tool.get("name") == "successor_tool"]
+        assert len(successor_tools) == 1
+        assert messages[successor_tools[0]["assistant_msg_idx"]].get("content") == "Successor answer"
+
+    # The pre-resolution branch has no production helper yet.  ``raising=False``
+    # keeps this oracle behavioral: the recorder stays empty until settlement
+    # actually invokes the helper, rather than failing during test setup.
+    monkeypatch.setattr(
+        streaming,
+        "_annotate_media_snapshots_for_settled_messages",
+        record_annotation,
+        raising=False,
+    )
+
+    streaming._settle_result_messages(
+        session,
+        previous_messages,
+        previous_context,
+        result_messages,
+        successor_prompt,
+        "webui",
+        None,
+    )
+
+    assert call_order == ["preserve", "annotate"]
+
+
 def test_local_cancel_before_flag_registration_stops_worker(tmp_path, monkeypatch):
     """A cancel between queue capture and flag registration reaches the worker."""
     sid = "issue6920_preflag_local"

@@ -1759,6 +1759,98 @@ def _prepare_marker_clean_writeback(
     return [], list(previous_context_messages or []), provenance
 
 
+def _annotate_media_snapshots_for_settled_messages(messages) -> None:
+    """Freeze local-file MEDIA: bytes at settle time so historical previews
+    keep showing the version the turn emitted, even after the file is
+    overwritten in place (#6922 follow-up).
+
+    Runs AFTER the display merge so the annotation rides the exact messages the
+    frontend will render. The store is content-addressed and the annotator is
+    idempotent (already-stored digests short-circuit), so re-settling the same
+    transcript is cheap. Never raises — snapshotting is best-effort durability.
+    """
+    try:
+        from api.media_snapshots import annotate_media_snapshots
+
+        annotate_media_snapshots(messages)
+    except Exception:
+        logger.debug("Media snapshot annotation failed during settle", exc_info=True)
+
+
+def _settle_result_messages(
+    session,
+    previous_messages,
+    previous_context_messages,
+    result_messages,
+    msg_text,
+    source,
+    active_turn_identity,
+):
+    (
+        result_messages,
+        next_context_messages,
+        verification_nudge_provenance,
+    ) = _prepare_marker_clean_writeback(
+        previous_context_messages,
+        result_messages,
+        active_turn_identity,
+    )
+    if result_messages:
+        _assign_stable_message_ids(
+            result_messages,
+            previous_messages,
+            previous_context_messages,
+        )
+        next_context_messages = _dedupe_replayed_context_messages(
+            previous_context_messages,
+            next_context_messages,
+            msg_text,
+        )
+        next_context_messages = _settle_current_turn_boundary(
+            previous_context_messages,
+            next_context_messages,
+            active_turn_identity,
+            msg_text,
+            source,
+        )
+    session.context_messages = (
+        _deduplicate_context_messages(next_context_messages)
+        if result_messages
+        else list(next_context_messages or [])
+    )
+    if result_messages:
+        session.context_messages = _settle_current_turn_boundary(
+            previous_context_messages,
+            session.context_messages,
+            active_turn_identity,
+            msg_text,
+            source,
+        )
+    previous_display_for_writeback, session.context_messages = _align_current_turn_display(
+        previous_messages,
+        session.context_messages,
+        active_turn_identity,
+    )
+    session.messages = _merge_display_messages_with_late_recovery(
+        session,
+        _merge_display_messages_after_agent_result(
+            previous_display_for_writeback,
+            previous_context_messages,
+            _restore_display_reasoning_metadata(previous_messages, result_messages),
+            msg_text,
+            source=source,
+            verification_nudge_provenance=verification_nudge_provenance,
+        ),
+        previous_messages,
+        previous_context_messages,
+        active_turn_identity,
+    )
+    _annotate_media_snapshots_for_settled_messages(session.messages)
+    _compact_session_image_parts_for_persistence(session)
+    _advance_truncation_watermark_after_commit(session)  # #3831
+    return result_messages
+
+
 def _settlement_recovered_row_identity(row):
     """Return the exact durable identity for one journal-recovered message."""
     if not isinstance(row, dict) or not row.get('_recovered_from_run_journal'):
@@ -2020,77 +2112,22 @@ def _preserve_late_recovered_rows_across_settlement(
             known_tool_keys.add(tool_key)
 
 
-def _settle_result_messages(
+def _merge_display_messages_with_late_recovery(
     session,
+    merged_messages,
     previous_messages,
     previous_context_messages,
-    result_messages,
-    msg_text,
-    source,
     active_turn_identity,
 ):
-    (
-        result_messages,
-        next_context_messages,
-        verification_nudge_provenance,
-    ) = _prepare_marker_clean_writeback(
-        previous_context_messages,
-        result_messages,
-        active_turn_identity,
-    )
-    if result_messages:
-        _assign_stable_message_ids(
-            result_messages,
-            previous_messages,
-            previous_context_messages,
-        )
-        next_context_messages = _dedupe_replayed_context_messages(
-            previous_context_messages,
-            next_context_messages,
-            msg_text,
-        )
-        next_context_messages = _settle_current_turn_boundary(
-            previous_context_messages,
-            next_context_messages,
-            active_turn_identity,
-            msg_text,
-            source,
-        )
-    session.context_messages = (
-        _deduplicate_context_messages(next_context_messages)
-        if result_messages
-        else list(next_context_messages or [])
-    )
-    if result_messages:
-        session.context_messages = _settle_current_turn_boundary(
-            previous_context_messages,
-            session.context_messages,
-            active_turn_identity,
-            msg_text,
-            source,
-        )
-    previous_display_for_writeback, session.context_messages = _align_current_turn_display(
-        previous_messages,
-        session.context_messages,
-        active_turn_identity,
-    )
-    session.messages = _merge_display_messages_after_agent_result(
-        previous_display_for_writeback,
-        previous_context_messages,
-        _restore_display_reasoning_metadata(previous_messages, result_messages),
-        msg_text,
-        source=source,
-        verification_nudge_provenance=verification_nudge_provenance,
-    )
+    """Install the merged display and splice late recovery before annotation."""
+    session.messages = merged_messages
     _preserve_late_recovered_rows_across_settlement(
         session,
         previous_messages,
         previous_context_messages,
         active_turn_identity,
     )
-    _compact_session_image_parts_for_persistence(session)
-    _advance_truncation_watermark_after_commit(session)  # #3831
-    return result_messages
+    return session.messages
 
 
 def _current_turn_already_has_visible_assistant_answer(messages, *, active_turn_identity=None):
