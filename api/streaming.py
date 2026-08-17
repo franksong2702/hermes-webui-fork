@@ -1831,16 +1831,17 @@ def _settle_result_messages(
         session.context_messages,
         active_turn_identity,
     )
+    session.messages = _merge_display_messages_after_agent_result(
+        previous_display_for_writeback,
+        previous_context_messages,
+        _restore_display_reasoning_metadata(previous_messages, result_messages),
+        msg_text,
+        source=source,
+        verification_nudge_provenance=verification_nudge_provenance,
+    )
     session.messages = _merge_display_messages_with_late_recovery(
         session,
-        _merge_display_messages_after_agent_result(
-            previous_display_for_writeback,
-            previous_context_messages,
-            _restore_display_reasoning_metadata(previous_messages, result_messages),
-            msg_text,
-            source=source,
-            verification_nudge_provenance=verification_nudge_provenance,
-        ),
+        session.messages,
         previous_messages,
         previous_context_messages,
         active_turn_identity,
