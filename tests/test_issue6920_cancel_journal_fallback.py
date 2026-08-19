@@ -2781,3 +2781,149 @@ def test_gateway_success_commit_late_stop_retires_old_generation(tmp_path, monke
         external_runtime_owned=True,
         success_text="successful answer",
     )
+
+
+def test_gateway_cancel_arming_before_flag_set_does_not_deadlock(tmp_path, monkeypatch):
+    """Gateway cancellation must not reconcile while its session lock is held."""
+    import api.gateway_chat as gateway_chat
+
+    sid = "issue6920_cancel_arm_gateway"
+    old_stream = "stream-cancel-arm-gateway"
+    session = _session(sid, old_stream)
+    old_prompt = session.pending_user_message
+    config.register_stream_owner(old_stream, sid)
+    config.register_session_writeback_owner(sid, old_stream)
+    config.STREAMS[old_stream] = queue.Queue()
+
+    success_save_entered = threading.Event()
+    release_success_save = threading.Event()
+    success_mark_attempted = threading.Event()
+    original_save = Session.save
+
+    def gated_success_save(session, *args, **kwargs):
+        assembled = any(
+            isinstance(row, dict)
+            and row.get("role") == "assistant"
+            and row.get("content") == "successful answer"
+            for row in getattr(session, "messages", [])
+        )
+        if (
+            not success_save_entered.is_set()
+            and assembled
+            and getattr(session, "active_stream_id", None) is None
+            and getattr(session, "pending_user_message", None) is None
+        ):
+            success_save_entered.set()
+            assert release_success_save.wait(timeout=5), (
+                "success Session.save was not released"
+            )
+        return original_save(session, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "save", gated_success_save)
+    monkeypatch.setattr(config, "get_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_chat,
+        "_gateway_base_url",
+        lambda *_args, **_kwargs: "http://gateway.test",
+    )
+    monkeypatch.setattr(gateway_chat, "_gateway_api_key", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(
+        gateway_chat,
+        "_gateway_use_runs_api_enabled",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        gateway_chat,
+        "gateway_supports_approval",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        gateway_chat,
+        "_gateway_reasoning_effort_for_request",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(config, "_main_model_request_overrides", lambda *_args, **_kwargs: {})
+
+    def fake_runs_api(*_args, **kwargs):
+        kwargs["put_gateway_event"]("token", {"text": "successful answer"})
+        return "successful answer", {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "estimated_cost": 0,
+        }
+
+    monkeypatch.setattr(gateway_chat, "_run_gateway_runs_api_streaming", fake_runs_api)
+
+    original_mark_success = gateway_chat.mark_stream_success_committed
+
+    def observe_success_mark(*args, **kwargs):
+        result = original_mark_success(*args, **kwargs)
+        success_mark_attempted.set()
+        return result
+
+    monkeypatch.setattr(gateway_chat, "mark_stream_success_committed", observe_success_mark)
+
+    arm_entered = threading.Event()
+    release_after_arm = threading.Event()
+    original_begin = streaming.begin_stream_cancel_generation
+
+    def pause_after_arm(*args, **kwargs):
+        armed = original_begin(*args, **kwargs)
+        if armed:
+            arm_entered.set()
+            assert release_after_arm.wait(timeout=5), (
+                "cancel-generation arm was not released"
+            )
+        return armed
+
+    monkeypatch.setattr(streaming, "begin_stream_cancel_generation", pause_after_arm)
+    worker_errors = []
+    cancel_errors = []
+    cancel_result = []
+
+    def run_worker():
+        try:
+            gateway_chat._run_gateway_chat_streaming(
+                sid,
+                old_prompt,
+                "test-model",
+                str(tmp_path),
+                old_stream,
+                [],
+                model_provider="test-provider",
+            )
+        except BaseException as exc:  # pragma: no cover - failure surface
+            worker_errors.append(exc)
+
+    def run_cancel():
+        try:
+            cancel_result.append(streaming.cancel_stream(old_stream))
+        except BaseException as exc:  # pragma: no cover - failure surface
+            cancel_errors.append(exc)
+
+    worker = threading.Thread(target=run_worker, daemon=True)
+    worker.start()
+    assert success_save_entered.wait(timeout=5), (
+        "real Gateway worker did not block pre-commit success save"
+    )
+
+    cancel_thread = threading.Thread(target=run_cancel, daemon=True)
+    cancel_thread.start()
+    assert arm_entered.wait(timeout=5), (
+        "cancel_stream did not pause after generation arming"
+    )
+    assert config.STREAM_CANCEL_GENERATIONS[(sid, old_stream)]["cancel_requested"] is True
+
+    release_success_save.set()
+    assert success_mark_attempted.wait(timeout=5), (
+        "Gateway worker did not attempt success commit"
+    )
+    release_after_arm.set()
+
+    worker.join(timeout=10)
+    cancel_thread.join(timeout=10)
+    assert not worker.is_alive(), "Gateway worker deadlocked during cancelled success settlement"
+    assert not cancel_thread.is_alive(), "cancel_stream deadlocked during cancelled success settlement"
+    assert cancel_result == [True]
+    assert not worker_errors
+    assert not cancel_errors

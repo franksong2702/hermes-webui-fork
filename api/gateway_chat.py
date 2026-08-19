@@ -1375,10 +1375,6 @@ def _run_gateway_chat_streaming(
                 _restore_cancelled_success_writeback(
                     durable_success=not stream_cancel_generation_pending(session_id, stream_id),
                 )
-                if mark_stream_worker_done(session_id, stream_id):
-                    from api.streaming import _reconcile_cancelled_stream_generation
-
-                    _reconcile_cancelled_stream_generation(session_id, stream_id)
                 return
             success_writeback_committed = True
         try:
