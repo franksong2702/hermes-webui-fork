@@ -85,6 +85,61 @@ from api.process_event_utils import (
 )
 
 
+def get_stream_runtime_snapshot() -> dict[str, object]:
+    """Return aggregate stream observations without waiting on the registry.
+
+    The registry is copied under a nonblocking ``STREAMS_LOCK`` acquire and the
+    lock is released before any channel lock is touched, so registry and channel
+    locks are never nested. Each channel is then read through its nonblocking
+    owner method: a channel busy with its own producer or subscriber work counts
+    as one unavailable channel and the loop keeps summing its siblings.
+    """
+    result = {
+        "available": False,
+        "active": 0,
+        "agent_instances": 0,
+        "subscribers": 0,
+        "offline_buffered_events": 0,
+        "offline_dropped_events": 0,
+        "subscriber_dropped_events": 0,
+        "unavailable_channels": 0,
+    }
+    try:
+        if not STREAMS_LOCK.acquire(blocking=False):
+            return result
+        try:
+            channels = list(STREAMS.values())
+            agent_count = len(AGENT_INSTANCES)
+        finally:
+            STREAMS_LOCK.release()
+        result["available"] = True
+        result["active"] = len(channels)
+        result["agent_instances"] = agent_count
+        for channel in channels:
+            try:
+                snapshot = channel.try_diagnostic_snapshot()
+                if snapshot is None:
+                    result["unavailable_channels"] += 1
+                    continue
+                result["subscribers"] += max(0, int(snapshot.get("subscriber_count", 0)))
+                result["offline_buffered_events"] += max(
+                    0, int(snapshot.get("offline_buffered_events", 0))
+                )
+                result["offline_dropped_events"] += max(
+                    0, int(snapshot.get("offline_dropped_events", 0))
+                )
+                result["subscriber_dropped_events"] += max(
+                    0, int(snapshot.get("subscriber_dropped_events", 0))
+                )
+            except Exception:
+                result["unavailable_channels"] += 1
+    except Exception:
+        # Keep the aggregates already summed from channels that read cleanly; a
+        # late unexpected failure must not discard successful sibling counts.
+        return result
+    return result
+
+
 def _session_payload_with_full_messages(session, *, tool_calls=None):
     """Return compact session metadata plus the embedded full transcript.
 
@@ -101,6 +156,29 @@ def _session_payload_with_full_messages(session, *, tool_calls=None):
     attach_todo_state(raw, messages)
     if tool_calls is not None:
         raw['tool_calls'] = tool_calls
+    try:
+        from api.session_ops import (
+            regeneration_authority,
+            regeneration_state,
+        )
+        canonical_messages, canonical_context = regeneration_state(session)
+        revision = regeneration_authority(
+            session,
+            rows=canonical_messages,
+            context=canonical_context,
+            full_transcript=True,
+            canonical_state=(canonical_messages, canonical_context),
+        )
+        if revision:
+            messages = list(canonical_messages)
+            raw['messages'] = messages
+            raw['message_count'] = len(messages)
+            attach_todo_state(raw, messages)
+            raw['regeneration_revision'] = revision
+        else:
+            raw.pop('regeneration_revision', None)
+    except Exception:
+        raw.pop('regeneration_revision', None)
     return raw
 
 
@@ -471,6 +549,7 @@ def _resolve_custom_provider_runtime_overrides(
     resolved_provider: str | None,
     resolved_api_key: str | None,
     resolved_base_url: str | None,
+    profile_name: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Return provider/key/base_url overrides for ``custom:*`` endpoints.
 
@@ -479,11 +558,24 @@ def _resolve_custom_provider_runtime_overrides(
     without authentication, so a missing key should not fail before the first
     request; pass a harmless placeholder to the SDK and let the endpoint accept
     it or return its own auth error.
+
+    ``profile_name`` binds the SESSION's own profile while
+    ``resolve_custom_provider_connection`` reads the endpoint AND the credential.
+    That helper resolves both from ONE ``get_config()``/env snapshot, so binding
+    the profile here keeps them from splitting across profiles: on a detached
+    worker thread (which doesn't inherit the request-profile TLS/env) an unbound
+    call would read the DEFAULT profile and pair a named profile's endpoint with
+    the default profile's API key (finding #3). No-op for the default/root
+    profile; when ``profile_name`` is None the ambient scope (if any) is used.
     """
     if not (isinstance(resolved_provider, str) and resolved_provider.startswith("custom:")):
         return resolved_provider, resolved_api_key, resolved_base_url
 
-    _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
+    from api import profiles as _profiles_api
+    with _profiles_api.profile_scope_for_detached_worker(
+        profile_name, "custom provider connection", logger_override=logger
+    ):
+        _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
     if not resolved_api_key and _cp_key:
         resolved_api_key = _cp_key
     if not resolved_base_url and _cp_base:
@@ -1475,12 +1567,29 @@ def _clean_synthetic_control_messages_with_provenance(messages):
 def _active_turn_authority(session, stream_id, msg_text):
     """Capture the stream-owned pending turn before settlement mutates it."""
     pending_text = getattr(session, 'pending_user_message', None)
+    token = build_active_turn_token(stream_id, getattr(session, 'pending_started_at', None))
+    checkpoint = (
+        next(
+            (
+                copy.deepcopy(message)
+                for message in reversed(list(getattr(session, 'messages', None) or []))
+                if isinstance(message, dict)
+                and message.get('role') == 'user'
+                and message.get('_active_turn_token') == token
+            ),
+            None,
+        )
+        if token
+        else None
+    )
     return {
-        'token': build_active_turn_token(stream_id, getattr(session, 'pending_started_at', None)),
+        'session_id': getattr(session, 'session_id', None),
+        'token': token,
         'text': pending_text if pending_text is not None else msg_text,
         'timestamp': getattr(session, 'pending_started_at', None),
         'source': getattr(session, 'pending_user_source', None) or 'webui',
         'attachments': copy.deepcopy(getattr(session, 'pending_attachments', None) or []),
+        'checkpoint': checkpoint,
         'current_turn_user_idx': None,
         'turn_id': '',
     }
@@ -1573,7 +1682,7 @@ def _mark_active_turn_checkpoint_in_history(messages, identity, msg_text, *, all
     if (
         not isinstance(message, dict)
         or message.get('role') != 'user'
-        or _normalize_user_text(message.get('content')) != _normalize_user_text(expected_text)
+        or _normalize_user_text(_message_text(message.get('content'))) != _normalize_user_text(expected_text)
     ):
         return messages, False
     _mark_active_turn_checkpoint(message, identity)
@@ -1620,19 +1729,24 @@ def _find_active_turn_checkpoint_index(result_messages, previous_context, identi
         if (
             isinstance(message, dict)
             and message.get('role') == 'user'
-            and _normalize_user_text(message.get('content')) == _normalize_user_text(expected_text)
+            and _normalize_user_text(_message_text(message.get('content'))) == _normalize_user_text(expected_text)
         ):
             return idx
     return None
 
 
 def _materialize_active_turn_user(identity, msg_text, source):
-    message = {
-        'role': 'user',
-        'content': identity.get('text') if isinstance(identity, dict) else msg_text,
-    }
+    checkpoint = identity.get('checkpoint') if isinstance(identity, dict) else None
+    message = (
+        copy.deepcopy(checkpoint)
+        if isinstance(checkpoint, dict) and checkpoint.get('role') == 'user'
+        else {
+            'role': 'user',
+            'content': identity.get('text') if isinstance(identity, dict) else msg_text,
+        }
+    )
     if isinstance(identity, dict):
-        if identity.get('timestamp') is not None:
+        if identity.get('timestamp') is not None and message.get('timestamp') is None:
             message['timestamp'] = identity['timestamp']
         if identity.get('attachments'):
             message['attachments'] = copy.deepcopy(identity['attachments'])
@@ -1641,8 +1755,15 @@ def _materialize_active_turn_user(identity, msg_text, source):
             identity.get('source') or source or 'webui',
             active_turn_token=identity.get('token'),
         )
+        if str(identity.get('source') or source or '').strip().lower() == 'fork':
+            child_session_id = identity.get('session_id')
+            if child_session_id:
+                message['_fork_child_turn'] = child_session_id
     else:
-        stamp_message_source(message, source)
+        stamp_message_source(
+            message,
+            source,
+        )
     return message
 
 
@@ -1658,7 +1779,18 @@ def _settle_current_turn_boundary(previous_context, result_messages, identity, m
         msg_text,
     )
     if _checkpoint_idx is not None:
-        _mark_active_turn_checkpoint(result_messages[_checkpoint_idx], identity)
+        existing_checkpoint = result_messages[_checkpoint_idx]
+        if isinstance(identity.get('checkpoint'), dict):
+            retained_checkpoint = _materialize_active_turn_user(identity, msg_text, source)
+            if (
+                retained_checkpoint.get('id') is None
+                and isinstance(existing_checkpoint, dict)
+                and existing_checkpoint.get('id') is not None
+            ):
+                retained_checkpoint['id'] = existing_checkpoint['id']
+            result_messages[_checkpoint_idx] = retained_checkpoint
+        else:
+            _mark_active_turn_checkpoint(existing_checkpoint, identity)
         return result_messages
     previous_context = list(previous_context or [])
     if _messages_have_prefix(result_messages, previous_context):
@@ -1746,6 +1878,24 @@ def _prepare_marker_clean_writeback(
     return [], list(previous_context_messages or []), provenance
 
 
+def _annotate_media_snapshots_for_settled_messages(messages) -> None:
+    """Freeze local-file MEDIA: bytes at settle time so historical previews
+    keep showing the version the turn emitted, even after the file is
+    overwritten in place (#6922 follow-up).
+
+    Runs AFTER the display merge so the annotation rides the exact messages the
+    frontend will render. The store is content-addressed and the annotator is
+    idempotent (already-stored digests short-circuit), so re-settling the same
+    transcript is cheap. Never raises — snapshotting is best-effort durability.
+    """
+    try:
+        from api.media_snapshots import annotate_media_snapshots
+
+        annotate_media_snapshots(messages)
+    except Exception:
+        logger.debug("Media snapshot annotation failed during settle", exc_info=True)
+
+
 def _settle_result_messages(
     session,
     previous_messages,
@@ -1808,6 +1958,7 @@ def _settle_result_messages(
         source=source,
         verification_nudge_provenance=verification_nudge_provenance,
     )
+    _annotate_media_snapshots_for_settled_messages(session.messages)
     _compact_session_image_parts_for_persistence(session)
     _advance_truncation_watermark_after_commit(session)  # #3831
     return result_messages
@@ -7305,7 +7456,7 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
         except (TypeError, ValueError):
             return False
         return (
-            _normalize_user_text(existing.get('content')) == _normalize_user_text(pending_text)
+            _normalize_user_text(_message_text(existing.get('content'))) == _normalize_user_text(pending_text)
             and existing_ts == recovered_ts
             and existing_source == pending_source
             and list(existing.get('attachments') or []) == pending_attachments
@@ -7319,6 +7470,8 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
         'timestamp': recovered_ts,
         '_recovered': True,
     }
+    if str(pending_source or '').strip().lower() == 'fork':
+        recovered['_fork_child_turn'] = session.session_id
     stamp_message_source(recovered, pending_source)
     if pending_attachments:
         recovered['attachments'] = pending_attachments
@@ -8658,22 +8811,27 @@ def _run_agent_streaming(
         try:
             try:
                 from api.route_approvals import (
-                    submit_gateway_pending_mirror as _submit_pending_for_polling,
+                    settle_gateway_pending_local_notification as _settle_pending_for_polling,
                     retire_gateway_pending_mirror as _retire_gateway_pending_mirror,
                 )
                 def _cleanup_gateway_pending_mirror():
                     _retire_gateway_pending_mirror(session_id)
             except ImportError:
-                _submit_pending_for_polling = None
+                _settle_pending_for_polling = None
                 _cleanup_gateway_pending_mirror = None
             from tools.approval import (
                 register_gateway_notify as _reg_notify,
                 unregister_gateway_notify as _unreg_notify,
             )
             def _approval_notify_cb(approval_data):
-                if _submit_pending_for_polling is not None:
+                if _settle_pending_for_polling is not None:
                     try:
-                        head, total = _submit_pending_for_polling(session_id, approval_data)
+                        auto_resolved, head, total = _settle_pending_for_polling(
+                            session_id,
+                            approval_data,
+                        )
+                        if auto_resolved and head is None:
+                            return
                         approval_data = {**(head or approval_data), "pending_count": total}
                     except Exception:
                         logger.warning("Failed to mirror approval into WebUI polling state", exc_info=True)
@@ -9289,46 +9447,54 @@ def _run_agent_streaming(
             _sig_provider = getattr(s, "model_provider", None) or provider_context
             _current_sig = _mk_sig(_sig_model, _sig_provider)
             _explicitly_picked = bool(_picked_sig) and _picked_sig == _current_sig
+            # Resolve the endpoint AND the credential inside ONE profile scope so
+            # they always come from the same profile-owned snapshot. Previously
+            # only resolve_model_provider() ran under the scope; the runtime-key
+            # and custom-provider resolution below ran after it closed, so a
+            # detached worker for a NAMED profile paired that profile's endpoint
+            # with the DEFAULT profile's API key (finding #3). No-op for the
+            # default/root profile.
             with profiles_api.profile_scope_for_detached_worker(
-                _resolved_profile_name, "model resolution", logger_override=logger
+                _resolved_profile_name, "model + credential resolution", logger_override=logger
             ):
                 warm_models_catalog_provenance_if_cold()
                 resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
                     model_with_provider_context(model, provider_context),
                     explicitly_picked=_explicitly_picked,
                 )
-            configured_base_url = resolved_base_url
+                configured_base_url = resolved_base_url
 
-            # Resolve API key via Hermes runtime provider (matches gateway behaviour).
-            # Pass the resolved provider so non-default providers get their own credentials.
-            resolved_api_key = None
-            try:
-                from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-                _rt = resolve_runtime_provider_with_anthropic_env_lock(
-                    resolve_runtime_provider,
-                    requested=resolved_provider,
-                    target_model=resolved_model,
-                )
-                resolved_api_key = _rt.get("api_key")
-                if not resolved_provider:
-                    resolved_provider = _rt.get("provider")
-                resolved_base_url = _runtime_preferred_base_url(
-                    _rt, resolved_provider, configured_base_url
-                )
-            except Exception as _e:
-                print(f"[webui] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
+                # Resolve API key via Hermes runtime provider (matches gateway behaviour).
+                # Pass the resolved provider so non-default providers get their own credentials.
+                resolved_api_key = None
+                try:
+                    from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                        resolve_runtime_provider,
+                        requested=resolved_provider,
+                        target_model=resolved_model,
+                    )
+                    resolved_api_key = _rt.get("api_key")
+                    if not resolved_provider:
+                        resolved_provider = _rt.get("provider")
+                    resolved_base_url = _runtime_preferred_base_url(
+                        _rt, resolved_provider, configured_base_url
+                    )
+                except Exception as _e:
+                    print(f"[webui] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
 
-            # Named custom providers (custom:slug) may not be resolvable by
-            # hermes_cli.runtime_provider directly. Fall back to config.yaml
-            # custom_providers[] so WebUI can pass explicit creds/base_url.
-            # Preserve the pre-canonicalization identity so image routing can
-            # still select the exact custom_providers entry after the rewrite
-            # to "custom" below.
-            _session_requested_provider = resolved_provider
-            resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
-                resolved_provider, resolved_api_key, resolved_base_url
-            )
+                # Named custom providers (custom:slug) may not be resolvable by
+                # hermes_cli.runtime_provider directly. Fall back to config.yaml
+                # custom_providers[] so WebUI can pass explicit creds/base_url.
+                # Preserve the pre-canonicalization identity so image routing can
+                # still select the exact custom_providers entry after the rewrite
+                # to "custom" below.
+                _session_requested_provider = resolved_provider
+                resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
+                    resolved_provider, resolved_api_key, resolved_base_url,
+                    profile_name=_resolved_profile_name,
+                )
 
             # Read per-profile config at call time (not module-level snapshot).
             # The streaming worker is a detached thread that does NOT inherit the
@@ -9585,6 +9751,12 @@ def _run_agent_streaming(
                     # field the cached agent silently retains the previous
                     # profile's SOUL.md (and any other profile-scoped context).
                     _profile_home or '',
+                    # Terminal backend identity: sessions switching between
+                    # remote (SSH) and local backends must not reuse a cached
+                    # agent that carries stale terminal env vars (#5937).
+                    _safe_profile_runtime_env.get('TERMINAL_ENV', '') or '',
+                    _safe_profile_runtime_env.get('TERMINAL_SSH_HOST', '') or '',
+                    _safe_profile_runtime_env.get('TERMINAL_SSH_USER', '') or '',
                 ], sort_keys=True)
                 _agent_sig = _hashlib.sha256(_sig_blob.encode()).hexdigest()[:16]
 
@@ -10358,10 +10530,18 @@ def _run_agent_streaming(
                         # Before emitting the error, try re-reading credentials
                         # and retrying once with a fresh agent.
                         _heal_result = None
-                        _heal_rt = _attempt_credential_self_heal(
-                            resolved_provider or '', session_id, _agent_lock,
-                            target_model=resolved_model,
-                        )
+                        # Bind the session's profile so the self-heal re-resolve
+                        # AND the custom-provider override below read one
+                        # profile-owned snapshot (finding #3): otherwise a named
+                        # profile's endpoint pairs with the default profile's key.
+                        from api import profiles as _profiles_api
+                        with _profiles_api.profile_scope_for_detached_worker(
+                            _resolved_profile_name, "credential self-heal", logger_override=logger
+                        ):
+                            _heal_rt = _attempt_credential_self_heal(
+                                resolved_provider or '', session_id, _agent_lock,
+                                target_model=resolved_model,
+                            )
                         if _heal_rt is not None:
                             logger.info('[webui] self-heal: retrying stream after credential refresh')
                             # Rebuild runtime variables from the refreshed resolve
@@ -10380,7 +10560,8 @@ def _run_agent_streaming(
                             if not _session_requested_provider:
                                 _session_requested_provider = resolved_provider
                             resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
-                                resolved_provider, resolved_api_key, resolved_base_url
+                                resolved_provider, resolved_api_key, resolved_base_url,
+                                profile_name=_resolved_profile_name,
                             )
                             # Rebuild agent kwargs and create a fresh agent
                             _agent_kwargs['api_key'] = resolved_api_key
@@ -11599,10 +11780,18 @@ def _run_agent_streaming(
         elif _exc_is_auth:
             if not _self_healed:
                 # ── Credential self-heal on 401 (#1401) ──
-                _heal_rt = _attempt_credential_self_heal(
-                    resolved_provider or '', session_id, _agent_lock,
-                    target_model=resolved_model,
-                )
+                # Bind the session's profile so the self-heal re-resolve AND the
+                # custom-provider override below read one profile-owned snapshot
+                # (finding #3): otherwise a named profile's endpoint pairs with
+                # the default profile's key.
+                from api import profiles as _profiles_api
+                with _profiles_api.profile_scope_for_detached_worker(
+                    _resolved_profile_name, "credential self-heal", logger_override=logger
+                ):
+                    _heal_rt = _attempt_credential_self_heal(
+                        resolved_provider or '', session_id, _agent_lock,
+                        target_model=resolved_model,
+                    )
                 if _heal_rt is not None:
                     logger.info('[webui] self-heal (except path): retrying stream after credential refresh')
                     _self_healed = True
@@ -11621,7 +11810,8 @@ def _run_agent_streaming(
                     if not _session_requested_provider:
                         _session_requested_provider = resolved_provider
                     resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
-                        resolved_provider, resolved_api_key, resolved_base_url
+                        resolved_provider, resolved_api_key, resolved_base_url,
+                        profile_name=_resolved_profile_name,
                     )
                     # Build a fresh agent with the new credentials
                     _heal_kwargs = dict(_agent_kwargs) if '_agent_kwargs' in dir() else {}
