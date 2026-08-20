@@ -1645,7 +1645,11 @@ def test_local_cancel_finalizes_late_admitted_journal_after_empty_snapshot(tmp_p
     def gated_append(writer, event, data):
         if event == "interim_assistant" and isinstance(data, dict) and data.get("text") == late_text:
             admitted.set()
-            assert release_append.wait(timeout=5), "late journal append was not released"
+            # Successor admission performs real session reload, route setup, and
+            # provider-snapshot capture before this gate is released.  Keep the
+            # handshake bounded below the outer test timeout, but do not let the
+            # append expire while that expected setup is still in progress.
+            assert release_append.wait(timeout=30), "late journal append was not released"
         return append_original(writer, event, data)
 
     monkeypatch.setattr(RunJournalWriter, "append_sse_event", gated_append)
@@ -1783,6 +1787,7 @@ def test_local_cancel_finalizes_late_admitted_journal_after_empty_snapshot(tmp_p
     monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
 
     errors = []
+    worker_finished = threading.Event()
 
     def run_worker():
         try:
@@ -1797,6 +1802,8 @@ def test_local_cancel_finalizes_late_admitted_journal_after_empty_snapshot(tmp_p
             )
         except BaseException as exc:  # pragma: no cover - failure surface
             errors.append(exc)
+        finally:
+            worker_finished.set()
 
     worker = threading.Thread(target=run_worker, daemon=True)
     worker.start()
@@ -1845,7 +1852,19 @@ def test_local_cancel_finalizes_late_admitted_journal_after_empty_snapshot(tmp_p
     assert not release_append.is_set(), "successor settled before the old append was released"
 
     release_append.set()
-    assert save_entered.wait(timeout=5), "final recovered Session.save did not block"
+    save_deadline = time.monotonic() + 5
+    while not (save_entered.is_set() or worker_finished.is_set()):
+        remaining = save_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        worker_finished.wait(timeout=min(0.05, remaining))
+    if errors:
+        # Surface the causal worker failure before reporting a derivative save
+        # barrier timeout, so the test cannot hide the original exception.
+        raise errors[0]
+    if worker_finished.is_set() and not save_entered.is_set():
+        pytest.fail("local worker exited before final recovered Session.save")
+    assert save_entered.is_set(), "final recovered Session.save did not block"
     assert (sid, stream_id) in config.STREAM_CANCEL_GENERATIONS
     assert config.STREAM_CANCEL_GENERATIONS[(sid, stream_id)]["reconcile_started"] is True
     blocked = Session.load(sid)
