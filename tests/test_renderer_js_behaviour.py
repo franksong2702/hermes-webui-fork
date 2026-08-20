@@ -145,6 +145,24 @@ class TestLabeledLinkDestinations:
         assert f'href="{url}"' in out
         assert ">Download</a>" in out
 
+    @pytest.mark.parametrize(
+        "url, rendered_href",
+        [
+            ("https://example.test/O'Reilly.pdf", "https://example.test/O&#39;Reilly.pdf"),
+            ('https://example.test/O"Reilly.pdf', "https://example.test/O%22Reilly.pdf"),
+        ],
+    )
+    def test_quote_bytes_inside_destination_do_not_enter_title_mode(
+        self,
+        driver_path,
+        url,
+        rendered_href,
+    ):
+        out = _render(driver_path, f"[Docs]({url})")
+        assert f'href="{rendered_href}"' in out
+        assert ">Docs</a>" in out
+        assert "[Docs](" not in out
+
     def test_empty_label_stays_visible_instead_of_becoming_an_empty_anchor(self, driver_path):
         url = "https://example.com/path"
         out = _render(driver_path, f"[]({url})")
@@ -283,6 +301,16 @@ class TestRendererSanitization:
         assert '&lt;img' in out
         assert '<img' not in out
         assert 'onerror' not in out or '&lt;img' in out
+
+    def test_raw_code_cannot_restore_executable_html_after_sanitizer(self, driver_path):
+        out = _render(
+            driver_path,
+            '<code><img src=x onerror="window.__gateCanary=1"></code>',
+        ).lower()
+        assert '<code>' in out and '</code>' in out
+        assert '<img' not in out
+        assert 'onerror' not in out
+        assert '__gatecanary' not in out
 
 
 class TestCommonLLMShapes:

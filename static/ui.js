@@ -7755,6 +7755,12 @@ function renderMd(raw){
   // [^\s)] regex truncated those URLs after settlement.
   function _stashMarkdownLinks(src, stash, marker){
     const allowed=/^(?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)/i;
+    const isTerminalTitleAt=(value,index,opener)=>{
+      const rest=value.slice(index);
+      if(opener==='"') return /^"(?:\\.|[^"\\])*"\s*\)/.test(rest);
+      if(opener==="'") return /^'(?:\\.|[^'\\])*'\s*\)/.test(rest);
+      return /^\((?:\\.|[^()\\])*\)\s*\)/.test(rest);
+    };
     let out='', cursor=0;
     while(cursor<src.length){
       const open=src.indexOf('[',cursor);
@@ -7773,8 +7779,14 @@ function renderMd(raw){
           if(ch===quote) quote='';
           continue;
         }
-        if(ch==='"'||ch==="'"){quote=ch;continue;}
-        if(ch==='('&&i>start&&/\s/.test(src[i-1])){titleDepth++;continue;}
+        if((ch==='"'||ch==="'")&&i>start&&/\s/.test(src[i-1])&&isTerminalTitleAt(src,i,ch)){
+          quote=ch;
+          continue;
+        }
+        if(ch==='('&&i>start&&/\s/.test(src[i-1])&&isTerminalTitleAt(src,i,ch)){
+          titleDepth++;
+          continue;
+        }
         if(ch===')'){
           if(titleDepth>0){titleDepth--;continue;}
           rawUrl=src.slice(start,i);
@@ -7962,6 +7974,9 @@ function renderMd(raw){
   // Complete raw tags were protected from labeled-link scanning above. Restore
   // them at the sanitizer boundary so unsafe attributes still fail closed.
   s=s.replace(/\x00T(\d+)\x00/g,(_,i)=>_htmlTagStash[+i]);
+  // Restore inline-code placeholders before sanitization so raw HTML nested in
+  // <code> cannot bypass _tag() and reappear as executable markup afterward.
+  s=s.replace(/\x00O(\d+)\x00/g,(_,i)=>_inlineCodeStash[+i]);
   // Sanitize any remaining HTML tags.  The renderer intentionally returns
   // HTML and inserts it with innerHTML later, so tag names alone are not enough:
   // raw/model-provided HTML like <img onerror=...> or <a href="javascript:...">
@@ -8118,9 +8133,9 @@ function renderMd(raw){
   // executable HTML in innerHTML (for example: <img src=x onerror=...//).
   s=s.replace(/<[a-zA-Z][\w:-]*[^>\n]*$/gm,tag=>esc(tag));
   // Autolink: convert plain URLs to clickable links.
-  // Stash <a>, <img> and <pre> blocks so autolink never runs inside them.
+  // Stash <a>, <img>, <code> and <pre> blocks so autolink never runs inside them.
   const _al_stash=[];
-  s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<img\b[^>]*>|<pre\b[^>]*>[\s\S]*?<\/pre>)/g,m=>{_al_stash.push(m);return `\x00B${_al_stash.length-1}\x00`;});
+  s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<img\b[^>]*>|<code\b[^>]*>[\s\S]*?<\/code>|<pre\b[^>]*>[\s\S]*?<\/pre>)/g,m=>{_al_stash.push(m);return `\x00B${_al_stash.length-1}\x00`;});
   s=s.replace(/(https?:\/\/[^\s<>"')\]\uFF09]+)/g,(url)=>{
     // Strip trailing punctuation that was likely not part of the URL.
     // CJK full-width punctuation (）。，；：！？、) is included because LLMs
@@ -8130,7 +8145,6 @@ function renderMd(raw){
     return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;
   });
   s=s.replace(/\x00B(\d+)\x00/g,(_,i)=>_al_stash[+i]);
-  s=s.replace(/\x00O(\d+)\x00/g,(_,i)=>_inlineCodeStash[+i]);
   // Restore math stash → katex placeholder spans/divs
   // These will be rendered by renderKatexBlocks() after DOM insertion
   s=s.replace(/\x00M(\d+)\x00/g,(_,i)=>{

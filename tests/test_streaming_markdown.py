@@ -249,6 +249,38 @@ console.log(JSON.stringify(hrefs));
         )
         assert json.loads(completed.stdout) == [url]
 
+    def test_smd_keeps_quote_bytes_inside_labeled_destinations(self):
+        urls = [
+            "https://example.test/O'Reilly.pdf",
+            'https://example.test/O"Reilly.pdf',
+        ]
+        script = f"""
+import * as smd from './static/vendor/smd.min.js';
+const urls={json.dumps(urls)};
+const hrefs=[];
+for(const url of urls){{
+  const renderer={{
+    data: {{}},
+    add_token() {{}},
+    end_token() {{}},
+    add_text() {{}},
+    set_attr(_data, attr, value) {{ if(attr===smd.HREF) hrefs.push(value); }},
+  }};
+  const parser=smd.parser(renderer);
+  smd.parser_write(parser, `[Docs](${{url}})`);
+  smd.parser_end(parser);
+}}
+console.log(JSON.stringify(hrefs));
+"""
+        completed = subprocess.run(
+            ["node", "--input-type=module", "-e", script],
+            cwd=REPO,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        assert json.loads(completed.stdout) == urls
+
     def test_smd_renderers_strip_optional_title_without_truncating_spaced_url(self):
         normalizer = extract_fn(UI_JS, "_normalizeMarkdownLinkDestination")
         link_href = extract_fn(MESSAGES_JS, "_smdLinkHref")
