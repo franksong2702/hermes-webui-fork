@@ -130,6 +130,7 @@ jobs:
             fi
             mkdir "$artifact_dir"
             local log="$artifact_dir/run.log"
+            local expected_gate_failure="CONVERSATION LIFECYCLE GATE FAILED: $expected_marker"
 
             if [ "$(find "$artifact_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
               echo "::error title=Dirty mutation artifacts::$name artifact directory is not empty"
@@ -147,7 +148,8 @@ jobs:
               echo "::error title=Mutation survived::$name unexpectedly passed"
               return 1
             fi
-            if ! grep -Fq -- "$expected_marker" "$log"; then
+            if ! grep -Fxq -- "$expected_marker" "$log" \
+              && ! grep -Fxq -- "$expected_gate_failure" "$log"; then
               echo "::error title=Unexpected mutation failure::$name failed without expected marker: $expected_marker"
               tail -200 "$log"
               return 1
@@ -164,7 +166,8 @@ jobs:
             )
             for classification_prefix in "${classification_prefixes[@]}"; do
               while IFS= read -r classification_marker; do
-                if [ "$classification_marker" = "$expected_marker" ]; then
+                if [ "$classification_marker" = "$expected_marker" ] \
+                  || [ "$classification_marker" = "$expected_gate_failure" ]; then
                   continue
                 fi
                 echo "::error title=Competing mutation classification::$name emitted competing marker: $classification_marker"
