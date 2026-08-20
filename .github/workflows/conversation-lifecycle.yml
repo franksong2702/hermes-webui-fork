@@ -33,6 +33,7 @@ jobs:
   live-to-final:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -151,6 +152,26 @@ jobs:
               tail -200 "$log"
               return 1
             fi
+            local classification_prefix
+            local classification_marker
+            local classification_prefixes=(
+              'MUTATION CANARY EXPECTED FAILURE:'
+              'NEGATIVE CANARY EXPECTED UNMARKED FAILURE:'
+              'NEGATIVE CANARY DISCRIMINATOR:'
+              'hermes lifecycle negative canary:'
+              'unexpected browser errors'
+              'WebUI server exited'
+            )
+            for classification_prefix in "${classification_prefixes[@]}"; do
+              while IFS= read -r classification_marker; do
+                if [ "$classification_marker" = "$expected_marker" ]; then
+                  continue
+                fi
+                echo "::error title=Competing mutation classification::$name emitted competing marker: $classification_marker"
+                tail -200 "$log"
+                return 1
+              done < <(grep -F -- "$classification_prefix" "$log" || true)
+            done
             echo "$name failed as expected with marker: $expected_marker"
           }
 
