@@ -6,6 +6,7 @@ import copy
 import json
 import queue
 import threading
+import time
 from unittest.mock import Mock, patch
 
 import pytest
@@ -39,6 +40,8 @@ def _isolate_state(tmp_path, monkeypatch):
     config.STREAM_SESSION_OWNERS.clear()
     config.SESSION_WRITEBACK_OWNERS.clear()
     config.STREAM_CANCEL_GENERATIONS.clear()
+    getattr(config, "STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS", set()).clear()
+    getattr(config, "STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS", []).clear()
     yield
     models.SESSIONS.clear()
     for mapping_name in (
@@ -55,6 +58,8 @@ def _isolate_state(tmp_path, monkeypatch):
     config.STREAM_SESSION_OWNERS.clear()
     config.SESSION_WRITEBACK_OWNERS.clear()
     config.STREAM_CANCEL_GENERATIONS.clear()
+    getattr(config, "STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS", set()).clear()
+    getattr(config, "STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS", []).clear()
 
 
 def _session(session_id: str, stream_id: str) -> Session:
@@ -2927,3 +2932,196 @@ def test_gateway_cancel_arming_before_flag_set_does_not_deadlock(tmp_path, monke
     assert cancel_result == [True]
     assert not worker_errors
     assert not cancel_errors
+
+
+def _wait_for_cancel_reconciliation(predicate, *, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        threading.Event().wait(0.01)
+    return bool(predicate())
+
+
+def _arm_quiescent_cancel_reconciliation(sid, stream_id):
+    session = _session(sid, stream_id)
+    _start_cancel_state(sid, stream_id)
+    config.register_stream_owner(stream_id, sid)
+    config.register_session_writeback_owner(sid, stream_id)
+    assert cancel_stream(stream_id) is True
+    record = config.STREAM_CANCEL_GENERATIONS[(sid, stream_id)]
+    assert isinstance(record.get("turn_start"), int)
+    return session
+
+
+def test_final_cancel_reconciliation_save_failure_retries_without_new_event(monkeypatch):
+    sid = "issue6920_retry_after_final_save"
+    old_stream = "stream-retry-old"
+    successor_stream = "stream-retry-successor"
+    late_text = "Late prose survives the first failed final save."
+    baseline_generations = len(config.STREAM_CANCEL_GENERATIONS)
+    baseline_retry_owners = len(
+        getattr(config, "STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS", ())
+    )
+
+    _arm_quiescent_cancel_reconciliation(sid, old_stream)
+    writer = RunJournalWriter(sid, old_stream)
+    writer.append_sse_event("token", {"text": late_text})
+    writer.append_sse_event(
+        "tool",
+        {
+            "name": "terminal",
+            "preview": "printf retry-once",
+            "args": {"command": "printf retry-once"},
+        },
+    )
+    writer.append_sse_event(
+        "tool_complete",
+        {"name": "terminal", "preview": "retry-once", "is_error": False},
+    )
+    assert config.mark_stream_worker_done(sid, old_stream) is True
+    config.register_session_writeback_owner(sid, successor_stream)
+
+    monkeypatch.setattr(
+        streaming,
+        "_CANCEL_RECONCILIATION_RETRY_DELAYS",
+        (0.01, 0.02),
+        raising=False,
+    )
+    save_original = Session.save
+    recovered_save_attempts = []
+
+    def fail_first_recovered_save(session, *args, **kwargs):
+        has_exact_recovery = any(
+            isinstance(row, dict)
+            and row.get("_recovered_from_run_journal") is True
+            and row.get("_recovered_stream_id") == old_stream
+            for row in getattr(session, "messages", [])
+        )
+        if has_exact_recovery:
+            recovered_save_attempts.append(copy.deepcopy(session.messages))
+            if len(recovered_save_attempts) == 1:
+                retry_owner = config.stream_cancel_reconciliation_retry_owner(
+                    sid,
+                    old_stream,
+                )
+                assert retry_owner is not None
+                assert retry_owner["attempts"] == 1
+                raise OSError("coordinator oracle: first final save fails")
+        return save_original(session, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "save", fail_first_recovered_save)
+    assert streaming._reconcile_cancelled_stream_generation(sid, old_stream) is False
+    assert _wait_for_cancel_reconciliation(
+        lambda: (sid, old_stream) not in config.STREAM_CANCEL_GENERATIONS
+    ), "retry owner did not converge without another event"
+
+    assert len(recovered_save_attempts) == 2
+    assert len(config.STREAM_CANCEL_GENERATIONS) == baseline_generations
+    assert len(
+        getattr(config, "STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS", ())
+    ) == baseline_retry_owners
+    assert config.session_writeback_owner(sid) == successor_stream
+    assert not getattr(config, "STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS", ())
+
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    recovered_rows = [
+        (index, row)
+        for index, row in enumerate(reloaded.messages)
+        if isinstance(row, dict)
+        and row.get("_recovered_from_run_journal") is True
+        and row.get("_recovered_stream_id") == old_stream
+    ]
+    assert [row.get("content") for _, row in recovered_rows] == [late_text]
+    marker_index = next(
+        index for index, row in enumerate(reloaded.messages) if row.get("_error") is True
+    )
+    assert recovered_rows[0][0] < marker_index
+    recovered_tools = [
+        tool
+        for tool in reloaded.tool_calls
+        if tool.get("_recovered_from_run_journal") is True
+        and tool.get("_recovered_stream_id") == old_stream
+    ]
+    assert len(recovered_tools) == 1
+    assert recovered_tools[0]["name"] == "terminal"
+    assert recovered_tools[0]["preview"] == "retry-once"
+    assert recovered_tools[0]["done"] is True
+    assert recovered_tools[0]["assistant_msg_idx"] == recovered_rows[0][0]
+    assert sum(
+        isinstance(row, dict)
+        and row.get("content") == late_text
+        for row in reloaded.context_messages
+    ) == 1
+
+
+def test_final_cancel_reconciliation_persistent_failure_dead_letters_bounded_owner(monkeypatch):
+    sid = "issue6920_retry_dead_letter"
+    old_stream = "stream-retry-dead-letter"
+    late_text = "Journal remains durable after bounded retry exhaustion."
+    baseline_generations = len(config.STREAM_CANCEL_GENERATIONS)
+    baseline_owners = len(config.SESSION_WRITEBACK_OWNERS)
+
+    _arm_quiescent_cancel_reconciliation(sid, old_stream)
+    writer = RunJournalWriter(sid, old_stream)
+    writer.append_sse_event("token", {"text": late_text})
+    assert writer._path.is_file()
+    assert config.mark_stream_worker_done(sid, old_stream) is True
+
+    monkeypatch.setattr(
+        streaming,
+        "_CANCEL_RECONCILIATION_RETRY_DELAYS",
+        (0.01, 0.02),
+        raising=False,
+    )
+    save_original = Session.save
+    recovered_save_attempts = {"count": 0}
+
+    def always_fail_recovered_save(session, *args, **kwargs):
+        has_exact_recovery = any(
+            isinstance(row, dict)
+            and row.get("_recovered_from_run_journal") is True
+            and row.get("_recovered_stream_id") == old_stream
+            for row in getattr(session, "messages", [])
+        )
+        if has_exact_recovery:
+            recovered_save_attempts["count"] += 1
+            raise OSError("coordinator oracle: persistent final save failure")
+        return save_original(session, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "save", always_fail_recovered_save)
+    assert streaming._reconcile_cancelled_stream_generation(sid, old_stream) is False
+    assert _wait_for_cancel_reconciliation(
+        lambda: (
+            (sid, old_stream) not in config.STREAM_CANCEL_GENERATIONS
+            and not getattr(
+                config,
+                "STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS",
+                {(sid, old_stream)},
+            )
+        )
+    ), "bounded retry owner did not retire after persistent failure"
+
+    assert recovered_save_attempts["count"] == 3
+    assert len(config.STREAM_CANCEL_GENERATIONS) == baseline_generations
+    assert len(config.SESSION_WRITEBACK_OWNERS) == baseline_owners
+    assert config.session_writeback_owner(sid) is None
+    assert writer._path.is_file()
+
+    dead_letters = list(
+        getattr(config, "STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS", ())
+    )
+    assert len(dead_letters) == 1
+    assert dead_letters[0]["session_id"] == sid
+    assert dead_letters[0]["stream_id"] == old_stream
+    assert dead_letters[0]["attempts"] == 3
+    assert dead_letters[0]["error_type"] == "OSError"
+
+    durable = Session.load(sid)
+    assert durable is not None
+    assert not any(
+        isinstance(row, dict)
+        and row.get("_recovered_stream_id") == old_stream
+        for row in durable.messages
+    )

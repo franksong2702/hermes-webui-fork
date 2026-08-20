@@ -50,6 +50,12 @@ from api.config import (
     claim_stream_cancel_reconciliation,
     complete_stream_cancel_reconciliation,
     stream_cancel_generation_pending,
+    begin_stream_cancel_reconciliation_retry,
+    update_stream_cancel_reconciliation_retry_attempts,
+    stream_cancel_reconciliation_retry_owner,
+    finish_stream_cancel_reconciliation_retry,
+    note_stream_cancel_reconciliation_failure,
+    dead_letter_stream_cancel_reconciliation,
     mark_stream_success_committed,
     retire_stream_cancel_generation,
     retire_stream_cancel_generation_after_success,
@@ -725,6 +731,10 @@ def _clarify_timeout_seconds(default: int = 120) -> int:
 
 
 _CANCEL_MARKER_PATTERNS = ('task cancelled', 'task canceled', 'response interrupted')
+
+# One initial attempt plus at most two delayed retries.  Tests may replace this
+# tuple with short delays, while production retains a real bounded backoff.
+_CANCEL_RECONCILIATION_RETRY_DELAYS = (0.25, 1.0)
 
 
 _WEBUI_PROGRESS_PROMPT = """
@@ -2510,9 +2520,11 @@ def _reconcile_cancelled_stream_generation_under_lock(session_id, stream_id, cla
     # The caller already owns the canonical per-session lock.  Resolve by id
     # here rather than consulting the worker's detached snapshot, which may
     # have been evicted and replaced by a successor turn.
+    _session_lookup_error = None
     try:
         current = get_session(session_id)
-    except Exception:
+    except Exception as exc:
+        _session_lookup_error = exc
         logger.debug(
             "Failed to resolve current session %s for cancellation journal reconciliation",
             session_id,
@@ -2521,7 +2533,60 @@ def _reconcile_cancelled_stream_generation_under_lock(session_id, stream_id, cla
         current = None
     if current is None:
         complete_stream_cancel_reconciliation(session_id, stream_id, success=False)
+        note_stream_cancel_reconciliation_failure(
+            session_id,
+            stream_id,
+            _session_lookup_error or RuntimeError("session lookup failed"),
+        )
         return False
+
+    # Reconciliation is a transaction over the in-memory Session projection.
+    # The journal helper can mutate messages, context_messages, and tool_calls
+    # before Session.save() raises; restoring only messages leaves a half-built
+    # provider context or stale tool owner indexes for the next retry.  Take a
+    # deep snapshot of the complete Session attribute set for this attempt and
+    # restore it on every failed durable commit.  A fresh invocation takes a
+    # fresh snapshot, so a later retry starts from the clean pre-attempt state.
+    _session_snapshot_is_full = True
+    try:
+        _session_attempt_snapshot = copy.deepcopy(vars(current))
+    except Exception:
+        # Session fields are normally JSON-shaped, but fail closed if an
+        # extension installs a non-copyable value: retain the required mutable
+        # reconciliation fields at minimum rather than allowing a partial
+        # attempt to leak into the next retry.
+        _session_snapshot_is_full = False
+        _session_attempt_snapshot = {
+            field: copy.deepcopy(getattr(current, field, None))
+            for field in (
+                "messages",
+                "context_messages",
+                "tool_calls",
+                "active_stream_id",
+                "pending_user_message",
+                "pending_attachments",
+                "pending_started_at",
+                "pending_user_source",
+                "updated_at",
+            )
+        }
+
+    def _restore_session_attempt_snapshot() -> None:
+        try:
+            if _session_snapshot_is_full:
+                current.__dict__.clear()
+                current.__dict__.update(_session_attempt_snapshot)
+                return
+            for field, value in _session_attempt_snapshot.items():
+                setattr(current, field, value)
+        except Exception:
+            logger.debug(
+                "Failed to restore failed cancellation reconciliation state for %s/%s",
+                session_id,
+                stream_id,
+                exc_info=True,
+            )
+
     # ``SESSION_WRITEBACK_OWNERS`` and ``active_stream_id`` describe the
     # session's *current* turn.  They may already name a successor: cancel
     # deliberately clears the old active id so chat-start can admit that
@@ -2956,12 +3021,14 @@ def _reconcile_cancelled_stream_generation_under_lock(session_id, stream_id, cla
         if not marker_rows and not _session_has_cancel_marker(current) and successor_user_index is None:
             _persist_cancelled_turn(current)
         current.save()
-    except Exception:
+    except Exception as exc:
         # Keep ownership live when the canonical save did not complete; a later
-        # retry/teardown can make another idempotent claim instead of reporting
-        # success while durable state is still missing.
-        current.messages = messages
+        # bounded retry can make another idempotent claim instead of reporting
+        # success while durable state is still missing.  Restore every mutable
+        # Session field changed by this attempt before reopening the claim.
+        _restore_session_attempt_snapshot()
         complete_stream_cancel_reconciliation(session_id, stream_id, success=False)
+        note_stream_cancel_reconciliation_failure(session_id, stream_id, exc)
         logger.debug(
             "Failed final cancellation journal reconciliation for %s/%s",
             session_id,
@@ -2978,18 +3045,168 @@ def _reconcile_cancelled_stream_generation_under_lock(session_id, stream_id, cla
     return True
 
 
-def _reconcile_cancelled_stream_generation(session_id, stream_id) -> bool:
-    """Claim and reconcile one quiescent cancellation generation."""
+def _attempt_cancelled_stream_generation_reconciliation(
+    session_id,
+    stream_id,
+    *,
+    retry_owner_claimed: bool = False,
+):
+    """Run one claim/save attempt and report ``(claimed, success)``.
+
+    The initial caller claims the retry owner immediately after the generation
+    claim and before entering the session-lock/save path.  That owner therefore
+    remains present when a failed attempt reopens ``reconcile_started``; no
+    natural teardown callback can start a competing claim in that interval.
+    Retry workers already own the exact key and pass ``retry_owner_claimed``.
+    """
+    if not retry_owner_claimed and stream_cancel_reconciliation_retry_owner(
+        session_id,
+        stream_id,
+    ) is not None:
+        return False, False
     claim = claim_stream_cancel_reconciliation(session_id, stream_id)
     if claim is None:
-        return False
+        return False, False
+    if not retry_owner_claimed and not begin_stream_cancel_reconciliation_retry(
+        session_id,
+        stream_id,
+        attempts=1,
+    ):
+        # Another exact owner won the race after the guard above.  Reopen this
+        # claim and let that owner perform the one bounded retry sequence.
+        complete_stream_cancel_reconciliation(session_id, stream_id, success=False)
+        return False, False
     lock = _get_session_agent_lock(session_id)
     with lock:
-        return _reconcile_cancelled_stream_generation_under_lock(
+        success = _reconcile_cancelled_stream_generation_under_lock(
             session_id,
             stream_id,
             claim,
         )
+    return True, bool(success)
+
+
+def _cancel_reconciliation_retry_wait(delay) -> None:
+    """Wait for a retry outside every generation/writeback/session lock."""
+    try:
+        delay = max(0.0, float(delay))
+    except (TypeError, ValueError):
+        delay = 0.0
+    if delay:
+        # Event.wait is interruptible and does not acquire any reconciliation or
+        # per-session lock.  Keeping the wait here, before the claim/lock path,
+        # makes the lock boundary explicit for reviewers and tests.
+        threading.Event().wait(delay)
+
+
+def _run_cancel_reconciliation_retry_owner(session_id, stream_id) -> None:
+    """Perform at most two delayed retries for one exact generation."""
+    attempts = 1  # the synchronous caller already consumed the initial try
+    try:
+        for delay in tuple(_CANCEL_RECONCILIATION_RETRY_DELAYS):
+            if stream_cancel_reconciliation_retry_owner(session_id, stream_id) is None:
+                return
+            _cancel_reconciliation_retry_wait(delay)
+            if stream_cancel_reconciliation_retry_owner(session_id, stream_id) is None:
+                return
+            if not stream_cancel_generation_pending(session_id, stream_id):
+                # A concurrent success/teardown already retired the exact
+                # generation.  Do not manufacture a dead-letter for it.
+                finish_stream_cancel_reconciliation_retry(session_id, stream_id)
+                return
+            claimed, success = _attempt_cancelled_stream_generation_reconciliation(
+                session_id,
+                stream_id,
+                retry_owner_claimed=True,
+            )
+            # Only an actual generation claim consumes one of the two retry
+            # attempts.  A transiently unavailable claim must not turn into a
+            # false three-attempt dead-letter while another owner is still
+            # executing the exact generation.
+            if claimed:
+                attempts += 1
+                update_stream_cancel_reconciliation_retry_attempts(
+                    session_id,
+                    stream_id,
+                    attempts,
+                )
+            if success:
+                finish_stream_cancel_reconciliation_retry(session_id, stream_id)
+                return
+            if not claimed:
+                # The owner cannot safely dead-letter a generation it did not
+                # claim.  Release the retry owner so the lifecycle callback
+                # that still owns the active claim can finish or retry it.
+                finish_stream_cancel_reconciliation_retry(session_id, stream_id)
+                return
+
+        if stream_cancel_reconciliation_retry_owner(session_id, stream_id) is None:
+            return
+        # The config helper atomically removes only this exact generation and
+        # compare-clears only its old writeback owner.  The run journal remains
+        # untouched for later lazy recovery.
+        dead_letter_stream_cancel_reconciliation(
+            session_id,
+            stream_id,
+            attempts=attempts,
+        )
+    except Exception as exc:
+        # The worker itself is bounded even if an unexpected registry or lock
+        # error occurs.  Preserve a diagnostic and retire the exact owner rather
+        # than leaving a permanent retry entry behind.
+        logger.debug(
+            "Bounded cancellation reconciliation retry failed for %s/%s",
+            session_id,
+            stream_id,
+            exc_info=True,
+        )
+        if stream_cancel_generation_pending(session_id, stream_id):
+            note_stream_cancel_reconciliation_failure(session_id, stream_id, exc)
+            dead_letter_stream_cancel_reconciliation(
+                session_id,
+                stream_id,
+                attempts=attempts,
+            )
+        else:
+            finish_stream_cancel_reconciliation_retry(session_id, stream_id)
+
+
+def _schedule_cancel_reconciliation_retry(session_id, stream_id, *, attempts: int) -> None:
+    """Start the already-claimed daemon owner after a failed attempt."""
+    if stream_cancel_reconciliation_retry_owner(session_id, stream_id) is None:
+        return
+    try:
+        threading.Thread(
+            target=_run_cancel_reconciliation_retry_owner,
+            args=(session_id, stream_id),
+            name=f"cancel-reconcile-{session_id}-{stream_id}",
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        note_stream_cancel_reconciliation_failure(session_id, stream_id, exc)
+        dead_letter_stream_cancel_reconciliation(
+            session_id,
+            stream_id,
+            attempts=attempts,
+        )
+
+
+def _reconcile_cancelled_stream_generation(session_id, stream_id) -> bool:
+    """Claim and reconcile once, then own bounded retries on save failure."""
+    claimed, success = _attempt_cancelled_stream_generation_reconciliation(
+        session_id,
+        stream_id,
+    )
+    if not claimed:
+        return False
+    if success:
+        # A retry owner can race a direct teardown-success path only for the
+        # exact same generation; releasing here is idempotent and keeps the
+        # owner registry bounded.
+        finish_stream_cancel_reconciliation_retry(session_id, stream_id)
+        return True
+    _schedule_cancel_reconciliation_retry(session_id, stream_id, attempts=1)
+    return False
 
 
 def _finalize_cancelled_turn(
@@ -3059,21 +3276,16 @@ def _finalize_cancelled_turn(
             return
         # Finalize against the CURRENT object — never the worker's snapshot.
         session = current
-    if stream_id and not ephemeral:
-        if mark_stream_worker_done(session_id, stream_id):
-            claim = claim_stream_cancel_reconciliation(session_id, stream_id)
-            if claim is not None:
-                _reconcile_cancelled_stream_generation_under_lock(
-                    session_id,
-                    stream_id,
-                    claim,
-                )
-            return
-        if stream_cancel_generation_pending(session_id, stream_id):
-            # cancel_stream() already persisted the visible marker.  Keep the
-            # generation owner live until the last admitted publication can
-            # trigger the shared final reconciliation.
-            return
+    if stream_id and not ephemeral and stream_cancel_generation_pending(session_id, stream_id):
+        # The worker-done transition and any final reconciliation are owned by
+        # the outer teardown, after this caller releases ``_agent_lock``.  The
+        # old implementation attempted the claim here when the generation was
+        # already quiescent; callers reach this helper under ``_agent_lock``
+        # and the reconciler acquires that same non-reentrant lock, so a late
+        # publication could deadlock before the durable old-generation save.
+        # cancel_stream() retries the claim after its user-boundary save when
+        # teardown happened before that boundary was durable.
+        return
     if ephemeral:
         if stream_id:
             retire_stream_cancel_generation(session_id, stream_id)
@@ -11045,6 +11257,13 @@ def _run_agent_streaming(
                         except Exception:
                             logger.debug("Failed to append cancelled turn journal event", exc_info=True)
                 put('cancel', _cancel_event_payload('Cancelled by user'))
+                # The agent run is quiescent once the terminal cancel event has
+                # been published.  Claim the exact generation here, outside
+                # the finalizer's per-session lock, so the last admitted
+                # publication can trigger durable recovery before outer
+                # teardown performs unrelated cleanup.
+                if mark_stream_worker_done(session_id, stream_id):
+                    _reconcile_cancelled_stream_generation(session_id, stream_id)
                 return
             # ── Ephemeral mode (/btw): deliver answer, skip persistence, cleanup ──
             if ephemeral:

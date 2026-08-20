@@ -8901,6 +8901,17 @@ SESSION_WRITEBACK_OWNERS_LOCK = threading.Lock()
 STREAM_CANCEL_GENERATIONS: dict[tuple[str, str], dict] = {}
 STREAM_CANCEL_GENERATIONS_LOCK = threading.Lock()
 
+# A failed final cancellation reconciliation has no future event guaranteed to
+# wake it up.  Keep one short-lived owner per exact generation so the recovery
+# path can perform a bounded amount of work without introducing a process-wide
+# polling loop or an unbounded queue.  The owner is retired on success or when
+# the bounded retry budget is exhausted.
+STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS: dict[tuple[str, str], dict] = {}
+STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS_LOCK = threading.Lock()
+STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS: list[dict] = []
+STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS_LOCK = threading.Lock()
+STREAM_CANCEL_RECONCILIATION_DEAD_LETTER_CAP = 100
+
 
 def _stream_cancel_generation_key(session_id: str, stream_id: str):
     session_id = str(session_id or "").strip()
@@ -9306,6 +9317,145 @@ def clear_session_writeback_owner_if_owned(session_id: str, stream_id: str) -> N
         with SESSION_WRITEBACK_OWNERS_LOCK:
             if SESSION_WRITEBACK_OWNERS.get(session_id) == stream_id:
                 SESSION_WRITEBACK_OWNERS.pop(session_id, None)
+
+
+def begin_stream_cancel_reconciliation_retry(
+    session_id: str,
+    stream_id: str,
+    *,
+    attempts: int = 1,
+) -> bool:
+    """Claim the one bounded retry owner for an exact cancelled generation."""
+    key = _stream_cancel_generation_key(session_id, stream_id)
+    if key is None:
+        return False
+    try:
+        attempts = max(1, int(attempts))
+    except (TypeError, ValueError):
+        attempts = 1
+    with STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS_LOCK:
+        if key in STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS:
+            return False
+        STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS[key] = {
+            "session_id": key[0],
+            "stream_id": key[1],
+            "attempts": attempts,
+            "started_at": time.time(),
+        }
+    return True
+
+
+def update_stream_cancel_reconciliation_retry_attempts(
+    session_id: str,
+    stream_id: str,
+    attempts: int,
+) -> bool:
+    """Update retry-attempt diagnostics while retaining the exact owner."""
+    key = _stream_cancel_generation_key(session_id, stream_id)
+    if key is None:
+        return False
+    try:
+        attempts = max(1, int(attempts))
+    except (TypeError, ValueError):
+        attempts = 1
+    with STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS_LOCK:
+        owner = STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS.get(key)
+        if owner is None:
+            return False
+        owner["attempts"] = attempts
+    return True
+
+
+def stream_cancel_reconciliation_retry_owner(
+    session_id: str,
+    stream_id: str,
+) -> dict | None:
+    """Return a copy of the exact retry owner, if one is still active."""
+    key = _stream_cancel_generation_key(session_id, stream_id)
+    if key is None:
+        return None
+    with STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS_LOCK:
+        owner = STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS.get(key)
+        return dict(owner) if isinstance(owner, dict) else None
+
+
+def finish_stream_cancel_reconciliation_retry(
+    session_id: str,
+    stream_id: str,
+) -> None:
+    """Release a retry owner after a successful or externally retired attempt."""
+    key = _stream_cancel_generation_key(session_id, stream_id)
+    if key is None:
+        return
+    with STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS_LOCK:
+        STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS.pop(key, None)
+
+
+def note_stream_cancel_reconciliation_failure(
+    session_id: str,
+    stream_id: str,
+    error: BaseException | str,
+) -> None:
+    """Attach a bounded failure diagnostic to the exact generation record."""
+    key = _stream_cancel_generation_key(session_id, stream_id)
+    if key is None:
+        return
+    error_type = type(error).__name__ if isinstance(error, BaseException) else "Exception"
+    error_message = str(error)[:256]
+    with STREAM_CANCEL_GENERATIONS_LOCK:
+        record = STREAM_CANCEL_GENERATIONS.get(key)
+        if record is not None:
+            record["last_error_type"] = error_type
+            record["last_error_message"] = error_message
+
+
+def dead_letter_stream_cancel_reconciliation(
+    session_id: str,
+    stream_id: str,
+    *,
+    attempts: int,
+    error_type: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Retire one exact failed generation and append a bounded diagnostic.
+
+    The run journal is deliberately untouched: it remains the durable source
+    for a later normal lazy-recovery read.  Compare-and-clear the old owner so
+    a successor stream's claim survives.
+    """
+    key = _stream_cancel_generation_key(session_id, stream_id)
+    if key is None:
+        return
+    try:
+        attempts = max(1, int(attempts))
+    except (TypeError, ValueError):
+        attempts = 1
+    with STREAM_CANCEL_GENERATIONS_LOCK:
+        record = STREAM_CANCEL_GENERATIONS.pop(key, None)
+        if record is not None:
+            error_type = error_type or record.get("last_error_type")
+            error_message = error_message or record.get("last_error_message")
+        with SESSION_WRITEBACK_OWNERS_LOCK:
+            if SESSION_WRITEBACK_OWNERS.get(key[0]) == key[1]:
+                SESSION_WRITEBACK_OWNERS.pop(key[0], None)
+    # Keep the exact retry owner present until the generation and its
+    # compare-and-clear owner have both retired.  A natural teardown callback
+    # that races this boundary therefore cannot observe a free retry key and
+    # re-claim a generation that is already being dead-lettered.
+    finish_stream_cancel_reconciliation_retry(*key)
+    diagnostic = {
+        "session_id": key[0],
+        "stream_id": key[1],
+        "attempts": attempts,
+        "error_type": str(error_type or "Exception")[:128],
+        "error_message": str(error_message or "")[:256],
+        "recorded_at": time.time(),
+    }
+    with STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS_LOCK:
+        STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS.append(diagnostic)
+        del STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS[
+            :-STREAM_CANCEL_RECONCILIATION_DEAD_LETTER_CAP
+        ]
 
 
 # ── Gateway capability cache ─────────────────────────────────────────────────
