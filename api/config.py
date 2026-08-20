@@ -9219,6 +9219,25 @@ SESSION_WRITEBACK_OWNERS_LOCK = threading.Lock()
 STREAM_CANCEL_GENERATIONS: dict[tuple[str, str], dict] = {}
 STREAM_CANCEL_GENERATIONS_LOCK = threading.Lock()
 
+# Only these journal events have a visible assistant/tool projection that the
+# cancellation reconciler can materialize.  Keep the count on the exact
+# generation so an admitted publication that is not visible to a later read
+# cannot be mistaken for a quiescent, empty turn.
+_STREAM_CANCEL_RECOVERABLE_PUBLICATION_EVENTS = frozenset({
+    "token",
+    "reasoning",
+    "interim_assistant",
+    "tool",
+    "tool_complete",
+})
+
+
+def _record_stream_cancel_publication(record: dict, event: str) -> None:
+    if event in _STREAM_CANCEL_RECOVERABLE_PUBLICATION_EVENTS:
+        record["admitted_recovery_events"] = (
+            int(record.get("admitted_recovery_events") or 0) + 1
+        )
+
 # A failed final cancellation reconciliation has no future event guaranteed to
 # wake it up.  Keep one short-lived owner per exact generation so the recovery
 # path can perform a bounded amount of work without introducing a process-wide
@@ -9260,6 +9279,7 @@ def begin_stream_cancel_generation(session_id: str, stream_id: str) -> bool:
                 "reconcile_started": False,
                 "success_committed": False,
                 "success_teardown": False,
+                "admitted_recovery_events": 0,
             },
         )
         if record.get("success_committed"):
@@ -9317,6 +9337,7 @@ def set_stream_cancel_turn_start(session_id: str, stream_id: str, turn_start) ->
                 "reconcile_started": False,
                 "success_committed": False,
                 "success_teardown": False,
+                "admitted_recovery_events": 0,
             },
         )
         record["turn_start"] = turn_start
@@ -9352,6 +9373,7 @@ def admit_stream_publication(
             if record.get("success_teardown"):
                 return None if event in ("cancel", "apperror") else False
             record["inflight"] += 1
+            _record_stream_cancel_publication(record, event)
             return key
         if record is not None and record.get("cancel_requested"):
             if record.get("discarded"):
@@ -9365,6 +9387,7 @@ def admit_stream_publication(
             ):
                 return False
             record["inflight"] += 1
+            _record_stream_cancel_publication(record, event)
             return key
         if current_owner != key[1]:
             if cancelled and not success_committed and event not in ("cancel", "apperror"):
@@ -9382,6 +9405,7 @@ def admit_stream_publication(
                 "reconcile_started": False,
                 "success_committed": False,
                 "success_teardown": False,
+                "admitted_recovery_events": 0,
             },
         )
         if (
@@ -9392,6 +9416,7 @@ def admit_stream_publication(
         ):
             return False
         record["inflight"] += 1
+        _record_stream_cancel_publication(record, event)
         return key
 
 
@@ -9447,6 +9472,7 @@ def mark_stream_success_committed(session_id: str, stream_id: str) -> bool:
                 "reconcile_started": False,
                 "success_committed": False,
                 "success_teardown": False,
+                "admitted_recovery_events": 0,
             },
         )
         if record.get("cancel_requested"):

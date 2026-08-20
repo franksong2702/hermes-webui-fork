@@ -2947,6 +2947,7 @@ def _append_journaled_partial_output(
     current_turn_start: int | None = None,
     current_turn_end: int | None = None,
     return_status: bool = False,
+    expected_recovery_events: int | None = None,
 ) -> bool | tuple[bool, bool]:
     """Recover already-emitted visible output from a dead stream journal.
 
@@ -2974,6 +2975,11 @@ def _append_journaled_partial_output(
     ``return_status`` additionally returns ``(appended, complete)`` where
     ``complete`` proves every visible journal segment/tool identity was
     materialized by this call or was already present for the exact stream.
+    ``expected_recovery_events`` optionally carries the exact-generation
+    admission count from the cancellation registry.  When supplied, the
+    completeness proof also requires the current exact-owner journal snapshot
+    to contain the same number of recoverable publication identities; a
+    nonempty subset is not sufficient to retire the durable cancellation hook.
     """
     def result(appended: bool, complete: bool = False):
         return (appended, complete) if return_status else appended
@@ -3011,6 +3017,48 @@ def _append_journaled_partial_output(
             )
         ]
     if not events:
+        return result(False)
+
+    if expected_recovery_events is None:
+        expected_recovery_event_count = None
+    elif (
+        isinstance(expected_recovery_events, int)
+        and not isinstance(expected_recovery_events, bool)
+        and expected_recovery_events >= 0
+    ):
+        expected_recovery_event_count = expected_recovery_events
+    else:
+        # A malformed admission count cannot authorize durable hook retirement.
+        expected_recovery_event_count = -1
+
+    # Prove admission cardinality before touching the canonical Session.  The
+    # journal may be readable while its final admitted row is still hidden by
+    # filesystem/event-bridge visibility; mutating the Session from that
+    # partial snapshot would force the caller to roll back successor objects.
+    # Count exact event identities using the same fallback as the materializer
+    # below, and fail closed before any message/context/tool projection work.
+    observed_recovery_event_ids: set[str] = set()
+    for event in events:
+        event_name = str(event.get('event') or event.get('type') or '')
+        event_id = event.get('event_id')
+        if not event_id and isinstance(event.get('seq'), int) and event.get('seq') > 0:
+            event_id = f'{stream_id}:{event["seq"]}'
+        event_id = str(event_id) if event_id else None
+        if (
+            event_id
+            and event_name in _cfg._STREAM_CANCEL_RECOVERABLE_PUBLICATION_EVENTS
+        ):
+            observed_recovery_event_ids.add(event_id)
+    if (
+        expected_recovery_event_count is not None
+        and (
+            expected_recovery_event_count < 0
+            or (
+                expected_recovery_event_count > 0
+                and len(observed_recovery_event_ids) != expected_recovery_event_count
+            )
+        )
+    ):
         return result(False)
 
     appended_any = False
@@ -3496,6 +3544,11 @@ def _append_journaled_partial_output(
         if not event_id and isinstance(event.get('seq'), int) and event.get('seq') > 0:
             event_id = f'{stream_id}:{event["seq"]}'
         event_id = str(event_id) if event_id else None
+        if (
+            event_id
+            and event_name in _cfg._STREAM_CANCEL_RECOVERABLE_PUBLICATION_EVENTS
+        ):
+            observed_recovery_event_ids.add(event_id)
         if event_name == 'reasoning':
             text = str(
                 payload.get('text') or payload.get('reasoning') or payload.get('thinking') or ''
@@ -3695,8 +3748,15 @@ def _append_journaled_partial_output(
     if recovered_tool_calls:
         session.tool_calls = list(session.tool_calls or []) + recovered_tool_calls
         appended_any = True
-    complete = bool(expected_event_ids) and not identity_conflict and expected_event_ids.issubset(
-        materialized_event_ids
+    recovery_event_count_complete = (
+        expected_recovery_event_count is None
+        or len(observed_recovery_event_ids) == expected_recovery_event_count
+    )
+    complete = (
+        bool(expected_event_ids)
+        and recovery_event_count_complete
+        and not identity_conflict
+        and expected_event_ids.issubset(materialized_event_ids)
     )
     return result(appended_any, complete)
 
