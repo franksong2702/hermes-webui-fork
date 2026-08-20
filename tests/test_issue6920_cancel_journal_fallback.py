@@ -1789,6 +1789,61 @@ def test_local_cancel_finalizes_late_admitted_journal_after_empty_snapshot(tmp_p
     errors = []
     worker_finished = threading.Event()
 
+    # Hosted required jobs may lack the context-local Hermes-home override even
+    # though local runs have it. Pin this schedule to the existing dynamic
+    # production path so neither worker can deadlock on the legacy full-turn
+    # module-patch lock while the old journal append is gated below.
+    import api.profiles as profiles_api
+
+    dynamic_override_homes = []
+    dynamic_capability_homes = []
+
+    def _install_dynamic_home_override(profile_home):
+        dynamic_override_homes.append(str(profile_home))
+        return object(), object(), True
+
+    def _reset_dynamic_home_override(_override_mod, _override_token, _installed):
+        return None
+
+    def _dynamic_skill_home_capability(profile_home):
+        dynamic_capability_homes.append(str(profile_home))
+        return True
+
+    class _LegacySkillHomeLock:
+        def __init__(self):
+            self.acquire_calls = 0
+
+        def acquire(self, *args, **kwargs):
+            self.acquire_calls += 1
+            raise AssertionError(
+                "target workers entered the legacy full-turn skill-home lock"
+            )
+
+        def release(self):
+            return None
+
+    legacy_skill_home_lock = _LegacySkillHomeLock()
+    monkeypatch.setattr(
+        streaming,
+        "_set_streaming_hermes_home_override",
+        _install_dynamic_home_override,
+    )
+    monkeypatch.setattr(
+        streaming,
+        "_reset_streaming_hermes_home_override",
+        _reset_dynamic_home_override,
+    )
+    monkeypatch.setattr(
+        profiles_api,
+        "_skill_modules_support_profile_home",
+        _dynamic_skill_home_capability,
+    )
+    monkeypatch.setattr(
+        profiles_api,
+        "_SKILL_HOME_MODULE_PATCH_LOCK",
+        legacy_skill_home_lock,
+    )
+
     def run_worker():
         try:
             streaming._run_agent_streaming(
@@ -1807,7 +1862,21 @@ def test_local_cancel_finalizes_late_admitted_journal_after_empty_snapshot(tmp_p
 
     worker = threading.Thread(target=run_worker, daemon=True)
     worker.start()
-    assert admitted.wait(timeout=5), "real local event bridge did not admit the late event"
+    admitted_deadline = time.monotonic() + 5
+    while not admitted.is_set():
+        if errors:
+            raise errors[0]
+        if legacy_skill_home_lock.acquire_calls:
+            pytest.fail(
+                "old worker selected the legacy skill-home fallback before event admission"
+            )
+        if worker_finished.is_set():
+            pytest.fail("old worker exited before admitting the late event")
+        remaining = admitted_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        admitted.wait(timeout=min(0.05, remaining))
+    assert admitted.is_set(), "real local event bridge did not admit the late event"
 
     assert streaming.cancel_stream(stream_id) is True
     assert worker.is_alive(), "cancel_stream must return before the provider worker completes"
@@ -1816,6 +1885,24 @@ def test_local_cancel_finalizes_late_admitted_journal_after_empty_snapshot(tmp_p
     # The production admission helper must be able to claim a successor while
     # the old generation is still blocked inside its durable journal append.
     import api.routes as routes
+
+    successor_worker_finished = threading.Event()
+    successor_worker_errors = []
+    real_successor_worker = routes._run_agent_streaming
+
+    def _run_successor_worker(*args, **kwargs):
+        try:
+            # Keep the real streaming worker and all route/cancel/reconciliation
+            # behavior; this wrapper only exposes an early escaping failure
+            # before the provider-snapshot barrier.
+            return real_successor_worker(*args, **kwargs)
+        except BaseException as exc:  # pragma: no cover - failure surface
+            successor_worker_errors.append(exc)
+            raise
+        finally:
+            successor_worker_finished.set()
+
+    monkeypatch.setattr(routes, "_run_agent_streaming", _run_successor_worker)
 
     models.SESSIONS.pop(sid, None)
     successor = Session.load(sid)
@@ -1840,9 +1927,28 @@ def test_local_cancel_finalizes_late_admitted_journal_after_empty_snapshot(tmp_p
     assert successor.active_stream_id == successor_stream_id
     assert successor.pending_user_message == successor_prompt
     assert config.session_writeback_owner(sid) == successor_stream_id
-    assert successor_snapshot_ready.wait(timeout=10), (
+    snapshot_deadline = time.monotonic() + 10
+    while not successor_snapshot_ready.is_set():
+        if successor_worker_errors:
+            # Surface the causal successor failure before a derivative snapshot
+            # timeout can hide it.
+            raise successor_worker_errors[0]
+        if legacy_skill_home_lock.acquire_calls:
+            pytest.fail(
+                "successor worker selected the legacy skill-home fallback before its provider snapshot"
+            )
+        if successor_worker_finished.is_set():
+            pytest.fail("successor worker exited before capturing its provider snapshot")
+        remaining = snapshot_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        successor_snapshot_ready.wait(timeout=min(0.05, remaining))
+    assert successor_snapshot_ready.is_set(), (
         "real successor worker did not capture its provider snapshot"
     )
+    assert len(dynamic_override_homes) == 2
+    assert len(dynamic_capability_homes) == 2
+    assert legacy_skill_home_lock.acquire_calls == 0
     assert successor_provider_history
     assert not any(
         row.get("content") == late_text
