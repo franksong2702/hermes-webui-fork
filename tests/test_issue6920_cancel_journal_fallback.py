@@ -3059,15 +3059,46 @@ def test_final_cancel_reconciliation_save_failure_retries_without_new_event(monk
 def test_final_cancel_reconciliation_persistent_failure_dead_letters_bounded_owner(monkeypatch):
     sid = "issue6920_retry_dead_letter"
     old_stream = "stream-retry-dead-letter"
+    successor_stream = "stream-retry-dead-letter-successor"
     late_text = "Journal remains durable after bounded retry exhaustion."
+    successor_prompt = "Successor turn must survive restart recovery."
+    successor_tool = "restart_successor_tool"
     baseline_generations = len(config.STREAM_CANCEL_GENERATIONS)
     baseline_owners = len(config.SESSION_WRITEBACK_OWNERS)
 
     _arm_quiescent_cancel_reconciliation(sid, old_stream)
     writer = RunJournalWriter(sid, old_stream)
     writer.append_sse_event("token", {"text": late_text})
+    writer.append_sse_event(
+        "tool",
+        {
+            "name": "terminal",
+            "preview": "printf durable-restart",
+            "args": {"command": "printf durable-restart"},
+        },
+    )
+    writer.append_sse_event(
+        "tool_complete",
+        {"name": "terminal", "preview": "durable-restart", "is_error": False},
+    )
     assert writer._path.is_file()
+    durable_before_retry = Session.load(sid)
+    assert durable_before_retry is not None
+    cancellation_marker = next(
+        row
+        for row in durable_before_retry.messages
+        if isinstance(row, dict) and row.get("_error") is True
+    )
+    expected_cancellation_content = cancellation_marker["content"]
+    assert cancellation_marker.get("_pending_journal_recovery") is True
+    assert cancellation_marker.get("_journal_retry_stream_id") == old_stream
     assert config.mark_stream_worker_done(sid, old_stream) is True
+    successor = models.get_session(sid)
+    assert successor is not None
+    _seed_successor_progress(successor, successor_prompt, successor_tool)
+    config.register_session_writeback_owner(sid, successor_stream)
+    expected_successor_messages = copy.deepcopy(successor.messages[-2:])
+    expected_successor_tool = copy.deepcopy(successor.tool_calls[-1])
 
     monkeypatch.setattr(
         streaming,
@@ -3105,8 +3136,8 @@ def test_final_cancel_reconciliation_persistent_failure_dead_letters_bounded_own
 
     assert recovered_save_attempts["count"] == 3
     assert len(config.STREAM_CANCEL_GENERATIONS) == baseline_generations
-    assert len(config.SESSION_WRITEBACK_OWNERS) == baseline_owners
-    assert config.session_writeback_owner(sid) is None
+    assert len(config.SESSION_WRITEBACK_OWNERS) == baseline_owners + 1
+    assert config.session_writeback_owner(sid) == successor_stream
     assert writer._path.is_file()
 
     dead_letters = list(
@@ -3125,3 +3156,368 @@ def test_final_cancel_reconciliation_persistent_failure_dead_letters_bounded_own
         and row.get("_recovered_stream_id") == old_stream
         for row in durable.messages
     )
+
+    # Simulate a managed restart: every volatile owner/diagnostic/cache is gone,
+    # while the session file and exact run journal remain. The normal production
+    # get_session() path must consume the durable hook without another event.
+    monkeypatch.setattr(Session, "save", save_original)
+    models.SESSIONS.clear()
+    models._JOURNAL_RETRY_LOCKS.clear()
+    config.STREAM_CANCEL_GENERATIONS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS.clear()
+    config.SESSION_WRITEBACK_OWNERS.clear()
+
+    recovered = models.get_session(sid)
+    assert recovered is not None
+    assert sum(
+        isinstance(row, dict)
+        and row.get("content") == late_text
+        and row.get("_recovered_stream_id") == old_stream
+        for row in recovered.messages
+    ) == 1
+    recovered_tools = [
+        tool
+        for tool in recovered.tool_calls
+        if isinstance(tool, dict)
+        and tool.get("_recovered_stream_id") == old_stream
+    ]
+    assert len(recovered_tools) == 1
+    assert recovered_tools[0]["name"] == "terminal"
+    assert recovered.messages[-2:] == expected_successor_messages
+    assert recovered.tool_calls[-1]["name"] == expected_successor_tool["name"]
+    successor_owner = recovered.tool_calls[-1]["assistant_msg_idx"]
+    assert recovered.messages[successor_owner] == expected_successor_messages[-1]
+    marker = next(
+        row
+        for row in recovered.messages
+        if isinstance(row, dict) and row.get("_error") is True
+    )
+    assert marker["content"] == expected_cancellation_content
+    assert marker.get("_pending_journal_recovery") is None
+    assert marker.get("_journal_retry_stream_id") is None
+
+    models.SESSIONS.clear()
+    recovered_again = models.get_session(sid)
+    assert recovered_again is not None
+    assert sum(
+        isinstance(row, dict)
+        and row.get("content") == late_text
+        for row in recovered_again.messages
+    ) == 1
+    assert len([
+        tool
+        for tool in recovered_again.tool_calls
+        if isinstance(tool, dict)
+        and tool.get("_recovered_stream_id") == old_stream
+    ]) == 1
+
+
+def test_cancel_reconciliation_backoff_abandonment_recovers_after_restart(monkeypatch):
+    sid = "issue6920_retry_backoff_restart"
+    old_stream = "stream-retry-backoff-restart"
+    late_text = "Backoff abandonment remains restart recoverable."
+
+    _arm_quiescent_cancel_reconciliation(sid, old_stream)
+    writer = RunJournalWriter(sid, old_stream)
+    writer.append_sse_event("token", {"text": late_text})
+    assert config.mark_stream_worker_done(sid, old_stream) is True
+
+    save_original = Session.save
+    failed_once = threading.Event()
+    wait_entered = threading.Event()
+    release_wait = threading.Event()
+
+    def fail_first_recovered_save(session, *args, **kwargs):
+        if not failed_once.is_set() and any(
+            isinstance(row, dict)
+            and row.get("_recovered_stream_id") == old_stream
+            for row in getattr(session, "messages", [])
+        ):
+            failed_once.set()
+            raise OSError("coordinator oracle: abandon retry during backoff")
+        return save_original(session, *args, **kwargs)
+
+    def block_retry_wait(_delay):
+        wait_entered.set()
+        assert release_wait.wait(timeout=10), "abandoned retry wait was not released"
+
+    monkeypatch.setattr(Session, "save", fail_first_recovered_save)
+    monkeypatch.setattr(streaming, "_CANCEL_RECONCILIATION_RETRY_DELAYS", (1.0,))
+    monkeypatch.setattr(streaming, "_cancel_reconciliation_retry_wait", block_retry_wait)
+
+    assert streaming._reconcile_cancelled_stream_generation(sid, old_stream) is False
+    assert failed_once.wait(timeout=5)
+    assert wait_entered.wait(timeout=5)
+
+    # Drop all process-local ownership while the old daemon is parked in its
+    # backoff, then recover solely through the durable marker and real loader.
+    monkeypatch.setattr(Session, "save", save_original)
+    durable_hook = Session.load(sid)
+    assert durable_hook is not None
+    durable_marker = next(
+        row
+        for row in durable_hook.messages
+        if isinstance(row, dict) and row.get("_error") is True
+    )
+    durable_marker["_journal_retry_attempts"] = models._JOURNAL_RETRY_MAX_ATTEMPTS
+    durable_marker["_journal_retry_first_seen_ts"] = (
+        time.time() - models._JOURNAL_RETRY_GIVEUP_SECONDS - 1
+    )
+    save_original(durable_hook)
+    models.SESSIONS.clear()
+    models._JOURNAL_RETRY_LOCKS.clear()
+    config.STREAM_CANCEL_GENERATIONS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS.clear()
+    config.SESSION_WRITEBACK_OWNERS.clear()
+    recovered = models.get_session(sid)
+    release_wait.set()
+
+    assert recovered is not None
+    assert sum(
+        isinstance(row, dict)
+        and row.get("content") == late_text
+        and row.get("_recovered_stream_id") == old_stream
+        for row in recovered.messages
+    ) == 1
+    marker = next(
+        row
+        for row in recovered.messages
+        if isinstance(row, dict) and row.get("_error") is True
+    )
+    assert marker.get("_pending_journal_recovery") is None
+
+
+def test_cancel_restart_retires_hook_when_exact_journal_was_already_materialized():
+    sid = "issue6920_cancel_restart_already_materialized"
+    old_stream = "stream-cancel-restart-already-materialized"
+    late_text = "Cancellation save already materialized this exact journal row."
+
+    _session(sid, old_stream)
+    _start_cancel_state(sid, old_stream)
+    writer = RunJournalWriter(sid, old_stream)
+    writer.append_sse_event("token", {"text": late_text})
+
+    assert cancel_stream(old_stream) is True
+    durable = Session.load(sid)
+    assert durable is not None
+    assert sum(
+        isinstance(row, dict)
+        and row.get("content") == late_text
+        and row.get("_recovered_stream_id") == old_stream
+        for row in durable.messages
+    ) == 1
+    marker = next(
+        row
+        for row in durable.messages
+        if isinstance(row, dict) and row.get("_error") is True
+    )
+    assert marker.get("_pending_journal_recovery") is True
+
+    # Crash before worker teardown/final reconciliation: only the sidecar and
+    # exact journal survive. The normal loader must recognize that every exact
+    # visible event is already represented and retire the hook transactionally.
+    models.SESSIONS.clear()
+    models._JOURNAL_RETRY_LOCKS.clear()
+    config.STREAM_CANCEL_GENERATIONS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS.clear()
+    config.SESSION_WRITEBACK_OWNERS.clear()
+
+    recovered = models.get_session(sid)
+    assert recovered is not None
+    assert sum(
+        isinstance(row, dict)
+        and row.get("content") == late_text
+        and row.get("_recovered_stream_id") == old_stream
+        for row in recovered.messages
+    ) == 1
+    marker = next(
+        row
+        for row in recovered.messages
+        if isinstance(row, dict) and row.get("_error") is True
+    )
+    assert marker.get("_pending_journal_recovery") is None
+    assert marker.get("_journal_retry_stream_id") is None
+
+
+def test_cancel_restart_splices_late_suffix_without_repeating_materialized_prefix():
+    sid = "issue6920_cancel_restart_late_suffix"
+    old_stream = "stream-cancel-restart-late-suffix"
+    early_text = "Prefix materialized by cancellation."
+    late_text = " Late suffix admitted before the crash."
+
+    _session(sid, old_stream)
+    _start_cancel_state(sid, old_stream)
+    writer = RunJournalWriter(sid, old_stream)
+    writer.append_sse_event("token", {"text": early_text})
+    assert cancel_stream(old_stream) is True
+
+    # This second token belongs to the same exact journal prose segment, but
+    # arrives after the cancellation save and before worker teardown/reconcile.
+    writer.append_sse_event("token", {"text": late_text})
+    models.SESSIONS.clear()
+    models._JOURNAL_RETRY_LOCKS.clear()
+    config.STREAM_CANCEL_GENERATIONS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS.clear()
+    config.SESSION_WRITEBACK_OWNERS.clear()
+
+    recovered = models.get_session(sid)
+    assert recovered is not None
+    exact_rows = [
+        row
+        for row in recovered.messages
+        if isinstance(row, dict)
+        and row.get("_recovered_stream_id") == old_stream
+    ]
+    assert "".join(str(row.get("content") or "") for row in exact_rows) == (
+        early_text + late_text
+    )
+    assert sum(early_text in str(row.get("content") or "") for row in exact_rows) == 1
+    marker_index = next(
+        index
+        for index, row in enumerate(recovered.messages)
+        if isinstance(row, dict) and row.get("_error") is True
+    )
+    assert all(recovered.messages.index(row) < marker_index for row in exact_rows)
+    marker = recovered.messages[marker_index]
+    assert marker.get("_pending_journal_recovery") is None
+
+
+def test_cancel_restart_extends_live_buffer_prefix_without_duplicate():
+    sid = "issue6920_cancel_restart_live_prefix"
+    old_stream = "stream-cancel-restart-live-prefix"
+    early_text = "Live prefix persisted by cancellation."
+    late_text = " Late journal suffix before the crash."
+
+    _session(sid, old_stream)
+    _start_cancel_state(sid, old_stream)
+    writer = RunJournalWriter(sid, old_stream)
+    writer.append_sse_event("token", {"text": early_text})
+    config.STREAM_PARTIAL_TEXT[old_stream] = early_text
+    assert cancel_stream(old_stream) is True
+
+    durable = Session.load(sid)
+    assert durable is not None
+    assert [
+        row.get("content")
+        for row in durable.messages
+        if isinstance(row, dict) and row.get("_partial") is True
+    ] == [early_text]
+
+    # The live buffer row has no journal event metadata. A late token extends
+    # that same visible segment before the crash; restart must adopt and extend
+    # the existing row rather than append the full segment a second time.
+    writer.append_sse_event("token", {"text": late_text})
+    models.SESSIONS.clear()
+    models._JOURNAL_RETRY_LOCKS.clear()
+    config.STREAM_CANCEL_GENERATIONS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS.clear()
+    config.SESSION_WRITEBACK_OWNERS.clear()
+
+    recovered = models.get_session(sid)
+    assert recovered is not None
+    expected = early_text + late_text
+    recovered_partials = [
+        row
+        for row in recovered.messages
+        if isinstance(row, dict) and row.get("_partial") is True
+    ]
+    assert [row.get("content") for row in recovered_partials] == [expected]
+    assert recovered_partials[0].get("_recovered_stream_id") == old_stream
+    assert sum(
+        isinstance(row, dict) and row.get("content") == expected
+        for row in recovered.context_messages
+    ) == 1
+    marker = next(
+        row
+        for row in recovered.messages
+        if isinstance(row, dict) and row.get("_error") is True
+    )
+    assert marker.get("_pending_journal_recovery") is None
+
+
+def test_cancel_restart_applies_late_tool_completion_before_retiring_hook():
+    sid = "issue6920_cancel_restart_late_tool_complete"
+    old_stream = "stream-cancel-restart-late-tool-complete"
+    first_tool_id = "late-tool-first"
+    second_tool_id = "late-tool-second"
+
+    _session(sid, old_stream)
+    _start_cancel_state(sid, old_stream)
+    writer = RunJournalWriter(sid, old_stream)
+    writer.append_sse_event(
+        "tool",
+        {
+            "name": "terminal",
+            "preview": "printf first",
+            "args": {"command": "printf first"},
+            "tid": first_tool_id,
+        },
+    )
+    writer.append_sse_event(
+        "tool",
+        {
+            "name": "terminal",
+            "preview": "printf second",
+            "args": {"command": "printf second"},
+            "tid": second_tool_id,
+        },
+    )
+    assert cancel_stream(old_stream) is True
+
+    durable = Session.load(sid)
+    assert durable is not None
+    exact_tools = [
+        tool
+        for tool in durable.tool_calls
+        if isinstance(tool, dict)
+        and tool.get("_recovered_stream_id") == old_stream
+    ]
+    assert {tool["tid"] for tool in exact_tools} == {first_tool_id, second_tool_id}
+    assert all(tool["done"] is False for tool in exact_tools)
+
+    # The completion arrives after cancellation persisted the tool card but
+    # before the process dies. Restart recovery must update that exact card,
+    # not treat the earlier tool-start event as complete coverage.
+    writer.append_sse_event(
+        "tool_complete",
+        {
+            "name": "terminal",
+            "preview": "late-complete",
+            "duration": 0.25,
+            "is_error": False,
+            "tid": first_tool_id,
+        },
+    )
+    models.SESSIONS.clear()
+    models._JOURNAL_RETRY_LOCKS.clear()
+    config.STREAM_CANCEL_GENERATIONS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_RETRY_OWNERS.clear()
+    config.STREAM_CANCEL_RECONCILIATION_DEAD_LETTERS.clear()
+    config.SESSION_WRITEBACK_OWNERS.clear()
+
+    recovered = models.get_session(sid)
+    assert recovered is not None
+    recovered_tools = [
+        tool
+        for tool in recovered.tool_calls
+        if isinstance(tool, dict)
+        and tool.get("_recovered_stream_id") == old_stream
+    ]
+    assert {tool["tid"] for tool in recovered_tools} == {first_tool_id, second_tool_id}
+    by_tid = {tool["tid"]: tool for tool in recovered_tools}
+    assert by_tid[first_tool_id]["done"] is True
+    assert by_tid[first_tool_id]["preview"] == "late-complete"
+    assert by_tid[first_tool_id]["duration"] == 0.25
+    assert by_tid[second_tool_id]["done"] is False
+    assert by_tid[second_tool_id]["preview"] == "printf second"
+    marker = next(
+        row
+        for row in recovered.messages
+        if isinstance(row, dict) and row.get("_error") is True
+    )
+    assert marker.get("_pending_journal_recovery") is None

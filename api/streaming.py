@@ -2719,7 +2719,13 @@ def _reconcile_cancelled_stream_generation_under_lock(session_id, stream_id, cla
     # have been evicted and replaced by a successor turn.
     _session_lookup_error = None
     try:
-        current = get_session(session_id)
+        # Resolve through the canonical cache/freshness path while explicitly
+        # bypassing read-side lazy retry.  This transaction owns the exact
+        # cancellation hook; letting get_session() consume it first would hide
+        # a failed final save from the bounded reconciliation owner.  The
+        # resolver takes models.LOCK itself, so cache replacement/LRU eviction
+        # cannot race a raw SESSIONS.get() snapshot here.
+        current = get_session(session_id, bypass_journal_retry=True)
     except Exception as exc:
         _session_lookup_error = exc
         logger.debug(
@@ -3217,6 +3223,23 @@ def _reconcile_cancelled_stream_generation_under_lock(session_id, stream_id, cla
                     )
         if not marker_rows and not _session_has_cancel_marker(current) and successor_user_index is None:
             _persist_cancelled_turn(current)
+        # A successful exact-generation commit and hook retirement must be one
+        # Session.save transaction.  If this save fails, the full snapshot
+        # restore below keeps these durable fields armed for a later retry.
+        for _row in current.messages or []:
+            if not isinstance(_row, dict):
+                continue
+            if (
+                _row.get('_journal_retry_kind') == 'cancelled'
+                and str(_row.get('_journal_retry_stream_id') or '') == str(stream_id)
+            ):
+                _row.pop('_pending_journal_recovery', None)
+                _row.pop('_journal_retry_kind', None)
+                _row.pop('_journal_retry_stream_id', None)
+                _row.pop('_journal_retry_attempts', None)
+                _row.pop('_journal_retry_first_seen_ts', None)
+                _row.pop('_journal_retry_turn_token', None)
+                _row.pop('_journal_retry_turn_start', None)
         current.save()
     except Exception as exc:
         # Keep ownership live when the canonical save did not complete; a later
@@ -14116,6 +14139,48 @@ def cancel_stream(stream_id: str) -> bool:
                         'provider_details_label': 'Cancellation details',
                         'timestamp': int(time.time()),
                     })
+                # Freeze the exact durable journal hook on the cancellation
+                # marker before any volatile final-reconciliation retry can
+                # run.  The marker itself is the owning boundary after a
+                # successor turn is admitted; stream/event identity is never
+                # inferred from successor content.
+                _cancel_retry_marker = None
+                for _candidate in reversed(_cs.messages):
+                    if not isinstance(_candidate, dict) or _candidate.get('role') != 'assistant':
+                        continue
+                    _candidate_content = str(_candidate.get('content') or '').strip().lower()
+                    if _candidate.get('_error') is True and any(
+                        pattern in _candidate_content for pattern in _CANCEL_MARKER_PATTERNS
+                    ):
+                        _cancel_retry_marker = _candidate
+                        break
+                if _cancel_retry_marker is not None:
+                    _cancel_retry_marker['_pending_journal_recovery'] = True
+                    _cancel_retry_marker['_journal_retry_kind'] = 'cancelled'
+                    _cancel_retry_marker['_journal_retry_stream_id'] = str(stream_id)
+                    _cancel_retry_marker.setdefault(
+                        '_journal_retry_attempts', 0,
+                    )
+                    _cancel_retry_marker.setdefault(
+                        '_journal_retry_first_seen_ts', int(time.time()),
+                    )
+                    if isinstance(_cancel_turn_start, int):
+                        _cancel_retry_marker['_journal_retry_turn_start'] = _cancel_turn_start
+                        try:
+                            _owner_turn = _cs.messages[_cancel_turn_start]
+                        except (IndexError, TypeError):
+                            _owner_turn = None
+                        if isinstance(_owner_turn, dict):
+                            _owner_token = _owner_turn.get('_active_turn_token')
+                            if _owner_token:
+                                _cancel_retry_marker['_journal_retry_turn_token'] = str(_owner_token)
+                _cs.save()
+                # The generation may only claim final reconciliation after the
+                # durable marker and owning user boundary have reached disk.
+                # If this initial save fails, leave the volatile generation
+                # pending but without a turn_start claim; a worker finalizer
+                # therefore cannot splice journal rows into an unpersisted
+                # session projection.
                 if isinstance(_cancel_turn_start, int):
                     set_stream_cancel_turn_start(
                         _cancel_session_id,
@@ -14125,7 +14190,6 @@ def cancel_stream(stream_id: str) -> bool:
                     _reconcile_after_cancel_cleanup = (
                         _cancel_generation_session_id == _cancel_session_id
                     )
-                _cs.save()
                 _cancel_session_payload = _redacted_session_payload_with_full_messages(_cs)
             except Exception:
                 logger.debug("Failed to clear session state on cancel for %s", _cancel_session_id)
