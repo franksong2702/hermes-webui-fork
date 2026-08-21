@@ -3059,6 +3059,494 @@ def test_gateway_cancel_arming_before_flag_set_does_not_deadlock(tmp_path, monke
     assert not cancel_errors
 
 
+def test_local_successor_cancel_after_success_save_preserves_detached_predecessor_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    """A successor Stop must not roll back a predecessor recovered after its snapshot."""
+    sid = "issue6920_successor_rollback_recovery"
+    old_stream = "stream-predecessor-recovery"
+    late_text = "Detached predecessor recovery survives successor rollback."
+    late_tool_id = "predecessor-tool-id"
+    late_tool_name = "predecessor_terminal"
+    successor_prompt = "Continue after predecessor cancellation"
+    successor_text = "successor answer must be rolled back"
+
+    session = _session(sid, old_stream)
+    _seed_historical_duplicate_prompt(session)
+    cancelled_prompt = session.pending_user_message
+    config.register_stream_owner(old_stream, sid)
+    config.register_session_writeback_owner(sid, old_stream)
+    config.STREAMS[old_stream] = queue.Queue()
+    # The worker registration replaces the pre-seeded flag; capture the exact
+    # event object from the worker constructor below rather than this setup
+    # placeholder.
+
+    admitted = threading.Event()
+    release_append = threading.Event()
+    successor_snapshot_ready = threading.Event()
+    release_successor_provider = threading.Event()
+    predecessor_recovery_saved = threading.Event()
+    successor_success_saved = threading.Event()
+    mark_attempted = threading.Event()
+    release_mark = threading.Event()
+    successor_finished = threading.Event()
+    causal_events = []
+    provider_history = []
+    run_lock = threading.Lock()
+    run_count = {"value": 0}
+    append_original = RunJournalWriter.append_sse_event
+
+    def gated_append(writer, event, data):
+        if (
+            event == "interim_assistant"
+            and isinstance(data, dict)
+            and data.get("text") == late_text
+        ):
+            admitted.set()
+            assert release_append.wait(timeout=30), "predecessor journal append was not released"
+        return append_original(writer, event, data)
+
+    monkeypatch.setattr(RunJournalWriter, "append_sse_event", gated_append)
+
+    save_original = Session.save
+
+    def observe_save(current, *args, **kwargs):
+        result = save_original(current, *args, **kwargs)
+        rows = getattr(current, "messages", None) or []
+        has_predecessor = any(
+            isinstance(row, dict)
+            and row.get("_recovered_from_run_journal") is True
+            and row.get("_recovered_stream_id") == old_stream
+            and row.get("content") == late_text
+            for row in rows
+        )
+        has_success = any(
+            isinstance(row, dict)
+            and row.get("role") == "assistant"
+            and row.get("content") == successor_text
+            for row in rows
+        )
+        if has_predecessor and not predecessor_recovery_saved.is_set():
+            causal_events.append("predecessor_recovery_save_return")
+            predecessor_recovery_saved.set()
+        if has_success and not successor_success_saved.is_set():
+            causal_events.append("successor_success_save_return")
+            successor_success_saved.set()
+        return result
+
+    monkeypatch.setattr(Session, "save", observe_save)
+
+    original_mark_success = streaming.mark_stream_success_committed
+
+    def gate_success_mark(*args, **kwargs):
+        causal_events.append("mark_stream_success_committed_attempt")
+        mark_attempted.set()
+        assert release_mark.wait(timeout=15), "success commit barrier was not released"
+        return original_mark_success(*args, **kwargs)
+
+    monkeypatch.setattr(streaming, "mark_stream_success_committed", gate_success_mark)
+
+    class FakeAgent:
+        def __init__(
+            self,
+            *,
+            stream_delta_callback=None,
+            tool_start_callback=None,
+            tool_complete_callback=None,
+            interim_assistant_callback=None,
+            session_id=None,
+            **_kwargs,
+        ):
+            self.session_id = session_id or sid
+            self.stream_delta_callback = stream_delta_callback
+            self.tool_start_callback = tool_start_callback
+            self.tool_complete_callback = tool_complete_callback
+            self.interim_assistant_callback = interim_assistant_callback
+            self.context_compressor = None
+            self.ephemeral_system_prompt = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._last_error = None
+            self.cancel_event = config.CANCEL_FLAGS.get(old_stream)
+
+        def run_conversation(self, **kwargs):
+            with run_lock:
+                run_count["value"] += 1
+                run_number = run_count["value"]
+            if run_number == 1:
+                self.tool_start_callback(
+                    late_tool_id,
+                    late_tool_name,
+                    {"command": "printf predecessor"},
+                )
+                self.tool_complete_callback(
+                    late_tool_id,
+                    late_tool_name,
+                    {"command": "printf predecessor"},
+                    "predecessor tool output",
+                )
+                # Tool journal identity is admitted before the successor
+                # snapshot, while the visible predecessor prose is held at
+                # the publication barrier.  The durable Session reconciliation
+                # therefore still occurs only after that successor snapshot.
+                self.interim_assistant_callback(late_text)
+                while not self.cancel_event.wait(0.01):
+                    pass
+                return {
+                    "completed": False,
+                    "final_response": "",
+                    "messages": list(kwargs.get("conversation_history") or []),
+                }
+
+            history = copy.deepcopy(kwargs.get("conversation_history") or [])
+            provider_history.append(history)
+            causal_events.append("successor_provider_snapshot")
+            successor_snapshot_ready.set()
+            assert release_successor_provider.wait(timeout=15), (
+                "successor provider did not reach its settlement barrier"
+            )
+            tool_id = "successor-tool-id"
+            tool_name = "successor_terminal"
+            tool_args = {"command": "printf successor"}
+            self.tool_start_callback(tool_id, tool_name, tool_args)
+            self.tool_complete_callback(
+                tool_id,
+                tool_name,
+                tool_args,
+                "successor tool output",
+            )
+            successor_user = {
+                "role": "user",
+                "content": kwargs.get("persist_user_message") or successor_prompt,
+            }
+            return {
+                "completed": True,
+                "final_response": successor_text,
+                "messages": history + [
+                    successor_user,
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": tool_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(tool_args),
+                            },
+                        }],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "content": "successor tool output",
+                    },
+                    {"role": "assistant", "content": successor_text},
+                ],
+            }
+
+        def interrupt(self, _message):
+            return None
+
+    monkeypatch.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
+    monkeypatch.setattr(
+        streaming,
+        "resolve_model_provider",
+        lambda *args, **kwargs: ("test-model", "test-provider", None),
+    )
+    monkeypatch.setattr(streaming, "get_config", lambda: {})
+    monkeypatch.setattr(config, "get_config", lambda: {})
+    monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        streaming,
+        "reconciled_state_db_messages_for_session",
+        lambda current, *args, prefer_context=False, **kwargs: copy.deepcopy(
+            getattr(current, "context_messages" if prefer_context else "messages", None) or []
+        ),
+    )
+    monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
+
+    # Hosted workers must use the existing dynamic profile-home path so this
+    # test exercises the production concurrent schedule without the legacy
+    # process-global skill-home lock.
+    import api.profiles as profiles_api
+
+    dynamic_override_homes = []
+    dynamic_capability_homes = []
+
+    def install_dynamic_home(profile_home):
+        dynamic_override_homes.append(str(profile_home))
+        return object(), object(), True
+
+    monkeypatch.setattr(streaming, "_set_streaming_hermes_home_override", install_dynamic_home)
+    monkeypatch.setattr(
+        streaming,
+        "_reset_streaming_hermes_home_override",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        profiles_api,
+        "_skill_modules_support_profile_home",
+        lambda profile_home: dynamic_capability_homes.append(str(profile_home)) or True,
+    )
+
+    old_errors = []
+
+    def run_old_worker():
+        try:
+            streaming._run_agent_streaming(
+                sid,
+                cancelled_prompt,
+                "test-model",
+                str(tmp_path),
+                old_stream,
+                [],
+                model_provider="test-provider",
+            )
+        except BaseException as exc:  # pragma: no cover - failure surface
+            old_errors.append(exc)
+
+    old_worker = threading.Thread(target=run_old_worker, daemon=True)
+    old_worker.start()
+    assert admitted.wait(timeout=10), "old worker did not admit predecessor recovery"
+
+    assert streaming.cancel_stream(old_stream) is True
+    assert old_worker.is_alive(), "old worker must remain blocked in the admitted journal append"
+    assert config.session_writeback_owner(sid) == old_stream
+
+    import api.routes as routes
+
+    successor_errors = []
+    successor_finished.clear()
+    real_successor_worker = routes._run_agent_streaming
+
+    def run_successor_worker(*args, **kwargs):
+        try:
+            return real_successor_worker(*args, **kwargs)
+        except BaseException as exc:  # pragma: no cover - failure surface
+            successor_errors.append(exc)
+            raise
+        finally:
+            successor_finished.set()
+
+    monkeypatch.setattr(routes, "_run_agent_streaming", run_successor_worker)
+    models.SESSIONS.pop(sid, None)
+    successor = Session.load(sid)
+    assert successor is not None
+    models.SESSIONS[sid] = successor
+    monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: "deferred")
+    response = routes._start_chat_stream_for_session(
+        successor,
+        msg=successor_prompt,
+        attachments=[],
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+        external_runtime_owned=False,
+    )
+    successor_stream = response["stream_id"]
+    assert config.session_writeback_owner(sid) == successor_stream
+    assert successor_snapshot_ready.wait(timeout=15), "successor provider snapshot was not reached"
+    assert provider_history
+    assert not any(
+        isinstance(row, dict)
+        and (
+            row.get("content") == late_text
+            or row.get("_recovered_stream_id") == old_stream
+        )
+        for row in provider_history[0]
+    )
+    assert not release_append.is_set()
+    causal_events.append("successor_snapshot_asserted")
+
+    # Keep the successor's provider snapshot object detached from the canonical
+    # cache while the cancelled predecessor reconciler saves its late journal
+    # rows.  Production can evict/replace this object at the same boundary;
+    # the successor must therefore not observe the durable recovery until its
+    # settlement merge explicitly reloads it.
+    models.SESSIONS.pop(sid, None)
+
+    release_append.set()
+    assert predecessor_recovery_saved.wait(timeout=15), (
+        "predecessor recovery did not reach a durable save after successor snapshot"
+    )
+    assert causal_events.index("successor_provider_snapshot") < causal_events.index(
+        "predecessor_recovery_save_return"
+    )
+
+    # The detached predecessor transaction has now retired its exact retry
+    # hook.  Reflect that canonical metadata readback on the successor's stale
+    # object so a later Session.load cannot mask a rollback overwrite by lazily
+    # re-importing the already-settled predecessor journal.
+    from api.models import _strip_journal_retry_meta
+
+    for row in successor.messages:
+        if (
+            isinstance(row, dict)
+            and row.get("_error") is True
+            and str(row.get("_journal_retry_stream_id") or "") == old_stream
+        ):
+            _strip_journal_retry_meta(row)
+
+    release_successor_provider.set()
+    assert successor_success_saved.wait(timeout=15), (
+        "successor success save did not return with predecessor recovery"
+    )
+    assert mark_attempted.wait(timeout=15), "worker did not reach post-save success commit barrier"
+    assert causal_events.index("predecessor_recovery_save_return") < causal_events.index(
+        "successor_success_save_return"
+    ) < causal_events.index("mark_stream_success_committed_attempt")
+
+    mid_save = Session.load(sid)
+    assert mid_save is not None
+    mid_recovered = [
+        row
+        for row in mid_save.messages
+        if row.get("_recovered_from_run_journal") is True
+        and row.get("_recovered_stream_id") == old_stream
+        and row.get("content") == late_text
+    ]
+    assert len(mid_recovered) == 1
+    mid_context_recovered = [
+        row
+        for row in mid_save.context_messages
+        if row.get("_recovered_from_run_journal") is True
+        and row.get("_recovered_stream_id") == old_stream
+        and row.get("content") == late_text
+    ]
+    assert len(mid_context_recovered) == 1
+    mid_recovered_tools = [
+        tool
+        for tool in mid_save.tool_calls
+        if tool.get("_recovered_from_run_journal") is True
+        and tool.get("_recovered_stream_id") == old_stream
+        and tool.get("tid") == late_tool_id
+    ]
+    assert len(mid_recovered_tools) == 1
+    mid_tool_owner = mid_recovered_tools[0].get("assistant_msg_idx")
+    assert isinstance(mid_tool_owner, int)
+    assert 0 <= mid_tool_owner < len(mid_save.messages)
+    assert mid_recovered_tools[0].get("_recovered_assistant_event_id") == (
+        mid_save.messages[mid_tool_owner].get("_recovered_event_id")
+    )
+    assert any(row.get("content") == successor_text for row in mid_save.messages)
+
+    cancel_result = []
+    cancel_errors = []
+
+    def cancel_successor():
+        try:
+            cancel_result.append(streaming.cancel_stream(successor_stream))
+        except BaseException as exc:  # pragma: no cover - failure surface
+            cancel_errors.append(exc)
+
+    cancel_thread = threading.Thread(target=cancel_successor, daemon=True)
+    cancel_thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        record = config.STREAM_CANCEL_GENERATIONS.get((sid, successor_stream))
+        if record and record.get("cancel_requested"):
+            break
+        threading.Event().wait(0.01)
+    record = config.STREAM_CANCEL_GENERATIONS.get((sid, successor_stream))
+    assert record is not None and record.get("cancel_requested") is True
+    causal_events.append("successor_stop_armed")
+    release_mark.set()
+
+    old_worker.join(timeout=15)
+    assert not old_worker.is_alive(), "old predecessor worker did not finish"
+    assert not old_errors
+    successor_finished.wait(timeout=15)
+    assert successor_finished.is_set(), "successor worker did not finish"
+    successor_thread = config.ACTIVE_RUNS.get(successor_stream)
+    if successor_thread is not None and hasattr(successor_thread, "join"):
+        successor_thread.join(timeout=15)
+    assert not successor_errors
+    cancel_thread.join(timeout=15)
+    assert not cancel_thread.is_alive(), "successor cancel did not settle"
+    assert not cancel_errors
+    assert cancel_result == [True]
+    assert config.session_writeback_owner(sid) is None
+
+    models.SESSIONS.pop(sid, None)
+    reloaded = Session.load(sid)
+    assert reloaded is not None
+    recovered_rows = [
+        (index, row)
+        for index, row in enumerate(reloaded.messages)
+        if row.get("role") == "assistant"
+        and row.get("content") == late_text
+        and row.get("_recovered_from_run_journal") is True
+        and row.get("_recovered_stream_id") == old_stream
+    ]
+    assert len(recovered_rows) == 1, reloaded.messages
+    assert not any(row.get("content") == successor_text for row in reloaded.messages)
+    assert any(
+        row.get("_error") is True and "cancel" in str(row.get("content") or "").lower()
+        for row in reloaded.messages
+    )
+
+    from api.run_journal import read_run_events
+
+    journal_events = read_run_events(sid, old_stream).get("events") or []
+    predecessor_event_id = next(
+        event["event_id"]
+        for event in journal_events
+        if event.get("event") == "interim_assistant"
+        and (event.get("payload") or {}).get("text") == late_text
+    )
+    predecessor_tool_event_id = next(
+        event["event_id"]
+        for event in journal_events
+        if event.get("event") == "tool"
+        and (event.get("payload") or {}).get("tid") == late_tool_id
+    )
+    recovered_row = recovered_rows[0][1]
+    assert recovered_row.get("_recovered_event_id") == predecessor_event_id
+    recovered_tools = [
+        tool
+        for tool in reloaded.tool_calls
+        if tool.get("_recovered_from_run_journal") is True
+        and tool.get("_recovered_stream_id") == old_stream
+        and tool.get("tid") == late_tool_id
+    ]
+    assert len(recovered_tools) == 1
+    recovered_tool = recovered_tools[0]
+    assert recovered_tool.get("_recovered_event_id") == predecessor_tool_event_id
+    owner_index = recovered_tool.get("assistant_msg_idx")
+    assert isinstance(owner_index, int)
+    owner_event_id = reloaded.messages[owner_index].get("_recovered_event_id")
+    assert recovered_tool.get("_recovered_assistant_event_id") == owner_event_id
+    assert owner_event_id in {predecessor_event_id, recovered_tool.get("_recovered_event_id")}
+
+    context_recovered = [
+        row
+        for row in reloaded.context_messages
+        if row.get("_recovered_from_run_journal") is True
+        and row.get("_recovered_stream_id") == old_stream
+        and row.get("content") == late_text
+    ]
+    assert len(context_recovered) == 1
+    next_context = _context_messages_for_new_turn(reloaded, "next turn after rollback")
+    assert sum(row.get("content") == late_text for row in next_context) == 1
+    assert causal_events.index("successor_provider_snapshot") < causal_events.index(
+        "predecessor_recovery_save_return"
+    ) < causal_events.index("successor_success_save_return") < causal_events.index(
+        "mark_stream_success_committed_attempt"
+    ) < causal_events.index("successor_stop_armed")
+
+
 def _wait_for_cancel_reconciliation(predicate, *, timeout=5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

@@ -12560,6 +12560,12 @@ def _run_agent_streaming(
                     else:
                         s.process_wakeup_pause = {}
                     _materialize_pending_user_turn_before_error(s)
+                    _preserve_late_recovered_rows_across_settlement(
+                        s,
+                        _success_previous_messages,
+                        _success_previous_context,
+                        _active_turn_identity,
+                    )
                     s.save()
 
                 s.active_stream_id = None
