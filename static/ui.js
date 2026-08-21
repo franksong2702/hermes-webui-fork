@@ -7716,6 +7716,37 @@ function renderMd(raw){
   // token is restored only after the final autolink stage below.
   const _inlineCodeStash=[];
   s=s.replace(/(<code\b[^>]*>[\s\S]*?<\/code>)/g,m=>{_inlineCodeStash.push(m);return `\x00O${_inlineCodeStash.length-1}\x00`;});
+  // Keep each complete raw anchor opaque through markdown-link scanning. The
+  // range is restored immediately before the sanitizer so its allowlists still
+  // govern hrefs, event handlers, and unsupported attributes.
+  const _rawAnchorStash=[];
+  s=(function _stashCompleteRawAnchors(src){
+    let out='', cursor=0;
+    while(cursor<src.length){
+      const match=/<a\b/i.exec(src.slice(cursor));
+      if(!match){out+=src.slice(cursor);break;}
+      const open=cursor+match.index;
+      let openEnd=-1,quote='';
+      for(let i=open+2;i<src.length;i++){
+        const ch=src[i];
+        if(quote){
+          if(ch===quote) quote='';
+          continue;
+        }
+        if(ch==='"'||ch==="'"){quote=ch;continue;}
+        if(ch==='>'){openEnd=i+1;break;}
+      }
+      if(openEnd<0){out+=src.slice(cursor);break;}
+      const close=/<\/a\s*>/i.exec(src.slice(openEnd));
+      if(!close){out+=src.slice(cursor,openEnd);cursor=openEnd;continue;}
+      const end=openEnd+close.index+close[0].length;
+      out+=src.slice(cursor,open);
+      _rawAnchorStash.push(src.slice(open,end));
+      out+=`\x00N${_rawAnchorStash.length-1}\x00`;
+      cursor=end;
+    }
+    return out;
+  })(s);
   // Raw HTML attributes can contain literal Markdown-looking text. Protect each
   // complete tag through link scanning, then restore it for the existing
   // sanitizer rather than allowing an attribute to become nested anchors.
@@ -7795,7 +7826,17 @@ function renderMd(raw){
         }
       }
       const normalizedUrl=normalizeLinkDestination(rawUrl);
-      if(end<0||!normalizedUrl||!allowed.test(normalizedUrl)){
+      if(end<0){
+        // The scan stopped at a proven line boundary (or end-of-input). Keep
+        // the already-scanned literal span intact and resume there; advancing
+        // only one character would rescan every later `[` in a malformed line.
+        const nextBoundary=src.slice(start).search(/[\r\n]/);
+        const boundary=nextBoundary<0?src.length:start+nextBoundary;
+        out+=src.slice(cursor,boundary);
+        cursor=boundary;
+        continue;
+      }
+      if(!normalizedUrl||!allowed.test(normalizedUrl)){
         out+=src.slice(cursor,open+1);
         cursor=open+1;
         continue;
@@ -7968,6 +8009,9 @@ function renderMd(raw){
   s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>)/g,m=>{_a_stash.push(m);return `\x00A${_a_stash.length-1}\x00`;});
   s=_stashMarkdownLinks(s,_a_stash,'A');
   s=s.replace(/\x00A(\d+)\x00/g,(_,i)=>_a_stash[+i]);
+  // Restore complete raw anchors first so nested raw-pre/inline-code placeholders
+  // can complete their normal R/T/O restoration passes before sanitization.
+  s=s.replace(/\x00N(\d+)\x00/g,(_,i)=>_rawAnchorStash[+i]);
   // Restore raw <pre> only after markdown rewrites so literal preformatted
   // content stays placeholder-protected, then let the sanitizer normalize tags.
   s=s.replace(/\x00R(\d+)\x00/g,(_,i)=>rawPreStash[+i]);
