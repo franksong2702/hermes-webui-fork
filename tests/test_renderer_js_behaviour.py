@@ -179,7 +179,98 @@ def _measure_unclosed_link_scan(timing_driver_path) -> tuple[float, float]:
     return tuple(float(value) for value in payload["medians"])
 
 
+_RAW_ANCHOR_TIMING_DRIVER_SRC = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+global.window = {};
+global.document = { createElement: () => ({ innerHTML: '', textContent: '' }), baseURI: 'http://localhost/app/' };
+function _sessionUrlForSid(sid) { return '/app/session/' + encodeURIComponent(String(sid || '')); }
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => (
+  {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const _IMAGE_EXTS=/\.(png|jpg|jpeg|gif|webp|bmp|ico|avif)$/i;
+const _SVG_EXTS=/\.svg$/i;
+const _AUDIO_EXTS=/\.(mp3|ogg|wav|m4a|aac|flac|wma|opus|webm)$/i;
+const _VIDEO_EXTS=/\.(mp4|webm|mkv|mov|avi|ogv|m4v)$/i;
+function _inlineMediaHtmlForRef(ref){
+  const r = String(ref || '');
+  if (/^https?:\/\//.test(r)) return `<img class="msg-media-img" src="${esc(r)}" alt="image" loading="lazy">`;
+  if (/^file:\/\//.test(r)){
+    const m = r.replace(/^file:\/\//i, '');
+    return `<img class="msg-media-img" src="api/media?path=${encodeURIComponent(m)}" alt="image" loading="lazy">`;
+  }
+  return `<img class="msg-media-img" src="api/media?path=${encodeURIComponent(r)}" alt="image" loading="lazy">`;
+}
+function extractFunc(name) {
+  const re = new RegExp('function\\s+' + name + '\\s*\\(');
+  const start = src.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = src.indexOf('{', start);
+  let depth = 1; i++;
+  while (depth > 0 && i < src.length) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') depth--;
+    i++;
+  }
+  return src.slice(start, i);
+}
+eval(extractFunc('_matchBacktickFenceLine'));
+eval(extractFunc('_isBacktickFenceClose'));
+eval(extractFunc('_normalizeMarkdownLinkDestination'));
+eval(extractFunc('renderMd'));
+
+const inputs = ['<a>'.repeat(4096), '<a>'.repeat(8192)];
+renderMd('warm-up');
+const medians = inputs.map(input => {
+  const samples = [];
+  for (let i = 0; i < 3; i++) {
+    const start = process.hrtime.bigint();
+    renderMd(input);
+    samples.push(Number(process.hrtime.bigint() - start) / 1e6);
+  }
+  samples.sort((a, b) => a - b);
+  return samples[1];
+});
+process.stdout.write(JSON.stringify({ medians }));
+"""
+
+
+@pytest.fixture(scope="module")
+def raw_anchor_timing_driver_path(tmp_path_factory):
+    p = tmp_path_factory.mktemp("renderer_raw_anchor_timing_driver") / "driver.js"
+    p.write_text(_RAW_ANCHOR_TIMING_DRIVER_SRC, encoding="utf-8")
+    return str(p)
+
+
+def _measure_unmatched_raw_anchor_scan(raw_anchor_timing_driver_path) -> tuple[float, float]:
+    result = subprocess.run(
+        [NODE, raw_anchor_timing_driver_path, str(UI_JS_PATH)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"node raw-anchor timing driver failed: {result.stderr}")
+    payload = json.loads(result.stdout)
+    return tuple(float(value) for value in payload["medians"])
+
+
 class TestSettledRendererRepairBatch:
+    def test_repeated_unmatched_raw_anchor_scan_has_bounded_growth(
+        self, raw_anchor_timing_driver_path
+    ):
+        median_12k, median_24k = _measure_unmatched_raw_anchor_scan(
+            raw_anchor_timing_driver_path
+        )
+        assert median_24k < 250.0, (
+            f"24576-byte unmatched raw-anchor scan exceeded 250 ms: "
+            f"12k={median_12k:.3f} ms, 24k={median_24k:.3f} ms"
+        )
+        assert median_24k <= 3.0 * median_12k, (
+            f"unmatched raw-anchor scan grew superlinearly: "
+            f"12k={median_12k:.3f} ms, 24k={median_24k:.3f} ms"
+        )
+
     def test_repeated_unclosed_link_scan_has_bounded_growth(self, timing_driver_path):
         median_16k, median_32k = _measure_unclosed_link_scan(timing_driver_path)
         assert median_32k < 250.0, (

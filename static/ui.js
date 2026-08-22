@@ -7738,7 +7738,7 @@ function renderMd(raw){
       }
       if(openEnd<0){out+=src.slice(cursor);break;}
       const close=/<\/a\s*>/i.exec(src.slice(openEnd));
-      if(!close){out+=src.slice(cursor,openEnd);cursor=openEnd;continue;}
+      if(!close){out+=src.slice(cursor);break;}
       const end=openEnd+close.index+close[0].length;
       out+=src.slice(cursor,open);
       _rawAnchorStash.push(src.slice(open,end));
@@ -8179,7 +8179,7 @@ function renderMd(raw){
   // Autolink: convert plain URLs to clickable links.
   // Stash <a>, <img>, <code> and <pre> blocks so autolink never runs inside them.
   const _al_stash=[];
-  s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<img\b[^>]*>|<code\b[^>]*>[\s\S]*?<\/code>|<pre\b[^>]*>[\s\S]*?<\/pre>)/g,m=>{_al_stash.push(m);return `\x00B${_al_stash.length-1}\x00`;});
+  s=s.replace(/(<a\b[^>]*>(?:(?!<a\b)[\s\S])*?(?:<\/a>|(?=<a\b))|<img\b[^>]*>|<code\b[^>]*>[\s\S]*?<\/code>|<pre\b[^>]*>[\s\S]*?<\/pre>)/g,m=>{_al_stash.push(m);return `\x00B${_al_stash.length-1}\x00`;});
   s=s.replace(/(https?:\/\/[^\s<>"')\]\uFF09]+)/g,(url)=>{
     // Strip trailing punctuation that was likely not part of the URL.
     // CJK full-width punctuation (）。，；：！？、) is included because LLMs
