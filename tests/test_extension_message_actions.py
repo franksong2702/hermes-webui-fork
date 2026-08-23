@@ -317,9 +317,10 @@ def test_render_path_reconciles_message_actions_before_session_html_is_cached():
     render_body = ui_js[render_start:render_end]
 
     assert "data-extension-message-actions" in render_body
-    assert render_body.index("_syncExtensionMessageActionSlots(inner);") < render_body.index(
+    guarded_sync = "if(typeof _syncExtensionMessageActionSlots==='function') _syncExtensionMessageActionSlots(inner);"
+    assert render_body.index(guarded_sync) < render_body.index(
         "const _html=inner.innerHTML;"
     )
     cache_restore = render_body.index("inner.innerHTML=cached.html;")
     cache_return = render_body.index("return;", cache_restore)
-    assert "_syncExtensionMessageActionSlots(inner);" in render_body[cache_restore:cache_return]
+    assert guarded_sync in render_body[cache_restore:cache_return]
