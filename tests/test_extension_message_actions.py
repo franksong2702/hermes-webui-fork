@@ -246,6 +246,14 @@ def test_core_message_action_surface_resolves_and_revalidates_visible_context():
         assert.notStrictEqual(context.text, S.messages[0].content,
           'invocation text comes from the Core-rendered visible row');
 
+        owner.dataset.rawText = '';
+        S.messages[0] = {{role: 'assistant', content: '', attachments: [{{name: 'diagram.png'}}]}};
+        assert.deepStrictEqual(_extensionMessageActionContext(slot, true), {{
+          sessionId: 'session-1', messageIndex: 7, role: 'assistant', text: ''
+        }}, 'attachment-only settled rows remain eligible with empty visible plain text');
+        owner.dataset.rawText = 'Visible plain text';
+        S.messages[0] = {{role: 'assistant', content: 'persisted provider payload'}};
+
         const html = _extensionMessageActionButtonHtml({{
           extensionId: 'alpha.ext', id: 'pin', label: 'Pin <message>', icon: 'pin',
           pressed: true, pending: true,
