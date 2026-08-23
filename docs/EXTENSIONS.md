@@ -399,7 +399,8 @@ pagination offset. It is stable when older history is prepended, but it is not a
 durable ID across edit, regenerate, or truncate operations. `text` is the
 Core-normalized visible plain text used by that row's Copy/TTS surface—not
 rendered HTML, hidden reasoning, the complete provider payload, or a
-transcript-wide read.
+transcript-wide read. It is an empty string when an otherwise eligible settled
+row has visible attachments or media but no plain text.
 
 A thenable returned by `onInvoke` controls pending state. Repeated clicks on the
 same extension/action/session/message target are suppressed while it is pending;

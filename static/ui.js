@@ -15332,7 +15332,7 @@ function _extensionMessageActionContext(slot,includeText){
   if(!Number.isSafeInteger(rawIdx)||rawIdx<0||!Number.isSafeInteger(messageIndex)||messageIndex<0) return null;
   if(_messageSessionIndexForRawIdx(rawIdx)!==messageIndex) return null;
   const message=S.messages&&S.messages[rawIdx];
-  if(!message||message.role!==role||!String(owner.dataset.rawText||'').trim()) return null;
+  if(!message||message.role!==role) return null;
   const context={sessionId:String(S.session.session_id||''),messageIndex,role};
   if(!context.sessionId) return null;
   if(includeText) context.text=String(owner.dataset.rawText||'');
