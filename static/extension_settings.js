@@ -19,7 +19,7 @@
   const MESSAGE_ACTION_ROLES=new Set(['user','assistant']);
   const MESSAGE_ACTION_LIMIT=2;
   const messageActionRegistrations=new Map();
-  const messageActionPending=new Set();
+  const messageActionPending=new Map();
   const messageActionChangeListeners=new Set();
   const currentExtensionStatus=new Map();
   let trustedSeeded=false;
@@ -478,7 +478,7 @@
       active=false;
       record.active=false;
       if(messageActionRegistrations.get(key)===record) messageActionRegistrations.delete(key);
-      for(const pendingKey of [...messageActionPending]){
+      for(const pendingKey of messageActionPending.keys()){
         if(pendingKey.startsWith(`${key}\u0000`)) messageActionPending.delete(pendingKey);
       }
       notifyMessageActionChange(clean,descriptor.id,'registration');
@@ -493,7 +493,7 @@
       record.active=false;
       messageActionRegistrations.delete(key);
     }
-    for(const key of [...messageActionPending]){
+    for(const key of messageActionPending.keys()){
       if(key.startsWith(prefix)) messageActionPending.delete(key);
     }
   }
@@ -593,12 +593,14 @@
     const onError=options&&options.onError;
     let settled=false;
     let failureReported=false;
-    messageActionPending.add(pendingKey);
+    const invocationToken={};
+    messageActionPending.set(pendingKey,invocationToken);
     notifyMessageActionChange(cleanExtensionId,cleanActionId,'pending');
 
     function settle(){
       if(settled) return false;
       settled=true;
+      if(messageActionPending.get(pendingKey)!==invocationToken) return false;
       messageActionPending.delete(pendingKey);
       notifyMessageActionChange(cleanExtensionId,cleanActionId,'pending');
       focusMessageActionTarget(opener);
