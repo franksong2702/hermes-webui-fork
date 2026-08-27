@@ -83,8 +83,8 @@ from api.run_journal import RunJournalWriter
 from api.todo_state import attach_todo_state, emit_todo_state
 from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
+from api.models import _append_recovered_turn_to_context
 from api.models import (
-    _append_recovered_turn_to_context,
     _is_empty_partial_activity_message,
     _evict_sessions_over_cap,
     clear_process_wakeup_pause,
