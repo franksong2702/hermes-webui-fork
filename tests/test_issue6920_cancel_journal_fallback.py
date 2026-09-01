@@ -19,6 +19,37 @@ from api.run_journal import RunJournalWriter
 from api.streaming import _context_messages_for_new_turn, cancel_stream
 
 
+def _empty_state_db_messages(*_args, with_revision=False, **_kwargs):
+    """Model an unavailable state.db while honoring the revision-read contract."""
+    if with_revision:
+        return models.StateDBSessionMessagesSnapshot(messages=[], revision=None)
+    return []
+
+
+def _session_state_db_messages(
+    current,
+    *_args,
+    prefer_context=False,
+    state_messages=None,
+    with_revision=False,
+    **_kwargs,
+):
+    """Return the test session projection without discarding snapshot identity."""
+    field = "context_messages" if prefer_context else "messages"
+    messages = copy.deepcopy(getattr(current, field, None) or [])
+    revision = (
+        state_messages.revision
+        if isinstance(state_messages, models.StateDBSessionMessagesSnapshot)
+        else None
+    )
+    if with_revision:
+        return models.StateDBSessionMessagesSnapshot(
+            messages=messages,
+            revision=revision,
+        )
+    return messages
+
+
 @pytest.fixture(autouse=True)
 def _isolate_state(tmp_path, monkeypatch):
     session_dir = tmp_path / "sessions"
@@ -1367,8 +1398,8 @@ def test_local_cancel_before_flag_registration_stops_worker(tmp_path, monkeypatc
     monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(streaming, "reconciled_state_db_messages_for_session", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "get_state_db_session_messages", _empty_state_db_messages)
+    monkeypatch.setattr(streaming, "reconciled_state_db_messages_for_session", _empty_state_db_messages)
     monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
 
     errors = []
@@ -1551,8 +1582,8 @@ def test_local_cancel_finalizer_defers_until_cancel_records_user_boundary(tmp_pa
     monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(streaming, "reconciled_state_db_messages_for_session", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "get_state_db_session_messages", _empty_state_db_messages)
+    monkeypatch.setattr(streaming, "reconciled_state_db_messages_for_session", _empty_state_db_messages)
     monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
 
     def run_worker():
@@ -1773,16 +1804,12 @@ def test_local_cancel_finalizes_late_admitted_journal_after_empty_snapshot(tmp_p
     monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
-
-    def _reconciled_state_messages(current, *args, prefer_context=False, **kwargs):
-        field = "context_messages" if prefer_context else "messages"
-        return copy.deepcopy(getattr(current, field, None) or [])
+    monkeypatch.setattr(streaming, "get_state_db_session_messages", _empty_state_db_messages)
 
     monkeypatch.setattr(
         streaming,
         "reconciled_state_db_messages_for_session",
-        _reconciled_state_messages,
+        _session_state_db_messages,
     )
     monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
 
@@ -2186,11 +2213,11 @@ def test_local_cancel_finalizes_late_admitted_journal_after_live_partial(tmp_pat
     monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "get_state_db_session_messages", _empty_state_db_messages)
     monkeypatch.setattr(
         streaming,
         "reconciled_state_db_messages_for_session",
-        lambda *_args, **_kwargs: [],
+        _empty_state_db_messages,
     )
     monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
 
@@ -2856,11 +2883,11 @@ def test_local_success_commit_late_stop_retires_old_generation(tmp_path, monkeyp
         monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
         monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
         monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
-        monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(streaming, "get_state_db_session_messages", _empty_state_db_messages)
         monkeypatch.setattr(
             streaming,
             "reconciled_state_db_messages_for_session",
-            lambda *_args, **_kwargs: [],
+            _empty_state_db_messages,
         )
         monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
 
@@ -3263,13 +3290,11 @@ def test_local_successor_cancel_after_success_save_preserves_detached_predecesso
     monkeypatch.setattr(config, "get_config_for_profile_home", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(streaming, "_build_session_db_for_stream", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(streaming, "get_state_db_session_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(streaming, "get_state_db_session_messages", _empty_state_db_messages)
     monkeypatch.setattr(
         streaming,
         "reconciled_state_db_messages_for_session",
-        lambda current, *args, prefer_context=False, **kwargs: copy.deepcopy(
-            getattr(current, "context_messages" if prefer_context else "messages", None) or []
-        ),
+        _session_state_db_messages,
     )
     monkeypatch.setattr(streaming, "warm_models_catalog_provenance_if_cold", lambda: None)
 
