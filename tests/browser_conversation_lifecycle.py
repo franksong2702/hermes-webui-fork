@@ -1171,7 +1171,16 @@ def main() -> int:
             print("OK  live activity: terminal-error run keeps reasoning + completed tool")
         else:
             print("OK  live activity: one Anchor worklog with reasoning + completed tool")
-        _wait_for_live_anchor_projection(page)
+        # The reloaded-Anchor crash rows certify the shared health classifier at
+        # a later, post-reload boundary.  The ordinary lifecycle rows already
+        # require this live registry projection.  Requiring it again here lets a
+        # hosted-browser projection delay abort before the crash is injected,
+        # so the discriminator can never prove the guard it targets.
+        if NEGATIVE_BITE not in {
+            "close-reloaded-anchor-group",
+            "server-death-reloaded-anchor-group",
+        }:
+            _wait_for_live_anchor_projection(page)
 
         # #6414 proof: the terminal handoff may rebuild DOM, but a browser paint
         # must never expose an expanded empty Worklog shell or an activity-less
