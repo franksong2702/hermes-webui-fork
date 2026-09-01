@@ -136,6 +136,21 @@ def _latest_anchor_scene_from_disk(state_root: Path, session_id: str) -> dict | 
     return None
 
 
+def _wait_for_latest_anchor_scene_from_disk(
+    state_root: Path,
+    session_id: str,
+    timeout: float = ANCHOR_SCENE_PERSIST_TIMEOUT,
+) -> dict | None:
+    """Wait for the JSON sidecar projection after the API scene is visible."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        scene = _latest_anchor_scene_from_disk(state_root, session_id)
+        if scene is not None:
+            return scene
+        time.sleep(0.1)
+    return _latest_anchor_scene_from_disk(state_root, session_id)
+
+
 def _safe_request_post_data(request_or_route_request) -> str:
     raw = getattr(request_or_route_request, "post_data", None)
     if callable(raw):
@@ -1344,7 +1359,7 @@ def main() -> int:
                 "OK  persisted scene via API: roles=%s terminal_present=%s"
                 % (sorted(set(scene_roles)), any(role == "terminal" for role in scene_roles))
             )
-            persisted_scene = _latest_anchor_scene_from_disk(state_dir, session_id)
+            persisted_scene = _wait_for_latest_anchor_scene_from_disk(state_dir, session_id)
             assert persisted_scene is not None, {
                 "session_id": session_id,
                 "state_dir": str(state_dir / "webui-state"),
