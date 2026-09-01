@@ -1192,6 +1192,8 @@ def main() -> int:
         # hosted-browser projection delay abort before the crash is injected,
         # so the discriminator can never prove the guard it targets.
         if NEGATIVE_BITE not in {
+            "close-reload-final-text",
+            "server-death-reload-final-text",
             "close-reloaded-anchor-group",
             "server-death-reloaded-anchor-group",
         }:
