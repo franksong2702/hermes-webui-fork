@@ -1126,10 +1126,57 @@ def test_auxiliary_retired_authority_rotation_fails_closed_without_clobbering(
     else:
         assert real_session_store[1].read_bytes() == authority["post_index"]
     if rotation != "owner":
-        assert models.SESSIONS[child.session_id] is child
+        assert child.session_id not in models.SESSIONS
+        assert child._persistence_revoked is True
+        assert child._persistence_generation.revoked is True
+        with pytest.raises(RuntimeError, match="persistence-revoked"):
+            child.save(touch_updated_at=False)
     assert authority["path"].read_bytes() == authority["before"]
     assert not _Thread.created
     assert trackers == []
+
+
+def test_auxiliary_rollback_failure_retires_shared_persistence_generation(
+    real_session_store, monkeypatch
+):
+    """An uncertain rejected child must not remain writable through aliases."""
+    sid = "auxiliary-rollback-failure-retires-generation"
+    child = models.Session(
+        session_id=sid,
+        title="prepared child",
+        messages=[{"role": "assistant", "content": "prepared"}],
+    )
+    models.SESSIONS[sid] = child
+    before = routes._snapshot_auxiliary_session_persistence(child)
+    child.save(touch_updated_at=False)
+    prepared = routes._snapshot_auxiliary_session_persistence(child)
+    shared_generation = child._persistence_generation
+    alias = models.Session(session_id=sid, title="captured alias")
+    assert alias._persistence_generation is shared_generation
+    durable_before = child.path.read_bytes()
+
+    monkeypatch.setattr(
+        routes,
+        "_restore_auxiliary_session_persistence",
+        lambda **_kwargs: False,
+    )
+
+    assert routes._rollback_auxiliary_session_after_authority_failure(
+        child,
+        before=before,
+        prepared=prepared,
+    ) is False
+
+    assert sid not in models.SESSIONS
+    assert child._persistence_revoked is True
+    assert shared_generation.revoked is True
+    child.title = "stale child overwrite"
+    with pytest.raises(RuntimeError, match="persistence-revoked"):
+        child.save(touch_updated_at=False)
+    alias.title = "stale alias overwrite"
+    with pytest.raises(RuntimeError, match="revoked|deleted"):
+        alias.save(touch_updated_at=False)
+    assert child.path.read_bytes() == durable_before
 
 
 @pytest.mark.parametrize("endpoint", ["btw", "background"])
@@ -1416,7 +1463,11 @@ def test_auxiliary_rollback_fails_closed_when_save_replaces_sidecar_first(
     rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
     row = next(row for row in rows if row.get("session_id") == sid)
     assert row["title"] == "successor child"
-    assert models.SESSIONS[sid] is child
+    assert sid not in models.SESSIONS
+    assert child._persistence_revoked is True
+    assert child._persistence_generation.revoked is True
+    with pytest.raises(RuntimeError, match="persistence-revoked"):
+        child.save(touch_updated_at=False)
 
 
 def test_auxiliary_rollback_holds_owner_lock_through_cleanup(

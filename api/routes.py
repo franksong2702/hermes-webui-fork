@@ -15502,6 +15502,23 @@ def handle_post(handler, parsed) -> bool:
             backup = p.with_suffix('.json.bak')
             retry_sidecar_snapshot = _snapshot_chat_start_file(p)
             retry_backup_snapshot = _snapshot_chat_start_file(backup)
+            if retry_sidecar_snapshot.get("error") or retry_backup_snapshot.get("error"):
+                logger.warning(
+                    "Cannot snapshot session artifacts for %s; preserving them for retry",
+                    sid,
+                )
+                return j(
+                    handler,
+                    {
+                        "ok": False,
+                        "state_db_cleanup_failed": False,
+                        "run_journal_cleanup_failed": False,
+                        "session_artifact_cleanup_failed": True,
+                        **worktree_retained,
+                        "error": "Session file snapshot failed; retry deletion",
+                    },
+                    status=500,
+                )
             residual_artifacts = []
             for artifact in (p, backup):
                 try:
@@ -22189,7 +22206,11 @@ def _rollback_auxiliary_session_after_authority_failure(
     session_id = str(getattr(session, "session_id", "") or "")
     if not isinstance(prepared, dict):
         return False
-    from api.models import _INDEX_WRITE_LOCK, _get_session_persistence_lock
+    from api.models import (
+        _INDEX_WRITE_LOCK,
+        _advance_session_persistence_generation,
+        _get_session_persistence_lock,
+    )
 
     # Fixed lock order: persistence lock -> index writer -> in-memory owner.
     # The persistence lock keeps a same-object Session.save() from replacing a
@@ -22211,6 +22232,13 @@ def _rollback_auxiliary_session_after_authority_failure(
                     before=before,
                     prepared=prepared,
                 ):
+                    # Restoration may already have replaced only part of the
+                    # durable image. Retire the whole shared SID capability,
+                    # not just this object, so aliases captured before the
+                    # failed rollback cannot overwrite that uncertain state.
+                    session._persistence_revoked = True
+                    _advance_session_persistence_generation(session_id)
+                    SESSIONS.pop(session_id, None)
                     return False
                 # This object is no longer an admissible writer after a
                 # successful auxiliary rollback.  Keep the transient marker

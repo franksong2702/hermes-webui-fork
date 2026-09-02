@@ -631,6 +631,39 @@ def test_delete_index_compensation_failure_reports_manual_recovery(
     assert case["backup"].read_bytes() == case["backup_bytes"]
 
 
+@pytest.mark.parametrize("failed_artifact", ["sidecar", "backup"])
+def test_delete_snapshot_failure_preserves_all_session_artifacts_for_retry(
+    models_module, monkeypatch, tmp_path, failed_artifact
+):
+    """Deletion must not unlink either retry artifact after an unreadable snapshot."""
+    routes_module = pytest.importorskip("api.routes")
+    session_dir, index_file = _install_delete_route_test_harness(
+        models_module, routes_module, monkeypatch, tmp_path
+    )
+    sid = f"delete-snapshot-failure-{failed_artifact}"
+    case = _seed_late_delete_retry_case(
+        models_module, session_dir, index_file, tmp_path, sid
+    )
+    original_snapshot = routes_module._snapshot_chat_start_file
+    failed_path = case[failed_artifact]
+
+    def fail_one_snapshot(path):
+        if Path(path) == failed_path:
+            return {"path": Path(path), "error": "snapshot denied"}
+        return original_snapshot(path)
+
+    monkeypatch.setattr(routes_module, "_snapshot_chat_start_file", fail_one_snapshot)
+    status, payload = _delete_result_via_route(routes_module, sid)
+
+    assert status == 500
+    assert payload["session_artifact_cleanup_failed"] is True
+    assert payload["error"] == "Session file snapshot failed; retry deletion"
+    assert case["sidecar"].read_bytes() == case["sidecar_bytes"]
+    assert case["backup"].read_bytes() == case["backup_bytes"]
+    restored_index = json.loads(index_file.read_text(encoding="utf-8"))
+    assert {row["session_id"]: row for row in restored_index} == case["index_by_sid"]
+
+
 def test_successful_delete_revokes_prelock_rename_owner(
     models_module, monkeypatch, tmp_path
 ):
