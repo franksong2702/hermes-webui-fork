@@ -194,6 +194,15 @@ function _clearRememberedNewChatDraftSession(sid) {
   } catch (_) {}
 }
 
+function _adoptRegenerationRevision(sessionPayload){
+  if(!S||!S.session||!sessionPayload||typeof sessionPayload!=='object') return;
+  if(Object.prototype.hasOwnProperty.call(sessionPayload,'regeneration_revision')){
+    S.session.regeneration_revision=sessionPayload.regeneration_revision;
+  }else{
+    delete S.session.regeneration_revision;
+  }
+}
+
 async function _restoreRememberedNewChatDraftSession() {
   let sid = '';
   try { sid = localStorage.getItem(NEW_CHAT_DRAFT_SESSION_KEY) || ''; } catch (_) { sid = ''; }
@@ -1413,15 +1422,20 @@ async function newSession(flash, options={}){
     _messagesTruncated=false;
     _oldestIdx=0;
     clearLiveToolCards();
-    // One-shot profile-switch workspace wins first; otherwise prefer the profile default.
+    // Explicit profile switch wins, then the current conversation, then the profile default.
+    // Provenance lets the server recover only a deleted inherited path; explicit paths stay strict.
     const switchWs=S._profileSwitchWorkspace;
     S._profileSwitchWorkspace=null;
-    const inheritWs=switchWs||(S._profileDefaultWorkspace||null)||(S.session?S.session.workspace:null);
+    const sessionWs=(!switchWs&&S.session)?S.session.workspace:null;
+    const inheritWs=switchWs||sessionWs||(S._profileDefaultWorkspace||null);
     const reqBody={
       workspace:inheritWs,
       profile:S.activeProfile||'default',
     };
-    if(S.session&&S.session.session_id) reqBody.prev_session_id=S.session.session_id;
+    if(S.session&&S.session.session_id){
+      reqBody.prev_session_id=S.session.session_id;
+      if(sessionWs) reqBody.workspace_inherited_from_prev_session=true;
+    }
     // Three-value worktree contract (#6022): explicit true/false is forwarded
     // verbatim; an ABSENT key lets the server apply the agent's config-level
     // `worktree:` default. Auto-bind paths pass worktree:false explicitly so a
@@ -1512,7 +1526,7 @@ async function newSession(flash, options={}){
     if(consumedExplicitModelOverride&&typeof _clearEmptyComposerModelOverride==='function'){
       _clearEmptyComposerModelOverride();
     }
-    S.session=data.session;S.messages=data.session.messages||[];
+    S.session=data.session;if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);S.messages=data.session.messages||[];
     S._pendingSessionToolsets=null;
     if(_sessionSourceFilter==='cli') _sessionSourceFilter='webui';
     if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
@@ -2004,6 +2018,7 @@ async function loadSession(sid){
     return loadSession(continuationSid,{...opts,skipLineageResolve:true,skipContinuationResolve:true,force:true,_preloadNotified:true});
   }
   S.session=data.session;
+  if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
   if(typeof _clearEmptyComposerModelOverride==='function') _clearEmptyComposerModelOverride();
   // Loading a real existing session abandons any pre-session toolset override
   // staged on the empty composer before any deferred refresh work runs.
@@ -2425,7 +2440,7 @@ async function loadSession(sid){
     );
   }
 
-  if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
+  if(typeof projectSessionArtifactsForOwner==='function') projectSessionArtifactsForOwner(sid);
 
   // ── Cross-channel handoff hint ──
   // After session fully loaded, check if this is a messaging session with
@@ -2946,12 +2961,20 @@ async function _generateHandoffSummary(sid, rounds) {
   } catch (e) {
     console.warn('Handoff summary failed:', e);
     if (S.session && S.session.session_id === sid && typeof setHandoffUi === 'function') {
+      // A 400 carries an actionable, user-fixable message (e.g. an ambiguous
+      // custom-provider slug collision: rename one provider so its slug is
+      // unique). Surface it verbatim rather than degrading to the generic
+      // "try again" card — previously the server answered 200 with a warning
+      // that this handler ignored, hiding the fix from the user.
+      const errorText = (e && e.status === 400 && e.message)
+        ? e.message
+        : ('Summary generation failed: ' + (e && e.message ? e.message : 'unknown error'));
       setHandoffUi({
         sessionId: sid,
         phase: 'error',
         channel,
         rounds,
-        errorText: 'Summary generation failed: ' + e.message,
+        errorText,
       });
     }
   }
@@ -3257,6 +3280,7 @@ async function _ensureMessagesLoaded(sid, opts) {
     );
   }
   if(S.session&&S.session.session_id===sid){
+    if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
     S.session.message_count=Number(data.session.message_count || msgs.length);
     S.lastUsage={...(data.session.last_usage||S.lastUsage||{})};
     // Phase 2: the messages=1 response carries the canonical cold-load
@@ -3953,6 +3977,11 @@ async function _ensureAllMessagesLoaded() {
     _syncToolCallsForLoadedMessages(msgs, data.session.tool_calls);
     if (S.session && S.session.session_id === sid) {
       S.session.message_count = Number(data.session.message_count || msgs.length);
+      if (Object.prototype.hasOwnProperty.call(data.session, 'regeneration_revision')) {
+        S.session.regeneration_revision = data.session.regeneration_revision;
+      } else {
+        delete S.session.regeneration_revision;
+      }
     }
   } finally {
     _loadingOlder = false;
