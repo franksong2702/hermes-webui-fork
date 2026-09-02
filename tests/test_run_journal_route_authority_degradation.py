@@ -745,7 +745,11 @@ def test_chat_start_cold_resolver_cannot_replace_canonical_rollback_owner(
 
     def resolve_cold_session():
         try:
-            resolver_result["session"] = models.get_session(sid)
+            # Exercise the lower-level publication race directly.  The public
+            # resolver now single-flights same-SID full loads, so racing two
+            # get_session() calls would test (and deadlock against) the gate
+            # rather than the persistence-generation/CAS fence under review.
+            resolver_result["session"], _lost_cas = models._load_and_publish_session(sid)
         except BaseException as exc:  # pragma: no cover - assertion below reports it
             resolver_errors.append(exc)
         finally:
