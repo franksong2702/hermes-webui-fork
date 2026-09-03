@@ -1041,6 +1041,72 @@ def test_auxiliary_retired_authority_removes_fresh_child_exactly(
 
 
 @pytest.mark.parametrize("endpoint", ["btw", "background"])
+def test_successful_auxiliary_rollback_revokes_captured_same_generation_alias(
+    real_session_store, monkeypatch, endpoint
+):
+    """A rejected child cannot be recreated by an alias captured pre-rollback."""
+    parent = _Session(f"{endpoint}-parent-successful-rollback-alias")
+    created = []
+    captured_aliases = []
+    real_new_session = models.new_session
+    real_activate = run_journal.activate_run_journal_session
+
+    def new_child(**kwargs):
+        child = real_new_session(**kwargs)
+        created.append(child)
+        _install_retired_authority_for_child(real_session_store[0].parent, child)
+        return child
+
+    def capture_alias_then_activate(session_id):
+        alias = models.Session.load(session_id)
+        assert alias is not None
+        assert alias is not created[0]
+        assert alias._persistence_generation is created[0]._persistence_generation
+        captured_aliases.append(alias)
+        return real_activate(session_id)
+
+    monkeypatch.setattr(routes, "get_session", lambda _sid: parent)
+    monkeypatch.setattr(models, "new_session", new_child)
+    monkeypatch.setattr(
+        run_journal,
+        "activate_run_journal_session",
+        capture_alias_then_activate,
+    )
+    trackers = []
+
+    response = _invoke_auxiliary_route(
+        monkeypatch,
+        endpoint,
+        parent,
+        trackers=trackers,
+    )
+
+    child = created[0]
+    alias = captured_aliases[0]
+    assert response["_status"] == 409
+    assert response["type"] == "run_journal_authority_unavailable"
+    assert child._persistence_revoked is True
+    assert child._persistence_generation.revoked is True
+    assert alias._persistence_generation is child._persistence_generation
+
+    child.title = "rejected canonical child"
+    with pytest.raises(RuntimeError, match="persistence-revoked"):
+        child.save(touch_updated_at=False)
+    alias.title = "rejected captured alias"
+    with pytest.raises(RuntimeError, match="revoked|deleted"):
+        alias.save(touch_updated_at=False)
+
+    assert not child.path.exists()
+    assert not child.path.with_suffix(".json.bak").exists()
+    if real_session_store[1].exists():
+        rows = json.loads(real_session_store[1].read_text(encoding="utf-8"))
+        assert all(row.get("session_id") != child.session_id for row in rows)
+    assert child.session_id not in models.SESSIONS
+    assert not _Thread.created
+    assert trackers == []
+
+
+@pytest.mark.parametrize("endpoint", ["btw", "background"])
 @pytest.mark.parametrize(
     "rotation",
     ["sidecar", "backup", "owner", "index_missing", "index_duplicate", "index_rotated"],

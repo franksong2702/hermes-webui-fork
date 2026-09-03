@@ -23512,10 +23512,10 @@ def _rollback_auxiliary_session_after_authority_failure(
                     SESSIONS.pop(session_id, None)
                     return False
                 # This object is no longer an admissible writer after a
-                # successful auxiliary rollback.  Keep the transient marker
-                # private so a save already waiting on the persistence lock
-                # cannot resurrect the removed sidecar/index row.  A distinct
-                # successor object for the same sid has no marker.
+                # successful auxiliary rollback. Retire the shared SID
+                # capability so every alias captured before cleanup also
+                # fails closed, and keep the exact-object marker as defense
+                # in depth for the canonical owner.
                 if SESSIONS.get(session_id) is not session:
                     logger.warning(
                         "Refusing auxiliary run-journal rollback for %s: in-memory child owner rotated during cleanup",
@@ -23523,6 +23523,7 @@ def _rollback_auxiliary_session_after_authority_failure(
                     )
                     return False
                 session._persistence_revoked = True
+                _advance_session_persistence_generation(session_id)
                 SESSIONS.pop(session_id, None)
     return True
 
