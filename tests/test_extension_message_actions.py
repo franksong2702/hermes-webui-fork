@@ -126,6 +126,46 @@ def test_message_action_registration_presentation_and_limits():
     _run_node(script)
 
 
+def test_message_action_async_pressed_fallback_consumes_rejection():
+    script = textwrap.dedent(
+        f"""
+        const fs = require('fs');
+        const assert = require('assert');
+        const store = new Map();
+        const unhandled = [];
+        process.on('unhandledRejection', error => unhandled.push(error));
+        global.window = {{
+          __HERMES_EXTENSION_CONFIG__: {{
+            extensions: [{{id: 'alpha.ext', name: 'Alpha'}}]
+          }},
+          localStorage: {{
+            getItem(key) {{ return store.has(key) ? store.get(key) : null; }},
+            setItem(key, value) {{ store.set(key, String(value)); }},
+            removeItem(key) {{ store.delete(key); }}
+          }}
+        }};
+        eval(fs.readFileSync({str(EXTENSION_SETTINGS_JS)!r}, 'utf8'));
+
+        const alpha = window.hermesExt.register('alpha.ext');
+        alpha.messages.registerAction({{
+          id: 'pin', label: 'Toggle pin', icon: 'pin',
+          getPressed() {{ return Promise.reject(new Error('invalid async pressed')); }},
+          onInvoke() {{}},
+        }});
+
+        const actions = window.HermesExtensionSettings._messageActionsForContext({{
+          sessionId: 's-1', messageIndex: 3, role: 'assistant'
+        }});
+        assert.strictEqual(actions[0].pressed, false,
+          'unsupported async presentation still fails closed');
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepStrictEqual(unhandled, [],
+          'the fallback must consume a rejected async presentation result');
+        """
+    )
+    _run_node("(async () => {\n" + script + "\n})().catch(error => { console.error(error); process.exit(1); });")
+
+
 def test_message_action_invocation_pending_failure_and_quarantine():
     script = textwrap.dedent(
         f"""

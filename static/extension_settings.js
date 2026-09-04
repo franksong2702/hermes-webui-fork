@@ -535,7 +535,12 @@
     try{
       const result=record.getPressed(context);
       if(result!==null&&(typeof result==='object'||typeof result==='function')){
-        try{if(typeof result.then==='function') return false;}catch(_thenError){return false;}
+        try{
+          if(typeof result.then==='function'){
+            Promise.resolve(result).catch(()=>{});
+            return false;
+          }
+        }catch(_thenError){return false;}
       }
       return result===true;
     }catch(_error){
