@@ -126,6 +126,46 @@ def test_message_action_registration_presentation_and_limits():
     _run_node(script)
 
 
+def test_message_action_async_pressed_fallback_consumes_rejection():
+    script = textwrap.dedent(
+        f"""
+        const fs = require('fs');
+        const assert = require('assert');
+        const store = new Map();
+        const unhandled = [];
+        process.on('unhandledRejection', error => unhandled.push(error));
+        global.window = {{
+          __HERMES_EXTENSION_CONFIG__: {{
+            extensions: [{{id: 'alpha.ext', name: 'Alpha'}}]
+          }},
+          localStorage: {{
+            getItem(key) {{ return store.has(key) ? store.get(key) : null; }},
+            setItem(key, value) {{ store.set(key, String(value)); }},
+            removeItem(key) {{ store.delete(key); }}
+          }}
+        }};
+        eval(fs.readFileSync({str(EXTENSION_SETTINGS_JS)!r}, 'utf8'));
+
+        const alpha = window.hermesExt.register('alpha.ext');
+        alpha.messages.registerAction({{
+          id: 'pin', label: 'Toggle pin', icon: 'pin',
+          getPressed() {{ return Promise.reject(new Error('invalid async pressed')); }},
+          onInvoke() {{}},
+        }});
+
+        const actions = window.HermesExtensionSettings._messageActionsForContext({{
+          sessionId: 's-1', messageIndex: 3, role: 'assistant'
+        }});
+        assert.strictEqual(actions[0].pressed, false,
+          'unsupported async presentation still fails closed');
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepStrictEqual(unhandled, [],
+          'the fallback must consume a rejected async presentation result');
+        """
+    )
+    _run_node("(async () => {\n" + script + "\n})().catch(error => { console.error(error); process.exit(1); });")
+
+
 def test_message_action_invocation_pending_failure_and_quarantine():
     script = textwrap.dedent(
         f"""
@@ -194,6 +234,62 @@ def test_message_action_invocation_pending_failure_and_quarantine():
         assert.strictEqual(alpha.messages.registerAction({{
           id: 'revive', label: 'Revive', icon: 'pin', onInvoke() {{}},
         }}), null, 'uninstalled IDs stay quarantined until reload');
+        """
+    )
+    _run_node("(async () => {\n" + script + "\n})().catch(error => { console.error(error); process.exit(1); });")
+
+
+def test_old_invocation_cannot_settle_replacement_registration():
+    script = textwrap.dedent(
+        f"""
+        const fs = require('fs');
+        const assert = require('assert');
+        const store = new Map();
+        global.window = {{
+          __HERMES_EXTENSION_CONFIG__: {{
+            extensions: [{{id: 'alpha.ext', name: 'Alpha'}}]
+          }},
+          localStorage: {{
+            getItem(key) {{ return store.has(key) ? store.get(key) : null; }},
+            setItem(key, value) {{ store.set(key, String(value)); }},
+            removeItem(key) {{ store.delete(key); }}
+          }}
+        }};
+        eval(fs.readFileSync({str(EXTENSION_SETTINGS_JS)!r}, 'utf8'));
+
+        const runtime = window.HermesExtensionSettings;
+        const alpha = window.hermesExt.register('alpha.ext');
+        const resolvers = [];
+        let calls = 0;
+        function descriptor() {{
+          return {{
+            id: 'pin', label: 'Toggle pin', icon: 'pin',
+            onInvoke() {{
+              calls += 1;
+              return new Promise(resolve => {{ resolvers.push(resolve); }});
+            }},
+          }};
+        }}
+        const context = {{sessionId: 's-1', messageIndex: 3, role: 'assistant', text: 'Visible text'}};
+
+        const unregister = alpha.messages.registerAction(descriptor());
+        assert.strictEqual(runtime._invokeMessageAction('alpha.ext', 'pin', context), true);
+        assert.strictEqual(unregister(), true);
+        assert.strictEqual(alpha.messages.registerAction(descriptor()) instanceof Function, true);
+        assert.strictEqual(runtime._invokeMessageAction('alpha.ext', 'pin', context), true);
+        assert.strictEqual(runtime._messageActionsForContext(context)[0].pending, true);
+
+        resolvers[0]();
+        await Promise.resolve();
+        assert.strictEqual(runtime._messageActionsForContext(context)[0].pending, true,
+          'an old invocation cannot clear replacement registration pending state');
+        assert.strictEqual(runtime._invokeMessageAction('alpha.ext', 'pin', context), false,
+          'the replacement invocation remains duplicate-suppressed');
+        assert.strictEqual(calls, 2);
+
+        resolvers[1]();
+        await Promise.resolve();
+        assert.strictEqual(runtime._messageActionsForContext(context)[0].pending, false);
         """
     )
     _run_node("(async () => {\n" + script + "\n})().catch(error => { console.error(error); process.exit(1); });")
