@@ -1305,7 +1305,8 @@ def test_done_a_attach_done_release_b_blocks_a_delayed_tts_callback():
 # ---------------------------------------------------------------------------
 
 
-def test_sessionless_cancel_cursor_preserves_released_partial_snapshot():
+@pytest.mark.parametrize("late_event", [None, "metering", "warning", "cancel", "apperror", "done", "stream_end", "error"])
+def test_sessionless_cancel_cursor_preserves_released_partial_snapshot(late_event):
     """A sessionless cancel keeps the canonical partial snapshot and marker.
 
     The real cancel listener clears S.activeStreamId before its /api/session
@@ -1359,6 +1360,14 @@ def test_sessionless_cancel_cursor_preserves_released_partial_snapshot():
           __results.sourceAdmittedBeforeFallback = !!(
             LIVE_STREAMS[SID] && LIVE_STREAMS[SID].source === sourceA
           );
+
+          // Deliver an already-queued event while the canonical cancel GET is
+          // pending. Clearing the pane active stream must not retire its owner.
+          const lateEvent = __LATE_CANCEL_EVENT__;
+          if (lateEvent) sourceA.dispatch(lateEvent, {
+            session_id: SID, type: 'cancelled', status: 'cancelled',
+            message: 'late terminal-adjacent event', event_id: 'stream-a:8',
+          });
 
           resolveCancel({ session: {
             session_id: SID,
@@ -1432,6 +1441,7 @@ def test_sessionless_cancel_cursor_preserves_released_partial_snapshot():
         """
     )
 
+    setup = setup.replace("__LATE_CANCEL_EVENT__", json.dumps(late_event))
     result = _run_harness(setup)
 
     assert result["partialWorklogRetained"] is True, (
@@ -1621,7 +1631,8 @@ def test_sessionless_cancel_fallback_cannot_regain_authority_after_start_failure
     assert result["inflightRemainsCleared"] is True
 
 
-def test_recovery_apperror_filters_control_text_after_released_restore():
+@pytest.mark.parametrize("late_event", [None, "metering", "warning", "cancel", "apperror", "done", "stream_end", "error"])
+def test_recovery_apperror_filters_control_text_after_released_restore(late_event):
     """Recovery filtering runs once after a valid released restore.
 
     The first phase runs the real ``apperror`` -> ``_restoreSettledSession``
@@ -1684,6 +1695,11 @@ def test_recovery_apperror_filters_control_text_after_released_restore():
                 { role: 'assistant', content: CONTROL, recovery_control: true },
               ],
             },
+          });
+          const lateEvent = __LATE_RECOVERY_EVENT__;
+          if (lateEvent) sourceA.dispatch(lateEvent, {
+            session_id: SID, type: 'interrupted', status: 'interrupted',
+            message: 'late terminal-adjacent event', event_id: 'stream-a:8',
           });
           await Promise.resolve();
           await Promise.resolve();
@@ -1757,6 +1773,7 @@ def test_recovery_apperror_filters_control_text_after_released_restore():
         """
     )
 
+    setup = setup.replace("__LATE_RECOVERY_EVENT__", json.dumps(late_event))
     result = _run_harness(setup)
 
     assert result["recoveryControlFiltered"] is True, (
@@ -2364,3 +2381,60 @@ def test_released_recovery_cannot_replace_prestart_optimistic_turn():
     assert result["newInflightSurvived"] is True, (
         "a released recovery must not delete a newer pre-start INFLIGHT owner"
     )
+
+
+@pytest.mark.parametrize("terminal_event", ["cancel", "apperror"])
+def test_failed_terminal_snapshot_releases_retained_source(terminal_event):
+    """A failed snapshot request still finishes its fallback and releases ownership."""
+    setup = r"""
+const SID = 'snapshot-failure-session', STREAM = 'snapshot-failure-stream';
+const CONTROL = '[System: Continue exactly where you left off. Do not retry the same tool call.]';
+const terminalEvent = __TERMINAL_EVENT__;
+function assistantDisplayName() { return 'Hermes'; }
+let rejectSnapshot, requests = 0;
+S.session = {session_id: SID};
+S.activeStreamId = STREAM;
+S.messages = [{role: 'user', content: 'request'}];
+if (terminalEvent === 'apperror') S.messages.push({role: 'assistant', content: CONTROL, recovery_control: true});
+INFLIGHT[SID] = {
+  messages: S.messages.slice(), streamId: STREAM, uploaded: [], toolCalls: [],
+  activityBurstAnchors: [], currentActivityBurstId: 0, currentLiveSegmentSeq: 0,
+};
+__apiHandler = url => {
+  if (url.includes('/api/session?')) {
+    requests++;
+    return new Promise((resolve, reject) => { rejectSnapshot = reject; });
+  }
+  return Promise.resolve({active: true});
+};
+(async () => {
+  attachLiveStream(SID, STREAM, [], {});
+  const source = __esCreated[0];
+  source.dispatch(terminalEvent, {
+    session_id: SID, type: terminalEvent === 'cancel' ? 'cancelled' : 'interrupted',
+    recovery_control: terminalEvent === 'apperror', message: CONTROL,
+  });
+  source.dispatch('stream_end', {session_id: SID});
+  source.dispatch('error', {});
+  rejectSnapshot(new Error('fixture snapshot request failed'));
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  const result = {
+    requests,
+    released: !LIVE_STREAMS[SID],
+    sourceClosed: source.readyState === EventSource.CLOSED,
+    paneIdle: S.activeStreamId === null,
+    fallbackApplied: terminalEvent === 'cancel'
+      ? S.messages.some(m => String(m.content || '').includes('Task cancelled'))
+      : !S.messages.some(m => String(m.content || '').includes('[System:')),
+  };
+  process.stdout.write(JSON.stringify(result) + '\n', () => process.exit(0));
+})().catch(error => { console.error(error.stack || error); process.exit(2); });
+"""
+    result = _run_harness(setup.replace("__TERMINAL_EVENT__", json.dumps(terminal_event)))
+    assert result == {
+        "requests": 1,
+        "released": True,
+        "sourceClosed": True,
+        "paneIdle": True,
+        "fallbackApplied": True,
+    }
