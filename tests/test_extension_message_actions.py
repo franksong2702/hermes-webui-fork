@@ -295,6 +295,66 @@ def test_old_invocation_cannot_settle_replacement_registration():
     _run_node("(async () => {\n" + script + "\n})().catch(error => { console.error(error); process.exit(1); });")
 
 
+@pytest.mark.parametrize("exit_mode", ["unregister", "replace", "uninstall", "resolve"])
+def test_retired_message_action_cannot_report_late_failure(exit_mode):
+    script = textwrap.dedent(
+        f"""
+        const fs = require('fs');
+        const assert = require('assert');
+        const failures = [], logs = [], changes = [];
+        let focusCalls = 0, resolveOriginal, rejectOriginal, resolveReplacement;
+        console.error = (...args) => logs.push(args);
+        global.window = {{
+          __HERMES_EXTENSION_CONFIG__: {{extensions: [{{id: 'alpha.ext', name: 'Alpha'}}]}}
+        }};
+        eval(fs.readFileSync({str(EXTENSION_SETTINGS_JS)!r}, 'utf8'));
+        const runtime = window.HermesExtensionSettings;
+        const alpha = window.hermesExt.register('alpha.ext');
+        runtime._onMessageActionChange(change => changes.push(change));
+        const context = {{sessionId: 's-1', messageIndex: 3, role: 'assistant', text: 'Visible text'}};
+        const unregister = alpha.messages.registerAction({{
+          id: 'pin', label: 'Toggle pin', icon: 'pin',
+          onInvoke() {{
+            return {{then(resolve, reject) {{ resolveOriginal = resolve; rejectOriginal = reject; }}}};
+          }}
+        }});
+        const opener = {{isConnected: true, focus() {{ focusCalls += 1; }}}};
+        assert.strictEqual(runtime._invokeMessageAction('alpha.ext', 'pin', context, {{
+          opener, onError(error) {{ failures.push(error); }}
+        }}), true);
+
+        const exitMode = {exit_mode!r};
+        if (exitMode === 'uninstall') {{
+          runtime.primeFromStatus({{extensions: []}});
+        }} else if (exitMode === 'resolve') {{
+          resolveOriginal();
+        }} else {{
+          assert.strictEqual(unregister(), true);
+          if (exitMode === 'replace') {{
+            alpha.messages.registerAction({{
+              id: 'pin', label: 'Replacement pin', icon: 'pin',
+              onInvoke() {{ return {{then(resolve) {{ resolveReplacement = resolve; }}}}; }}
+            }});
+            assert.strictEqual(runtime._invokeMessageAction('alpha.ext', 'pin', context), true);
+          }}
+        }}
+
+        const beforeChanges = changes.length, beforeFocus = focusCalls;
+        rejectOriginal(new Error('late failure from retired invocation'));
+        assert.deepStrictEqual(failures, [], 'a retired invocation must not surface a failure toast');
+        assert.deepStrictEqual(logs, [], 'retired callbacks are not current action failures');
+        assert.strictEqual(changes.length, beforeChanges, 'late failure must not refresh current actions');
+        assert.strictEqual(focusCalls, beforeFocus, 'late failure must not restore stale focus');
+        if (exitMode === 'replace') {{
+          assert.strictEqual(runtime._messageActionsForContext(context)[0].pending, true);
+          resolveReplacement();
+          assert.strictEqual(runtime._messageActionsForContext(context)[0].pending, false);
+        }}
+        """
+    )
+    _run_node(script)
+
+
 def test_core_message_action_surface_resolves_and_revalidates_visible_context():
     ui_js = UI_JS.read_text(encoding="utf-8")
     start = ui_js.index("function _extensionMessageActionContext")

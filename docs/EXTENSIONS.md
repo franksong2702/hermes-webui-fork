@@ -405,8 +405,11 @@ row has visible attachments or media but no plain text.
 A thenable returned by `onInvoke` controls pending state. Repeated clicks on the
 same extension/action/session/message target are suppressed while it is pending;
 different targets may run concurrently. Throws, thenable-access failures, and
-rejections are isolated and surfaced as a generic failure. Core preserves and
-restores the connected opener when possible after settlement. There is no Core
+rejections from the current invocation are isolated and surfaced as a generic
+failure. Once an invocation has settled, or its action is unregistered or
+uninstalled, late callbacks cannot report a failure, refresh actions, clear a
+replacement invocation's pending state, or restore stale focus. Core preserves
+and restores the connected opener when possible after settlement. There is no Core
 timeout, message/session mutation API, arbitrary row markup, extension-controlled
 ordering, or overflow menu in V1.
 

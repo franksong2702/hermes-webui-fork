@@ -613,6 +613,9 @@
     }
 
     function fail(error){
+      // Error reporting is a terminal effect too: retired invocations must not
+      // surface a stale failure after unregister, replacement, or settlement.
+      if(settled||messageActionPending.get(pendingKey)!==invocationToken) return;
       if(!failureReported){
         failureReported=true;
         reportMessageActionFailure(record,error,onError);
