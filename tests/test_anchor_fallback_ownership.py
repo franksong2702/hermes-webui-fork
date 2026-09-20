@@ -692,6 +692,15 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
           return Array.isArray(scene && scene.activity_rows)
             && scene.activity_rows.some((row) => row && (row.role === 'tool' || row.role === 'thinking' || row.kind === 'tool' || row.kind === 'thinking'));
         }}
+        function _loadedCompactionMarkerRawIdxs() {{ return []; }}
+        function _selectCompactionCardPlacements() {{
+          return {{ preWindowMarkers: [], inlineMarkers: [], taskOwner: null }};
+        }}
+        function _insertCompactionCardNodes() {{
+          return {{ insertedNodes: [], taskOwnerNode: null }};
+        }}
+        function _insertPreservedCompressionTaskFallback() {{ return false; }}
+        function _pinCompactionCardAtTop() {{ return false; }}
         function _renderSettledAnchorSceneForMessage(message, segment, rawIdx) {{
           if (!_anchorSceneSceneHasWorklogWorthyRows(message && message._anchor_activity_scene)) return false;
           const group = new FakeElement('div');

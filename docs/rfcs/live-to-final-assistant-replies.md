@@ -453,6 +453,11 @@ Expected behavior:
   missing structured write evidence from the full turn before its display
   window is trimmed, but the frontend must consume the Anchor scene rather
   than a separate final-answer artifact field.
+  Client-submitted scene artifacts remain untrusted candidates after persistence.
+  Session reads must re-prove them from paired successful tool records before
+  publishing the display window; matching the current session ID is insufficient.
+  An unproved replay result clears the artifact list. Historical-root replay stays
+  bounded and cannot rebind a file to the session's new workspace.
 - Reconnect, replay, session switching, cancel, interruption, and no-final
   terminal paths should preserve enough tool/artifact metadata to rebuild the
   same artifact handoff.
