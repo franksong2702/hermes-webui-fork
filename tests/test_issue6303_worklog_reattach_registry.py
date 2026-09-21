@@ -337,6 +337,7 @@ def _run_harness(
                 _function_source(_read(MESSAGES_JS), "_chatPayloadModelState"),
                 _function_source(_read(MESSAGES_JS), "_clearStaleBusyStateBeforeSend"),
                 _function_source(_read(MESSAGES_JS), "_restoreComposerDraftAfterFailedSend"),
+                _function_source(_read(MESSAGES_JS), "_recoverCompressedSend"),
                 _function_source(_read(MESSAGES_JS), "_runOptionalPreStartUiStep"),
                 _function_source(_read(MESSAGES_JS), "_runOptionalPostStartUiStep"),
                 _function_source(_read(MESSAGES_JS), "applySessionTitleUpdate"),
