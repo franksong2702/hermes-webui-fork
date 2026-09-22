@@ -594,7 +594,15 @@ def _request_session_visibility_exempt(method: str, path: str | None) -> bool:
 
 
 def _session_id_visible_to_request_profile(handler, sid, *, emit_error: bool = True) -> bool:
-    """Return whether ``sid`` belongs to the active profile."""
+    """Return whether ``sid`` belongs to the active profile.
+
+    On a profile mismatch, the helper mirrors the detail-load endpoint's
+    contract (#13043, #13493): return ``409 session_profile_mismatch`` for
+    a session owned by a KNOWN other profile, and keep ``404 Session
+    not found`` only for the unknown/legacy None-profile case so the
+    frontend's self-heal (clear stale URL + localStorage) keeps firing
+    for actually-missing sids. ``#7710``.
+    """
     if not isinstance(sid, str) or not sid:
         return True
     if not is_safe_session_id(sid):
@@ -603,9 +611,23 @@ def _session_id_visible_to_request_profile(handler, sid, *, emit_error: bool = T
         session = get_session(sid, metadata_only=True)
     except KeyError:
         return True
-    if not _session_visible_to_active_profile(getattr(session, "profile", None), handler):
+    session_profile = getattr(session, "profile", None) or None
+    if not _session_visible_to_active_profile(session_profile, handler):
         if emit_error:
-            bad(handler, "Session not found", 404)
+            if session_profile:
+                j(handler, {
+                    "error": "Session belongs to a different profile",
+                    "code": "session_profile_mismatch",
+                    "session_id": sid,
+                    "profile": session_profile,
+                }, status=409)
+            else:
+                # Unknown/legacy None-profile sidecar: keep the 404 so the
+                # frontend's self-heal still fires. _profiles_match coerces
+                # None->'default', so a truly missing/legacy session under a
+                # non-default active profile would otherwise emit a useless
+                # 409 with profile=null.
+                bad(handler, "Session not found", 404)
         return False
     return True
 
@@ -5330,7 +5352,21 @@ def _handle_session_anchor_scene(handler, body):
     # this an authenticated request under profile A could persist anchor scenes
     # onto a session owned by profile B (cross-profile write). Reject as 404 —
     # same shape the read path uses — and leave anchor_activity_scenes untouched.
-    if not _session_visible_to_active_profile(getattr(s, "profile", None) or None, handler):
+    # #7710: cross-profile writes are rejected with 409
+    # ``session_profile_mismatch`` so the client can offer to switch
+    # to the owning profile (mirrors the detail-load endpoint's
+    # contract at #13043 / #13493). 404 is preserved for the
+    # None-profile (unknown/legacy) case so the frontend self-heal
+    # path still fires for actually-missing sids.
+    _anchor_session_profile = getattr(s, "profile", None) or None
+    if not _session_visible_to_active_profile(_anchor_session_profile, handler):
+        if _anchor_session_profile:
+            return j(handler, {
+                "error": "Session belongs to a different profile",
+                "code": "session_profile_mismatch",
+                "session_id": sid,
+                "profile": _anchor_session_profile,
+            }, status=409)
         return bad(handler, "Session not found", 404)
     with _get_session_agent_lock(sid):
         idx, message = _find_anchor_scene_message(
@@ -11008,6 +11044,11 @@ def _pre_compression_continuation_session_id(session) -> str | None:
     exists either in memory or on disk. Follow bounded snapshot-to-snapshot hops
     so repeated compression still lands on the latest visible continuation.
     """
+    from api.compression_continuation import durable_compression_continuation
+
+    sealed, tip = durable_compression_continuation(session)
+    if sealed:
+        return tip
     if not getattr(session, "pre_compression_snapshot", False):
         return None
     sid = _safe_first(getattr(session, "session_id", None))
@@ -11225,6 +11266,7 @@ from api.run_journal import (
     _parse_run_journal_event_id as _shared_parse_run_journal_event_id,
     bound_run_journal_snapshot_args,
     find_run_summary,
+    journal_replay_visible,
     read_run_events,
     read_session_run_events,
     session_journal_fingerprint,
@@ -11285,8 +11327,10 @@ from api.route_approvals import (  # noqa: F401 — re-exports for backward comp
     gateway_pending_mirrors,
     release_gateway_approval_relay_owner,
     retire_gateway_pending_mirror,
+    settle_gateway_pending_run,
     reconcile_gateway_pending_mirror_locked,
     resolve_gateway_pending_local,
+    resolve_gateway_pending_run,
     resolve_gateway_pending_local_all,
     resolve_gateway_pending_local_no_run_mirror,
     set_session_yolo_enabled,
@@ -11600,9 +11644,7 @@ button:hover{background:rgba(124,185,255,.25)}
   <h1>{{BOT_NAME}}</h1>
   <p class="sub">{{LOGIN_SUBTITLE}}</p>
   <form id="login-form" data-invalid-pw="{{LOGIN_INVALID_PW}}" data-conn-failed="{{LOGIN_CONN_FAILED}}">
-    <input type="password" id="pw" placeholder="{{LOGIN_PLACEHOLDER}}" autofocus>
-    <button type="submit">{{LOGIN_BTN}}</button>
-    <button type="button" id="passkey-login" class="passkey-login" style="display:none">Sign in with passkey</button>
+    {{PASSWORD_FORM_HTML}}
     {{OIDC_LOGIN_HTML}}
   </form>
   <div class="err" id="err"></div>
@@ -14159,6 +14201,36 @@ def handle_get(handler, parsed) -> bool:
         ]
         from urllib.parse import quote
         from api.updates import WEBUI_VERSION
+        # #7056: only render the password input / submit / passkey controls
+        # when password auth is actually enabled. With native OIDC configured
+        # and ``HERMES_WEBUI_PASSWORD`` unset, the form previously still
+        # displayed the password prompt and accepted — silently 401-ing at
+        # the server — every submit. The OIDC SSO entry point stays the
+        # sole path. ``is_password_auth_enabled`` is the same predicate
+        # ``/api/auth/status`` reports as ``password_auth_enabled``.
+        from api.auth import are_passkeys_enabled, is_password_auth_enabled
+
+        # The password INPUT is gated on a configured password, but the passkey
+        # button must survive a passwordless-passkey deployment: settings expose
+        # ``passwordless_enabled = passkeys registered AND not password_auth_enabled``
+        # (routes.py ~14059) and ``is_auth_enabled()`` counts passkeys as an
+        # independent auth method, so hiding the button when no password is set
+        # would remove the ONLY working login affordance for those instances.
+        _passkey_button_html = (
+            '<button type="button" id="passkey-login" class="passkey-login" '
+            'style="display:none">Sign in with passkey</button>'
+        )
+        if is_password_auth_enabled():
+            _password_form_html = (
+                f'<input type="password" id="pw" '
+                f'placeholder="{_html.escape(_login_strings["placeholder"])}" autofocus>'
+                f'<button type="submit">{_html.escape(_login_strings["btn"])}</button>'
+                f'{_passkey_button_html}'
+            )
+        elif are_passkeys_enabled():
+            _password_form_html = _passkey_button_html
+        else:
+            _password_form_html = ""
         version_token = quote(WEBUI_VERSION, safe="")
         _page = (
             _LOGIN_PAGE_HTML.replace("{{BOT_NAME}}", _bn)
@@ -14167,10 +14239,7 @@ def handle_get(handler, parsed) -> bool:
             .replace("{{LANG}}", _html.escape(_login_strings["lang"]))
             .replace("{{LOGIN_TITLE}}", _html.escape(_login_strings["title"]))
             .replace("{{LOGIN_SUBTITLE}}", _html.escape(_login_strings["subtitle"]))
-            .replace(
-                "{{LOGIN_PLACEHOLDER}}", _html.escape(_login_strings["placeholder"])
-            )
-            .replace("{{LOGIN_BTN}}", _html.escape(_login_strings["btn"]))
+            .replace("{{PASSWORD_FORM_HTML}}", _password_form_html)
             .replace("{{LOGIN_INVALID_PW}}", _html.escape(_login_strings["invalid_pw"]))
             .replace(
                 "{{LOGIN_CONN_FAILED}}", _html.escape(_login_strings["conn_failed"])
@@ -15012,7 +15081,11 @@ def handle_get(handler, parsed) -> bool:
                 if stop_gateway_run(run_id):
                     owner_sid = stream_owner_session_id(stream_id)
                     if owner_sid:
-                        retire_gateway_pending_mirror(owner_sid, run_id=run_id)
+                        settle_gateway_pending_run(
+                            owner_sid,
+                            run_id,
+                            reason="Gateway run was cancelled before approval resolution",
+                        )
                 else:
                     gateway_stop_blocked = True
         except Exception:
@@ -19104,6 +19177,8 @@ def _replay_run_journal(
         max_seq=max_seq,
     )
     for entry in journal.get("events") or []:
+        if not journal_replay_visible(entry):
+            continue
         _sse_with_id(
             handler,
             entry.get("event") or entry.get("type") or "message",
@@ -19557,14 +19632,14 @@ def _handle_sse_stream(handler, parsed):
                 continue
             if len(item) >= 3:
                 event, data, queued_event_id = item[0], item[1], item[2]
+                event_id = queued_event_id
             else:
                 event, data = item
-                queued_event_id = STREAM_LAST_EVENT_ID.get(stream_id)
+                event_id = STREAM_LAST_EVENT_ID.get(stream_id)
             # Stage-364: emit `id:` from STREAM_LAST_EVENT_ID side-channel so
             # the frontend's `_lastRunJournalSeq` cursor advances during live
             # streaming. Without this, mid-stream error→replay would arrive
             # with after_seq=0 and double-render every journaled event.
-            event_id = queued_event_id or STREAM_LAST_EVENT_ID.get(stream_id)
             event_seq = _run_journal_same_run_seq(event_id, stream_id)
             if replay_cutoff_seq is not None and event_seq is not None and event_seq <= replay_cutoff_seq:
                 continue
@@ -19639,6 +19714,8 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
 
     def emit_replay(events, stream_id, cutoff_seq):
         for entry in events:
+            if not journal_replay_visible(entry):
+                continue
             event_id = str(entry.get("event_id") or "")
             event_seq = _run_journal_same_run_seq(event_id, stream_id)
             if cutoff_seq is not None and event_seq is not None and event_seq > cutoff_seq:
@@ -19705,10 +19782,10 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
                     continue
                 if len(item) >= 3:
                     event, data, queued_event_id = item[0], item[1], item[2]
+                    event_id = queued_event_id
                 else:
                     event, data = item
-                    queued_event_id = STREAM_LAST_EVENT_ID.get(active_stream_id)
-                event_id = queued_event_id or STREAM_LAST_EVENT_ID.get(active_stream_id)
+                    event_id = STREAM_LAST_EVENT_ID.get(active_stream_id)
                 event_seq = _run_journal_same_run_seq(event_id, active_stream_id)
                 _is_terminal = event in SSE_RELAY_CLOSE_EVENTS
                 _already_sent = (
@@ -24488,6 +24565,17 @@ def _handle_session_compression_recovery_start(handler, body):
     except KeyError:
         return bad(handler, "Session not found", 404)
     if not _session_visible_to_active_profile(getattr(source, "profile", None), handler):
+        # #7710: same contract as the detail-load endpoint — 409
+        # ``session_profile_mismatch`` for a known other profile,
+        # 404 only for the None-profile self-heal path.
+        _recovery_session_profile = getattr(source, "profile", None)
+        if _recovery_session_profile:
+            return j(handler, {
+                "error": "Session belongs to a different profile",
+                "code": "session_profile_mismatch",
+                "session_id": sid,
+                "profile": _recovery_session_profile,
+            }, status=409)
         return bad(handler, "Session not found", 404)
     recovery = compression_recovery_payload_for_session(source)
     if not recovery:
@@ -24887,8 +24975,29 @@ def _handle_chat_start(handler, body, diag=None):
                 # Empty placeholders can still be retagged when the
                 # requested profile matches the active request profile.
                 s.profile = requested_profile
+            elif session_profile:
+                # #7710: known other profile → 409 ``session_profile_mismatch``
+                # so the client can offer to switch to it (#5419).
+                # 404 is preserved only for the None-profile
+                # (unknown/legacy) self-heal case.
+                return j(handler, {
+                    "error": "Session belongs to a different profile",
+                    "code": "session_profile_mismatch",
+                    "session_id": body.get("session_id", ""),
+                    "profile": session_profile,
+                }, status=409)
             else:
                 return bad(handler, "Session not found", 404)
+        # Resolve durable rotations before any workspace/model/pending mutation.
+        # GET navigation adopts the tip; POST never silently replays a user turn.
+        from api.compression_continuation import durable_compression_continuation
+        sealed, continuation = durable_compression_continuation(s)
+        if sealed:
+            return j(handler, {
+                "error": "This session was compressed. Open its continuation before sending.",
+                "code": "session_rotated",
+                "continuation_session_id": continuation,
+            }, status=409)
         regeneration = None
         if body.get("regenerate") is True:
             if any(key in body for key in ("message", "attachments", "keep_count", "prompt", "prompt_index")):
@@ -26733,7 +26842,6 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: st
     found_target = False
     gateway_keys = []
     local_gateway_approval_id = ""
-    gateway_head_matches_target = False
     with _lock:
         reconcile_gateway_pending_mirror_locked(sid)
         queue = _pending.get(sid)
@@ -26805,9 +26913,6 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: st
                 gw_data = getattr(gw_entry, "data", None) or {}
                 gw_approval_id = str(gw_data.get("approval_id") or "").strip()
                 gw_run_id = str(gw_data.get("run_id") or "").strip()
-                gateway_head_matches_target = bool(
-                    run_id and gw_approval_id == approval_id and gw_run_id == run_id
-                )
                 if gw_approval_id == approval_id and (not run_id or gw_run_id == run_id):
                     local_gateway_approval_id = approval_id
                 elif not run_id and found_target and pending:
@@ -26868,8 +26973,10 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: st
         local_gateway_resolved, _head, _total = resolve_gateway_pending_local(
             sid, local_gateway_approval_id, choice
         )
-    elif approval_id and found_target and run_id and gateway_head_matches_target:
-        gateway_resolved = resolve_gateway_approval(sid, choice, resolve_all=False) or 0
+    elif approval_id and found_target and run_id:
+        gateway_resolved, _head, _total = resolve_gateway_pending_run(
+            sid, approval_id, run_id, choice
+        )
     elif not approval_id:
         gateway_resolved = resolve_gateway_approval(sid, choice, resolve_all=False) or 0
     # Keep the historical no-id response path truthy for old clients/tests while
@@ -29107,6 +29214,16 @@ def _handle_session_import_cli(handler, body):
             if requested_profile and not _profiles_match(existing_profile, requested_profile):
                 return bad(handler, "Session not found in CLI store", 404)
         elif not _session_visible_to_active_profile(existing_profile, handler):
+            # #7710: same contract as the detail-load endpoint —
+            # 409 ``session_profile_mismatch`` for a known other
+            # profile, 404 only for the None-profile self-heal path.
+            if existing_profile:
+                return j(handler, {
+                    "error": "Session belongs to a different profile",
+                    "code": "session_profile_mismatch",
+                    "session_id": sid,
+                    "profile": existing_profile,
+                }, status=409)
             return bad(handler, "Session not found in CLI store", 404)
         refresh_profile = requested_profile or existing_profile
         cli_meta = _resolve_cli_import_metadata(
