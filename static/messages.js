@@ -1307,6 +1307,9 @@ async function _recoverCompressedSend(error,sid,draftText,filesSnapshot,clearPro
   delete INFLIGHT[sid];
   if(typeof clearInflightState==='function') clearInflightState(sid);
   if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(sid);
+  // This POST did not admit a turn. Release its replaced parent transport
+  // before continuation loading can suspend, fail, or hand off to a newer owner.
+  _releaseReplacedLiveAttachment(sid);
   stopApprovalPolling();stopClarifyPolling();removeThinking();setBusy(false);
   try{
     await loadSession(target);
