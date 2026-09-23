@@ -3,7 +3,70 @@
 
 ## [Unreleased]
 
+### Performance
+
+- **Opening a session while its task is still running is much faster.** Rebuilding the live
+  snapshot from the run journal parsed the journal twice, walked every metering row and grew the
+  reasoning text with repeated string concatenation, which is quadratic on long runs. The journal
+  is now parsed once, metering rows are skipped (their timestamp watermark is kept) and reasoning
+  deltas are joined once per segment. On a 15 MB / 22.7k-event journal the author measured the
+  rebuild going from 4.34 s to 0.49 s with a byte-identical snapshot. The interim-echo check now matches a
+  compact-equivalent suffix without a fixed window, so an echo stretched by interior whitespace is
+  no longer shown twice. (#7310, #7569 by @happy5318)
+
 ### Fixed
+
+- **Opening the sidebar can no longer stall the agent's writes to `state.db`.** Several WebUI
+  paths that only read the agent's `state.db` could quietly become writers. The read-only opener
+  fell back to a writable connection when `mode=ro` failed. The session listing self-healed a
+  missing `idx_messages_session` with `CREATE INDEX` through its own writable connection, which
+  holds the SQLite writer lock for minutes on a large `messages` table. The cron sidebar, insights
+  and deep-health checks opened the database with a bare `sqlite3.connect()`. Every one of these
+  readers now opens strictly read-only (`file:...?mode=ro`) and never creates an index. A missing
+  index falls back to the existing pre-aggregated listing. The gateway watcher also no longer polls
+  the database when no client is subscribed. Operators with an older agent can create the read
+  indexes in a drained maintenance window with `scripts/ensure_state_db_read_indexes.py`; see
+  `docs/troubleshooting.md`. (#7445 by @ruizanthony)
+
+- **A failed chat launch no longer leaves the session stuck "running".** If the worker thread
+  couldn't start, its stream ownership and the session's pending-stream fields were never cleared,
+  so the session could look permanently active and the registries grew. Launch failure now clears
+  exactly that stream's records, after releasing the chat-start lock, and never evicts a successor
+  stream. (#6869, #6937 by @jbdrak)
+- **A compressed conversation no longer shows up twice in the sidebar.** When context
+  compression started the continuation a few milliseconds before the parent was marked ended, the
+  continuation wasn't recognised. The sidebar then showed a duplicate same-title row plus a
+  spurious child-session entry, and opening the conversation didn't stitch the transcript. Both the
+  sidebar and the transcript stitcher now accept a bounded (2 s) early start when every other
+  lineage signal agrees: same source, direct parent link, a compression (or `cli_close`) end reason and not a fork.
+  (#6931, #7021 by @webtecnica)
+- **The profile switcher no longer 500s in a two-container Docker setup.** With the agent
+  source not mounted (`HERMES_WEBUI_CHAT_BACKEND=gateway`), `GET /api/profiles` fell through to
+  a skills-stats fallback that imported `agent.skill_utils` unguarded, so the missing module
+  surfaced as an error on every profile-list load. The import is now guarded and the skill
+  stats report as unknown in that case, so the picker stays usable (the skills line is simply
+  omitted). Thanks @webtecnica. (#7305, #7312)
+
+- **A title that mixes Chinese, Japanese or Korean with English terms is no longer rejected.**
+  The cross-script guard that stops a generated title from drifting into the wrong language
+  treated the borrowed Latin words in a CJK title as drift, so a valid title like
+  `WeChat Pay 回调失败排查` or `Python 代码修复` was thrown away and the session kept its
+  fallback title. Latin terms are now accepted when the title also contains CJK text, while
+  an all-Latin title for a CJK conversation is still rejected. Thanks @MuhammadUsamaMX.
+  (#7693, #7727)
+
+- **A late-arriving prompt no longer renders below the reply it asked for.** When a message
+  reached the transcript from `state.db` after the sidecar had already been merged⟪HERMES-CONTEXT-COMPRESSION: 809 of 1,009 chars omitted here by Hermes's context compressor. This is NOT part of the original tool call and must never be reproduced in new output — always write full, untruncated content.⟫- **A rejected request no longer poisons the next one on the same connection.** `server.py`
+  is a raw HTTP/1.1 handler where `rfile` is the socket itself, so answering a request
+  before reading its body left those bytes queued. The next request on a keep-alive
+  connection was then parsed starting mid-body, and the client got
+  `400 Bad request syntax ('{"a": "b"}GET /api/health HTTP/1.1')` — an error naming a
+  request it never sent, which is expensive to diagnose from the client side. Every
+  reject path now arms `Connection: close` when a body is still pending, and framing is
+  validated strictly (RFC 9110 `1*DIGIT`, duplicate and comma-combined `Content-Length`
+  reconciled, every `Transfer-Encoding` refused since nothing here decodes one). A
+  genuinely bodyless rejection keeps its keep-alive, so healthy pooled connections are
+  not dropped. Thanks @rodrigogs. (#7550, #6658)
 
 - **Opening a session that belongs to another profile now offers to switch to it instead of
   looking deleted.** Several cross-profile guards answered `404 Session not found`, which the
