@@ -105,6 +105,10 @@ Agent-owned state.db durability, or interruption of asynchronous delegations.
 Those require their own runtime/Agent contracts. Existing filesystem-cleanup
 error handling and retention policy are not redefined by this lifetime fix.
 
+Persistence handles are process-local capabilities, not conversation data.
+They must stay out of `Session.__dict__` JSON exports, while shallow/deep copies
+retain the original captured lifetime and remain revoked after deletion.
+
 ## Inactive compression continuation recovery
 
 The Agent profile's SQLite compression lineage owns the canonical continuation,

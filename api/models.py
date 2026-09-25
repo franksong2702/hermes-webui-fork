@@ -1379,6 +1379,11 @@ def _validated_webui_pending_user_timestamp_identity(session, value):
 
 
 class Session:
+    # Export/legacy callers serialize __dict__. Keep process-local capabilities
+    # in a slot, while preserving ordinary dynamic fields and weak references.
+    # copy/deepcopy retain this slot and its existing lifetime semantics.
+    __slots__ = ("_persistence_handles", "__dict__", "__weakref__")
+
     def __init__(self, session_id: str=None, title: str='Untitled',
                  workspace=str(DEFAULT_WORKSPACE), created_workspace=None,
                  model=DEFAULT_MODEL,
