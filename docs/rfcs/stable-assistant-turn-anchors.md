@@ -617,8 +617,12 @@ identity values do not authorize identity-based coalescing.
 Different identified reasoning events may legitimately have identical text and
 must both survive a session reload. Exact event redelivery is counted once,
 including before comparison with an aggregate transcript reasoning field.
-Compatible segmented reasoning retains its identities instead of being replaced
-by the aggregate. Identity-less compatibility rows remain role-scoped so prose
+Before that comparison, identity-less exact copies are reconciled with their
+identified counterpart in either input order. Compatible segmented reasoning
+substitutes only at matching transcript reasoning slots, never by moving the
+whole saved scene ahead of transcript tool/prose rows. A segment spanning
+unmatched transcript boundaries does not authorize identity reassignment.
+Transcript-first tool-body and activity-order rules remain unchanged. Identity-less compatibility rows remain role-scoped so prose
 cannot suppress thinking with the same text. Transcript tool enrichment and final
 answer filtering retain their existing rules.
 

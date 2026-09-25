@@ -198,13 +198,17 @@ def _row(
     return row
 
 
-def _settle(rows, *, reasoning=None):
+def _settle(rows, *, reasoning=None, messages=None, tool_calls=None):
     from api import routes
 
-    messages = [
-        {"role": "user", "content": "question"},
-        {"role": "assistant", "content": "Final answer"},
-    ]
+    messages = (
+        copy.deepcopy(messages)
+        if messages is not None
+        else [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "Final answer"},
+        ]
+    )
     if reasoning is not None:
         messages[-1]["reasoning_content"] = reasoning
     scene = {
@@ -218,17 +222,17 @@ def _settle(rows, *, reasoning=None):
         "activity_rows": rows,
         "final_answer": "Final answer",
     }
-    original = copy.deepcopy((messages, scene))
+    original = copy.deepcopy((messages, scene, tool_calls))
     record = {
-        "message_index": 1,
+        "message_index": len(messages) - 1,
         "stream_id": "stream-1",
         "scene": scene,
         "message_ref": routes._assistant_anchor_scene_message_ref(messages[-1]),
     }
     result = routes._hydrate_anchor_activity_scenes(
-        messages, {record["message_ref"]: record}
-    )[1]["_anchor_activity_scene"]
-    assert (messages, scene) == original, (
+        messages, {record["message_ref"]: record}, tool_calls=tool_calls
+    )[-1]["_anchor_activity_scene"]
+    assert (messages, scene, tool_calls) == original, (
         "projection must not mutate the input transcript or scene"
     )
     return result
@@ -290,3 +294,170 @@ def test_malformed_identity_does_not_merge_distinct_text(invalid_id):
         "First observation",
         "Second observation",
     ]
+
+
+@pytest.mark.parametrize("legacy_first", [False, True])
+@pytest.mark.parametrize("reasoning_shape", ["metadata", "content-parts"])
+@pytest.mark.parametrize("status", ["running", "completed"])
+def test_review_legacy_copy_does_not_invalidate_identified_reasoning(
+    legacy_first, reasoning_shape, status
+):
+    identified = _row("Preserved reasoning", "event-a", status=status)
+    legacy = _row("Preserved reasoning", status=status)
+    rows = [legacy, identified] if legacy_first else [identified, legacy]
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "Final answer"},
+    ]
+    if reasoning_shape == "metadata":
+        messages[-1]["reasoning_content"] = "Preserved reasoning"
+    else:
+        messages[-1]["content"] = [
+            {"type": "thinking", "thinking": "Preserved reasoning"},
+            {"type": "text", "text": "Final answer"},
+        ]
+    result = _settle(rows, messages=messages)
+    assert [
+        (r.get("event_id"), r["text"], r["status"])
+        for r in result["activity_rows"]
+        if r["role"] == "thinking"
+    ] == [("event-a", "Preserved reasoning", "completed")]
+
+
+@pytest.mark.parametrize("legacy_first", [False, True])
+def test_review_legacy_copy_does_not_hide_two_equal_identified_events(legacy_first):
+    rows = [_row("Repeat.", "event-a"), _row("Repeat.", "event-b")]
+    rows.insert(0 if legacy_first else len(rows), _row("Repeat."))
+    result = _settle(rows, reasoning="Repeat.Repeat.")
+    assert [
+        r.get("event_id") for r in result["activity_rows"] if r["role"] == "thinking"
+    ] == ["event-a", "event-b"]
+
+
+@pytest.mark.parametrize("source", ["tool_calls", "_partial_tool_calls", "external"])
+def test_review_compatible_reasoning_keeps_transcript_tool_body_authoritative(source):
+    from api import routes
+
+    call = {
+        "id": "tool-1",
+        "name": "read_file",
+        "args": {"path": "note.txt"},
+        "output": "The complete transcript-owned tool output",
+        "assistant_msg_idx": 1,
+    }
+    stale = routes._anchor_scene_tool_row({**call, "output": "old"}, 0, 1, "stream-1")
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": "Final answer",
+            "reasoning_content": "Reason.",
+        },
+    ]
+    external = [call] if source == "external" else None
+    if source != "external":
+        messages[-1][source] = [call]
+    result = _settle(
+        [stale, _row("Reason.", "event-a")], messages=messages, tool_calls=external
+    )
+    tools = [r for r in result["activity_rows"] if r["role"] == "tool"]
+    assert len(tools) == 1
+    assert tools[0]["tool"]["snippet"] == call["output"]
+    assert tools[0]["tool"]["output"] == call["output"]
+    assert tools[0]["payload"]["snippet"] == call["output"]
+
+
+def test_review_saved_scene_cannot_jump_before_earlier_transcript_activity():
+    from api import routes
+
+    call = {"id": "tool-1", "name": "read_file", "output": "transcript output"}
+    stale = routes._anchor_scene_tool_row({**call, "output": "old"}, 0, 1, "stream-1")
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": "Earlier transcript activity",
+            "tool_calls": [call],
+        },
+        {
+            "role": "assistant",
+            "content": "Final answer",
+            "reasoning_content": "Reason.",
+        },
+    ]
+    result = _settle([stale, _row("Reason.", "event-a")], messages=messages)
+    assert [r["role"] for r in result["activity_rows"]] == ["prose", "tool", "thinking"]
+    assert result["activity_rows"][0]["text"] == "Earlier transcript activity"
+
+
+def test_review_segmented_reasoning_stays_at_its_transcript_positions():
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "Before.",
+            "tool_calls": [{"id": "tool-1", "name": "read_file", "output": "output"}],
+        },
+        {"role": "assistant", "content": "Final answer", "reasoning_content": "After."},
+    ]
+    result = _settle(
+        [_row("Before.", "event-a"), _row("After.", "event-b")], messages=messages
+    )
+    assert [(r["role"], r.get("event_id")) for r in result["activity_rows"]] == [
+        ("thinking", "event-a"),
+        ("tool", None),
+        ("thinking", "event-b"),
+    ]
+
+
+def test_review_content_part_thinking_keeps_tool_interleaving_and_full_body():
+    from api import routes
+
+    call = {"id": "tool-1", "name": "read_file", "output": "complete output"}
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "Before."},
+                {"type": "tool_use", "id": "tool-1", "name": "read_file", "input": {}},
+                {"type": "thinking", "thinking": "After."},
+                {"type": "text", "text": "Final answer"},
+            ],
+            "tool_calls": [call],
+        },
+    ]
+    stale = routes._anchor_scene_tool_row({**call, "output": "old"}, 0, 1, "stream-1")
+    rows = [_row("Before.", "event-a"), _row("After.", "event-b"), stale]
+    result = _settle(rows, messages=messages)
+    assert [(r["role"], r.get("event_id")) for r in result["activity_rows"]] == [
+        ("thinking", "event-a"),
+        ("tool", None),
+        ("thinking", "event-b"),
+    ]
+    assert result["activity_rows"][1]["tool"]["snippet"] == call["output"]
+    reloaded = _settle(
+        json.loads(json.dumps(result))["activity_rows"], messages=messages
+    )
+    assert reloaded["activity_rows"] == result["activity_rows"]
+
+
+def test_unmatched_reasoning_slot_does_not_borrow_a_later_event_identity():
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "", "reasoning_content": "First."},
+        {
+            "role": "assistant",
+            "content": "Final answer",
+            "reasoning_content": "Second.",
+        },
+    ]
+    # One saved event spans two distinct transcript slots. Do not move it to the
+    # first slot or infer which part of its identity belongs to each message.
+    result = _settle([_row("First.Second.", "spanning-event")], messages=messages)
+    assert [
+        (r.get("event_id"), r["text"])
+        for r in result["activity_rows"]
+        if r["role"] == "thinking"
+    ] == [(None, "First."), (None, "Second.")]

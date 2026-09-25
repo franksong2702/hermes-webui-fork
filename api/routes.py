@@ -5119,38 +5119,83 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
     rows = []
     seen = {}
     identityless_text_rows = []
+    # Normalize the saved reasoning exactly as row reconciliation does: distinct
+    # IDs survive equal text, but a legacy projection must not count a second
+    # time merely because it lacks the ID carried by the same visible row.
     scene_thinking_rows = []
     scene_reasoning_ids = set()
+    scene_reasoning_texts = set()
+    legacy_reasoning_indexes = {}
     for row in scene.get("activity_rows") or []:
-        if not isinstance(row, dict) or row.get("role") != "thinking" or not _anchor_scene_clean_text(row.get("text")):
+        if not isinstance(row, dict) or row.get("role") != "thinking":
+            continue
+        text_key = _anchor_scene_text_key(row.get("text"))
+        if not text_key:
             continue
         durable_identity = _anchor_scene_row_durable_identity(row)
-        if durable_identity and durable_identity in scene_reasoning_ids:
-            continue
         if durable_identity:
+            if durable_identity in scene_reasoning_ids:
+                continue
             scene_reasoning_ids.add(durable_identity)
-        scene_thinking_rows.append(row)
-    scene_reasoning_key = _anchor_scene_text_key(
-        "".join(str(row.get("text") or "") for row in scene_thinking_rows)
+            legacy_index = legacy_reasoning_indexes.pop(text_key, None)
+            if legacy_index is not None:
+                scene_thinking_rows[legacy_index] = row
+            else:
+                scene_thinking_rows.append(row)
+        elif text_key not in scene_reasoning_texts:
+            legacy_reasoning_indexes[text_key] = len(scene_thinking_rows)
+            scene_thinking_rows.append(row)
+        scene_reasoning_texts.add(text_key)
+
+    # Only substitute a saved segment at a matching transcript reasoning slot.
+    # A global text match is insufficient: putting the whole saved scene first
+    # also changes tool-body priority and moves later activity ahead of earlier
+    # transcript rows. No tool or prose row participates in this substitution.
+    transcript_reasoning_slots = {}
+    for local_idx in range(turn_start + 1, local_final_idx + 1):
+        message = messages[local_idx]
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        parts = [
+            _anchor_scene_content_text(part)
+            for part in (content if isinstance(content, list) else [])
+            if isinstance(part, dict) and part.get("type") in ("thinking", "reasoning")
+        ]
+        parts = [part for part in parts if _anchor_scene_clean_text(part)]
+        if not _anchor_scene_message_has_content_tool_use(message):
+            parts = ["".join(parts) or _anchor_scene_message_reasoning_text(message)]
+        elif not parts:
+            parts = [_anchor_scene_message_reasoning_text(message)]
+        for ordinal, text in enumerate(parts):
+            if _anchor_scene_clean_text(text):
+                transcript_reasoning_slots[(local_idx, ordinal)] = text
+
+    reasoning_replacements = {}
+    reasoning_cursor = 0
+    for slot, text in transcript_reasoning_slots.items():
+        target_key = _anchor_scene_text_key(text)
+        group = []
+        matched = False
+        while reasoning_cursor < len(scene_thinking_rows):
+            group.append(scene_thinking_rows[reasoning_cursor])
+            reasoning_cursor += 1
+            group_key = _anchor_scene_text_key("".join(str(row.get("text") or "") for row in group))
+            if group_key == target_key:
+                reasoning_replacements[slot] = group
+                matched = True
+                break
+            if not target_key.startswith(group_key):
+                break
+        if not matched:
+            reasoning_replacements.clear()
+            break
+    if reasoning_cursor != len(scene_thinking_rows):
+        reasoning_replacements.clear()
+    preserve_scene_thinking = bool(scene_thinking_rows) and (
+        not transcript_reasoning_slots or bool(reasoning_replacements)
     )
-    transcript_reasoning_key = _anchor_scene_text_key(
-        "".join(
-            (
-                "".join(
-                    _anchor_scene_content_text(part)
-                    for part in (message.get("content") or [])
-                    if isinstance(part, dict) and part.get("type") in ("thinking", "reasoning")
-                )
-                or _anchor_scene_message_reasoning_text(message)
-            )
-            for message in messages[turn_start + 1 : local_final_idx + 1]
-            if isinstance(message, dict) and message.get("role") == "assistant"
-        )
-    )
-    scene_has_authoritative_thinking = bool(scene_thinking_rows) and (
-        not transcript_reasoning_key or scene_reasoning_key == transcript_reasoning_key
-    )
-    drop_live_thinking = bool(transcript_reasoning_key) and not scene_has_authoritative_thinking
+    drop_live_thinking = bool(transcript_reasoning_slots) and not preserve_scene_thinking
 
     def merge_duplicate_tool_row(existing, incoming, *, prefer_incoming_body=False):
         if not isinstance(existing, dict) or not isinstance(incoming, dict):
@@ -5295,11 +5340,6 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
                     {"role": row.get("role"), "text_key": text_key, "index": index}
                 )
 
-    if scene_has_authoritative_thinking:
-        for row in scene.get("activity_rows") or []:
-            if isinstance(row, dict) and row.get("role") != "terminal":
-                push(row)
-
     order = 0
     content_tool_indexes_by_idx = {}
     used_content_tool_indexes_by_idx = {}
@@ -5321,9 +5361,16 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
         used_content_tool_indexes = set()
         id_flexible_content_tool_indexes = set()
         if content_rows:
+            reasoning_ordinal = 0
             for row in content_rows:
-                if scene_has_authoritative_thinking and row.get("role") == "thinking":
-                    continue
+                if row.get("role") == "thinking":
+                    replacements = reasoning_replacements.get((local_idx, reasoning_ordinal))
+                    reasoning_ordinal += 1
+                    if replacements:
+                        for replacement in replacements:
+                            push(replacement)
+                        order += 1
+                        continue
                 previous_len = len(rows)
                 push(row)
                 if row.get("role") == "tool" and len(rows) > previous_len:
@@ -5337,12 +5384,18 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
             push(_anchor_scene_prose_row(text, order, absolute_idx, stream_id))
             order += 1
         reasoning = _anchor_scene_message_reasoning_text(message)
+        if not content_rows:
+            reasoning = transcript_reasoning_slots.get((local_idx, 0), reasoning)
         if (
-            not scene_has_authoritative_thinking
-            and _anchor_scene_clean_text(reasoning)
+            _anchor_scene_clean_text(reasoning)
             and _anchor_scene_text_key(reasoning) != _anchor_scene_text_key(text)
         ):
-            push(_anchor_scene_thinking_row(reasoning, order, absolute_idx, stream_id))
+            replacements = reasoning_replacements.get((local_idx, 0))
+            if replacements:
+                for replacement in replacements:
+                    push(replacement)
+            else:
+                push(_anchor_scene_thinking_row(reasoning, order, absolute_idx, stream_id))
             order += 1
         for key in ("tool_calls", "_partial_tool_calls"):
             calls = message.get(key)
@@ -5421,10 +5474,9 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
             continue
         push(row, prefer_incoming_tool_body=True)
         order += 1
-    if not scene_has_authoritative_thinking:
-        for row in scene.get("activity_rows") or []:
-            if isinstance(row, dict) and row.get("role") != "terminal":
-                push(row)
+    for row in scene.get("activity_rows") or []:
+        if isinstance(row, dict) and row.get("role") != "terminal":
+            push(row)
     for row in scene.get("activity_rows") or []:
         if isinstance(row, dict) and row.get("role") == "terminal":
             push(row)
