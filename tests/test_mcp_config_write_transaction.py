@@ -292,3 +292,36 @@ def test_operator_config_override_is_still_authoritative(store, monkeypatch):
     store.call("update")
     assert store.paths["work"].read_bytes() == before
     assert "new" in store.read("default")["mcp_servers"]
+
+
+def test_toggle_does_not_mutate_aliased_server(store):
+    shared = {"command": "shared-command"}
+    store.paths["work"].write_text(
+        yaml.safe_dump(
+            {
+                "mcp_servers": {"first": shared, "second": shared},
+                "server_template": shared,
+            }
+        )
+    )
+    store.call("toggle", "first").send_response.assert_called_once_with(200)
+    saved = store.read("work")
+    assert saved["mcp_servers"]["first"]["enabled"] is False
+    assert saved["mcp_servers"]["second"] == {"command": "shared-command"}
+    assert saved["server_template"] == {"command": "shared-command"}
+
+
+@pytest.mark.parametrize("operation", ["update", "toggle", "delete"])
+def test_mcp_container_alias_does_not_modify_unrelated_section(store, operation):
+    shared = {
+        "shared": {"command": "shared-command"},
+        "remove": {"command": "remove-command"},
+    }
+    original = copy.deepcopy(shared)
+    store.paths["work"].write_text(
+        yaml.safe_dump({"mcp_servers": shared, "unrelated": shared})
+    )
+    store.call(operation).send_response.assert_called_once_with(200)
+    saved = store.read("work")
+    assert saved["unrelated"] == original
+    assert saved["mcp_servers"] != original

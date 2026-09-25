@@ -30421,8 +30421,7 @@ def _handle_mcp_server_delete(handler, name):
         config_path = _get_config_path()
         cfg = _load_mcp_config_for_write(config_path)
         servers = cfg.get("mcp_servers", {})
-        if not isinstance(servers, dict):
-            servers = {}
+        servers = dict(servers) if isinstance(servers, dict) else {}
         if name not in servers:
             error = (f"MCP server '{name}' not found", 404)
         else:
@@ -30449,14 +30448,14 @@ def _handle_mcp_server_toggle(handler, name, body):
         config_path = _get_config_path()
         cfg = _load_mcp_config_for_write(config_path)
         servers = cfg.get("mcp_servers", {})
-        if not isinstance(servers, dict):
-            servers = {}
+        servers = dict(servers) if isinstance(servers, dict) else {}
         if name not in servers:
             error = (f"MCP server '{name}' not found", 404)
         elif not isinstance(servers[name], dict):
             error = (f"MCP server '{name}' has invalid config", 400)
         else:
-            servers[name]["enabled"] = enabled
+            # Valid YAML aliases may share this mapping with another server.
+            servers[name] = {**servers[name], "enabled": enabled}
             cfg["mcp_servers"] = servers
             _save_yaml_config_file(config_path, cfg)
     if error is not None:
@@ -30498,8 +30497,7 @@ def _handle_mcp_server_update(handler, name, body):
         config_path = _get_config_path()
         cfg = _load_mcp_config_for_write(config_path)
         servers = cfg.get("mcp_servers", {})
-        if not isinstance(servers, dict):
-            servers = {}
+        servers = dict(servers) if isinstance(servers, dict) else {}
         existing_cfg = servers.get(name, {})
         if body.get("url"):
             server_cfg["url"] = body["url"].strip()

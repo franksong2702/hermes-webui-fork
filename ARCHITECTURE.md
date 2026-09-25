@@ -550,7 +550,8 @@ atomic writer. `HERMES_CONFIG_PATH` keeps its documented precedence; this does
 not redirect operator-configured files or change profile resolution.
 
 Raw `${ENV_VAR}` references, unrelated configuration and masked credentials keep
-their original stored values. Runtime-expanded cache dictionaries are never the
+their original stored values. YAML-aliased containers and the selected server
+entry are detached before mutation so an edit cannot change a sibling or template. Runtime-expanded cache dictionaries are never the
 write source. An unreadable, malformed or non-mapping existing document aborts
 without overwriting it; a missing/empty document can be initialized. Failed disk
 writes do not publish uncommitted mutations into the runtime cache. Reloading
