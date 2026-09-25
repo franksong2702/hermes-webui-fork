@@ -404,18 +404,27 @@ def test_cancel_restart_tool_recovery_does_not_claim_successor_tool():
         {
             "name": "terminal",
             "preview": preview,
-            "args": {"command": "printf old"},
-            "tid": "old-tool",
+            "args": {"command": "printf old-first"},
+            "tid": "old-tool-first",
+        },
+    )
+    writer.append_sse_event(
+        "tool",
+        {
+            "name": "terminal",
+            "preview": preview,
+            "args": {"command": "printf old-second"},
+            "tid": "old-tool-second",
         },
     )
     writer.append_sse_event(
         "tool_complete",
         {
             "name": "terminal",
-            "preview": "old-complete",
+            "preview": "old-first-complete",
             "duration": 0.25,
             "is_error": False,
-            "tid": "old-tool",
+            "tid": "old-tool-first",
         },
     )
     assert cancel_stream(stream_id) is True
@@ -443,10 +452,14 @@ def test_cancel_restart_tool_recovery_does_not_claim_successor_tool():
         for tool in recovered.tool_calls
         if isinstance(tool, dict) and tool.get("_recovered_stream_id") == stream_id
     ]
-    assert len(recovered_tools) == 1
-    assert recovered_tools[0]["done"] is True
-    assert recovered_tools[0]["preview"] == "old-complete"
-    assert recovered_tools[0]["duration"] == 0.25
+    assert len(recovered_tools) == 2
+    by_tid = {tool["tid"]: tool for tool in recovered_tools}
+    assert set(by_tid) == {"old-tool-first", "old-tool-second"}
+    assert by_tid["old-tool-first"]["done"] is True
+    assert by_tid["old-tool-first"]["preview"] == "old-first-complete"
+    assert by_tid["old-tool-first"]["duration"] == 0.25
+    assert by_tid["old-tool-second"]["done"] is False
+    assert by_tid["old-tool-second"]["preview"] == preview
 
     successor_tools = [
         tool
@@ -465,6 +478,7 @@ def test_cancel_restart_tool_recovery_does_not_claim_successor_tool():
     assert recovered.messages[successor_owner_index].get("content") == successor_assistant["content"]
 
     marker_index, _ = _cancel_marker(recovered)
-    owner_index = recovered_tools[0]["assistant_msg_idx"]
-    assert owner_index < marker_index
-    assert recovered.messages[owner_index].get("_recovered_stream_id") == stream_id
+    for tool in recovered_tools:
+        owner_index = tool["assistant_msg_idx"]
+        assert owner_index < marker_index
+        assert recovered.messages[owner_index].get("_recovered_stream_id") == stream_id
