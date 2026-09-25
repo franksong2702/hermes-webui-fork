@@ -74,6 +74,30 @@ individually valid rows can reach disk out of order and the session replay
 reader must reject them as noncontiguous. This does not change caller-supplied
 sequence semantics, cross-process ownership, or failed-write recovery.
 
+
+## Cancelled journal-only restart recovery
+
+When Stop has no in-memory assistant partial to persist, the cancellation marker
+may carry a bounded exact-stream run-journal recovery hook. The hook does not
+continue or replay provider execution; it only makes already-emitted durable
+prose, display reasoning, and tool activity recoverable after process loss.
+
+The worker registry remains authoritative while the cancelling worker is known
+live. Registry absence in the same process is not sufficient because stale-run
+reclamation can remove bookkeeping before a wedged worker physically exits.
+The marker therefore records its creating process instance: the same process may
+consume a nonempty hook only after that journal is explicitly terminal, while a
+new process instance may recover a nonterminal durable tail because the old
+writer cannot survive the interpreter restart.
+
+Recovery is owned by the marker's exact stream and cancelled user boundary.
+Rows reconstructed after a restart are placed before that cancellation marker
+and before any persisted successor turn; model-context projection follows the
+same boundary and fails closed if the owning user cannot be identified. Content
+or tool equality in earlier/later turns is not ownership evidence. The hook is
+retired only in the same successful session save that commits the recovered
+projection; a failed save restores the in-memory hook for a later retry.
+
 ## Inactive compression continuation recovery
 
 The Agent profile's SQLite compression lineage owns the canonical continuation,
