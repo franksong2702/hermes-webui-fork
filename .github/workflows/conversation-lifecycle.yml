@@ -13,7 +13,11 @@ on:
       - 'api/**.py'
       - 'server.py'
       - 'tests/browser_conversation_lifecycle.py'
+      - 'tests/test_lifecycle_proof_summary.py'
+      - 'scripts/lifecycle_proof_summary.py'
+      - 'tests/sidebar_terminal_barrier_server.py'
       - 'tests/browser_historical_transcript_hydration.py'
+      - 'tests/browser_reconnect_scene_redraw.py'
       - 'requirements*.txt'
       - 'pyproject.toml'
       - '.github/workflows/conversation-lifecycle.yml'
@@ -24,7 +28,11 @@ on:
       - 'api/**.py'
       - 'server.py'
       - 'tests/browser_conversation_lifecycle.py'
+      - 'tests/test_lifecycle_proof_summary.py'
+      - 'scripts/lifecycle_proof_summary.py'
+      - 'tests/sidebar_terminal_barrier_server.py'
       - 'tests/browser_historical_transcript_hydration.py'
+      - 'tests/browser_reconnect_scene_redraw.py'
       - 'requirements*.txt'
       - 'pyproject.toml'
       - '.github/workflows/conversation-lifecycle.yml'
@@ -33,7 +41,8 @@ jobs:
   live-to-final:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
+    # Keep existing proof rows informational; reconnect regressions fail CI.
+    continue-on-error: ${{ matrix.name != 'reconnect-scene-redraw' }}
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +55,9 @@ jobs:
             scenario: terminal-error
           - name: historical-transcript-hydration
             script: tests/browser_historical_transcript_hydration.py
+          - name: reconnect-scene-redraw
+            script: tests/browser_reconnect_scene_redraw.py
+            browsers: chromium
     steps:
       - uses: actions/checkout@v4
 
@@ -66,19 +78,49 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Run conversation lifecycle gate
+        id: gate
         env:
           LIFECYCLE_ARTIFACT_DIR: lifecycle-artifacts
           HISTORICAL_HYDRATION_ARTIFACT_DIR: lifecycle-artifacts
           LIFECYCLE_SCENARIO: ${{ matrix.scenario }}
+          BROWSERS: ${{ matrix.browsers }}
         run: python ${{ matrix.script }}
 
       - name: Run settlement frame proof
+        id: settle_frame
         if: matrix.scenario == 'normal'
         env:
           LIFECYCLE_ARTIFACT_DIR: lifecycle-artifacts
           LIFECYCLE_SCENARIO: normal
           LIFECYCLE_TEST_BITE: settle-worklog-frame-proof
         run: python tests/browser_conversation_lifecycle.py
+
+      - name: Recover a missing terminal frame
+        id: missing_terminal
+        if: matrix.scenario == 'normal'
+        env:
+          LIFECYCLE_ARTIFACT_DIR: lifecycle-artifacts/missing-terminal
+          LIFECYCLE_SCENARIO: normal
+          LIFECYCLE_TEST_BITE: sidebar-idle-missing-terminal
+        run: python tests/browser_conversation_lifecycle.py
+
+      - name: Record raw proof result
+        id: proof_record
+        if: always()
+        env:
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          SETTLE_FRAME_OUTCOME: ${{ steps.settle_frame.outcome }}
+          MISSING_TERMINAL_OUTCOME: ${{ steps.missing_terminal.outcome }}
+        run: python scripts/lifecycle_proof_summary.py record --row "${{ matrix.name }}"
+
+      - name: Upload raw proof result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lifecycle-result-${{ github.run_attempt }}-${{ matrix.name }}
+          path: lifecycle-results/${{ matrix.name }}.json
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload failure artifacts
         if: failure()
@@ -418,20 +460,17 @@ jobs:
     needs: [live-to-final, mutation-canary]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v4
+      - name: Download current-attempt raw results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lifecycle-result-${{ github.run_attempt }}-*
+          path: lifecycle-results
+          merge-multiple: true
       - name: Publish aggregate result
+        if: always()
         env:
-          LIFECYCLE_RESULT: ${{ needs.live-to-final.result }}
           MUTATION_RESULT: ${{ needs.mutation-canary.result }}
-        run: |
-          {
-            echo "## Conversation lifecycle proof"
-            echo
-            echo "| Component | Result |"
-            echo "| --- | --- |"
-            echo "| Lifecycle rows | $LIFECYCLE_RESULT |"
-            echo "| Mutation canaries | $MUTATION_RESULT |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          test "$LIFECYCLE_RESULT" = success
-          test "$MUTATION_RESULT" = success
+        run: python scripts/lifecycle_proof_summary.py check

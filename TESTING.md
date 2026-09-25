@@ -36,6 +36,24 @@ npm run lint:runtime
 npx eslint --no-config-lookup -c eslint.runtime-guard.config.mjs "static/**/*.js"
 ```
 
+## Native raster redaction boundary
+
+Run `./scripts/test.sh tests/test_mpf_jpeg_redaction.py tests/test_raster_data_uri_redaction.py tests/test_security_redaction.py`.
+Native `messages[*].content[*].image_url.url` raster data may bypass text
+credential scanning only after complete container validation. MPF JPEGs require
+an APP2 MP Index with bounded TIFF entries, contiguous declared JPEG extents,
+and a complete SOF/scan/EOI sequence in each image. Gaps, overlaps, malformed
+frames, and trailing bytes fall back to text redaction. Image-shaped tool
+metadata does not acquire this exemption. This is structural validation, not
+pixel decoding or secret detection inside image metadata/pixels.
+
+`tests/fixtures/multipicture.jpg` contains two Pillow-generated 8x8 solid-color
+frames (red and blue), not private photographs; generation instructions live in
+`tests/test_mpf_jpeg_redaction.py`. The tests cover both TIFF byte orders and
+credential text appended after the final EOI. Helper timing improvements do
+not by themselves prove browser or shared-server responsiveness; verify those
+separately with a real conversation and concurrent requests.
+
 ## Python lint gate (ruff) — forward-looking, new-code-only
 
 The Python twin of the ESLint runtime guard. A curated `ruff` ruleset
@@ -166,20 +184,44 @@ for bite in \
 done
 ```
 
-The dedicated `Conversation lifecycle (informational)` workflow runs the current
-proof rows (`normal`, `terminal-error`, and `historical-transcript-hydration`) and
-automatically verifies the mutation commands above still fail with their
-scenario-specific expected-failure marker. It also runs the seven negative
-classification and discriminator checks above and rejects them if they emit
-either classification marker. Its `Lifecycle proof summary` result aggregates
-those checks, so a broken proof row, a mutation that unexpectedly survives, or an
-unrelated browser/server failure is visible as a failed workflow result. The
-workflow can also be started manually from the Actions page.
+The dedicated `Conversation lifecycle (informational)` workflow preserves the
+current normal, terminal-error and historical-hydration rows, plus the strict
+Chromium `reconnect-scene-redraw` row. The normal row also exercises settlement
+frames and missing-terminal recovery. Mutation, negative-classification and
+health-guard-knockout canaries test whether failures are identified for the right
+reason, rather than accepting any nonzero exit as proof.
 
-It remains informational: this change does not make it a required merge check.
-The maintainer's private QA harness remains broader; later public slices will add
-session switching, reconnect/replay, cancellation, compression, recovery, and a
-shadow-soak record before the workflow can be considered for promotion.
+`Lifecycle proof summary` requires current-run, current-attempt raw step results
+from all four rows and successful mutation canaries. A missing, skipped, cancelled
+or failed proof is not success, even if job-level `continue-on-error` would soften
+its result. Failed-attempt reruns need **Re-run all jobs** so the summary has a
+complete same-attempt certificate; it does not silently reuse an older row.
+
+Required merge checks remain a maintainer-controlled repository setting; this PR
+does not modify them. The original informational rows retain their job policy and
+the reconnect row still forbids `continue-on-error`. Workflow failures are visible
+through the independent summary, not hidden by those job policies.
+
+### Active-session reconnect redraw gate
+
+`tests/browser_reconnect_scene_redraw.py` is an opt-in deterministic browser
+gate for reconnecting to a running session with a large Anchor activity scene.
+It uses an isolated temporary server/home and fixture SSE events—no agent,
+provider credentials, or production state. By default it checks Chromium and
+WebKit, desktop and 390px viewports, and all three activity display modes:
+
+```bash
+pip install playwright
+python -m playwright install chromium webkit
+python tests/browser_reconnect_scene_redraw.py
+```
+
+`TOOL_COUNT`, `BROWSERS`, and `MODES` narrow the matrix. `MEASURE_BASELINE=1`
+records an unoptimized baseline without enforcing the redraw ceiling;
+`METRICS_FILE` saves JSON metrics and `SCREENSHOT_DIR` saves generated-fixture
+screenshots. This gate tests page reconstruction, journal-cursor resume, and
+subsequent fixture SSE updates. It does not test a real provider/network or PWA
+service-worker cache behavior.
 
 ### Streaming reader intent
 
