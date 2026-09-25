@@ -606,6 +606,26 @@ take their rows, so the answer is not rebuilt as a second assistant segment
 above itself. Live rendering is unchanged: while the turn streams, the inline
 live segment is hidden and the prose row is the visible answer.
 
+### Server hydration of identified reasoning
+
+Within an already selected turn scene, server hydration uses a non-empty string
+`event_id`, then a durable `row_id` or `local_id`, before normalized text to
+reconcile prose/thinking rows. Generated `settled:`, `hydrated:` and `activity:`
+row positions are projection addresses, not durable event identities. Non-string
+identity values do not authorize identity-based coalescing.
+
+Different identified reasoning events may legitimately have identical text and
+must both survive a session reload. Exact event redelivery is counted once,
+including before comparison with an aggregate transcript reasoning field.
+Compatible segmented reasoning retains its identities instead of being replaced
+by the aggregate. Identity-less compatibility rows remain role-scoped so prose
+cannot suppress thinking with the same text. Transcript tool enrichment and final
+answer filtering retain their existing rules.
+
+This is a server read-side rule, not a new producer schema or transport owner.
+It cannot recover a segment already omitted by a client before persistence; live
+frontend settlement and attachment/navigation lifetimes remain separate work.
+
 ## Replay, Reload, And Reconstruction
 
 Replay/reload should reconstruct the same Assistant Turn Anchor from durable
