@@ -482,3 +482,159 @@ def test_cancel_restart_tool_recovery_does_not_claim_successor_tool():
         owner_index = tool["assistant_msg_idx"]
         assert owner_index < marker_index
         assert recovered.messages[owner_index].get("_recovered_stream_id") == stream_id
+
+
+@pytest.mark.parametrize("new_runtime_active", [True, False])
+def test_newer_blocked_cancel_does_not_hide_older_recoverable_hook(new_runtime_active):
+    sid = "cancel-restart-two-hooks"
+    old_stream = "stream-cancel-old-ready"
+    new_stream = "stream-cancel-new-blocked"
+    old_text = "Older cancelled output is already durable."
+    process_token = models._JOURNAL_RECOVERY_PROCESS_TOKEN
+
+    old_user = {"role": "user", "content": "Older prompt.", "timestamp": 10}
+    old_marker = {
+        "role": "assistant",
+        "content": "Task cancelled.",
+        "_error": True,
+        "timestamp": 11,
+        "_pending_journal_recovery": True,
+        "_journal_retry_kind": "cancelled",
+        "_journal_retry_stream_id": old_stream,
+        "_journal_retry_attempts": 0,
+        "_journal_retry_first_seen_ts": int(time.time()),
+        "_journal_retry_process_token": process_token,
+        "_journal_retry_turn_start": 0,
+    }
+    new_user = {"role": "user", "content": "Newer prompt.", "timestamp": 20}
+    new_marker = {
+        "role": "assistant",
+        "content": "Task cancelled.",
+        "_error": True,
+        "timestamp": 21,
+        "_pending_journal_recovery": True,
+        "_journal_retry_kind": "cancelled",
+        "_journal_retry_stream_id": new_stream,
+        "_journal_retry_attempts": 0,
+        "_journal_retry_first_seen_ts": int(time.time()),
+        "_journal_retry_process_token": process_token,
+        "_journal_retry_turn_start": 2,
+    }
+    session = Session(
+        session_id=sid,
+        title="two cancel hooks",
+        messages=[
+            copy.deepcopy(old_user),
+            copy.deepcopy(old_marker),
+            copy.deepcopy(new_user),
+            copy.deepcopy(new_marker),
+        ],
+        context_messages=[copy.deepcopy(old_user), copy.deepcopy(new_user)],
+    )
+    session.save()
+
+    old_writer = RunJournalWriter(sid, old_stream)
+    old_writer.append_sse_event("token", {"text": old_text})
+    old_writer.append_sse_event("cancel", {"message": "Cancelled by user"})
+
+    new_writer = RunJournalWriter(sid, new_stream)
+    new_writer.append_sse_event(
+        "token", {"text": "Newer output remains owned by a live worker."}
+    )
+    if new_runtime_active:
+        config.ACTIVE_RUNS[new_stream] = {
+            "session_id": sid,
+            "backend": "legacy",
+            "phase": "cancelling",
+            "started_at": time.time(),
+        }
+
+    models.SESSIONS.clear()
+    recovered = models.get_session(sid)
+
+    old_rows = [
+        row for row in recovered.messages
+        if isinstance(row, dict) and row.get("_recovered_stream_id") == old_stream
+    ]
+    assert [row.get("content") for row in old_rows] == [old_text]
+
+    pending_by_stream = {
+        str(row.get("_journal_retry_stream_id")): row
+        for row in recovered.messages
+        if isinstance(row, dict) and row.get("_journal_retry_kind") == "cancelled"
+    }
+    assert old_stream not in pending_by_stream
+    assert pending_by_stream[new_stream].get("_pending_journal_recovery") is True
+
+
+def test_cancel_restart_context_uses_cancelled_user_ordinal_for_duplicate_prompt_and_timestamp():
+    sid = "cancel-restart-duplicate-user-owner"
+    stream_id = "stream-cancel-restart-duplicate-user-owner"
+    prompt = "Repeat exactly the same prompt."
+    timestamp = 10
+    recovered_text = "Recovered output belongs to the second identical prompt."
+
+    session = _start_cancelled_turn(sid, stream_id)
+    historical_user = {
+        "role": "user",
+        "content": prompt,
+        "timestamp": timestamp,
+        "_owner_probe": "historical-owner",
+    }
+    historical_assistant = {
+        "role": "assistant",
+        "content": "Historical answer.",
+        "timestamp": timestamp,
+    }
+    cancelled_user = {
+        "role": "user",
+        "content": prompt,
+        "timestamp": timestamp,
+        "_owner_probe": "cancelled-owner",
+    }
+    session.pending_user_message = prompt
+    session.pending_started_at = float(timestamp)
+    session.messages[:] = [
+        copy.deepcopy(historical_user),
+        copy.deepcopy(historical_assistant),
+        copy.deepcopy(cancelled_user),
+    ]
+    session.context_messages[:] = copy.deepcopy(session.messages)
+    session.save()
+
+    writer = RunJournalWriter(sid, stream_id)
+    writer.append_sse_event("token", {"text": recovered_text})
+    assert cancel_stream(stream_id) is True
+
+    cancelled = Session.load(sid)
+    assert cancelled is not None
+    successor_user = {"role": "user", "content": "Successor prompt.", "timestamp": 20}
+    successor_assistant = {"role": "assistant", "content": "Successor answer.", "timestamp": 21}
+    cancelled.messages.extend([copy.deepcopy(successor_user), copy.deepcopy(successor_assistant)])
+    cancelled.context_messages.extend([copy.deepcopy(successor_user), copy.deepcopy(successor_assistant)])
+    cancelled.save()
+
+    _simulate_restart()
+    recovered = models.get_session(sid)
+    context = recovered.context_messages
+
+    historical_index = next(
+        index for index, row in enumerate(context)
+        if isinstance(row, dict) and row.get("_owner_probe") == "historical-owner"
+    )
+    cancelled_index = next(
+        index for index, row in enumerate(context)
+        if isinstance(row, dict) and row.get("_owner_probe") == "cancelled-owner"
+    )
+    recovered_index = next(
+        index for index, row in enumerate(context)
+        if isinstance(row, dict)
+        and row.get("_recovered_stream_id") == stream_id
+        and row.get("content") == recovered_text
+    )
+    successor_index = next(
+        index for index, row in enumerate(context)
+        if isinstance(row, dict) and row.get("content") == successor_user["content"]
+    )
+
+    assert historical_index < cancelled_index < recovered_index < successor_index

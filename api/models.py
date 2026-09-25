@@ -3812,21 +3812,39 @@ def _rehome_cancel_journal_context(
         session.context_messages = remaining
         return
 
-    owner_content = _normalize_journal_recovery_text(owner_message.get('content'))
-    owner_timestamp = owner_message.get('timestamp')
     owner_position = None
-    for index, row in enumerate(remaining):
-        if not isinstance(row, dict) or row.get('role') != 'user':
-            continue
-        if (
-            _normalize_journal_recovery_text(row.get('content')) == owner_content
-            and row.get('timestamp') == owner_timestamp
-        ):
-            owner_position = index
-            break
+    owner_token = str(owner_message.get('_active_turn_token') or '').strip()
+    if owner_token:
+        # A live-turn token is stronger than content/timestamp. Repeated prompts
+        # can legitimately have identical text and second-resolution timestamps.
+        for index, row in enumerate(remaining):
+            if (
+                isinstance(row, dict)
+                and row.get('role') == 'user'
+                and str(row.get('_active_turn_token') or '').strip() == owner_token
+            ):
+                owner_position = index
+                break
+    else:
+        # Legacy rows may not carry a turn token. Map by the user-turn ordinal,
+        # not by text/timestamp, so two identical prompts cannot exchange
+        # ownership. If compaction removed the owning ordinal, fail closed.
+        owner_user_ordinal = sum(
+            1
+            for row in messages[:owner_message_index + 1]
+            if isinstance(row, dict) and row.get('role') == 'user'
+        )
+        seen_users = 0
+        for index, row in enumerate(remaining):
+            if not isinstance(row, dict) or row.get('role') != 'user':
+                continue
+            seen_users += 1
+            if seen_users == owner_user_ordinal:
+                owner_position = index
+                break
     if owner_position is None:
-        # Without the owning user boundary, old assistant output must not be
-        # inserted after a successor in provider context.
+        # Without the authoritative owning user boundary, old assistant output
+        # must not be inserted under an earlier duplicate or after a successor.
         session.context_messages = remaining
         return
 
@@ -3979,7 +3997,38 @@ def _retry_journal_recovery_in_place(
             if _is_cancel_journal_retry_marker(message)
         ]
         if cancel_candidates:
-            idx, msg = cancel_candidates[-1]
+            # Multiple cancelled turns may remain pending in one transcript.
+            # A newer hook that is still owned by a live worker (or by a
+            # same-process nonterminal journal) must not starve an older hook
+            # whose exact stream is already safe to recover.
+            active_stream_ids = _active_stream_ids()
+            idx = None
+            msg = None
+            for candidate_idx, candidate in reversed(cancel_candidates):
+                candidate_stream_id = str(
+                    candidate.get('_journal_retry_stream_id') or ''
+                ).strip()
+                candidate_process_token = str(
+                    candidate.get('_journal_retry_process_token') or ''
+                ).strip()
+                if not candidate_stream_id or not candidate_process_token:
+                    continue
+                if candidate_stream_id in active_stream_ids:
+                    continue
+                if candidate_process_token == _JOURNAL_RECOVERY_PROCESS_TOKEN:
+                    try:
+                        from api.run_journal import latest_run_summary
+
+                        if not latest_run_summary(
+                            session.session_id, candidate_stream_id
+                        ).get('terminal'):
+                            continue
+                    except Exception:
+                        continue
+                idx, msg = candidate_idx, candidate
+                break
+            if msg is None:
+                return False
             cancel_hook = True
         else:
             idx = None
