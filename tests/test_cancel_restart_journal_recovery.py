@@ -580,7 +580,7 @@ def test_newer_blocked_cancel_does_not_hide_older_recoverable_hook(new_runtime_a
     assert pending_by_stream[new_stream].get("_pending_journal_recovery") is True
 
 
-def test_cancel_restart_context_uses_cancelled_turn_token_for_duplicate_prompt_and_timestamp():
+def test_cancel_restart_context_fails_closed_for_ambiguous_duplicate_prompt_and_timestamp():
     sid = "cancel-restart-duplicate-user-owner"
     stream_id = "stream-cancel-restart-duplicate-user-owner"
     prompt = "Repeat exactly the same prompt."
@@ -593,6 +593,7 @@ def test_cancel_restart_context_uses_cancelled_turn_token_for_duplicate_prompt_a
         "content": prompt,
         "timestamp": timestamp,
         "_owner_probe": "historical-owner",
+        "_active_turn_token": "historical-owner-token",
     }
     historical_assistant = {
         "role": "assistant",
@@ -621,6 +622,25 @@ def test_cancel_restart_context_uses_cancelled_turn_token_for_duplicate_prompt_a
 
     cancelled = Session.load(sid)
     assert cancelled is not None
+    display_owner = next(
+        row for row in cancelled.messages
+        if isinstance(row, dict) and row.get("_owner_probe") == "cancelled-owner"
+    )
+    marker_index, marker = _cancel_marker(cancelled)
+    owner_token = str(display_owner.get("_active_turn_token") or "")
+    assert owner_token
+    assert marker.get("_journal_retry_owner_token") == owner_token
+    historical_context = next(
+        row for row in cancelled.context_messages
+        if isinstance(row, dict) and row.get("_owner_probe") == "historical-owner"
+    )
+    cancelled_context = next(
+        row for row in cancelled.context_messages
+        if isinstance(row, dict) and row.get("_owner_probe") == "cancelled-owner"
+    )
+    assert historical_context.get("_active_turn_token") == "historical-owner-token"
+    assert not cancelled_context.get("_active_turn_token")
+
     successor_user = {"role": "user", "content": "Successor prompt.", "timestamp": 20}
     successor_assistant = {"role": "assistant", "content": "Successor answer.", "timestamp": 21}
     cancelled.messages.extend([copy.deepcopy(successor_user), copy.deepcopy(successor_assistant)])
@@ -631,27 +651,130 @@ def test_cancel_restart_context_uses_cancelled_turn_token_for_duplicate_prompt_a
     recovered = models.get_session(sid)
     context = recovered.context_messages
 
-    historical_index = next(
-        index for index, row in enumerate(context)
+    # The duplicate tokenless provider owner is ambiguous. Recovery remains
+    # visible in the transcript, but provider context must not guess either
+    # equal prompt as its owner or overwrite the historical token.
+    assert not any(
+        isinstance(row, dict)
+        and row.get("_recovered_stream_id") == stream_id
+        for row in context
+    )
+    historical_context = next(
+        row for row in context
         if isinstance(row, dict) and row.get("_owner_probe") == "historical-owner"
     )
-    cancelled_index = next(
-        index for index, row in enumerate(context)
-        if isinstance(row, dict) and row.get("_owner_probe") == "cancelled-owner"
-    )
-    recovered_index = next(
-        index for index, row in enumerate(context)
+    assert historical_context.get("_active_turn_token") == "historical-owner-token"
+    recovered_display = next(
+        row for row in recovered.messages
         if isinstance(row, dict)
         and row.get("_recovered_stream_id") == stream_id
         and row.get("content") == recovered_text
     )
+    display_index = recovered.messages.index(recovered_display)
+    marker_index, _marker = _cancel_marker(recovered)
     successor_index = next(
-        index for index, row in enumerate(context)
+        index for index, row in enumerate(recovered.messages)
         if isinstance(row, dict) and row.get("content") == successor_user["content"]
     )
+    assert display_index < marker_index < successor_index
 
-    assert historical_index < cancelled_index < recovered_index < successor_index
 
+
+def test_cancel_restart_context_does_not_reassign_earlier_repeated_prompt_owner():
+    sid = "cancel-restart-earlier-owner"
+    stream_id = "stream-cancel-restart-earlier-owner"
+    prompt = "Repeat prompt whose earlier owner must stay intact."
+    timestamp = 10
+    recovered_text = "Recovered output must not inherit the earlier prompt."
+
+    session = _start_cancelled_turn(sid, stream_id)
+    historical_user = {
+        "role": "user",
+        "content": prompt,
+        "timestamp": timestamp,
+        "_owner_probe": "historical-owner",
+        "_active_turn_token": "historical-owner-token",
+    }
+    cancelled_user = {
+        "role": "user",
+        "content": prompt,
+        "timestamp": timestamp,
+        "_owner_probe": "cancelled-owner",
+    }
+    session.pending_user_message = prompt
+    session.pending_started_at = float(timestamp)
+    session.messages[:] = [
+        copy.deepcopy(historical_user),
+        {"role": "assistant", "content": "Historical answer.", "timestamp": timestamp},
+        copy.deepcopy(cancelled_user),
+    ]
+    # The current pending owner has not reached provider context yet. The only
+    # context user is an earlier equal prompt that already has a different token.
+    session.context_messages[:] = [copy.deepcopy(historical_user)]
+    session.save()
+
+    writer = RunJournalWriter(sid, stream_id)
+    writer.append_sse_event("token", {"text": recovered_text})
+    assert cancel_stream(stream_id) is True
+
+    cancelled = Session.load(sid)
+    assert cancelled is not None
+    display_owner = next(
+        row for row in cancelled.messages
+        if isinstance(row, dict) and row.get("_owner_probe") == "cancelled-owner"
+    )
+    owner_token = str(display_owner.get("_active_turn_token") or "")
+    assert owner_token
+    marker_index, marker = _cancel_marker(cancelled)
+    assert marker.get("_journal_retry_owner_token") == owner_token
+
+    historical_context = next(
+        row for row in cancelled.context_messages
+        if isinstance(row, dict) and row.get("_owner_probe") == "historical-owner"
+    )
+    assert historical_context.get("_active_turn_token") == "historical-owner-token"
+    assert all(
+        not (
+            isinstance(row, dict)
+            and row.get("role") == "user"
+            and row.get("_active_turn_token") == owner_token
+        )
+        for row in cancelled.context_messages
+    )
+
+    successor_user = {"role": "user", "content": "Successor prompt.", "timestamp": 20}
+    successor_assistant = {"role": "assistant", "content": "Successor answer.", "timestamp": 21}
+    cancelled.messages.extend([copy.deepcopy(successor_user), copy.deepcopy(successor_assistant)])
+    cancelled.context_messages.extend([copy.deepcopy(successor_user), copy.deepcopy(successor_assistant)])
+    cancelled.save()
+
+    _simulate_restart()
+    recovered = models.get_session(sid)
+
+    assert not any(
+        isinstance(row, dict)
+        and row.get("_recovered_stream_id") == stream_id
+        for row in recovered.context_messages
+    )
+    historical_context = next(
+        row for row in recovered.context_messages
+        if isinstance(row, dict) and row.get("_owner_probe") == "historical-owner"
+    )
+    assert historical_context.get("_active_turn_token") == "historical-owner-token"
+
+    recovered_display = next(
+        row for row in recovered.messages
+        if isinstance(row, dict)
+        and row.get("_recovered_stream_id") == stream_id
+        and row.get("content") == recovered_text
+    )
+    display_index = recovered.messages.index(recovered_display)
+    marker_index, _marker = _cancel_marker(recovered)
+    successor_index = next(
+        index for index, row in enumerate(recovered.messages)
+        if isinstance(row, dict) and row.get("content") == successor_user["content"]
+    )
+    assert display_index < marker_index < successor_index
 def test_cancel_restart_context_fails_closed_when_compression_removed_exact_owner():
     sid = "cancel-restart-compressed-owner-missing"
     stream_id = "stream-cancel-restart-compressed-owner-missing"

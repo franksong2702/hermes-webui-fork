@@ -14830,47 +14830,60 @@ def cancel_stream(stream_id: str) -> bool:
                                 _message_matches_pending_checkpoint,
                             )
 
-                            _append_recovered_turn_to_context(_cs, _cancel_owner)
-                            if _cancel_turn_token:
-                                _context_messages = getattr(_cs, 'context_messages', None)
-                                if isinstance(_context_messages, list):
-                                    _token_matches = [
+                            _context_messages = getattr(_cs, 'context_messages', None)
+                            if not _cancel_turn_token:
+                                _append_recovered_turn_to_context(_cs, _cancel_owner)
+                            elif not isinstance(_context_messages, list):
+                                # Let the existing helper initialize context from
+                                # the now-token-bearing display history.
+                                _append_recovered_turn_to_context(_cs, _cancel_owner)
+                            else:
+                                _token_matches = [
+                                    _row
+                                    for _row in _context_messages
+                                    if (
+                                        isinstance(_row, dict)
+                                        and _row.get('role') == 'user'
+                                        and _row.get('_active_turn_token') == _cancel_turn_token
+                                    )
+                                ]
+                                if not _token_matches:
+                                    _strict_matches = [
                                         _row
                                         for _row in _context_messages
-                                        if (
-                                            isinstance(_row, dict)
-                                            and _row.get('role') == 'user'
-                                            and _row.get('_active_turn_token') == _cancel_turn_token
-                                        )
-                                    ]
-                                    if not _token_matches:
-                                        # At Stop there cannot yet be a successor
-                                        # turn for this active stream. The last
-                                        # provider-context user row is therefore
-                                        # the only tokenless candidate we may
-                                        # promote, and only when it still matches
-                                        # the full pending checkpoint. Never scan
-                                        # older equal-text rows for a substitute.
-                                        _last_context_user = next(
-                                            (
-                                                _row
-                                                for _row in reversed(_context_messages)
-                                                if isinstance(_row, dict) and _row.get('role') == 'user'
-                                            ),
-                                            None,
-                                        )
                                         if _message_matches_pending_checkpoint(
-                                            _last_context_user,
+                                            _row,
                                             _pending_user,
                                             _pending_started,
                                             _pending_source,
                                             _pending_atts,
-                                        ):
-                                            stamp_message_source(
-                                                _last_context_user,
-                                                _pending_source,
-                                                active_turn_token=_cancel_turn_token,
-                                            )
+                                        )
+                                    ]
+                                    _tail = _context_messages[-1] if _context_messages else None
+                                    if (
+                                        len(_strict_matches) == 1
+                                        and _strict_matches[0] is _tail
+                                        and isinstance(_tail, dict)
+                                        and not _tail.get('_active_turn_token')
+                                    ):
+                                        # Only a unique tokenless checkpoint at
+                                        # the exact context tail may be upgraded.
+                                        # Repeated equal prompts or a row already
+                                        # owned by another token are ambiguous and
+                                        # must remain untouched.
+                                        stamp_message_source(
+                                            _tail,
+                                            _pending_source,
+                                            active_turn_token=_cancel_turn_token,
+                                        )
+                                    elif not _strict_matches:
+                                        # The current pending user is absent from
+                                        # provider context. Append the exact
+                                        # token-bearing owner rather than binding
+                                        # an older content-equal row.
+                                        _append_recovered_turn_to_context(
+                                            _cs, _cancel_owner
+                                        )
                 except Exception:
                     logger.debug(
                         "Failed to recover pending user message on cancel for %s",
