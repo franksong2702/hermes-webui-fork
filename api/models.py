@@ -3707,18 +3707,21 @@ def _is_cancel_journal_retry_marker(message: dict) -> bool:
 
 
 def _cancel_journal_retry_owner_index(session, marker_idx: int, marker: dict) -> int | None:
-    """Resolve the user row that owns a cancelled stream's durable hook."""
+    """Resolve the exact token-bearing user row owned by a cancel hook."""
     messages = getattr(session, 'messages', None) or []
-    saved_index = marker.get('_journal_retry_turn_start')
-    if type(saved_index) is int and 0 <= saved_index < marker_idx:
-        row = messages[saved_index]
-        if isinstance(row, dict) and row.get('role') == 'user':
-            return saved_index
-    for index in range(min(marker_idx, len(messages)) - 1, -1, -1):
-        row = messages[index]
-        if isinstance(row, dict) and row.get('role') == 'user':
-            return index
-    return None
+    owner_token = str(marker.get('_journal_retry_owner_token') or '').strip()
+    if not owner_token:
+        return None
+    matches = [
+        index
+        for index, row in enumerate(messages[:marker_idx])
+        if (
+            isinstance(row, dict)
+            and row.get('role') == 'user'
+            and str(row.get('_active_turn_token') or '').strip() == owner_token
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _rehome_cancel_journal_rows(session, marker_idx: int, stream_id: str) -> None:
@@ -3767,10 +3770,10 @@ def _rehome_cancel_journal_rows(session, marker_idx: int, stream_id: str) -> Non
 def _rehome_cancel_journal_context(
     session,
     *,
-    owner_message_index: int,
+    owner_token: str,
     stream_id: str,
 ) -> None:
-    """Project exact recovered rows before a successor by owner, never by text."""
+    """Project exact recovered rows after the token-owned context user only."""
     context = getattr(session, 'context_messages', None)
     messages = getattr(session, 'messages', None)
     if not isinstance(context, list) or not isinstance(messages, list):
@@ -3804,49 +3807,26 @@ def _rehome_cancel_journal_context(
         session.context_messages = remaining
         return
 
-    if not (0 <= owner_message_index < len(messages)):
+    owner_token = str(owner_token or '').strip()
+    if not owner_token:
         session.context_messages = remaining
         return
-    owner_message = messages[owner_message_index]
-    if not isinstance(owner_message, dict) or owner_message.get('role') != 'user':
-        session.context_messages = remaining
-        return
-
-    owner_position = None
-    owner_token = str(owner_message.get('_active_turn_token') or '').strip()
-    if owner_token:
-        # A live-turn token is stronger than content/timestamp. Repeated prompts
-        # can legitimately have identical text and second-resolution timestamps.
-        for index, row in enumerate(remaining):
-            if (
-                isinstance(row, dict)
-                and row.get('role') == 'user'
-                and str(row.get('_active_turn_token') or '').strip() == owner_token
-            ):
-                owner_position = index
-                break
-    else:
-        # Legacy rows may not carry a turn token. Map by the user-turn ordinal,
-        # not by text/timestamp, so two identical prompts cannot exchange
-        # ownership. If compaction removed the owning ordinal, fail closed.
-        owner_user_ordinal = sum(
-            1
-            for row in messages[:owner_message_index + 1]
-            if isinstance(row, dict) and row.get('role') == 'user'
+    owner_positions = [
+        index
+        for index, row in enumerate(remaining)
+        if (
+            isinstance(row, dict)
+            and row.get('role') == 'user'
+            and str(row.get('_active_turn_token') or '').strip() == owner_token
         )
-        seen_users = 0
-        for index, row in enumerate(remaining):
-            if not isinstance(row, dict) or row.get('role') != 'user':
-                continue
-            seen_users += 1
-            if seen_users == owner_user_ordinal:
-                owner_position = index
-                break
-    if owner_position is None:
-        # Without the authoritative owning user boundary, old assistant output
-        # must not be inserted under an earlier duplicate or after a successor.
+    ]
+    if len(owner_positions) != 1:
+        # Compression may legitimately remove the exact provider-context owner.
+        # Visible transcript recovery remains valid, but old assistant output
+        # must never be guessed onto a successor user turn.
         session.context_messages = remaining
         return
+    owner_position = owner_positions[0]
 
     insert_at = len(remaining)
     for index in range(owner_position + 1, len(remaining)):
@@ -3882,7 +3862,7 @@ def _strip_journal_retry_meta(marker: dict) -> None:
     marker.pop('_journal_retry_attempts', None)
     marker.pop('_journal_retry_first_seen_ts', None)
     marker.pop('_journal_retry_kind', None)
-    marker.pop('_journal_retry_turn_start', None)
+    marker.pop('_journal_retry_owner_token', None)
     marker.pop('_journal_retry_process_token', None)
 
 
@@ -4011,7 +3991,14 @@ def _retry_journal_recovery_in_place(
                 candidate_process_token = str(
                     candidate.get('_journal_retry_process_token') or ''
                 ).strip()
-                if not candidate_stream_id or not candidate_process_token:
+                candidate_owner_token = str(
+                    candidate.get('_journal_retry_owner_token') or ''
+                ).strip()
+                if (
+                    not candidate_stream_id
+                    or not candidate_process_token
+                    or not candidate_owner_token
+                ):
                     continue
                 if candidate_stream_id in active_stream_ids:
                     continue
@@ -4077,7 +4064,8 @@ def _retry_journal_recovery_in_place(
             marker_process_token = str(
                 msg.get('_journal_retry_process_token') or ''
             ).strip()
-            if not marker_process_token:
+            owner_token = str(msg.get('_journal_retry_owner_token') or '').strip()
+            if not marker_process_token or not owner_token:
                 # Unknown process ownership is not permission to consume an
                 # exact cancellation hook.
                 return False
@@ -4154,7 +4142,7 @@ def _retry_journal_recovery_in_place(
                 _rehome_cancel_journal_rows(session, idx, str(stream_id))
                 _rehome_cancel_journal_context(
                     session,
-                    owner_message_index=owner_index,
+                    owner_token=owner_token,
                     stream_id=str(stream_id),
                 )
                 # Keep the user-visible cancellation wording. Only the durable

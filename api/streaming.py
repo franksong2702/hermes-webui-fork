@@ -14755,12 +14755,14 @@ def cancel_stream(stream_id: str) -> bool:
                 # in unit tests using Mock sessions) cannot escape and skip the rest of
                 # the cleanup.
                 _cancel_turn_start = None
+                _cancel_turn_token = None
                 try:
                     _pending_user = getattr(_cs, 'pending_user_message', None)
                     _pending_source = getattr(_cs, 'pending_user_source', None)
                     _pending_atts_raw = getattr(_cs, 'pending_attachments', None)
                     _pending_atts = list(_pending_atts_raw) if isinstance(_pending_atts_raw, (list, tuple)) else []
                     _pending_started = getattr(_cs, 'pending_started_at', None) or 0
+                    _cancel_turn_token = build_active_turn_token(stream_id, _pending_started)
                     _msgs_for_recovery = _cs.messages if isinstance(_cs.messages, list) else None
                     if _pending_user and _msgs_for_recovery is not None:
                         _last_user = None
@@ -14796,22 +14798,79 @@ def cancel_stream(stream_id: str) -> bool:
                                 'content': _pending_user,
                                 'timestamp': _recovered_ts,
                             }
-                            stamp_message_source(_user_turn, _pending_source)
+                            stamp_message_source(
+                                _user_turn,
+                                _pending_source,
+                                active_turn_token=_cancel_turn_token,
+                            )
                             if _pending_atts:
                                 _user_turn['attachments'] = _pending_atts
                             _msgs_for_recovery.append(_user_turn)
                             _cancel_turn_start = len(_msgs_for_recovery) - 1
 
                         if isinstance(_cancel_turn_start, int):
+                            # Bind the durable cancel hook to the same exact turn
+                            # identity used by normal settlement. A display ordinal
+                            # cannot be translated into provider context after
+                            # compression because the two lists may have different
+                            # user-row counts.
+                            _cancel_owner = _msgs_for_recovery[_cancel_turn_start]
+                            if _cancel_turn_token:
+                                stamp_message_source(
+                                    _cancel_owner,
+                                    _pending_source,
+                                    active_turn_token=_cancel_turn_token,
+                                )
+
                             # Keep the cancelled user boundary in provider context
                             # so a later exact-stream recovery can be inserted before
                             # a successor instead of becoming orphaned display state.
-                            from api.models import _append_recovered_turn_to_context
-
-                            _append_recovered_turn_to_context(
-                                _cs,
-                                _msgs_for_recovery[_cancel_turn_start],
+                            from api.models import (
+                                _append_recovered_turn_to_context,
+                                _message_matches_pending_checkpoint,
                             )
+
+                            _append_recovered_turn_to_context(_cs, _cancel_owner)
+                            if _cancel_turn_token:
+                                _context_messages = getattr(_cs, 'context_messages', None)
+                                if isinstance(_context_messages, list):
+                                    _token_matches = [
+                                        _row
+                                        for _row in _context_messages
+                                        if (
+                                            isinstance(_row, dict)
+                                            and _row.get('role') == 'user'
+                                            and _row.get('_active_turn_token') == _cancel_turn_token
+                                        )
+                                    ]
+                                    if not _token_matches:
+                                        # At Stop there cannot yet be a successor
+                                        # turn for this active stream. The last
+                                        # provider-context user row is therefore
+                                        # the only tokenless candidate we may
+                                        # promote, and only when it still matches
+                                        # the full pending checkpoint. Never scan
+                                        # older equal-text rows for a substitute.
+                                        _last_context_user = next(
+                                            (
+                                                _row
+                                                for _row in reversed(_context_messages)
+                                                if isinstance(_row, dict) and _row.get('role') == 'user'
+                                            ),
+                                            None,
+                                        )
+                                        if _message_matches_pending_checkpoint(
+                                            _last_context_user,
+                                            _pending_user,
+                                            _pending_started,
+                                            _pending_source,
+                                            _pending_atts,
+                                        ):
+                                            stamp_message_source(
+                                                _last_context_user,
+                                                _pending_source,
+                                                active_turn_token=_cancel_turn_token,
+                                            )
                 except Exception:
                     logger.debug(
                         "Failed to recover pending user message on cancel for %s",
@@ -14890,7 +14949,11 @@ def cancel_stream(stream_id: str) -> bool:
                 # read can recover already-emitted journal output without
                 # replaying provider execution. Live-buffer partials keep their
                 # existing path and deliberately do not opt into this slice.
-                if _partial_msg is None and isinstance(_cancel_turn_start, int):
+                if (
+                    _partial_msg is None
+                    and isinstance(_cancel_turn_start, int)
+                    and _cancel_turn_token
+                ):
                     _cancel_retry_marker = None
                     for _candidate in reversed(_cs.messages):
                         if not isinstance(_candidate, dict) or _candidate.get('role') != 'assistant':
@@ -14913,7 +14976,7 @@ def cancel_stream(stream_id: str) -> bool:
                         _cancel_retry_marker['_journal_retry_process_token'] = (
                             _JOURNAL_RECOVERY_PROCESS_TOKEN
                         )
-                        _cancel_retry_marker['_journal_retry_turn_start'] = _cancel_turn_start
+                        _cancel_retry_marker['_journal_retry_owner_token'] = _cancel_turn_token
                 _cs.save()
                 _cancel_session_payload = _redacted_session_payload_with_full_messages(_cs)
             except Exception:

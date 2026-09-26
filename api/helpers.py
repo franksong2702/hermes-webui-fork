@@ -29,7 +29,7 @@ _PUBLIC_MESSAGE_INTERNAL_FIELDS = frozenset({
     "_journal_retry_attempts",
     "_journal_retry_first_seen_ts",
     "_journal_retry_kind",
-    "_journal_retry_turn_start",
+    "_journal_retry_owner_token",
     "_journal_retry_process_token",
     "_webui_trusted_agent_input_text",
     "_webui_unmatched_native_image_mirror",

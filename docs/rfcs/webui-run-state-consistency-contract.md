@@ -90,13 +90,17 @@ consume a nonempty hook only after that journal is explicitly terminal, while a
 new process instance may recover a nonterminal durable tail because the old
 writer cannot survive the interpreter restart.
 
-Recovery is owned by the marker's exact stream and cancelled user boundary.
-Rows reconstructed after a restart are placed before that cancellation marker
-and before any persisted successor turn; model-context projection follows the
-same boundary and fails closed if the owning user cannot be identified. Content
-or tool equality in earlier/later turns is not ownership evidence. The hook is
-retired only in the same successful session save that commits the recovered
-projection; a failed save restores the in-memory hook for a later retry.
+Recovery is owned by the marker's exact stream and exact active-turn token.
+Stop stamps that token onto the owning display user row and the exact matching
+provider-context user row before the hook becomes durable. Rows reconstructed
+after a restart are placed before that cancellation marker and before any
+persisted successor turn. Provider-context projection is inserted only after a
+unique matching token; compression that removed the owner fails closed for
+provider context while visible transcript recovery may still succeed. Display
+ordinals, content, timestamps, or tool equality are not cross-layer ownership
+evidence. The hook is retired only in the same successful session save that
+commits the recovered projection; a failed save restores the in-memory hook for
+a later retry.
 
 ## Inactive compression continuation recovery
 

@@ -129,6 +129,7 @@ def test_cancel_retry_metadata_stays_server_private():
     _, marker = _cancel_marker(durable)
     assert marker["_pending_journal_recovery"] is True
     assert marker["_journal_retry_process_token"]
+    assert marker["_journal_retry_owner_token"]
 
     public = public_session_projection({"messages": durable.messages})
     public_marker = next(
@@ -142,7 +143,7 @@ def test_cancel_retry_metadata_stays_server_private():
         "_journal_retry_attempts",
         "_journal_retry_first_seen_ts",
         "_journal_retry_kind",
-        "_journal_retry_turn_start",
+        "_journal_retry_owner_token",
         "_journal_retry_process_token",
     ):
         assert field not in public_marker
@@ -492,7 +493,14 @@ def test_newer_blocked_cancel_does_not_hide_older_recoverable_hook(new_runtime_a
     old_text = "Older cancelled output is already durable."
     process_token = models._JOURNAL_RECOVERY_PROCESS_TOKEN
 
-    old_user = {"role": "user", "content": "Older prompt.", "timestamp": 10}
+    old_owner_token = "old-cancel-owner-token"
+    new_owner_token = "new-cancel-owner-token"
+    old_user = {
+        "role": "user",
+        "content": "Older prompt.",
+        "timestamp": 10,
+        "_active_turn_token": old_owner_token,
+    }
     old_marker = {
         "role": "assistant",
         "content": "Task cancelled.",
@@ -504,9 +512,14 @@ def test_newer_blocked_cancel_does_not_hide_older_recoverable_hook(new_runtime_a
         "_journal_retry_attempts": 0,
         "_journal_retry_first_seen_ts": int(time.time()),
         "_journal_retry_process_token": process_token,
-        "_journal_retry_turn_start": 0,
+        "_journal_retry_owner_token": old_owner_token,
     }
-    new_user = {"role": "user", "content": "Newer prompt.", "timestamp": 20}
+    new_user = {
+        "role": "user",
+        "content": "Newer prompt.",
+        "timestamp": 20,
+        "_active_turn_token": new_owner_token,
+    }
     new_marker = {
         "role": "assistant",
         "content": "Task cancelled.",
@@ -518,7 +531,7 @@ def test_newer_blocked_cancel_does_not_hide_older_recoverable_hook(new_runtime_a
         "_journal_retry_attempts": 0,
         "_journal_retry_first_seen_ts": int(time.time()),
         "_journal_retry_process_token": process_token,
-        "_journal_retry_turn_start": 2,
+        "_journal_retry_owner_token": new_owner_token,
     }
     session = Session(
         session_id=sid,
@@ -567,7 +580,7 @@ def test_newer_blocked_cancel_does_not_hide_older_recoverable_hook(new_runtime_a
     assert pending_by_stream[new_stream].get("_pending_journal_recovery") is True
 
 
-def test_cancel_restart_context_uses_cancelled_user_ordinal_for_duplicate_prompt_and_timestamp():
+def test_cancel_restart_context_uses_cancelled_turn_token_for_duplicate_prompt_and_timestamp():
     sid = "cancel-restart-duplicate-user-owner"
     stream_id = "stream-cancel-restart-duplicate-user-owner"
     prompt = "Repeat exactly the same prompt."
@@ -638,3 +651,164 @@ def test_cancel_restart_context_uses_cancelled_user_ordinal_for_duplicate_prompt
     )
 
     assert historical_index < cancelled_index < recovered_index < successor_index
+
+def test_cancel_restart_context_fails_closed_when_compression_removed_exact_owner():
+    sid = "cancel-restart-compressed-owner-missing"
+    stream_id = "stream-cancel-restart-compressed-owner-missing"
+    prompt = "Cancelled prompt after compressed history."
+    recovered_text = "Recovered output must stay out of context without its exact owner."
+
+    session = _start_cancelled_turn(sid, stream_id)
+    history = []
+    for index in range(3):
+        history.extend([
+            {"role": "user", "content": f"Historical prompt {index}.", "timestamp": index * 2 + 1},
+            {"role": "assistant", "content": f"Historical answer {index}.", "timestamp": index * 2 + 2},
+        ])
+    cancelled_user = {
+        "role": "user",
+        "content": prompt,
+        "timestamp": 10,
+        "_owner_probe": "cancelled-owner",
+    }
+    compression_summary = {
+        "role": "user",
+        "content": "[Earlier conversation compressed into summary.]",
+        "timestamp": 9,
+        "_owner_probe": "compression-summary",
+    }
+    session.pending_user_message = prompt
+    session.pending_started_at = 10.0
+    session.messages[:] = history + [copy.deepcopy(cancelled_user)]
+    session.context_messages[:] = [
+        copy.deepcopy(compression_summary),
+        copy.deepcopy(cancelled_user),
+    ]
+    session.save()
+
+    writer = RunJournalWriter(sid, stream_id)
+    writer.append_sse_event("token", {"text": recovered_text})
+    assert cancel_stream(stream_id) is True
+
+    cancelled = Session.load(sid)
+    assert cancelled is not None
+    successors = []
+    for index in range(3):
+        successors.extend([
+            {"role": "user", "content": f"Successor prompt {index}.", "timestamp": 20 + index * 2},
+            {"role": "assistant", "content": f"Successor answer {index}.", "timestamp": 21 + index * 2},
+        ])
+    cancelled.messages.extend(copy.deepcopy(successors))
+    # Simulate a later compression that retained the summary and successors but
+    # removed the cancelled turn's provider-context owner.
+    cancelled.context_messages[:] = [copy.deepcopy(compression_summary)] + copy.deepcopy(successors)
+    cancelled.save()
+
+    _simulate_restart()
+    recovered = models.get_session(sid)
+
+    recovered_display = [
+        row for row in recovered.messages
+        if isinstance(row, dict)
+        and row.get("_recovered_stream_id") == stream_id
+        and row.get("content") == recovered_text
+    ]
+    assert len(recovered_display) == 1
+    marker_index, _marker = _cancel_marker(recovered)
+    display_index = recovered.messages.index(recovered_display[0])
+    first_successor_index = next(
+        index for index, row in enumerate(recovered.messages)
+        if isinstance(row, dict) and row.get("content") == "Successor prompt 0."
+    )
+    assert display_index < marker_index < first_successor_index
+
+    # Provider context has no exact token-bearing cancelled owner after
+    # compression, so visible recovery must not be attached to any successor.
+    assert not any(
+        isinstance(row, dict)
+        and row.get("_recovered_stream_id") == stream_id
+        for row in recovered.context_messages
+    )
+
+
+def test_cancel_restart_context_uses_exact_owner_token_after_compression():
+    sid = "cancel-restart-compressed-owner-token"
+    stream_id = "stream-cancel-restart-compressed-owner-token"
+    prompt = "Cancelled prompt whose exact owner survives compression."
+    recovered_text = "Recovered output belongs immediately after the cancelled owner."
+
+    session = _start_cancelled_turn(sid, stream_id)
+    history = []
+    for index in range(3):
+        history.extend([
+            {"role": "user", "content": f"Historical prompt {index}.", "timestamp": index * 2 + 1},
+            {"role": "assistant", "content": f"Historical answer {index}.", "timestamp": index * 2 + 2},
+        ])
+    cancelled_user = {
+        "role": "user",
+        "content": prompt,
+        "timestamp": 10,
+        "_owner_probe": "cancelled-owner",
+    }
+    compression_summary = {
+        "role": "user",
+        "content": "[Earlier conversation compressed into summary.]",
+        "timestamp": 9,
+        "_owner_probe": "compression-summary",
+    }
+    session.pending_user_message = prompt
+    session.pending_started_at = 10.0
+    session.messages[:] = history + [copy.deepcopy(cancelled_user)]
+    session.context_messages[:] = [
+        copy.deepcopy(compression_summary),
+        copy.deepcopy(cancelled_user),
+    ]
+    session.save()
+
+    writer = RunJournalWriter(sid, stream_id)
+    writer.append_sse_event("token", {"text": recovered_text})
+    assert cancel_stream(stream_id) is True
+
+    cancelled = Session.load(sid)
+    assert cancelled is not None
+    display_owner = next(
+        row for row in cancelled.messages
+        if isinstance(row, dict) and row.get("_owner_probe") == "cancelled-owner"
+    )
+    context_owner = next(
+        row for row in cancelled.context_messages
+        if isinstance(row, dict) and row.get("_owner_probe") == "cancelled-owner"
+    )
+    owner_token = str(display_owner.get("_active_turn_token") or "")
+    assert owner_token
+    assert context_owner.get("_active_turn_token") == owner_token
+
+    successors = [
+        {"role": "user", "content": "Successor prompt 0.", "timestamp": 20},
+        {"role": "assistant", "content": "Successor answer 0.", "timestamp": 21},
+        {"role": "user", "content": "Successor prompt 1.", "timestamp": 22},
+        {"role": "assistant", "content": "Successor answer 1.", "timestamp": 23},
+    ]
+    cancelled.messages.extend(copy.deepcopy(successors))
+    cancelled.context_messages.extend(copy.deepcopy(successors))
+    cancelled.save()
+
+    _simulate_restart()
+    recovered = models.get_session(sid)
+    context = recovered.context_messages
+
+    owner_index = next(
+        index for index, row in enumerate(context)
+        if isinstance(row, dict) and row.get("_active_turn_token") == owner_token
+    )
+    recovered_index = next(
+        index for index, row in enumerate(context)
+        if isinstance(row, dict)
+        and row.get("_recovered_stream_id") == stream_id
+        and row.get("content") == recovered_text
+    )
+    successor_index = next(
+        index for index, row in enumerate(context)
+        if isinstance(row, dict) and row.get("content") == "Successor prompt 0."
+    )
+    assert owner_index < recovered_index < successor_index
