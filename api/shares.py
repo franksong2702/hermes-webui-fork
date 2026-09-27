@@ -22,6 +22,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import unquote
 
 from api.config import STATE_DIR
 from api.helpers import redact_session_data
@@ -123,6 +124,104 @@ def _redact_share_paths(text: str, extra_paths) -> str:
 _SHARE_MEDIA_RE = re.compile(
     r"MEDIA:(?!https?://)([^\s\)\]>]+)"
 )
+
+# Public-share hardening for renderer-active references that bypass
+# _SHARE_MEDIA_RE because they already look like HTTP(S), plus bare file://
+# references that renderMd() routes through the authenticated /api/media path.
+# The public snapshot is the trust boundary: it must be safe without knowing
+# reverse-proxy origin configuration.
+_SHARE_ANY_MEDIA_RE = re.compile(r"MEDIA:([^\s\)\]]+)", re.IGNORECASE)
+_SHARE_WRAPPED_MEDIA_RE = re.compile(r"`MEDIA:([^`\s]+)`", re.IGNORECASE)
+_SHARE_FILE_MARKDOWN_RE = re.compile(
+    r"!?\[[^\r\n]*?\]\(\s*file://[^)\s]+\s*\)",
+    re.IGNORECASE,
+)
+_SHARE_FILE_CODE_RE = re.compile(r"`file://[^`\r\n]+`", re.IGNORECASE)
+_SHARE_FILE_URI_RE = re.compile(r"file://[^\s<>\"')\]]+", re.IGNORECASE)
+_SHARE_MEDIA_SAFETY_MAX_CHARS = 16 * 1024
+_SHARE_MEDIA_SAFETY_DECODE_ROUNDS = 4
+_SHARE_PRIVATE_MEDIA_ENDPOINT_RE = re.compile(
+    r"/api(?:/+|\./)+media(?=[/?#&]|$)",
+    re.IGNORECASE,
+)
+_SHARE_PRIVATE_MEDIA_PATH_PARAM_RE = re.compile(
+    r"(?:^|[?&#])path\s*=",
+    re.IGNORECASE,
+)
+
+
+def _bounded_decode_share_media_ref(raw: str) -> str | None:
+    """Decode one public MEDIA reference with a small fail-closed budget."""
+    if not isinstance(raw, str) or len(raw) > _SHARE_MEDIA_SAFETY_MAX_CHARS:
+        return None
+    value = html.unescape(raw)
+    total = len(value)
+    for _ in range(_SHARE_MEDIA_SAFETY_DECODE_ROUNDS):
+        decoded = html.unescape(unquote(value))
+        total += len(decoded)
+        if total > _SHARE_MEDIA_SAFETY_MAX_CHARS * (_SHARE_MEDIA_SAFETY_DECODE_ROUNDS + 1):
+            return None
+        if decoded == value:
+            return value
+        value = decoded
+    # More decoding would still change the value: classification is uncertain,
+    # so the public boundary rejects it instead of publishing a partial view.
+    return value if html.unescape(unquote(value)) == value else None
+
+
+def _share_media_ref_is_private(raw: str) -> bool:
+    """Return True when a MEDIA ref can route back to private local media."""
+    decoded = _bounded_decode_share_media_ref(raw)
+    if decoded is None:
+        return True
+    normalized = decoded.strip().lower().replace("\\", "/")
+    if "file:" in normalized:
+        return True
+
+    # Browser/server URL normalization can collapse duplicate slashes, /./,
+    # and ordinary path/../ segments. Normalize only for endpoint detection;
+    # preserve the original public token when it remains public.
+    compact = re.sub(r"/+", "/", normalized)
+    for _ in range(8):
+        next_compact = compact.replace("/./", "/")
+        next_compact = re.sub(r"/[^/?#]+/\.\./", "/", next_compact)
+        if next_compact == compact:
+            break
+        compact = next_compact
+
+    for match in _SHARE_PRIVATE_MEDIA_ENDPOINT_RE.finditer(compact):
+        if _SHARE_PRIVATE_MEDIA_PATH_PARAM_RE.search(compact[match.end():]):
+            return True
+    return False
+
+
+def _omit_private_share_media_references(text: str) -> str:
+    """Remove renderer-active private media references from a public snapshot.
+
+    This intentionally does not infer the WebUI's public origin. Any MEDIA URL
+    that decodes to the authenticated /api/media?path= shape is private,
+    regardless of host. Ordinary public HTTP(S) media remain unchanged.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    # renderMd() makes backtick-wrapped MEDIA tokens active before code stashing;
+    # mirror that normalization before classification.
+    text = _SHARE_WRAPPED_MEDIA_RE.sub(lambda m: f"MEDIA:{m.group(1)}", text)
+
+    def _replace_media(match: re.Match) -> str:
+        raw = str(match.group(1) or "")
+        return _PLACEHOLDER if _share_media_ref_is_private(raw) else match.group(0)
+
+    text = _SHARE_ANY_MEDIA_RE.sub(_replace_media, text)
+
+    # Public JSON must not expose filesystem URIs even when markdown would have
+    # treated the literal as inert code. Replace larger constructs first so the
+    # snapshot does not retain broken markdown shells around the placeholder.
+    text = _SHARE_FILE_MARKDOWN_RE.sub(_PLACEHOLDER, text)
+    text = _SHARE_FILE_CODE_RE.sub(_PLACEHOLDER, text)
+    return _SHARE_FILE_URI_RE.sub(_PLACEHOLDER, text)
+
 
 # Max size (in bytes) for files we'll embed as base64 in a share snapshot.
 _SHARE_EMBED_MAX_BYTES = 512 * 1024  # 512 KiB
@@ -353,12 +452,14 @@ def _sanitize_message(message: dict, *, redact_paths=(), allowed_roots: tuple[Pa
         return None
     # ALWAYS-ON hardening for the public boundary, independent of any setting:
     # (1) force credential redaction, (2) embed allowed local media,
-    # (3) strip known local paths.
+    # (3) remove residual renderer-active private media references,
+    # (4) strip known local paths.
     text = _force_redact_credentials(text)
     # Embed local media BEFORE path redaction so the concrete path is still
     # available for file reads.  MEDIA: references become self-contained data
     # URIs — or a static placeholder if the path is outside the allowed roots.
     text = _embed_share_media(text, allowed_roots=allowed_roots)
+    text = _omit_private_share_media_references(text)
     text = _redact_share_paths(text, redact_paths)
     if not text.strip():
         return None
@@ -440,6 +541,11 @@ def build_share_snapshot(session) -> dict:
     _raw_title = safe_session.get("title")
     _raw_title = _raw_title if isinstance(_raw_title, str) else "Untitled"
     title = _force_redact_credentials(_raw_title or "Untitled")
+    # Titles share the same public trust boundary but have no file-reading
+    # context. Local MEDIA refs fail closed; ordinary public HTTP(S) refs may
+    # remain, while residual file:// and authenticated /api/media refs do not.
+    title = _embed_share_media(title, allowed_roots=())
+    title = _omit_private_share_media_references(title)
     title = _redact_share_paths(title, redact_paths) or "Untitled"
     return {
         "title": title,
