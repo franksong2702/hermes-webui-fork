@@ -67,6 +67,39 @@ def test_external_api_media_like_path_without_path_parameter_is_preserved():
     assert _sanitize(text) == text
 
 
+def test_deep_dot_segments_cannot_evade_private_media_route():
+    text = (
+        "MEDIA:https://webui.example/api/1/2/3/4/5/6/7/8/9/"
+        "../../../../../../../../../media?path=/tmp/private.png"
+    )
+
+    assert _sanitize(text) == shares._PLACEHOLDER
+
+
+def test_direct_markdown_image_to_private_media_is_omitted():
+    text = "![private](https://webui.example/api/media?path=/tmp/private.png)"
+
+    assert _sanitize(text) == shares._PLACEHOLDER
+
+
+def test_public_media_path_with_fragment_path_text_is_preserved():
+    text = (
+        "MEDIA:https://cdn.example/albums/api/media/photos/2024.jpg"
+        "#path=screenshot.png"
+    )
+
+    assert _sanitize(text) == text
+
+
+def test_public_markdown_image_with_api_media_path_segment_is_preserved():
+    text = (
+        "![public](https://cdn.example/albums/api/media/photos/2024.jpg"
+        "#path=screenshot.png)"
+    )
+
+    assert _sanitize(text) == text
+
+
 def test_existing_safe_local_image_embedding_remains_self_contained(workspace):
     content = _sanitize("MEDIA:safe.png", workspace=workspace)
 
