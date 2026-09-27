@@ -15,6 +15,7 @@ import json
 import logging
 import mimetypes
 import os
+import posixpath
 import re
 import secrets
 import tempfile
@@ -22,7 +23,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from api.config import STATE_DIR
 from api.helpers import redact_session_data
@@ -138,16 +139,13 @@ _SHARE_FILE_MARKDOWN_RE = re.compile(
 )
 _SHARE_FILE_CODE_RE = re.compile(r"`file://[^`\r\n]+`", re.IGNORECASE)
 _SHARE_FILE_URI_RE = re.compile(r"file://[^\s<>\"')\]]+", re.IGNORECASE)
+_SHARE_MARKDOWN_IMAGE_RE = re.compile(
+    r"!\[[^\]\r\n]*\]\(\s*(?:<([^>\r\n]+)>|([^\s)\r\n]+))(?:\s+[^)]*)?\s*\)",
+    re.IGNORECASE,
+)
+_SHARE_HTTP_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
 _SHARE_MEDIA_SAFETY_MAX_CHARS = 16 * 1024
 _SHARE_MEDIA_SAFETY_DECODE_ROUNDS = 4
-_SHARE_PRIVATE_MEDIA_ENDPOINT_RE = re.compile(
-    r"/api(?:/+|\./)+media(?=[/?#&]|$)",
-    re.IGNORECASE,
-)
-_SHARE_PRIVATE_MEDIA_PATH_PARAM_RE = re.compile(
-    r"(?:^|[?&#])path\s*=",
-    re.IGNORECASE,
-)
 
 
 def _bounded_decode_share_media_ref(raw: str) -> str | None:
@@ -169,30 +167,75 @@ def _bounded_decode_share_media_ref(raw: str) -> str | None:
     return value if html.unescape(unquote(value)) == value else None
 
 
+def _share_query_has_path_param(query: str) -> bool:
+    """Return True only for a real path= query field, never a fragment."""
+    for field in str(query or "").split("&"):
+        key, sep, _value = field.partition("=")
+        if sep and key.strip().lower() == "path":
+            return True
+    return False
+
+
+def _canonical_share_url_path(path: str) -> str:
+    """Apply browser-style slash/dot-segment normalization to a URL path."""
+    value = str(path or "").replace("\\", "/")
+    value = re.sub(r"/+", "/", value)
+    if not value.startswith("/"):
+        value = "/" + value
+    normalized = posixpath.normpath(value)
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    if normalized != "/":
+        normalized = normalized.rstrip("/")
+    return normalized.lower()
+
+
+def _share_url_candidate_is_private(candidate: str) -> bool:
+    """Classify one decoded URL/path candidate against the private media route."""
+    try:
+        parsed = urlsplit(str(candidate or "").strip())
+    except ValueError:
+        # An unparseable renderer-active candidate cannot be proven public.
+        return True
+    return (
+        _canonical_share_url_path(parsed.path) == "/api/media"
+        and _share_query_has_path_param(parsed.query)
+    )
+
+
+def _iter_share_url_candidates(value: str):
+    """Yield the whole value plus every nested HTTP(S) URL start.
+
+    Bounded decoding happens before this step, so a percent-encoded nested URL
+    becomes visible here. Starting a candidate at every scheme occurrence lets
+    us classify an inner private URL without mistaking an outer CDN path that
+    merely contains the text "/api/media".
+    """
+    text = str(value or "").strip()
+    if text:
+        yield text
+    for match in _SHARE_HTTP_SCHEME_RE.finditer(text):
+        start = match.start()
+        if start == 0:
+            continue
+        tail = text[start:]
+        candidate = re.split(r"[\s<>\"'\x60\]\)]", tail, maxsplit=1)[0]
+        if candidate:
+            yield candidate
+
+
 def _share_media_ref_is_private(raw: str) -> bool:
-    """Return True when a MEDIA ref can route back to private local media."""
+    """Return True when a renderer-active ref can route to private local media."""
     decoded = _bounded_decode_share_media_ref(raw)
     if decoded is None:
         return True
-    normalized = decoded.strip().lower().replace("\\", "/")
-    if "file:" in normalized:
+    normalized = decoded.strip().replace("\\", "/")
+    if "file:" in normalized.lower():
         return True
-
-    # Browser/server URL normalization can collapse duplicate slashes, /./,
-    # and ordinary path/../ segments. Normalize only for endpoint detection;
-    # preserve the original public token when it remains public.
-    compact = re.sub(r"/+", "/", normalized)
-    for _ in range(8):
-        next_compact = compact.replace("/./", "/")
-        next_compact = re.sub(r"/[^/?#]+/\.\./", "/", next_compact)
-        if next_compact == compact:
-            break
-        compact = next_compact
-
-    for match in _SHARE_PRIVATE_MEDIA_ENDPOINT_RE.finditer(compact):
-        if _SHARE_PRIVATE_MEDIA_PATH_PARAM_RE.search(compact[match.end():]):
-            return True
-    return False
+    return any(
+        _share_url_candidate_is_private(candidate)
+        for candidate in _iter_share_url_candidates(normalized)
+    )
 
 
 def _omit_private_share_media_references(text: str) -> str:
@@ -214,6 +257,15 @@ def _omit_private_share_media_references(text: str) -> str:
         return _PLACEHOLDER if _share_media_ref_is_private(raw) else match.group(0)
 
     text = _SHARE_ANY_MEDIA_RE.sub(_replace_media, text)
+
+    # Markdown images are renderer-active even without the MEDIA: prefix.
+    # Run their URL through the same classifier so direct private media links
+    # cannot survive into the anonymous share page.
+    def _replace_markdown_image(match: re.Match) -> str:
+        raw = str(match.group(1) or match.group(2) or "")
+        return _PLACEHOLDER if _share_media_ref_is_private(raw) else match.group(0)
+
+    text = _SHARE_MARKDOWN_IMAGE_RE.sub(_replace_markdown_image, text)
 
     # Public JSON must not expose filesystem URIs even when markdown would have
     # treated the literal as inert code. Replace larger constructs first so the
