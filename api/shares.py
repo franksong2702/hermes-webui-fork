@@ -131,7 +131,7 @@ _SHARE_MEDIA_RE = re.compile(
 # references that renderMd() routes through the authenticated /api/media path.
 # The public snapshot is the trust boundary: it must be safe without knowing
 # reverse-proxy origin configuration.
-_SHARE_ANY_MEDIA_RE = re.compile(r"MEDIA:([^\s\)\]]+)", re.IGNORECASE)
+_SHARE_ANY_MEDIA_RE = re.compile(r"MEDIA:([^\s\)\]]+)")
 _SHARE_WRAPPED_MEDIA_RE = re.compile(r"`MEDIA:([^`\s]+)`")
 _SHARE_FILE_MARKDOWN_RE = re.compile(
     r"!?\[[^\]\r\n]*\]\(\s*file://[^)\s]+\s*\)",
