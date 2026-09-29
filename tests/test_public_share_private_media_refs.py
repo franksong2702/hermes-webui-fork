@@ -61,6 +61,20 @@ def test_public_https_media_without_private_endpoint_is_preserved():
     assert _sanitize(text) == text
 
 
+def test_lowercase_wrapped_media_token_stays_inert_code():
+    text = "`media:https://webui.example/api/media?path=/tmp/private.png`"
+
+    assert _sanitize(text) == text
+
+
+def test_public_link_before_file_link_on_same_line_is_preserved():
+    text = "see [public](https://cdn.example/a.png) and [x](file:///etc/passwd)"
+
+    content = _sanitize(text)
+
+    assert content == f"see [public](https://cdn.example/a.png) and {shares._PLACEHOLDER}"
+
+
 def test_external_api_media_like_path_without_path_parameter_is_preserved():
     text = "MEDIA:https://cdn.example/api/media/public-image.png"
 
