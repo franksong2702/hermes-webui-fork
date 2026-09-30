@@ -6,7 +6,7 @@ import pytest
 
 import api.models as models
 import api.routes as routes
-from api.run_journal import RunJournalWriter
+from api.run_journal import RunJournalWriter, _run_path
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +75,54 @@ def test_live_snapshot_recovers_real_state_saved_events():
             },
         },
     ]
+
+
+def test_state_saved_unencodable_row_does_not_drop_valid_live_snapshot():
+    session_id = "state_saved_surrogate_session"
+    run_id = "state_saved_surrogate_run"
+    writer = RunJournalWriter(session_id, run_id)
+
+    valid = writer.append_sse_event(
+        "state_saved",
+        {
+            "session_id": session_id,
+            "kind": "memory",
+            "action": "saved",
+            "name": "valid-memory",
+        },
+    )
+    malformed = {
+        "version": 1,
+        "event_id": f"{run_id}:{valid['seq'] + 1}",
+        "seq": valid["seq"] + 1,
+        "run_id": run_id,
+        "session_id": session_id,
+        "event": "state_saved",
+        "type": "state_saved",
+        "created_at": valid["created_at"] + 0.001,
+        "terminal": False,
+        "terminal_state": None,
+        "payload": {
+            "session_id": session_id,
+            "kind": "skill",
+            "action": "updated",
+            "name": "\ud800",
+        },
+    }
+    # Write escaped JSON directly: the normal writer rejects a lone surrogate
+    # while a legacy/external journal can still contain the valid JSON escape.
+    path = _run_path(session_id, run_id)
+    with path.open("a", encoding="ascii") as fh:
+        fh.write(routes.json.dumps(malformed, ensure_ascii=True, separators=(",", ":")) + "\n")
+
+    snapshot = routes._run_journal_live_snapshot(run_id)
+    assert snapshot is not None
+    side_effects = snapshot["anchor_activity_scene"]["side_effects"]
+    assert len(side_effects) == 1
+    assert side_effects[0]["event_id"] == valid["event_id"]
+    assert side_effects[0]["payload"]["name"] == "valid-memory"
+
+
 
 
 @pytest.mark.parametrize(

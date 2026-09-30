@@ -3753,11 +3753,14 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             ):
                 if side_effects_truncated:
                     continue
-                encoded_side_effect = json.dumps(
-                    side_effect,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
+                try:
+                    encoded_side_effect = json.dumps(
+                        side_effect,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                except UnicodeEncodeError:
+                    continue
                 if (
                     len(side_effects) >= _RUN_JOURNAL_STATE_SAVED_MAX_EVENTS
                     or side_effect_bytes + len(encoded_side_effect)
