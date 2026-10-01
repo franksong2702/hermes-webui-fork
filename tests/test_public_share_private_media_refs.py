@@ -6,6 +6,7 @@ import struct
 import zlib
 import shutil
 import subprocess
+from urllib.parse import quote_from_bytes
 
 import pytest
 
@@ -108,7 +109,8 @@ def test_large_self_contained_base64_image_survives_snapshot(mime):
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_large_valid_png_survives_snapshot_and_production_renderer(tmp_path):
+@pytest.mark.parametrize("encoding", ["base64", "percent", "percent-private-text"])
+def test_large_valid_png_survives_snapshot_and_production_renderer(tmp_path, encoding):
     # A complete PNG with deterministic, poorly compressible RGB pixels.
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
@@ -116,20 +118,86 @@ def test_large_valid_png_survives_snapshot_and_production_renderer(tmp_path):
     pixels = bytes((i * 73 + i // 256) % 256 for i in range(128 * 128 * 3))
     scanlines = b"".join(b"\0" + pixels[i:i + 384] for i in range(0, len(pixels), 384))
     png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 128, 128, 8, 2, 0, 0, 0))
+    if encoding == "percent-private-text":
+        # Text inside image bytes is inert data, not a renderer-active URL.
+        png += chunk(b"tEXt", b"Comment\0https://webui.example/api/media?path=/tmp/private.png file:///tmp/private.png")
     png += chunk(b"IDAT", zlib.compress(scanlines, level=0)) + chunk(b"IEND", b"")
-    ref = "data:image/png;base64," + base64.b64encode(png).decode()
+    if encoding == "base64":
+        ref = "data:image/png;base64," + base64.b64encode(png).decode()
+    else:
+        ref = "data:image/png," + quote_from_bytes(png, safe="")
     text = f"![chart]({ref})"
     assert len(ref) > shares._SHARE_MEDIA_SAFETY_MAX_CHARS
     session = Session(session_id="share-large-png", messages=[{"role": "assistant", "content": text}])
-    content = shares.build_share_snapshot(session)["messages"][0]["content"]
-    assert content == text
     driver = tmp_path / "large-png-render.js"
     driver.write_text(_DRIVER_SRC, encoding="utf-8")
+    # Establish renderer support before exercising the public snapshot boundary.
+    original_rendered = subprocess.run(
+        [NODE, str(driver), str(REPO_ROOT / "static" / "ui.js")],
+        input=text, capture_output=True, text=True, timeout=30, check=True,
+    ).stdout
+    assert f'src="{ref}"' in original_rendered
+    content = shares.build_share_snapshot(session)["messages"][0]["content"]
+    assert content == text
     rendered = subprocess.run(
         [NODE, str(driver), str(REPO_ROOT / "static" / "ui.js")],
         input=content, capture_output=True, text=True, timeout=30, check=True,
     ).stdout
     assert f'src="{ref}"' in rendered
+
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("mime", ["png", "jpg", "jpeg", "gif", "webp", "avif", "PNG"])
+def test_large_percent_raster_forms_survive_snapshot_and_renderer(tmp_path, mime):
+    ref = f"data:image/{mime}," + "%89" * 6000
+    text = f"![image]({ref})"
+    assert len(ref) > shares._SHARE_MEDIA_SAFETY_MAX_CHARS
+    assert _sanitize(text) == text
+    driver = tmp_path / "percent-raster-render.js"
+    driver.write_text(_DRIVER_SRC, encoding="utf-8")
+    rendered = subprocess.run(
+        [NODE, str(driver), str(REPO_ROOT / "static" / "ui.js")],
+        input=text, capture_output=True, text=True, timeout=30, check=True,
+    ).stdout
+    assert f'src="{ref}"' in rendered
+
+
+@pytest.mark.parametrize("encoding", ["base64", "percent"])
+@pytest.mark.parametrize("offset", [-1, 0, 1], ids=["below-limit", "at-limit", "over-limit"])
+def test_self_contained_image_uri_size_boundary(encoding, offset):
+    prefix = "data:image/png;base64," if encoding == "base64" else "data:image/png,"
+    size = shares._SHARE_DATA_IMAGE_MAX_CHARS + offset
+    payload = "A" * (size - len(prefix))
+    if encoding == "percent":
+        payload = "%89" + payload[3:]
+    text = f"![image]({prefix}{payload})"
+    assert _sanitize(text) == (text if offset <= 0 else shares._PLACEHOLDER)
+
+
+@pytest.mark.parametrize("ref", [
+    "data:image/svg+xml," + "%3Csvg%3E" * 3000,
+    "data:image/png;charset=utf-8," + "%89" * 6000,
+    "data:image/bmp," + "%89" * 6000,
+    "data:text/html," + "%3Cscript%3E" * 2000,
+    "data:image/png," + "%89" * 6000 + "?next=https://webui.example/api/media?path=private.png",
+    "data:image/png," + "%89" * 6000 + "#fragment",
+    "data:image/png," + "%89" * 6000 + "\\private.png",
+    "data:image/png," + "%89" * 6000 + '<script>',
+], ids=["percent-svg", "charset-parameter", "unsupported-raster", "html-scheme",
+        "private-url-suffix", "fragment", "backslash", "html-payload"])
+def test_large_non_renderer_percent_image_fails_closed(ref):
+    assert _sanitize(f"![unsafe]({ref})") == shares._PLACEHOLDER
+
+
+def test_percent_image_does_not_exempt_neighboring_private_references():
+    image = "![image](data:image/png," + "%89" * 6000 + ")"
+    text = (
+        f"before {image} "
+        "![private](https://webui.example/api/media?path=/tmp/private.png) "
+        "file:///tmp/private.png after"
+    )
+    assert _sanitize(text) == f"before {image} {shares._PLACEHOLDER} {shares._PLACEHOLDER} after"
 
 
 @pytest.mark.parametrize("ref", [
