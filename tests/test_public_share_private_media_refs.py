@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import base64
+import struct
+import zlib
 import shutil
 import subprocess
 
@@ -94,6 +97,49 @@ def test_direct_markdown_image_to_private_media_is_omitted():
     text = "![private](https://webui.example/api/media?path=/tmp/private.png)"
 
     assert _sanitize(text) == shares._PLACEHOLDER
+
+
+@pytest.mark.parametrize("mime", ["png", "jpeg", "gif", "webp", "avif", "svg+xml"])
+def test_large_self_contained_base64_image_survives_snapshot(mime):
+    ref = f"data:image/{mime};base64," + base64.b64encode(b"image" * 4000).decode()
+    text = f"![chart]({ref})"
+    assert len(ref) > shares._SHARE_MEDIA_SAFETY_MAX_CHARS
+    assert _sanitize(text) == text
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_large_valid_png_survives_snapshot_and_production_renderer(tmp_path):
+    # A complete PNG with deterministic, poorly compressible RGB pixels.
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    pixels = bytes((i * 73 + i // 256) % 256 for i in range(128 * 128 * 3))
+    scanlines = b"".join(b"\0" + pixels[i:i + 384] for i in range(0, len(pixels), 384))
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 128, 128, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(scanlines, level=0)) + chunk(b"IEND", b"")
+    ref = "data:image/png;base64," + base64.b64encode(png).decode()
+    text = f"![chart]({ref})"
+    assert len(ref) > shares._SHARE_MEDIA_SAFETY_MAX_CHARS
+    session = Session(session_id="share-large-png", messages=[{"role": "assistant", "content": text}])
+    content = shares.build_share_snapshot(session)["messages"][0]["content"]
+    assert content == text
+    driver = tmp_path / "large-png-render.js"
+    driver.write_text(_DRIVER_SRC, encoding="utf-8")
+    rendered = subprocess.run(
+        [NODE, str(driver), str(REPO_ROOT / "static" / "ui.js")],
+        input=content, capture_output=True, text=True, timeout=30, check=True,
+    ).stdout
+    assert f'src="{ref}"' in rendered
+
+
+@pytest.mark.parametrize("ref", [
+    "data:image/png;base64," + "A" * (2 * 1024 * 1024),
+    "data:image/png;base64," + "A" * 17000 + "%2Fapi%2Fmedia%3Fpath%3Dprivate.png",
+    "data:image/png;base64," + "A" * 17000 + "file:///tmp/private.png",
+    "data:text/html;base64," + "A" * 17000,
+], ids=["oversized", "encoded-private-path", "literal-file-path", "html-scheme"])
+def test_large_non_renderer_base64_image_does_not_bypass_private_boundary(ref):
+    assert _sanitize(f"![unsafe]({ref})") == shares._PLACEHOLDER
 
 
 def test_public_media_path_with_fragment_path_text_is_preserved():

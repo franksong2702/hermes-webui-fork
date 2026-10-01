@@ -146,6 +146,13 @@ _SHARE_MARKDOWN_IMAGE_RE = re.compile(
 _SHARE_HTTP_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
 _SHARE_MEDIA_SAFETY_MAX_CHARS = 16 * 1024
 _SHARE_MEDIA_SAFETY_DECODE_ROUNDS = 4
+# Match the renderer's supported base64 image forms and 2 MiB URI budget.
+# A complete self-contained payload cannot route to authenticated local media.
+_SHARE_BASE64_IMAGE_RE = re.compile(
+    r"data:image/(?:png|jpe?g|gif|webp|avif|svg\+xml);base64,[a-z0-9+/=]+",
+    re.IGNORECASE,
+)
+_SHARE_DATA_IMAGE_MAX_CHARS = 2 * 1024 * 1024
 
 
 def _bounded_decode_share_media_ref(raw: str) -> str | None:
@@ -226,6 +233,12 @@ def _iter_share_url_candidates(value: str):
 
 def _share_media_ref_is_private(raw: str) -> bool:
     """Return True when a renderer-active ref can route to private local media."""
+    if (
+        isinstance(raw, str)
+        and len(raw) <= _SHARE_DATA_IMAGE_MAX_CHARS
+        and _SHARE_BASE64_IMAGE_RE.fullmatch(raw)
+    ):
+        return False
     decoded = _bounded_decode_share_media_ref(raw)
     if decoded is None:
         return True
