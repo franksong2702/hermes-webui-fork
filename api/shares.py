@@ -133,6 +133,10 @@ _SHARE_MEDIA_RE = re.compile(
 # reverse-proxy origin configuration.
 _SHARE_ANY_MEDIA_RE = re.compile(r"MEDIA:([^\s\)\]]+)")
 _SHARE_WRAPPED_MEDIA_RE = re.compile(r"`MEDIA:([^`\s]+)`")
+# Titles classify the complete wrapper before the bare-token alternative.
+_SHARE_TITLE_MEDIA_RE = re.compile(
+    _SHARE_WRAPPED_MEDIA_RE.pattern + "|" + _SHARE_ANY_MEDIA_RE.pattern
+)
 _SHARE_FILE_MARKDOWN_RE = re.compile(
     r"!?\[[^\]\r\n]*\]\(\s*file://[^)\s]+\s*\)",
     re.IGNORECASE,
@@ -259,7 +263,7 @@ def _share_media_ref_is_private(raw: str) -> bool:
     )
 
 
-def _omit_private_share_media_references(text: str) -> str:
+def _omit_private_share_media_references(text: str, *, plain_text: bool = False) -> str:
     """Remove renderer-active private media references from a public snapshot.
 
     This intentionally does not infer the WebUI's public origin. Any MEDIA URL
@@ -269,15 +273,25 @@ def _omit_private_share_media_references(text: str) -> str:
     if not isinstance(text, str) or not text:
         return text
 
-    # renderMd() makes backtick-wrapped MEDIA tokens active before code stashing;
-    # mirror that normalization before classification.
-    text = _SHARE_WRAPPED_MEDIA_RE.sub(lambda m: f"MEDIA:{m.group(1)}", text)
+    # Bodies mirror renderMd()'s wrapped-token activation. Plain-text titles
+    # keep public wrappers intact and omit a private wrapper as one unit.
+    if not plain_text:
+        text = _SHARE_WRAPPED_MEDIA_RE.sub(lambda m: f"MEDIA:{m.group(1)}", text)
 
     def _replace_media(match: re.Match) -> str:
-        raw = str(match.group(1) or "")
-        return _PLACEHOLDER if _share_media_ref_is_private(raw) else match.group(0)
+        raw = str(match.group(1) or (match.group(2) if plain_text else "") or "")
+        if _share_media_ref_is_private(raw):
+            return _PLACEHOLDER
+        if plain_text:
+            # Titles have no file-reading context: reuse the no-root embedding
+            # decision for local paths, before any wrapper can be consumed.
+            token = f"MEDIA:{raw}"
+            if _embed_share_media(token, allowed_roots=()) != token:
+                return _PLACEHOLDER
+        return match.group(0)
 
-    text = _SHARE_ANY_MEDIA_RE.sub(_replace_media, text)
+    media_re = _SHARE_TITLE_MEDIA_RE if plain_text else _SHARE_ANY_MEDIA_RE
+    text = media_re.sub(_replace_media, text)
 
     # Markdown images are renderer-active even without the MEDIA: prefix.
     # Run their URL through the same classifier so direct private media links
@@ -617,8 +631,7 @@ def build_share_snapshot(session) -> dict:
     # Titles share the same public trust boundary but have no file-reading
     # context. Local MEDIA refs fail closed; ordinary public HTTP(S) refs may
     # remain, while residual file:// and authenticated /api/media refs do not.
-    title = _embed_share_media(title, allowed_roots=())
-    title = _omit_private_share_media_references(title)
+    title = _omit_private_share_media_references(title, plain_text=True)
     title = _redact_share_paths(title, redact_paths) or "Untitled"
     return {
         "title": title,

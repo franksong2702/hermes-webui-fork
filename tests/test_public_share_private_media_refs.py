@@ -351,3 +351,61 @@ def test_public_share_title_omits_file_uri(tmp_path):
 
     assert snapshot["title"] == shares._PLACEHOLDER
     assert "file://" not in snapshot["title"].lower()
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "wrapped"])
+@pytest.mark.parametrize("ref,private", [
+    ("https://cdn.example/icon.png", False),
+    ("https://cdn.example/albums/api/media/photos.png#path=public.png", False),
+    ("/home/me/secret.png", True),
+    ("relative-secret.png", True),
+    ("file:///home/me/secret.png", True),
+    ("https://webui.example/api/media?path=/home/me/secret.png", True),
+    ("https://cdn.example/render?next=https%253A%252F%252Fwebui.example%252Fapi%252Fmedia%253Fpath%253Dsecret.png", True),
+], ids=["public", "public-path-lookalike", "local-absolute", "local-relative",
+        "file-uri", "private-endpoint", "encoded-private-endpoint"])
+def test_public_share_title_wrapped_media_matrix(tmp_path, wrapped, ref, private):
+    token = f"MEDIA:{ref}"
+    if wrapped:
+        token = f"`{token}`"
+    text = f"See {token} here"
+    session = Session(
+        session_id="share-title-wrapped-media",
+        title=text,
+        messages=[{"role": "assistant", "content": text}],
+        workspace=str(tmp_path),
+    )
+    snapshot = shares.build_share_snapshot(session)
+    expected_title = f"See {shares._PLACEHOLDER} here" if private else text
+    assert snapshot["title"] == expected_title
+    # Bodies retain the production renderer's activation of wrapped MEDIA.
+    if not private:
+        assert snapshot["messages"][0]["content"] == f"See MEDIA:{ref} here"
+    else:
+        assert ref not in snapshot["messages"][0]["content"]
+
+
+def test_public_share_title_wrapped_media_keeps_neighbors_and_lowercase(tmp_path):
+    public = "`MEDIA:https://cdn.example/icon.png`"
+    private = "`MEDIA:/home/me/secret.png`"
+    lowercase = "`media:https://cdn.example/inert.png`"
+    text = f"Reference {public} and {private} then {lowercase}"
+    session = Session(
+        session_id="share-title-wrapped-neighbors",
+        title=text,
+        messages=[{"role": "user", "content": "hello"}],
+        workspace=str(tmp_path),
+    )
+    snapshot = shares.build_share_snapshot(session)
+    assert snapshot["title"] == f"Reference {public} and {shares._PLACEHOLDER} then {lowercase}"
+
+
+def test_public_share_title_preserves_exact_review_public_wrapper(tmp_path):
+    text = "Reference `MEDIA:https://cdn.example/icon.png`"
+    session = Session(
+        session_id="share-title-exact-review",
+        title=text,
+        messages=[{"role": "user", "content": "hello"}],
+        workspace=str(tmp_path),
+    )
+    assert shares.build_share_snapshot(session)["title"] == text
