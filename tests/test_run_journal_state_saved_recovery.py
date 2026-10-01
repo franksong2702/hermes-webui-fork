@@ -126,6 +126,44 @@ def test_state_saved_unencodable_row_does_not_drop_valid_live_snapshot():
 
 
 @pytest.mark.parametrize(
+    "created_at",
+    [10**400, -(10**400), float("inf"), float("-inf"), float("nan"), True, "123.5"],
+    ids=["overflow", "negative-overflow", "inf", "negative-inf", "nan", "bool", "string"],
+)
+def test_state_saved_invalid_timestamp_preserves_valid_live_snapshot(created_at):
+    session_id = "state_saved_timestamp_session"
+    run_id = "state_saved_timestamp_run"
+    writer = RunJournalWriter(session_id, run_id)
+    writer.append_sse_event("token", {"text": "Still working"})
+    valid = writer.append_sse_event(
+        "state_saved",
+        {"session_id": session_id, "kind": "memory", "action": "saved", "name": "valid-memory"},
+    )
+    malformed = copy.deepcopy(valid)
+    malformed.update(
+        created_at=created_at,
+        seq=valid["seq"] + 1,
+        event_id=f"{run_id}:{valid['seq'] + 1}",
+    )
+    path = _run_path(session_id, run_id)
+    # Exercise the real JSON reader with an oversized JSON integer. The normal
+    # writer emits finite timestamps, but existing journals can be malformed.
+    with path.open("a", encoding="ascii") as fh:
+        fh.write(routes.json.dumps(malformed, ensure_ascii=True) + "\n")
+    journal_before = path.read_bytes()
+
+    snapshot = routes._run_journal_live_snapshot(run_id)
+    assert snapshot is not None
+    side_effects = snapshot["anchor_activity_scene"]["side_effects"]
+    assert len(side_effects) == 1
+    assert side_effects[0]["event_id"] == valid["event_id"]
+    assert side_effects[0]["payload"]["name"] == "valid-memory"
+    assert side_effects[0]["created_at"] == valid["created_at"]
+    assert snapshot["last_assistant_text"] == "Still working"
+    assert path.read_bytes() == journal_before
+
+
+@pytest.mark.parametrize(
     ("mutation",),
     [
         (lambda event: event.update({"session_id": "foreign_session"}),),

@@ -3539,7 +3539,10 @@ def _run_journal_state_saved_side_effect(
     created_at = event.get("created_at")
     if isinstance(created_at, bool) or not isinstance(created_at, (int, float)):
         return None
-    created_at = float(created_at)
+    try:
+        created_at = float(created_at)
+    except OverflowError:
+        return None
     if created_at != created_at or created_at in (float("inf"), float("-inf")):
         return None
     return {
