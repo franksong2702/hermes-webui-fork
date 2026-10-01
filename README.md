@@ -225,7 +225,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Grouped by Today / Yesterday / Earlier in the sidebar (collapsible date groups)
 - Download as Markdown transcript, full JSON export, or import from JSON
 - Create a public read-only share link for the active conversation from the Control Center; shared pages show a sanitized transcript snapshot without workspace, profile, or live controls; eligible local images are frozen into the snapshot, and self-contained base64 images and renderer-supported percent-encoded raster images retain the renderer's 2 MiB URI limit independently of the private-reference decode budget (SVG remains base64-only, and malformed base64 does not gain the percent-payload exemption), while private `file://` and authenticated `/api/media?path=...` references are omitted
-  Share titles are plain text: public backtick-wrapped `MEDIA:` references keep their exact text; private references are omitted together with their surrounding backticks.
+  Share titles are plain text: public `MEDIA:` references, including supported self-contained image data URIs within the same 2 MiB limit, keep their exact text and any backtick wrapper; private references are omitted together with their surrounding backticks.
 - Sessions persist across page reloads and SSH tunnel reconnects
 - Browser tab title reflects the active session name
 - CLI session bridge -- CLI sessions from hermes-agent's SQLite store appear in the sidebar with a gold "cli" badge; click to import with full history and reply normally

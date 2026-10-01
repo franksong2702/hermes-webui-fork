@@ -409,3 +409,113 @@ def test_public_share_title_preserves_exact_review_public_wrapper(tmp_path):
         workspace=str(tmp_path),
     )
     assert shares.build_share_snapshot(session)["title"] == text
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "wrapped"])
+def test_public_share_title_keeps_review_gif(tmp_path, wrapped):
+    # Complete 1x1 GIF89a, matching the reviewer-pinned title shape.
+    gif_uri = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+    gif = base64.b64decode(gif_uri.split(",", 1)[1], validate=True)
+    assert gif.startswith(b"GIF89a\x01\x00\x01\x00") and gif.endswith(b";")
+    token = f"MEDIA:{gif_uri}"
+    if wrapped:
+        token = f"`{token}`"
+    title = f"Logo {token}"
+    session = Session(
+        session_id="share-title-review-gif",
+        title=title,
+        messages=[{"role": "user", "content": "hello"}],
+        workspace=str(tmp_path),
+    )
+    assert shares.build_share_snapshot(session)["title"] == title
+    assert session.title == title
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "wrapped"])
+@pytest.mark.parametrize("mime,encoding", [
+    *((mime, "base64") for mime in ["png", "jpg", "jpeg", "gif", "webp", "avif", "svg+xml"]),
+    *((mime, "percent") for mime in ["png", "jpg", "jpeg", "gif", "webp", "avif"]),
+])
+def test_public_share_title_keeps_supported_data_image_forms(tmp_path, wrapped, mime, encoding):
+    # This matrix checks URI policy; the review GIF above checks a real image.
+    suffix = ";base64," + base64.b64encode(b"image" * 4000).decode()
+    if encoding == "percent":
+        suffix = "," + "%89" * 6000
+    ref = f"data:image/{mime}{suffix}"
+    assert len(ref) > shares._SHARE_MEDIA_SAFETY_MAX_CHARS
+    token = f"MEDIA:{ref}"
+    if wrapped:
+        token = f"`{token}`"
+    title = f"Logo {token} here"
+    session = Session(
+        session_id="share-title-data-image-forms",
+        title=title,
+        messages=[{"role": "user", "content": "hello"}],
+        workspace=str(tmp_path),
+    )
+    assert shares.build_share_snapshot(session)["title"] == title
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "wrapped"])
+@pytest.mark.parametrize("encoding", ["base64", "percent"])
+@pytest.mark.parametrize("offset", [-1, 0, 1], ids=["below-limit", "at-limit", "over-limit"])
+def test_public_share_title_data_image_size_boundary(tmp_path, wrapped, encoding, offset):
+    prefix = "data:image/png;base64," if encoding == "base64" else "data:image/png,"
+    payload = "A" * (shares._SHARE_DATA_IMAGE_MAX_CHARS + offset - len(prefix))
+    if encoding == "percent":
+        payload = "%89" + payload[3:]
+    token = f"MEDIA:{prefix}{payload}"
+    if wrapped:
+        token = f"`{token}`"
+    title = f"Logo {token} here"
+    session = Session(
+        session_id="share-title-image-size-boundary",
+        title=title,
+        messages=[{"role": "user", "content": "hello"}],
+        workspace=str(tmp_path),
+    )
+    expected = title if offset <= 0 else f"Logo {shares._PLACEHOLDER} here"
+    assert shares.build_share_snapshot(session)["title"] == expected
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "wrapped"])
+@pytest.mark.parametrize("ref", [
+    "data:image/svg+xml,%3Csvg%3E",
+    "data:image/png;charset=utf-8,%89PNG",
+    "data:image/bmp;base64,AAAA",
+    "data:text/html;base64,AAAA",
+    "data:image/png;base64,AAAA%2Fapi%2Fmedia%3Fpath%3Dprivate.png",
+    "data:image/png;base64,AAAA" + "file:///tmp/private.png",
+    "data:image/png;base64," + "A" * 17000 + "%2Fapi%2Fmedia%3Fpath%3Dprivate.png",
+    "data:image/png," + "%89" * 6000 + "?next=https://webui.example/api/media?path=private.png",
+], ids=["percent-svg", "charset-parameter", "unsupported-raster", "html-scheme",
+        "encoded-private-base64-suffix", "literal-file-base64-suffix",
+        "large-malformed-base64", "private-url-percent-suffix"])
+def test_public_share_title_rejects_unsupported_data_image_forms(tmp_path, wrapped, ref):
+    token = f"MEDIA:{ref}"
+    if wrapped:
+        token = f"`{token}`"
+    session = Session(
+        session_id="share-title-data-image-negative",
+        title=f"Logo {token} here",
+        messages=[{"role": "user", "content": "hello"}],
+        workspace=str(tmp_path),
+    )
+    assert shares.build_share_snapshot(session)["title"] == f"Logo {shares._PLACEHOLDER} here"
+
+
+def test_public_share_title_image_exemption_does_not_exempt_private_neighbors(tmp_path):
+    ref = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+    image = f"`MEDIA:{ref}`"
+    title = (
+        f"Logo {image} and `MEDIA:/home/me/secret.png` then "
+        "MEDIA:https://cdn.example/render?next=https%253A%252F%252Fwebui.example%252Fapi%252Fmedia%253Fpath%253Dsecret.png"
+    )
+    session = Session(
+        session_id="share-title-data-image-neighbors",
+        title=title,
+        messages=[{"role": "user", "content": "hello"}],
+        workspace=str(tmp_path),
+    )
+    expected = f"Logo {image} and {shares._PLACEHOLDER} then {shares._PLACEHOLDER}"
+    assert shares.build_share_snapshot(session)["title"] == expected

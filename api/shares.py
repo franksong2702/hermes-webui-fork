@@ -240,16 +240,21 @@ def _iter_share_url_candidates(value: str):
             yield candidate
 
 
-def _share_media_ref_is_private(raw: str) -> bool:
-    """Return True when a renderer-active ref can route to private local media."""
-    if (
+def _share_media_ref_is_self_contained_image(raw: str) -> bool:
+    """Recognize a complete supported image URI within the renderer's budget."""
+    return bool(
         isinstance(raw, str)
         and len(raw) <= _SHARE_DATA_IMAGE_MAX_CHARS
         and (
             _SHARE_BASE64_IMAGE_RE.fullmatch(raw)
             or _SHARE_RASTER_DATA_IMAGE_RE.fullmatch(raw)
         )
-    ):
+    )
+
+
+def _share_media_ref_is_private(raw: str) -> bool:
+    """Return True when a renderer-active ref can route to private local media."""
+    if _share_media_ref_is_self_contained_image(raw):
         return False
     decoded = _bounded_decode_share_media_ref(raw)
     if decoded is None:
@@ -283,6 +288,8 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
         if _share_media_ref_is_private(raw):
             return _PLACEHOLDER
         if plain_text:
+            if _share_media_ref_is_self_contained_image(raw):
+                return match.group(0)
             # Titles have no file-reading context: reuse the no-root embedding
             # decision for local paths, before any wrapper can be consumed.
             token = f"MEDIA:{raw}"
