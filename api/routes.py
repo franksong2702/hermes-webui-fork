@@ -4364,6 +4364,11 @@ def _sanitize_anchor_activity_scene(scene):
         raise ValueError("scene.activity_rows is too large")
     scene_copy = copy.deepcopy(scene)
     encoded = json.dumps(scene_copy, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    if len(encoded) > _ANCHOR_ACTIVITY_SCENE_MAX_BYTES and "side_effects" in scene_copy:
+        # Recovered outcomes must not displace a rows-only Worklog that fits.
+        # Keep the original rows and the same UTF-8 persistence budget.
+        scene_copy.pop("side_effects")
+        encoded = json.dumps(scene_copy, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
     if len(encoded) > _ANCHOR_ACTIVITY_SCENE_MAX_BYTES:
         raise ValueError("scene payload is too large")
     return json.loads(encoded.decode("utf-8"))
