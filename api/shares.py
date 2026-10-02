@@ -345,9 +345,37 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
     # Public JSON must not expose filesystem URIs even when markdown would have
     # treated the literal as inert code. Replace larger constructs first so the
     # snapshot does not retain broken markdown shells around the placeholder.
-    text = _SHARE_FILE_MARKDOWN_RE.sub(_PLACEHOLDER, text)
-    text = _SHARE_FILE_CODE_RE.sub(_PLACEHOLDER, text)
-    return _SHARE_FILE_URI_RE.sub(_PLACEHOLDER, text)
+    for pattern in (_SHARE_FILE_MARKDOWN_RE, _SHARE_FILE_CODE_RE, _SHARE_FILE_URI_RE):
+        # Recompute after every scrub: replacing a private neighbor shifts the
+        # image offsets. URI metadata is inert within a complete accepted image.
+        protected = []
+        for image in _SHARE_MARKDOWN_IMAGE_RE.finditer(text):
+            group = 1 if image.group(1) is not None else 2
+            if _share_media_ref_is_self_contained_image(image.group(group)):
+                protected.append(image.span(group))
+        for media in media_re.finditer(text):
+            token = (
+                _SHARE_ANY_MEDIA_RE.match(text, media.start())
+                if plain_text and media.group(1) is None else media
+            )
+            parts = split_media_token_ref(text, token)
+            if parts and _share_media_ref_is_self_contained_image(parts[0]):
+                start = token.start(1)
+                protected.append((start, start + len(parts[0])))
+        parts = []
+        cursor = 0
+        for start, end in sorted(protected):
+            if end <= cursor:
+                continue
+            # Scrub gaps rather than whole matches: an internal file:// match
+            # can cross a closing backtick into an outside private neighbor.
+            start = max(start, cursor)
+            parts.append(pattern.sub(_PLACEHOLDER, text[cursor:start]))
+            parts.append(text[start:end])
+            cursor = end
+        parts.append(pattern.sub(_PLACEHOLDER, text[cursor:]))
+        text = "".join(parts)
+    return text
 
 
 # Max size (in bytes) for files we'll embed as base64 in a share snapshot.

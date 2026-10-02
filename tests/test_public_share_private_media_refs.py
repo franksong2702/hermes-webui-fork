@@ -697,3 +697,70 @@ def test_quoted_media_snapshot_keeps_public_ref_and_private_closer(tmp_path, quo
     if not ref.startswith("data:"):
         assert snapshot["messages"][0]["content"] == expected
     assert session.title == text and session.messages[0]["content"] == text
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("location", ["body", "bare-title", "wrapped-title"])
+@pytest.mark.parametrize("encoding", ["raw-colon-slash", "fully-escaped", "base64"])
+def test_png_file_uri_metadata_survives_snapshot_with_private_neighbors(tmp_path, location, encoding):
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", 3, 2, 8, 2, 0, 0, 0))
+           + chunk(b"tEXt", b"Comment\0file:///etc/x")
+           + chunk(b"IDAT", zlib.compress(b"\0" + b"\xfb\xef\xff" * 3 + b"\0" + b"\x12\x34\x56" * 3))
+           + chunk(b"IEND", b""))
+    if encoding == "base64":
+        ref = "data:image/png;base64," + base64.b64encode(png).decode()
+    else:
+        ref = "data:image/png," + quote_from_bytes(png, safe=":/" if encoding == "raw-colon-slash" else "")
+    if encoding == "raw-colon-slash":
+        assert "file:///etc/x" in ref
+    image = f"![chart]({ref})" if location == "body" else f"MEDIA:{ref}"
+    if location == "wrapped-title":
+        image = f"`{image}`"
+    private = ["file:///etc/secret.txt", "![private](file:///etc/private.png)",
+               "`file:///etc/private.pdf`", "MEDIA:file:///etc/private.gif"]
+    text = f"before {image} after " + " and ".join(private)
+    session = Session(session_id="png-file-metadata", title=text if location != "body" else "PNG metadata",
+                      messages=[{"role": "assistant", "content": text if location == "body" else "hello"}], workspace=str(tmp_path))
+    # Independent data decoder and original production renderer must accept it.
+    decoded = subprocess.run([NODE, "-e", "fetch(process.argv[1]).then(r=>r.arrayBuffer()).then(b=>process.stdout.write(Buffer.from(b)))", ref], capture_output=True, timeout=30, check=True).stdout
+    assert decoded == png
+    driver = tmp_path / "metadata-png-render.js"
+    driver.write_text(_DRIVER_SRC, encoding="utf-8")
+    render_input = f"![chart]({ref})"
+    before = subprocess.run([NODE, str(driver), str(REPO_ROOT / "static" / "ui.js")], input=render_input, capture_output=True, text=True, timeout=30, check=True).stdout
+    assert f'src="{ref}"' in before
+    snapshot = shares.build_share_snapshot(session)
+    actual = snapshot["messages"][0]["content"] if location == "body" else snapshot["title"]
+    assert actual == f"before {image} after " + " and ".join([shares._PLACEHOLDER] * len(private))
+    if location == "body":
+        after = subprocess.run([NODE, str(driver), str(REPO_ROOT / "static" / "ui.js")], input=actual, capture_output=True, text=True, timeout=30, check=True).stdout
+        assert f'src="{ref}"' in after
+    assert session.title == text if location != "body" else session.title == "PNG metadata"
+    assert session.messages[0]["content"] == (text if location == "body" else "hello")
+
+
+@pytest.mark.parametrize("prefix", ["data:image/png,", "data:image/png;base64,", "data:image/svg+xml,"])
+def test_image_file_scrub_exemption_does_not_cover_invalid_or_oversized_refs(prefix):
+    ref = prefix + "A" * shares._SHARE_DATA_IMAGE_MAX_CHARS + "file:///etc/private.png"
+    content = _sanitize(f"![unsafe]({ref}) file:///etc/neighbor.txt")
+    assert "file://" not in content and "/etc/neighbor.txt" not in content
+    assert shares._PLACEHOLDER in content
+
+
+@pytest.mark.parametrize("neighbor", ["bare", "code", "both-sides"])
+def test_image_metadata_protection_stops_at_wrapped_title_boundary(tmp_path, neighbor):
+    ref = "data:image/png,%89PNGfile:///etc/metadata"
+    image = f"`MEDIA:{ref}`"
+    if neighbor == "bare":
+        text, expected = image + "file:///etc/secret.txt", image + shares._PLACEHOLDER
+    elif neighbor == "code":
+        text, expected = image + "`file:///etc/secret.txt`", image + shares._PLACEHOLDER
+    else:
+        text = "file:///etc/before.txt " + image + "file:///etc/after.txt"
+        expected = shares._PLACEHOLDER + " " + image + shares._PLACEHOLDER
+    session = Session(session_id="metadata-span-boundary", title=text, messages=[{"role": "user", "content": "hello"}], workspace=str(tmp_path))
+    assert shares.build_share_snapshot(session)["title"] == expected
