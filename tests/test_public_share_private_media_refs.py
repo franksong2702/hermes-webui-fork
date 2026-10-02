@@ -109,21 +109,27 @@ def test_large_self_contained_base64_image_survives_snapshot(mime):
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-@pytest.mark.parametrize("encoding", ["base64", "percent", "percent-private-text"])
+@pytest.mark.parametrize("encoding", ["base64", "percent", "percent-private-text", "escaped-base64"])
 def test_large_valid_png_survives_snapshot_and_production_renderer(tmp_path, encoding):
     # A complete PNG with deterministic, poorly compressible RGB pixels.
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
-    pixels = bytes((i * 73 + i // 256) % 256 for i in range(128 * 128 * 3))
-    scanlines = b"".join(b"\0" + pixels[i:i + 384] for i in range(0, len(pixels), 384))
-    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 128, 128, 8, 2, 0, 0, 0))
+    width, height = (120, 100) if encoding == "escaped-base64" else (128, 128)
+    stride = width * 3
+    pixels = bytes((i * 73 + i // 256) % 256 for i in range(width * height * 3))
+    scanlines = b"".join(b"\0" + pixels[i:i + stride] for i in range(0, len(pixels), stride))
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
     if encoding == "percent-private-text":
         # Text inside image bytes is inert data, not a renderer-active URL.
         png += chunk(b"tEXt", b"Comment\0https://webui.example/api/media?path=/tmp/private.png file:///tmp/private.png")
     png += chunk(b"IDAT", zlib.compress(scanlines, level=0)) + chunk(b"IEND", b"")
-    if encoding == "base64":
-        ref = "data:image/png;base64," + base64.b64encode(png).decode()
+    if encoding in ("base64", "escaped-base64"):
+        payload = base64.b64encode(png).decode()
+        if encoding == "escaped-base64":
+            assert "/" in payload and "+" in payload
+            payload = payload.replace("/", "%2F").replace("+", "%2B")
+        ref = "data:image/png;base64," + payload
     else:
         ref = "data:image/png," + quote_from_bytes(png, safe="")
     text = f"![chart]({ref})"
@@ -412,11 +418,15 @@ def test_public_share_title_preserves_exact_review_public_wrapper(tmp_path):
 
 
 @pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "wrapped"])
-def test_public_share_title_keeps_review_gif(tmp_path, wrapped):
+@pytest.mark.parametrize("escaped", [False, True], ids=["literal-base64", "escaped-base64"])
+def test_public_share_title_keeps_review_gif(tmp_path, wrapped, escaped):
     # Complete 1x1 GIF89a, matching the reviewer-pinned title shape.
     gif_uri = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
     gif = base64.b64decode(gif_uri.split(",", 1)[1], validate=True)
     assert gif.startswith(b"GIF89a\x01\x00\x01\x00") and gif.endswith(b";")
+    if escaped:
+        prefix, payload = gif_uri.split(",", 1)
+        gif_uri = prefix + "," + payload.replace("/", "%2F").replace("+", "%2B")
     token = f"MEDIA:{gif_uri}"
     if wrapped:
         token = f"`{token}`"
@@ -519,3 +529,100 @@ def test_public_share_title_image_exemption_does_not_exempt_private_neighbors(tm
     )
     expected = f"Logo {image} and {shares._PLACEHOLDER} then {shares._PLACEHOLDER}"
     assert shares.build_share_snapshot(session)["title"] == expected
+
+
+
+def _snapshot_escaped_image(tmp_path, ref, location):
+    # Long body MEDIA data URI filename handling (#7949) is a separate issue.
+    body = f"![image]({ref})"
+    title = f"MEDIA:{ref}"
+    if location == "wrapped-title":
+        title = f"`{title}`"
+    session = Session(
+        session_id="share-escaped-image",
+        title=f"before {title} after" if location != "body" else "Image",
+        messages=[{"role": "assistant", "content": f"before {body} after" if location == "body" else "hello"}],
+        workspace=str(tmp_path),
+    )
+    snapshot = shares.build_share_snapshot(session)
+    return (snapshot["messages"][0]["content"], session.messages[0]["content"]) if location == "body" else (snapshot["title"], session.title)
+
+
+@pytest.mark.parametrize("location", ["body", "bare-title", "wrapped-title"])
+@pytest.mark.parametrize("mime", ["png", "jpg", "jpeg", "gif", "webp", "avif", "PNG"])
+def test_escaped_base64_raster_mimes_keep_original_snapshot_text(tmp_path, location, mime):
+    # Both literal and escaped + survive; slash escape is case-insensitive.
+    payload = base64.b64encode(b"\xfb\xef\xff" * 5000).decode()
+    ref = f"data:image/{mime};base64," + payload.replace("/", "%2f").replace("++", "+%2B")
+    assert len(ref) > shares._SHARE_MEDIA_SAFETY_MAX_CHARS
+    actual, original = _snapshot_escaped_image(tmp_path, ref, location)
+    assert actual == original
+
+
+@pytest.mark.parametrize("location", ["body", "bare-title", "wrapped-title"])
+@pytest.mark.parametrize("payload", [
+    "+%2B//", "%2B+//", "%2b%2B%2f%2F", "aQ%3D%3d", "%61%51==",
+], ids=["literal-plus-first", "literal-plus-second", "escape-case", "padding", "alphabet"])
+def test_once_escaped_base64_formats_survive_snapshot(tmp_path, location, payload):
+    ref = "DATA:IMAGE/GIF;BASE64," + payload
+    actual, original = _snapshot_escaped_image(tmp_path, ref, location)
+    assert actual == original
+
+
+@pytest.mark.parametrize("location", ["body", "bare-title", "wrapped-title"])
+@pytest.mark.parametrize("payload", [
+    "AAAA%", "AAAA%2", "AAAA%ZZ", "AAAA%252F", "AAAA%20", "AAAA%0A",
+    "AAAA%00", "AAAA%FF", "A%2F", "AAAA%3D", "AAAA%3D===", "AA%3DA", "AAAA%2Fapi%2Fmedia%3Fpath%3Dprivate.png",
+    "AAAA%2Ffile%3A%2F%2F%2Ftmp%2Fprivate.png",
+    "AAAA%2F?junk", "AAAA%2F#junk", "AAAA%2F\\junk", "AAAA%2F<script>",
+    "AAAA%2F?next=https://webui.example/api/media?path=private.png",
+], ids=["bare-percent", "short-escape", "nonhex-escape", "double-escape", "space", "newline",
+        "nul", "nonascii", "incomplete-quartet", "excess-padding", "four-padding", "middle-padding", "private-route", "file-uri",
+        "raw-query", "raw-fragment", "raw-backslash", "raw-markup", "raw-private-url"])
+def test_malformed_escaped_base64_fails_closed_in_snapshot(tmp_path, location, payload):
+    ref = "data:image/png;base64," + payload
+    actual, _ = _snapshot_escaped_image(tmp_path, ref, location)
+    assert actual == f"before {shares._PLACEHOLDER} after"
+
+
+@pytest.mark.parametrize("location", ["body", "bare-title", "wrapped-title"])
+@pytest.mark.parametrize("offset", [-1, 0, 1], ids=["below-limit", "at-limit", "over-limit"])
+def test_escaped_base64_original_uri_size_boundary(tmp_path, location, offset):
+    # Valid base64 has even escaped length; MIME aliases permit each exact size.
+    prefix = "data:image/png;base64," if offset == 0 else "data:image/jpeg;base64,"
+    size = shares._SHARE_DATA_IMAGE_MAX_CHARS + offset
+    length = size - len(prefix)
+    escapes = 1 if length % 4 == 2 else 2
+    payload = "%41" * escapes + "A" * (length - 3 * escapes)
+    ref = prefix + payload
+    assert len(ref) == size
+    actual, original = _snapshot_escaped_image(tmp_path, ref, location)
+    assert actual == (original if offset <= 0 else f"before {shares._PLACEHOLDER} after")
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "wrapped"])
+def test_escaped_base64_svg_title_stays_outside_raster_exemption(tmp_path, wrapped):
+    ref = "data:image/svg+xml;base64," + "%41" * 6000
+    location = "wrapped-title" if wrapped else "bare-title"
+    actual, _ = _snapshot_escaped_image(tmp_path, ref, location)
+    assert actual == f"before {shares._PLACEHOLDER} after"
+
+
+@pytest.mark.parametrize("location", ["body", "bare-title", "wrapped-title"])
+def test_escaped_base64_does_not_exempt_private_snapshot_neighbors(tmp_path, location):
+    ref = "data:image/gif;base64,+%2B%2F/"
+    image = f"![image]({ref})" if location == "body" else f"MEDIA:{ref}"
+    if location == "wrapped-title":
+        image = f"`{image}`"
+    private = "MEDIA:https://cdn.example/render?next=https%253A%252F%252Fwebui.example%252Fapi%252Fmedia%253Fpath%253Dprivate.png"
+    file_ref = "file:///tmp/private.png"
+    text = f"before {image} and {private} then {file_ref} after"
+    session = Session(
+        session_id="share-escaped-image-neighbors",
+        title=text if location != "body" else "Image",
+        messages=[{"role": "assistant", "content": text if location == "body" else "hello"}],
+        workspace=str(tmp_path),
+    )
+    snapshot = shares.build_share_snapshot(session)
+    actual = snapshot["messages"][0]["content"] if location == "body" else snapshot["title"]
+    assert actual == f"before {image} and {shares._PLACEHOLDER} then {shares._PLACEHOLDER} after"

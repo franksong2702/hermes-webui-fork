@@ -152,7 +152,7 @@ _SHARE_MEDIA_SAFETY_MAX_CHARS = 16 * 1024
 _SHARE_MEDIA_SAFETY_DECODE_ROUNDS = 4
 # Match self-contained renderer image forms and its 2 MiB URI budget.
 # A complete self-contained payload cannot route to authenticated local media.
-# Keep base64 (including SVG) strict; percent payloads apply only to raster URIs.
+# Keep SVG base64 strict; escaped raster base64 must validate after one decode.
 _SHARE_BASE64_IMAGE_RE = re.compile(
     r"data:image/(?:png|jpe?g|gif|webp|avif|svg\+xml);base64,[a-z0-9+/=]+",
     re.IGNORECASE,
@@ -160,6 +160,12 @@ _SHARE_BASE64_IMAGE_RE = re.compile(
 _SHARE_RASTER_DATA_IMAGE_RE = re.compile(
     r"data:image/(?:png|jpe?g|gif|webp|avif),[a-z0-9+/=%._~:@!$&'()*+,;-]*",
     re.IGNORECASE,
+)
+# Recognize the raster header even if the escaped payload is malformed.
+# Validation below must reject it instead of falling through to URL handling.
+_SHARE_ESCAPED_BASE64_RASTER_RE = re.compile(
+    r"data:image/(?:png|jpe?g|gif|webp|avif);base64,(.*)",
+    re.IGNORECASE | re.DOTALL,
 )
 _SHARE_DATA_IMAGE_MAX_CHARS = 2 * 1024 * 1024
 
@@ -242,20 +248,32 @@ def _iter_share_url_candidates(value: str):
 
 def _share_media_ref_is_self_contained_image(raw: str) -> bool:
     """Recognize a complete supported image URI within the renderer's budget."""
-    return bool(
-        isinstance(raw, str)
-        and len(raw) <= _SHARE_DATA_IMAGE_MAX_CHARS
-        and (
-            _SHARE_BASE64_IMAGE_RE.fullmatch(raw)
-            or _SHARE_RASTER_DATA_IMAGE_RE.fullmatch(raw)
-        )
-    )
+    if not isinstance(raw, str) or len(raw) > _SHARE_DATA_IMAGE_MAX_CHARS:
+        return False
+    if _SHARE_BASE64_IMAGE_RE.fullmatch(raw) or _SHARE_RASTER_DATA_IMAGE_RE.fullmatch(raw):
+        return True
+    match = _SHARE_ESCAPED_BASE64_RASTER_RE.fullmatch(raw)
+    if not match or "%" not in match.group(1):
+        return False
+    try:
+        # unquote preserves literal +; a second decode is never permitted.
+        payload = unquote(match.group(1))
+        # b64decode alone tolerates surplus padding after a complete quartet.
+        if len(payload) % 4 or payload.endswith("==="):
+            return False
+        base64.b64decode(payload, validate=True)
+    except ValueError:
+        return False
+    return True
 
 
 def _share_media_ref_is_private(raw: str) -> bool:
     """Return True when a renderer-active ref can route to private local media."""
     if _share_media_ref_is_self_contained_image(raw):
         return False
+    # Malformed escaped raster payloads fail closed even below the URL budget.
+    if "%" in raw and _SHARE_ESCAPED_BASE64_RASTER_RE.fullmatch(raw):
+        return True
     decoded = _bounded_decode_share_media_ref(raw)
     if decoded is None:
         return True
