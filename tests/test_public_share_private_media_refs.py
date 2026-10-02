@@ -764,3 +764,80 @@ def test_image_metadata_protection_stops_at_wrapped_title_boundary(tmp_path, nei
         expected = shares._PLACEHOLDER + " " + image + shares._PLACEHOLDER
     session = Session(session_id="metadata-span-boundary", title=text, messages=[{"role": "user", "content": "hello"}], workspace=str(tmp_path))
     assert shares.build_share_snapshot(session)["title"] == expected
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("prefix", ["![a](x ", "![a](chart.png ", "![a](x\n", "![a](x\r\n", "![a](x\t"])
+def test_malformed_markdown_prefix_cannot_hide_following_private_image(prefix,tmp_path):
+    private="https://webui.example/api/media?path=/tmp/private.png"
+    body=prefix+f"![b]({private})"
+    session=Session(session_id="malformed-private-image",messages=[{"role":"assistant","content":body}])
+    content=shares.build_share_snapshot(session)["messages"][0]["content"]
+    driver=tmp_path/"malformed-private.js";driver.write_text(_DRIVER_SRC)
+    rendered=subprocess.run([NODE,str(driver),str(REPO_ROOT/"static/ui.js")],input=content,text=True,capture_output=True,timeout=30,check=True).stdout
+    assert "/api/media?path=" not in rendered
+    assert private not in content
+    assert session.messages[0]["content"]==body
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("body", [
+    '![a](https://webui.example/api/media?path=![b](https://cdn.example/public.png))',
+    '![a](https://webui.example/api/media?path=/tmp/private.png "![b](https://cdn.example/public.png)")',
+])
+def test_supported_private_outer_image_cannot_skip_to_public_nested_image(body,tmp_path):
+    session=Session(session_id="private-outer-image",messages=[{"role":"assistant","content":body}])
+    content=shares.build_share_snapshot(session)["messages"][0]["content"]
+    driver=tmp_path/"private-outer.js";driver.write_text(_DRIVER_SRC)
+    rendered=subprocess.run([NODE,str(driver),str(REPO_ROOT/"static/ui.js")],input=content,text=True,capture_output=True,timeout=30,check=True).stdout
+    assert "/api/media?path=" not in content
+    assert "/api/media?path=" not in rendered
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("prefix,suffix", [
+    ("![a](x ", ""), ("![a](chart.png ", ""), ("![a](x\n", ""),
+    ("![a](HTTPS://cdn.example/a.png ", ""), ("![a](<x> ", ""),
+])
+@pytest.mark.parametrize("form", ["large-base64", "raw-percent-metadata"])
+def test_malformed_unknown_prefix_preserves_supported_real_png(prefix,suffix,form,tmp_path):
+    def chunk(kind,data):
+        return struct.pack(">I",len(data))+kind+data+struct.pack(">I",zlib.crc32(kind+data))
+    width,height=(120,100) if form=="large-base64" else (3,2)
+    pixels=bytes((i*73+i//256)%256 for i in range(width*height*3))
+    stride=width*3
+    raw=b"".join(b"\0"+pixels[i:i+stride] for i in range(0,len(pixels),stride))
+    png=b"\x89PNG\r\n\x1a\n"+chunk(b"IHDR",struct.pack(">IIBBBBB",width,height,8,2,0,0,0))
+    if form=="raw-percent-metadata":png+=chunk(b"tEXt",b"Comment\0file:///etc/x")
+    png+=chunk(b"IDAT",zlib.compress(raw,level=0))+chunk(b"IEND",b"")
+    ref=("data:image/png;base64,"+base64.b64encode(png).decode() if form=="large-base64" else "data:image/png,"+quote_from_bytes(png,safe=":/"))
+    if form=="large-base64":assert len(ref)>shares._SHARE_MEDIA_SAFETY_MAX_CHARS
+    decoded=subprocess.run([NODE,"-e","fetch(process.argv[1]).then(r=>r.arrayBuffer()).then(b=>process.stdout.write(Buffer.from(b)))",ref],capture_output=True,timeout=30,check=True).stdout
+    assert decoded==png
+    body=prefix+f"![b]({ref})"+suffix
+    driver=tmp_path/"nested-real-png.js";driver.write_text(_DRIVER_SRC)
+    before=subprocess.run([NODE,str(driver),str(REPO_ROOT/"static/ui.js")],input=body,text=True,capture_output=True,timeout=30,check=True).stdout
+    assert f'src="{ref}"' in before
+    session=Session(session_id="nested-real-png",messages=[{"role":"assistant","content":body}])
+    content=shares.build_share_snapshot(session)["messages"][0]["content"]
+    assert content==body
+    after=subprocess.run([NODE,str(driver),str(REPO_ROOT/"static/ui.js")],input=content,text=True,capture_output=True,timeout=30,check=True).stdout
+    assert f'src="{ref}"' in after
+    assert session.messages[0]["content"]==body
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("body", [
+    '![public](https://cdn.example/a.png)',
+    '![public](https://cdn.example/a.png "caption")',
+    '![left](https://cdn.example/a.png) ![private](https://webui.example/api/media?path=/tmp/private.png) ![right](https://cdn.example/b.png)',
+])
+def test_strict_image_boundary_preserves_public_neighbors_and_caption(body,tmp_path):
+    session=Session(session_id="strict-public-images",messages=[{"role":"assistant","content":body}])
+    content=shares.build_share_snapshot(session)["messages"][0]["content"]
+    driver=tmp_path/"strict-public.js";driver.write_text(_DRIVER_SRC)
+    rendered=subprocess.run([NODE,str(driver),str(REPO_ROOT/"static/ui.js")],input=content,text=True,capture_output=True,timeout=30,check=True).stdout
+    assert "https://cdn.example/a.png" in rendered
+    assert "/api/media?path=" not in rendered
+    if '![right]' in body:assert "https://cdn.example/b.png" in rendered
+    else:assert content==body

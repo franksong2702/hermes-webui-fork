@@ -143,8 +143,17 @@ _SHARE_FILE_MARKDOWN_RE = re.compile(
 )
 _SHARE_FILE_CODE_RE = re.compile(r"`file://[^`\r\n]+`", re.IGNORECASE)
 _SHARE_FILE_URI_RE = re.compile(r"file://[^\s<>\"')\]]+", re.IGNORECASE)
+# Unknown malformed destinations must not consume a later image marker. A
+# renderer-supported outer scheme still consumes its full reference so a private
+# outer URL cannot evade classification by nesting a public image inside it.
+# The renderer's outer Markdown scheme gate is case-sensitive.
+_SHARE_MARKDOWN_IMAGE_DESTINATION_GUARD = (
+    r"(?:(?=(?-i:https?://|file://|data:image/))|(?![^)\r\n]*!\[))"
+)
 _SHARE_MARKDOWN_IMAGE_RE = re.compile(
-    r"!\[[^\]\r\n]*\]\(\s*(?:<([^>\r\n]+)>|([^\s)\r\n]+))(?:\s+[^)]*)?\s*\)",
+    r"!\[[^\]\r\n]*\]\(\s*(?:"
+    rf"<({_SHARE_MARKDOWN_IMAGE_DESTINATION_GUARD}[^>\r\n]+)>|"
+    rf"({_SHARE_MARKDOWN_IMAGE_DESTINATION_GUARD}[^)\r\n]+))\s*\)",
     re.IGNORECASE,
 )
 _SHARE_HTTP_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
