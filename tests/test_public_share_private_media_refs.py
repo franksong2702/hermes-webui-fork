@@ -571,13 +571,13 @@ def test_once_escaped_base64_formats_survive_snapshot(tmp_path, location, payloa
 
 @pytest.mark.parametrize("location", ["body", "bare-title", "wrapped-title"])
 @pytest.mark.parametrize("payload", [
-    "AAAA%", "AAAA%2", "AAAA%ZZ", "AAAA%252F", "AAAA%20", "AAAA%0A",
-    "AAAA%00", "AAAA%FF", "A%2F", "AAAA%3D", "AAAA%3D===", "AA%3DA", "AAAA%2Fapi%2Fmedia%3Fpath%3Dprivate.png",
+    "AAAA%", "AAAA%2", "AAAA%ZZ", "AAAA%252F",
+    "AAAA%00", "AAAA%FF", "AAAA%3D", "AAAA%3D===", "AA%3DA", "AAAA%2Fapi%2Fmedia%3Fpath%3Dprivate.png",
     "AAAA%2Ffile%3A%2F%2F%2Ftmp%2Fprivate.png",
     "AAAA%2F?junk", "AAAA%2F#junk", "AAAA%2F\\junk", "AAAA%2F<script>",
     "AAAA%2F?next=https://webui.example/api/media?path=private.png",
-], ids=["bare-percent", "short-escape", "nonhex-escape", "double-escape", "space", "newline",
-        "nul", "nonascii", "incomplete-quartet", "excess-padding", "four-padding", "middle-padding", "private-route", "file-uri",
+], ids=["bare-percent", "short-escape", "nonhex-escape", "double-escape",
+        "nul", "nonascii", "excess-padding", "four-padding", "middle-padding", "private-route", "file-uri",
         "raw-query", "raw-fragment", "raw-backslash", "raw-markup", "raw-private-url"])
 def test_malformed_escaped_base64_fails_closed_in_snapshot(tmp_path, location, payload):
     ref = "data:image/png;base64," + payload
@@ -626,3 +626,74 @@ def test_escaped_base64_does_not_exempt_private_snapshot_neighbors(tmp_path, loc
     snapshot = shares.build_share_snapshot(session)
     actual = snapshot["messages"][0]["content"] if location == "body" else snapshot["title"]
     assert actual == f"before {image} and {shares._PLACEHOLDER} then {shares._PLACEHOLDER} after"
+
+
+@pytest.mark.parametrize("location", ["body", "bare-title", "wrapped-title"])
+@pytest.mark.parametrize("payload", ["AAAA%20", "AAAA%0A", "A%2F", "AA%09%0C%0D%20"])
+def test_forgiving_escaped_base64_is_not_malformed(tmp_path, location, payload):
+    actual, original = _snapshot_escaped_image(tmp_path, "data:image/png;base64," + payload, location)
+    assert actual == original
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("location", ["body", "bare-title", "wrapped-title"])
+@pytest.mark.parametrize("form", ["unpadded", "plus-slash-unpadded", "lf", "crlf", "mime-wrapped"])
+def test_real_png_forgiving_base64_snapshot_and_renderer(tmp_path, location, form):
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+           + chunk(b"tEXt", b"k\0vv")
+           + chunk(b"IDAT", zlib.compress(b"\0\xfb\xef\xff", level=0))
+           + chunk(b"IEND", b""))
+    payload = base64.b64encode(png).decode()
+    assert payload.endswith("=") and ("+" in payload or "/" in payload)
+    if form == "unpadded":
+        escaped = quote_from_bytes(payload.rstrip("=").encode(), safe="")
+    elif form == "plus-slash-unpadded":
+        escaped = payload.rstrip("=").replace("+", "%2B").replace("/", "%2F")
+    else:
+        separator = "\r\n" if form != "lf" else "\n"
+        width = 76 if form == "mime-wrapped" else 12
+        escaped = quote_from_bytes(separator.join(payload[i:i + width] for i in range(0, len(payload), width)).encode(), safe="")
+    ref = "data:image/png;base64," + escaped
+    # Browser-equivalent data decoding is checked independently of our validator.
+    decoded = subprocess.run([NODE, "-e", "fetch(process.argv[1]).then(r=>r.arrayBuffer()).then(b=>process.stdout.write(Buffer.from(b)))", ref], capture_output=True, timeout=30, check=True).stdout
+    assert decoded == png
+    driver = tmp_path / "forgiving-png-render.js"
+    driver.write_text(_DRIVER_SRC, encoding="utf-8")
+    body = f"![image]({ref})"
+    before = subprocess.run([NODE, str(driver), str(REPO_ROOT / "static" / "ui.js")], input=body, capture_output=True, text=True, timeout=30, check=True).stdout
+    assert f'src="{ref}"' in before
+    actual, original = _snapshot_escaped_image(tmp_path, ref, location)
+    assert actual == original
+    if location == "body":
+        after = subprocess.run([NODE, str(driver), str(REPO_ROOT / "static" / "ui.js")], input=actual, capture_output=True, text=True, timeout=30, check=True).stdout
+        assert f'src="{ref}"' in after
+
+
+@pytest.mark.parametrize("quote", ['"', "'", "&quot;", "&#39;"])
+@pytest.mark.parametrize("ref,private", [
+    ("data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", False),
+    ("https://cdn.example/logo.png", False),
+    ("/tmp/private.png", True),
+    ("https://webui.example/api/media?path=/tmp/private.png", True),
+])
+def test_quoted_media_snapshot_keeps_public_ref_and_private_closer(tmp_path, quote, ref, private):
+    text = f"Logo {quote}MEDIA:{ref}{quote} end"
+    session = Session(session_id="quoted-share-media", title=text,
+                      messages=[{"role": "assistant", "content": text}], workspace=str(tmp_path))
+    snapshot = shares.build_share_snapshot(session)
+    if private:
+        # Shared suffix splitting normalizes entity closers to their quote byte.
+        closer = '"' if quote == "&quot;" else "'" if quote == "&#39;" else quote
+        expected = f"Logo {quote}{shares._PLACEHOLDER}{closer} end"
+    else:
+        expected = text
+    assert snapshot["title"] == expected
+    # Body MEDIA data-URI embedding is the separate existing #7949 path.
+    # Real data-image body preservation is asserted above through Markdown.
+    if not ref.startswith("data:"):
+        assert snapshot["messages"][0]["content"] == expected
+    assert session.title == text and session.messages[0]["content"] == text

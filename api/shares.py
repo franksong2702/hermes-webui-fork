@@ -257,11 +257,16 @@ def _share_media_ref_is_self_contained_image(raw: str) -> bool:
         return False
     try:
         # unquote preserves literal +; a second decode is never permitted.
-        payload = unquote(match.group(1))
-        # b64decode alone tolerates surplus padding after a complete quartet.
-        if len(payload) % 4 or payload.endswith("==="):
+        payload = re.sub(r"[ \t\n\f\r]", "", unquote(match.group(1)))
+        # Match the browser's forgiving-base64 after exactly one URI decode.
+        if len(payload) % 4 == 0:
+            if payload.endswith("=="):
+                payload = payload[:-2]
+            elif payload.endswith("="):
+                payload = payload[:-1]
+        if len(payload) % 4 == 1 or not re.fullmatch(r"[A-Za-z0-9+/]*", payload):
             return False
-        base64.b64decode(payload, validate=True)
+        base64.b64decode(payload + "=" * (-len(payload) % 4), validate=True)
     except ValueError:
         return False
     return True
@@ -302,9 +307,19 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
         text = _SHARE_WRAPPED_MEDIA_RE.sub(lambda m: f"MEDIA:{m.group(1)}", text)
 
     def _replace_media(match: re.Match) -> str:
-        raw = str(match.group(1) or (match.group(2) if plain_text else "") or "")
+        # The title alternation puts bare references in group 2. Give the
+        # shared splitter the original bare match so quoted prose stays outside
+        # classification, just as in the local-image embedding path.
+        token_match = (
+            _SHARE_ANY_MEDIA_RE.match(text, match.start())
+            if plain_text and match.group(1) is None else match
+        )
+        parts = split_media_token_ref(text, token_match)
+        if not parts:
+            return match.group(0)
+        raw, suffix = parts
         if _share_media_ref_is_private(raw):
-            return _PLACEHOLDER
+            return _PLACEHOLDER + suffix
         if plain_text:
             if _share_media_ref_is_self_contained_image(raw):
                 return match.group(0)
@@ -312,7 +327,7 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
             # decision for local paths, before any wrapper can be consumed.
             token = f"MEDIA:{raw}"
             if _embed_share_media(token, allowed_roots=()) != token:
-                return _PLACEHOLDER
+                return _PLACEHOLDER + suffix
         return match.group(0)
 
     media_re = _SHARE_TITLE_MEDIA_RE if plain_text else _SHARE_ANY_MEDIA_RE
