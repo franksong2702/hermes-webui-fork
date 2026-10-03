@@ -1,6 +1,6 @@
 """Tests for issue #538 — MCP server management API."""
-import json
-from unittest.mock import patch, MagicMock
+import json, pytest
+from unittest.mock import patch, MagicMock, call
 import yaml
 from api.routes import (
     _handle_mcp_servers_list,
@@ -43,31 +43,30 @@ SAMPLE_MCP = {
 class TestMcpList:
     """GET /api/mcp/servers — list with masked secrets."""
 
-    @patch('api.routes._active_profile_mcp_config_data')
+    @patch('api.routes.get_config_for_profile_home')
     @patch('api.routes.get_active_hermes_home')
     def test_returns_servers_list(self, mock_home, mock_cfg):
-        mock_home.return_value = object()
+        mock_home.return_value = sentinel_home = object()
         mock_cfg.return_value = {'mcp_servers': SAMPLE_MCP}
         h = _make_handler()
         _handle_mcp_servers_list(h)
         assert h.send_response.called
         status = h.send_response.call_args[0][0]
         assert status == 200
-        mock_cfg.assert_called_once_with()
+        mock_cfg.assert_called_once_with(sentinel_home)
 
-    @patch('api.routes._active_profile_mcp_config_data')
+    @patch('api.routes.get_config_for_profile_home')
     @patch('api.routes.get_active_hermes_home')
     def test_reads_active_profile_home_for_servers(self, mock_home, mock_cfg):
-        mock_home.return_value = object()
+        mock_home.return_value = sentinel_home = object()
         mock_cfg.return_value = {'mcp_servers': {'active': SAMPLE_MCP['searxng']}}
         h = _make_handler()
         _handle_mcp_servers_list(h)
         payload = _json_payload(h)
         assert [srv['name'] for srv in payload['servers']] == ['active']
-        mock_home.assert_called_once()
-        mock_cfg.assert_called_once_with()
+        mock_cfg.assert_called_once_with(sentinel_home)
 
-    @patch('api.routes._active_profile_mcp_config_data')
+    @patch('api.routes.get_config_for_profile_home')
     @patch('api.routes.get_active_hermes_home')
     def test_empty_config(self, mock_home, mock_cfg):
         mock_home.return_value = object()
@@ -83,11 +82,10 @@ class TestMcpList:
         assert payload['reload_required'] is True
 
     @patch('api.routes._mcp_runtime_status_by_name')
-    @patch('api.routes._active_profile_mcp_config_data')
+    @patch('api.routes.get_config_for_profile_home')
     @patch('api.routes.get_active_hermes_home')
-    def test_list_payload_includes_status_tool_counts_and_safe_invalid_config(self, mock_home, mock_cfg, mock_runtime, tmp_path):
-        profile_home = tmp_path / "profiles" / "work"
-        mock_home.return_value = profile_home
+    def test_list_payload_includes_status_tool_counts_and_safe_invalid_config(self, mock_home, mock_cfg, mock_runtime):
+        mock_home.return_value = object()
         mock_cfg.return_value = {
             'mcp_servers': {
                 'searxng': {'command': 'mcp-searxng', 'args': ['--port', '8888']},
@@ -100,8 +98,8 @@ class TestMcpList:
             }
         }
         mock_runtime.return_value = {
-            'searxng': {'profile_home': str(profile_home), 'connected': True, 'tools': 3},
-            'web-reader': {'profile_home': str(profile_home), 'connected': False, 'tools': 0},
+            'searxng': {'connected': True, 'tools': 3},
+            'web-reader': {'connected': False, 'tools': 0},
         }
         h = _make_handler()
         _handle_mcp_servers_list(h)
@@ -117,7 +115,6 @@ class TestMcpList:
         assert by_name['disabled']['status'] == 'disabled'
         assert by_name['broken']['transport'] == 'invalid'
         assert by_name['broken']['status'] == 'invalid_config'
-        mock_cfg.assert_called_once_with()
 
     def test_secrets_are_masked(self):
         """_mask_secrets hides API keys in headers and env."""
@@ -145,8 +142,8 @@ class TestMcpList:
         """YAML numeric false-y values should not show a disabled server as enabled."""
         assert _parse_mcp_enabled(0) is False
 
-    def test_root_profile_writes_honor_external_config_override(self, monkeypatch, tmp_path):
-        """Root/default MCP writes use the same HERMES_CONFIG_PATH as reads."""
+    def test_active_home_list_reads_external_config_override_used_by_writes(self, monkeypatch, tmp_path):
+        """HERMES_CONFIG_PATH outside the active home remains the read/write authority."""
         from api import config, profiles, routes
 
         active_home = tmp_path / 'active-home'
@@ -164,10 +161,7 @@ class TestMcpList:
         monkeypatch.setenv('HERMES_CONFIG_PATH', str(override_path))
         monkeypatch.setattr(profiles, 'get_active_hermes_home', lambda: active_home)
         monkeypatch.setattr(routes, 'get_active_hermes_home', lambda: active_home)
-        monkeypatch.setattr(routes, 'get_active_profile_name', lambda: 'default')
-        monkeypatch.setattr(routes, '_is_root_profile', lambda name: name == 'default')
-        monkeypatch.setattr(routes, '_is_isolated_profile_mode', lambda: False)
-        monkeypatch.setattr(routes, '_mcp_runtime_status_by_name', lambda: {})
+        monkeypatch.setattr(routes, '_mcp_runtime_status_by_name', lambda *_args, **_kwargs: {})
         config.reload_config()
 
         h = _make_handler()
@@ -183,79 +177,14 @@ class TestMcpList:
         assert 'new-srv' in saved['mcp_servers']
         assert 'new-srv' not in active_home_saved['mcp_servers']
 
-    def test_named_profile_writes_ignore_external_config_override(self, monkeypatch, tmp_path):
-        """Named-profile MCP writes stay inside the active profile home."""
-        from api import config, profiles, routes
-
-        active_home = tmp_path / 'profiles' / 'work'
-        override_path = tmp_path / 'root-config' / 'config.yaml'
-        active_home.mkdir(parents=True)
-        override_path.parent.mkdir()
-        active_home.joinpath('config.yaml').write_text(
-            yaml.safe_dump({'mcp_servers': {'work-srv': {'command': 'work'}}}, sort_keys=False),
-            encoding='utf-8',
-        )
-        override_path.write_text(
-            yaml.safe_dump({'mcp_servers': {'override-srv': {'command': 'override'}}}, sort_keys=False),
-            encoding='utf-8',
-        )
-        monkeypatch.setenv('HERMES_CONFIG_PATH', str(override_path))
-        monkeypatch.setattr(profiles, 'get_active_hermes_home', lambda: active_home)
-        monkeypatch.setattr(routes, 'get_active_hermes_home', lambda: active_home)
-        monkeypatch.setattr(routes, 'get_active_profile_name', lambda: 'work')
-        monkeypatch.setattr(routes, '_is_root_profile', lambda name: name == 'default')
-        monkeypatch.setattr(routes, '_is_isolated_profile_mode', lambda: False)
-        monkeypatch.setattr(routes, '_mcp_runtime_status_by_name', lambda: {})
-        config.reload_config()
-
-        h = _make_handler()
-        _handle_mcp_servers_list(h)
-        payload = _json_payload(h)
-        assert [srv['name'] for srv in payload['servers']] == ['work-srv']
-
-        h = _make_handler()
-        h.command = 'PUT'
-        _handle_mcp_server_update(h, 'new-srv', {'command': 'new-command'})
-
-        h = _make_handler()
-        _handle_mcp_servers_list(h)
-        payload = _json_payload(h)
-        assert {srv['name'] for srv in payload['servers']} == {'work-srv', 'new-srv'}
-
-        h = _make_handler()
-        h.command = 'PATCH'
-        _handle_mcp_server_toggle(h, 'work-srv', {'enabled': False})
-
-        h = _make_handler()
-        _handle_mcp_servers_list(h)
-        payload = _json_payload(h)
-        by_name = {srv['name']: srv for srv in payload['servers']}
-        assert by_name['work-srv']['enabled'] is False
-
-        h = _make_handler()
-        h.command = 'DELETE'
-        _handle_mcp_server_delete(h, 'new-srv')
-
-        h = _make_handler()
-        _handle_mcp_servers_list(h)
-        payload = _json_payload(h)
-        assert [srv['name'] for srv in payload['servers']] == ['work-srv']
-
-        saved = yaml.safe_load(override_path.read_text(encoding='utf-8'))
-        active_home_saved = yaml.safe_load(active_home.joinpath('config.yaml').read_text(encoding='utf-8'))
-        assert saved['mcp_servers'] == {'override-srv': {'command': 'override'}}
-        assert active_home_saved['mcp_servers'] == {
-            'work-srv': {'command': 'work', 'enabled': False},
-        }
-
 
 class TestMcpSave:
     """PUT /api/mcp/servers/<name> — add or update."""
 
     @patch('api.routes.reload_config')
     @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._active_profile_mcp_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_add_new_stdio_server(self, mock_cfg, mock_path, mock_save, mock_reload):
         mock_cfg.return_value = {}
         h = _make_handler()
@@ -269,8 +198,8 @@ class TestMcpSave:
 
     @patch('api.routes.reload_config')
     @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._active_profile_mcp_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_add_new_http_server(self, mock_cfg, mock_path, mock_save, mock_reload):
         mock_cfg.return_value = {}
         h = _make_handler()
@@ -282,8 +211,8 @@ class TestMcpSave:
 
     @patch('api.routes.reload_config')
     @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._active_profile_mcp_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_update_existing(self, mock_cfg, mock_path, mock_save, mock_reload):
         mock_cfg.return_value = {'mcp_servers': {'existing': {'command': 'old'}}}
         h = _make_handler()
@@ -295,27 +224,8 @@ class TestMcpSave:
 
     @patch('api.routes.reload_config')
     @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._active_profile_mcp_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes._load_yaml_config_file_raw')
-    def test_update_existing_preserves_disabled_state(self, mock_cfg, mock_path, mock_save, mock_reload):
-        mock_cfg.return_value = {
-            'mcp_servers': {'existing': {'command': 'old', 'enabled': False}}
-        }
-        h = _make_handler()
-        h.command = 'PUT'
-        body = {"command": "new-cmd"}
-        _handle_mcp_server_update(h, 'existing', body)
-        saved = mock_save.call_args[0][1]
-        assert saved['mcp_servers']['existing']['command'] == 'new-cmd'
-        assert saved['mcp_servers']['existing']['enabled'] is False
-        payload = _json_payload(h)
-        assert payload['server']['enabled'] is False
-        assert payload['server']['status'] == 'disabled'
-
-    @patch('api.routes.reload_config')
-    @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._active_profile_mcp_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_preserves_other_servers(self, mock_cfg, mock_path, mock_save, mock_reload):
         mock_cfg.return_value = {'mcp_servers': {'keep': {'command': 'stay'}}}
         h = _make_handler()
@@ -348,8 +258,8 @@ class TestMcpDelete:
 
     @patch('api.routes.reload_config')
     @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._active_profile_mcp_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_delete_existing(self, mock_cfg, mock_path, mock_save, mock_reload):
         mock_cfg.return_value = {'mcp_servers': {'target': {'command': 'rm'}}}
         h = _make_handler()
@@ -359,7 +269,7 @@ class TestMcpDelete:
         saved = mock_save.call_args[0][1]
         assert 'target' not in saved.get('mcp_servers', {})
 
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_delete_nonexistent(self, mock_cfg):
         mock_cfg.return_value = {'mcp_servers': {}}
         h = _make_handler()
@@ -370,8 +280,8 @@ class TestMcpDelete:
 
     @patch('api.routes.reload_config')
     @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._active_profile_mcp_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_preserves_others(self, mock_cfg, mock_path, mock_save, mock_reload):
         mock_cfg.return_value = {'mcp_servers': {'a': {'c': '1'}, 'b': {'c': '2'}}}
         h = _make_handler()
@@ -459,8 +369,8 @@ class TestMcpToggle:
 
     @patch('api.routes.reload_config')
     @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._active_profile_mcp_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_disable_server(self, mock_cfg, mock_path, mock_save, mock_reload):
         mock_cfg.return_value = {'mcp_servers': {'myserver': {'command': 'run'}}}
         h = _make_handler()
@@ -473,8 +383,8 @@ class TestMcpToggle:
 
     @patch('api.routes.reload_config')
     @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._active_profile_mcp_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_enable_server(self, mock_cfg, mock_path, mock_save, mock_reload):
         mock_cfg.return_value = {'mcp_servers': {'myserver': {'command': 'run', 'enabled': False}}}
         h = _make_handler()
@@ -483,7 +393,7 @@ class TestMcpToggle:
         saved = mock_save.call_args[0][1]
         assert saved['mcp_servers']['myserver']['enabled'] is True
 
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_nonexistent_server_returns_404(self, mock_cfg):
         mock_cfg.return_value = {'mcp_servers': {}}
         h = _make_handler()
@@ -508,8 +418,8 @@ class TestMcpToggle:
 
     @patch('api.routes.reload_config')
     @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._active_profile_mcp_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_response_payload(self, mock_cfg, mock_path, mock_save, mock_reload):
         mock_cfg.return_value = {'mcp_servers': {'srv': {'url': 'http://localhost'}}}
         h = _make_handler()
@@ -521,8 +431,8 @@ class TestMcpToggle:
 
     @patch('api.routes.reload_config')
     @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._active_profile_mcp_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes._load_yaml_config_file_raw')
+    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
+    @patch('api.routes._load_mcp_config_for_write')
     def test_url_encoded_name(self, mock_cfg, mock_path, mock_save, mock_reload):
         """Names with special characters must be URL-decoded."""
         mock_cfg.return_value = {'mcp_servers': {'my server': {'command': 'x'}}}

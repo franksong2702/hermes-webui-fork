@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from api.config import STATE_DIR, get_config, load_settings
+from api.helpers import request_declares_body
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,12 @@ _TRUSTED_AUTH_HEADER_ENV = 'HERMES_WEBUI_TRUSTED_AUTH_HEADER'
 _TRUSTED_GROUPS_HEADER_ENV = 'HERMES_WEBUI_TRUSTED_GROUPS_HEADER'
 _TRUSTED_GROUP_PROFILE_MAP_ENV = 'HERMES_WEBUI_GROUP_PROFILE_MAP'
 _TRUSTED_AUTH_LOGOUT_URL_ENV = 'HERMES_WEBUI_TRUSTED_AUTH_LOGOUT_URL'
+# Opt-in: also treat '|' as a group separator in the trusted-groups header.
+# Off by default so an existing deployment whose group NAME legitimately
+# contains a literal '|' is never silently re-split into two groups (which
+# could change its profile binding). Set to 1/true/yes/on for identity
+# providers (some Authentik outpost configs) that emit "admins|developpeur".
+_TRUSTED_GROUPS_PIPE_SEPARATOR_ENV = 'HERMES_WEBUI_TRUSTED_GROUPS_PIPE_SEPARATOR'
 _TRUSTED_AUTH_WARNINGS_EMITTED: set[str] = set()
 
 
@@ -722,7 +729,20 @@ def _trusted_groups_header_value(handler) -> list[str]:
     if not raw:
         return []
     values = []
-    for part in str(raw).replace('\n', ',').split(','):
+    # Authentik's outpost typically joins multiple group names with a comma or
+    # newline; parse those as separators by default. Some proxy provider /
+    # property-mapping configs instead emit a pipe-separated list (e.g.
+    # "admins|developpeur"), which a comma-only split would treat as one
+    # unmatched group name — silently dropping the session to the unbound
+    # "default" profile despite a legitimate mapped membership. Pipe splitting
+    # is therefore available but OPT-IN (HERMES_WEBUI_TRUSTED_GROUPS_PIPE_SEPARATOR),
+    # because a group NAME can legitimately contain a literal '|' and must not be
+    # re-split by default — doing so unconditionally could change an existing
+    # deployment's profile binding.
+    normalized = str(raw).replace('\n', ',')
+    if str(os.getenv(_TRUSTED_GROUPS_PIPE_SEPARATOR_ENV, '')).strip().lower() in ('1', 'true', 'yes', 'on'):
+        normalized = normalized.replace('|', ',')
+    for part in normalized.split(','):
         part = part.strip()
         if part:
             values.append(part)
@@ -834,137 +854,6 @@ def session_bound_profile(cookie_value: str) -> str | None:
     return bound_profile or None
 
 
-def _trusted_session_bound_profile(record: object) -> str | None:
-    """Return the profile bound to a persisted session record.
-
-    Trusted session cleanup checks both the newer ``bound_profile`` field and the
-    legacy ``profile`` field so stale records are discovered regardless of
-    historical key shape.
-    """
-    if not isinstance(record, dict):
-        return None
-    bound_profile = record.get('bound_profile')
-    if not bound_profile:
-        bound_profile = record.get('profile')
-    bound_profile = str(bound_profile or '').strip()
-    return bound_profile or None
-
-
-def _assert_profile_delete_has_no_active_trusted_binding(target_profile: str) -> None:
-    """Fail-closed guard for destructive profile deletions.
-
-    Prevents deletion when any trusted session authority still points at the
-    candidate profile, including legacy session records and trusted group policy
-    bindings.
-    """
-    try:
-        from api import profiles as _profiles
-    except Exception as exc:
-        logger.debug(
-            "Could not load profile helpers while validating trusted profile delete",
-            exc_info=exc,
-        )
-        raise RuntimeError(
-            "Cannot validate trusted-session bindings for profile deletion"
-        ) from None
-
-    target = str(target_profile or '').strip()
-    if not target:
-        return
-
-    def _matches_target(candidate: str | None) -> bool:
-        if not candidate:
-            return False
-        return _profiles._profiles_match(candidate, target)
-
-    try:
-        with _SESSIONS_LOCK:
-            for _token, record in list(_sessions.items()):
-                if not isinstance(record, dict):
-                    continue
-                auth_type = str(record.get('auth_type') or '').strip()
-                if auth_type and auth_type != 'trusted':
-                    continue
-                bound_profile = _trusted_session_bound_profile(record)
-                if _matches_target(bound_profile):
-                    raise RuntimeError(
-                        "Profile is bound to an active trusted session"
-                    )
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        logger.debug(
-            "Could not verify trusted-session bindings for profile deletion",
-            exc_info=exc,
-        )
-        raise RuntimeError(
-            "Cannot validate trusted-session bindings for profile deletion"
-        ) from None
-
-    try:
-        mapping = _trusted_group_profile_map()
-    except Exception as exc:
-        logger.debug(
-            "Could not parse trusted-group profile map while validating deletion",
-            exc_info=exc,
-        )
-        raise RuntimeError(
-            "Cannot validate trusted group-policy bindings for profile deletion"
-        ) from None
-
-    if mapping:
-        for mapped_profile in mapping.values():
-            if _matches_target(str(mapped_profile or '').strip()):
-                raise RuntimeError(
-                    "Profile is bound by trusted group policy"
-                )
-
-
-def clear_trusted_session_bindings_for_deleted_profile(profile_name: str) -> int:
-    """Clear trusted-session profile bindings that point at a deleted profile.
-
-    Return the number of session records updated.  Deleting a profile may leave
-    existing trusted sessions pinned to that profile; without this cleanup those
-    sessions can reconnect as orphaned-bound sessions and fail profile checks on
-    every protected request.  This function is intentionally fail-closed: any
-    resolution ambiguity leaves existing records untouched.
-    """
-    try:
-        from api import profiles as _profiles
-    except Exception:
-        logger.debug("Could not load profile helpers while clearing deleted-session bindings", exc_info=True)
-        return 0
-
-    target_profile = str(profile_name or '').strip()
-    if not target_profile:
-        return 0
-
-    updated = 0
-    try:
-        with _SESSIONS_LOCK:
-            for token, record in list(_sessions.items()):
-                if not isinstance(record, dict):
-                    continue
-                auth_type = str(record.get('auth_type') or '').strip()
-                if auth_type and auth_type != 'trusted':
-                    continue
-                bound_profile = _trusted_session_bound_profile(record)
-                if not bound_profile:
-                    continue
-                if not _profiles._profiles_match(bound_profile, target_profile):
-                    continue
-                record = dict(record)
-                record['bound_profile'] = None
-                _sessions[token] = record
-                updated += 1
-            if updated:
-                _save_sessions(_sessions)
-        return updated
-    except Exception:
-        logger.debug("Could not clear trusted session bindings for deleted profile", exc_info=True)
-        return 0
-
-
 def is_trusted_auth_enabled() -> bool:
     return _trusted_auth_header_configured()
 
@@ -1002,21 +891,11 @@ def reset_trusted_auth_request_state(handler) -> None:
             pass
 
 
-def _apply_trusted_session_profile(
-    handler,
-    bound_profile: str | None,
-    cookie_value: str,
-    *,
-    selected_profile: str | None = None,
-) -> None:
+def _apply_trusted_session_profile(handler, bound_profile: str | None, cookie_value: str) -> None:
+    if bound_profile is None:
+        return
     from api.helpers import get_profile_cookie
     from api.profiles import set_request_profile
-
-    if bound_profile is None:
-        selected = str(selected_profile or '').strip()
-        if selected:
-            _queue_pending_cookie(handler, _build_profile_cookie_header(selected, cookie_value))
-        return
 
     set_request_profile(bound_profile)
     if get_profile_cookie(handler) != bound_profile:
@@ -1052,14 +931,6 @@ def ensure_trusted_auth_session(handler) -> dict | None:
     if info and info.get('username') == username and info.get('bound_profile') == bound_profile:
         _apply_trusted_session_profile(handler, bound_profile, cookie_value)
         return _remember_trusted_auth_session(handler, info, cookie_value)
-    selected_profile_for_rotation = None
-    if info and info.get('bound_profile') is None:
-        try:
-            from api.profiles import get_active_profile_name
-
-            selected_profile_for_rotation = str(get_active_profile_name() or '').strip() or None
-        except Exception:
-            selected_profile_for_rotation = None
     if info:
         invalidate_session(cookie_value)
     cookie_value = create_session(
@@ -1068,12 +939,7 @@ def ensure_trusted_auth_session(handler) -> dict | None:
         bound_profile=bound_profile,
     )
     _queue_pending_cookie(handler, _auth_cookie_header(cookie_value, handler))
-    _apply_trusted_session_profile(
-        handler,
-        bound_profile,
-        cookie_value,
-        selected_profile=selected_profile_for_rotation,
-    )
+    _apply_trusted_session_profile(handler, bound_profile, cookie_value)
     info = get_session_info(cookie_value)
     return _remember_trusted_auth_session(handler, info, cookie_value)
 
@@ -1339,6 +1205,42 @@ def check_auth(handler, parsed) -> bool:
         handler.send_header('Location', 'login?next=' + _next)
         handler.send_header('Content-Length', '0')
         handler.end_headers()
+    return False
+
+
+def check_auth_or_close(handler, parsed) -> bool:
+    """Check auth; when rejected, close so an unread body can't poison HTTP/1.1 reuse.
+
+    The flag is armed BEFORE check_auth() writes its 401/302, so end_headers()
+    can advertise ``Connection: close``; success restores the prior flag so an
+    authenticated request keeps its keep-alive.
+
+    Armed ONLY when the request's framing declares a body still queued in
+    ``rfile`` (see ``request_declares_body()``), which is the same rule the other
+    reject-before-read sites apply through ``arm_connection_close_if_body_pending()``.
+    Arming unconditionally was the mirror image of the over-close this PR already
+    fixed on the sidecar path: a body-less POST that failed auth answered
+    ``401`` WITH ``Connection: close`` and dropped the client's pipelined
+    follow-up, killing a healthy keep-alive connection for no framing reason.
+    Verified on the wire, pipelined down one socket against the production
+    handler: ``POST /api/session/new`` with no ``Content-Length`` (and with
+    ``Content-Length: 0``) answered ``401`` + ``Connection: close`` and the
+    following ``GET /api/auth/status`` was never served. The helper cannot be
+    swapped in directly here because the arming has to happen before
+    ``check_auth()`` writes its response and be undone if it succeeds.
+
+    ``close_connection`` only exists once BaseHTTPRequestHandler has parsed a
+    request line, so partially-built handler stubs may not have it at all. Read
+    it defensively and only arm/restore when it was really there: inventing the
+    attribute on a stub would leave a bogus keep-alive verdict behind.
+    """
+    if not hasattr(handler, 'close_connection') or not request_declares_body(handler):
+        return check_auth(handler, parsed)
+    prior_close = handler.close_connection
+    handler.close_connection = True
+    if check_auth(handler, parsed):
+        handler.close_connection = prior_close
+        return True
     return False
 
 

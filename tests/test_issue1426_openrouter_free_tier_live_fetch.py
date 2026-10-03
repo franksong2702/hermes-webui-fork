@@ -17,7 +17,6 @@ the urllib.request layer is monkeypatched.
 """
 from __future__ import annotations
 
-import copy
 import json
 import urllib.request
 
@@ -67,34 +66,16 @@ def _isolate_openrouter_cache(monkeypatch):
     except Exception:
         pass
 
-    # Force openrouter to be detected through the same cache/snapshot path used
-    # by production callers. A bare config.cfg rebind can be overwritten when a
-    # previous shard test leaves _cfg_path pointing at a stale profile home.
-    openrouter_cfg = {
-        "model": {"provider": "openrouter", "default": "anthropic/claude-sonnet-4.6"},
-        "providers": {"openrouter": {"api_key": "sk-or-test-key"}},
-    }
-    try:
-        config_path = config._get_config_path()
-        config_mtime = config_path.stat().st_mtime
-    except OSError:
-        config_path = config._get_config_path()
-        config_mtime = 0.0
-    monkeypatch.setattr(config, "_cfg_cache", openrouter_cfg, raising=False)
-    monkeypatch.setattr(config, "_cfg_path", config_path, raising=False)
-    monkeypatch.setattr(config, "_cfg_mtime", config_mtime, raising=False)
+    # Force openrouter to be detected by injecting it into config
     monkeypatch.setattr(
         config,
-        "_cfg_fingerprint",
-        config._fingerprint_config(openrouter_cfg),
+        "cfg",
+        {
+            "model": {"provider": "openrouter", "default": "anthropic/claude-sonnet-4.6"},
+            "providers": {"openrouter": {"api_key": "sk-or-test-key"}},
+        },
         raising=False,
     )
-    monkeypatch.setattr(config, "cfg", openrouter_cfg, raising=False)
-
-    def _load_openrouter_config_raw(_path, _copy=True):
-        return copy.deepcopy(openrouter_cfg) if _copy else openrouter_cfg
-
-    monkeypatch.setattr(config, "_load_yaml_config_file_raw", _load_openrouter_config_raw)
     # Reset module-level cache
     try:
         config.invalidate_models_cache()

@@ -25,7 +25,7 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 
 try:  # POSIX-only; Windows-style environments fall back to process-local locking.
     import fcntl
@@ -36,6 +36,7 @@ from api.config import (
     _PROVIDER_DISPLAY,
     _PROVIDER_MODELS,
     _coerce_provider_cost_budget,
+    _configured_model_ids,
     _custom_provider_slug_from_name,
     _get_label_for_model,
     _models_from_live_provider_ids,
@@ -44,7 +45,7 @@ from api.config import (
     _read_visible_codex_cache_model_ids,
     _save_yaml_config_file,
     _thread_local_env_value,
-    get_config_snapshot as get_config,
+    get_config,
     invalidate_models_cache,
     reload_config,
 )
@@ -55,8 +56,6 @@ from api.plugin_providers import (
     plugin_model_provider_ids,
 )
 
-# Provider surfaces are read-only. Keep the established local ``get_config``
-# seam for focused tests while binding it to a detached per-request snapshot.
 logger = logging.getLogger(__name__)
 
 
@@ -426,6 +425,19 @@ def _entry_exhausted_ttl_seconds(error_code):
     code = str(error_code or "").strip()
     if code == "401":
         return 5 * 60
+    if code == "402":
+        # #6626: keep WebUI's eligibility decision tied to the installed
+        # runtime contract. The runtime routes 402 via
+        # credential_pool._exhausted_ttl() (120s when the new
+        # EXHAUSTED_TTL_402_SECONDS is present, 1h fallback otherwise).
+        # Hard-coding 120s here would let display/probe code mark an entry
+        # usable before CredentialPool.select() is willing to lease it on
+        # mixed-version installations.
+        try:
+            from agent.credential_pool import _exhausted_ttl as _runtime_exhausted_ttl
+            return _runtime_exhausted_ttl(int(code))
+        except Exception:
+            return 60 * 60
     return 60 * 60
 
 
@@ -825,6 +837,19 @@ def _entry_exhausted_ttl_seconds(error_code):
     code = str(error_code or "").strip()
     if code == "401":
         return 5 * 60
+    if code == "402":
+        # #6626: keep WebUI's eligibility decision tied to the installed
+        # runtime contract. The runtime routes 402 via
+        # credential_pool._exhausted_ttl() (120s when the new
+        # EXHAUSTED_TTL_402_SECONDS is present, 1h fallback otherwise).
+        # Hard-coding 120s here would let display/probe code mark an entry
+        # usable before CredentialPool.select() is willing to lease it on
+        # mixed-version installations.
+        try:
+            from agent.credential_pool import _exhausted_ttl as _runtime_exhausted_ttl
+            return _runtime_exhausted_ttl(int(code))
+        except Exception:
+            return 60 * 60
     return 60 * 60
 
 
@@ -1099,10 +1124,7 @@ def _provider_value_counts_as_api_key(provider_id: str, value: object) -> bool:
     return True
 
 
-def _provider_has_shadowed_codex_oauth_value(
-    provider_id: str,
-    config_data: dict | None = None,
-) -> bool:
+def _provider_has_shadowed_codex_oauth_value(provider_id: str) -> bool:
     """True when the bare OpenAI credential slot contains only a Codex OAuth JWT.
 
     Users who authenticate Codex can end up with a ChatGPT/Codex JWT in a
@@ -1123,7 +1145,7 @@ def _provider_has_shadowed_codex_oauth_value(
             values.append(env_values.get(alias))
             values.append(_thread_local_env_value(alias))
 
-    cfg = config_data if isinstance(config_data, dict) else get_config()
+    cfg = get_config()
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, dict):
         active_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -1146,12 +1168,7 @@ def _provider_has_shadowed_codex_oauth_value(
     return any(_looks_like_codex_oauth_token(str(value or "")) for value in values)
 
 
-def _write_env_file(
-    env_path: Path,
-    updates: dict[str, str | None],
-    *,
-    update_process_env: bool | Callable[[], bool] = True,
-) -> None:
+def _write_env_file(env_path: Path, updates: dict[str, str | None]) -> None:
     """Write key=value pairs to the .env file.
 
     Values of ``None`` cause the key to be removed.
@@ -1162,28 +1179,12 @@ def _write_env_file(
     Holds ``_ENV_LOCK`` from ``api.streaming`` for the entire load → modify →
     write cycle to prevent TOCTOU races between concurrent POST /api/providers
     calls (each reading the same file baseline and overwriting the other's key).
-    Also serialises os.environ mutations with streaming sessions. Callers that
-    need profile ownership checks may pass a callable; it is evaluated inside
-    ``_ENV_LOCK`` so a concurrent process-wide profile switch cannot happen
-    between the ownership decision and the live ``os.environ`` mutation.
+    Also serialises os.environ mutations with streaming sessions.
     """
     from api.streaming import _ENV_LOCK
     import stat as _stat
 
     with _ENV_LOCK:
-        try:
-            should_update_process_env = (
-                update_process_env()
-                if callable(update_process_env)
-                else bool(update_process_env)
-            )
-        except Exception:
-            logger.debug(
-                "Could not determine process-env ownership for env write",
-                exc_info=True,
-            )
-            should_update_process_env = False
-
         # ── Read existing lines (preserving comments and blank lines) ──
         existing_lines: list[str] = []
         if env_path.exists():
@@ -1206,8 +1207,7 @@ def _write_env_file(
         for key, value in updates.items():
             if value is None:
                 # Mark the line for removal (None sentinel) and clear env.
-                if should_update_process_env:
-                    os.environ.pop(key, None)
+                os.environ.pop(key, None)
                 if key in existing_key_indices:
                     output_lines[existing_key_indices[key]] = None  # type: ignore[assignment]
                 continue
@@ -1217,8 +1217,7 @@ def _write_env_file(
             # Reject embedded newlines/carriage returns to prevent .env injection
             if "\n" in clean or "\r" in clean:
                 raise ValueError("API key must not contain newline characters.")
-            if should_update_process_env:
-                os.environ[key] = clean
+            os.environ[key] = clean
 
             if key in existing_key_indices:
                 output_lines[existing_key_indices[key]] = f"{key}={clean}"
@@ -1267,38 +1266,7 @@ def _write_env_file(
             pass
 
 
-def _provider_key_process_env_snapshot() -> tuple[str, str] | None:
-    """Return ``(request_profile, process_profile)`` for the current ownership decision."""
-    from api import profiles as _profiles
-
-    with _profiles._profile_lock:
-        request_profile = str(_profiles.get_active_profile_name() or "").strip()
-        process_profile = str(getattr(_profiles, "_active_profile", "") or "").strip()
-        if not request_profile or not process_profile:
-            return None
-        return request_profile, process_profile
-
-
-def _provider_key_write_updates_process_env() -> bool:
-    """Return whether a provider-key write targets the live process profile."""
-    try:
-        from api import profiles as _profiles
-    except Exception:
-        logger.debug("Could not load profile helpers for provider key ownership", exc_info=True)
-        return False
-
-    try:
-        snapshot = _provider_key_process_env_snapshot()
-        if not snapshot:
-            return False
-        request_profile, process_profile = snapshot
-        return _profiles._profiles_match(process_profile, request_profile)
-    except Exception:
-        logger.debug("Could not determine process-env ownership for provider key write", exc_info=True)
-        return False
-
-
-def _provider_has_key(provider_id: str, config_data: dict | None = None) -> bool:
+def _provider_has_key(provider_id: str) -> bool:
     """Check whether a provider has a configured API key.
 
     Checks (in order):
@@ -1340,7 +1308,7 @@ def _provider_has_key(provider_id: str, config_data: dict | None = None) -> bool
     except ImportError:
         pass
 
-    cfg = config_data if isinstance(config_data, dict) else get_config()
+    cfg = get_config()
     # Check model.api_key — only match if this provider is the active one.
     # Previously this checked globally, causing all providers to show
     # "configured" when the active provider had a top-level api_key.
@@ -2612,7 +2580,7 @@ def get_providers() -> dict[str, Any]:
     for pid in sorted(known_ids):
         display_name = effective_provider_display_name(pid, _PROVIDER_DISPLAY)
         is_oauth = _provider_is_oauth(pid)
-        has_key = _provider_has_key(pid, cfg)
+        has_key = _provider_has_key(pid)
         plugin_auth_status: dict[str, Any] | None = None
         if not has_key and is_plugin_model_provider(pid):
             try:
@@ -2719,24 +2687,17 @@ def get_providers() -> dict[str, Any]:
                 except Exception:
                     pass
 
-        if (
-            pid == "openai"
-            and not has_key
-            and _provider_has_shadowed_codex_oauth_value(pid, cfg)
-        ):
+        if pid == "openai" and not has_key and _provider_has_shadowed_codex_oauth_value(pid):
             continue
 
         models = list(_PROVIDER_MODELS.get(pid, []))
         models_total = len(models)
         # OpenAI Codex account catalogs drift independently from WebUI releases.
-        # The model picker already prefers hermes_cli + Codex local cache for
-        # this provider (the agent's `provider_model_ids("openai-codex")` filters
-        # IDs with `supported_in_api: false`, but Codex CLI still surfaces some
-        # of those — notably `gpt-5.3-codex-spark` from #1680 — in its picker).
-        # Merge both sources here so the providers card matches the picker
-        # exactly. Static entries remain the offline fallback when live
-        # discovery and the local Codex cache are both unavailable. (#1807
-        # follow-up to v0.51.19 #1812.)
+        # The model picker combines hermes_cli discovery with visible local
+        # Codex cache entries. Merge both sources here so the providers card
+        # matches the picker. Static entries are the offline fallback when live
+        # discovery and the local cache are unavailable. (#1807 follow-up to
+        # v0.51.19 #1812.)
         if pid == "openai-codex":
             live_ids = _read_live_provider_model_ids("openai-codex")
             live_id_set = set(live_ids)
@@ -2832,11 +2793,7 @@ def get_providers() -> dict[str, Any]:
         is_self_hosted = pid in _SELF_HOSTED_PROVIDER_IDS
         try:
             from api.config import _get_provider_base_url
-            provider_base_url = (
-                _get_provider_base_url(pid, config_data=cfg)
-                if is_self_hosted
-                else None
-            )
+            provider_base_url = _get_provider_base_url(pid) if is_self_hosted else None
         except Exception:
             provider_base_url = None
         _is_plugin = is_plugin_model_provider(pid)
@@ -2876,12 +2833,20 @@ def get_providers() -> dict[str, Any]:
                     cp_name,
                 )
                 continue
-            # Collect models from `models` list or `model` single
-            cp_models = []
-            if isinstance(cp.get("models"), list):
-                cp_models = [{"id": str(m), "label": str(m)} for m in cp["models"]]
-            elif cp.get("model"):
-                cp_models = [{"id": cp["model"], "label": cp["model"]}]
+            # Build the model list using the same sticky-before-plural
+            # ordering as the model picker (api/config.py:7308-7314):
+            # the singular ``model`` field goes first, then unique IDs from
+            # the ``models`` catalog are appended via _configured_model_ids
+            # (which strips whitespace, drops empty IDs, and de-duplicates).
+            # This keeps the Providers card consistent with the picker.
+            cp_model_ids: list[str] = []
+            _singular_model = str(cp.get("model") or "").strip()
+            if _singular_model:
+                cp_model_ids.append(_singular_model)
+            for _mid in _configured_model_ids(cp.get("models")):
+                if _mid not in cp_model_ids:
+                    cp_model_ids.append(_mid)
+            cp_models = [{"id": mid, "label": mid} for mid in cp_model_ids]
             # Check for env var reference (${VAR_NAME} pattern)
             cp_api_key = str(cp.get("api_key") or "")
             cp_has_key = bool(cp_api_key.strip())
@@ -2971,11 +2936,7 @@ def set_provider_key(provider_id: str, api_key: str | None) -> dict[str, Any]:
 
     env_path = _get_hermes_home() / ".env"
     try:
-        _write_env_file(
-            env_path,
-            {env_var: api_key},
-            update_process_env=_provider_key_write_updates_process_env,
-        )
+        _write_env_file(env_path, {env_var: api_key})
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     except Exception as exc:
@@ -3046,7 +3007,7 @@ def _clean_provider_key_from_config(provider_id: str) -> None:
         return
 
     try:
-        import yaml as _yaml
+        from api import yaml_compat as _yaml
 
         changed = False
 

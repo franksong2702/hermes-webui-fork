@@ -27,7 +27,7 @@ def isolate_models_catalog_state(monkeypatch, tmp_path):
     monkeypatch.setattr(cfg, "_cfg_mtime", config_path.stat().st_mtime, raising=False)
     monkeypatch.setattr(cfg, "_cfg_has_in_memory_overrides", lambda: True)
     monkeypatch.setattr(cfg, "_get_auth_store_path", lambda: auth_store_path)
-    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda *, config_data=None: None)
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: None)
     monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda *_a, **_k: None)
     # Point the stale-cache loader's path at an isolated (by default nonexistent)
     # temp file so the over-budget stale fallback (#3928 follow-up) stays
@@ -36,7 +36,7 @@ def isolate_models_catalog_state(monkeypatch, tmp_path):
     # flakes. Tests exercising the stale path override _get_models_cache_path
     # to write their own payload.
     monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: tmp_path / "models_cache.json")
-    monkeypatch.setattr(cfg, "_delete_models_cache_on_disk", lambda *, config_data=None: None)
+    monkeypatch.setattr(cfg, "_delete_models_cache_on_disk", lambda: None)
     monkeypatch.setattr(
         cfg,
         "_models_cache_source_fingerprint",
@@ -44,15 +44,12 @@ def isolate_models_catalog_state(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(cfg, "_available_models_cache", None, raising=False)
     monkeypatch.setattr(cfg, "_available_models_cache_ts", 0.0, raising=False)
-    monkeypatch.setattr(cfg, "_available_models_live_rebuild_ts", 0.0, raising=False)
     monkeypatch.setattr(
         cfg,
         "_available_models_cache_source_fingerprint",
         None,
         raising=False,
     )
-    monkeypatch.setattr(cfg, "_models_cache_provenance", None, raising=False)
-    monkeypatch.setattr(cfg, "_advertised_model_ids_memo", None, raising=False)
     monkeypatch.setattr(cfg, "_cache_build_in_progress", False, raising=False)
     monkeypatch.setattr(cfg, "cfg", {}, raising=False)
     monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: hermes_home)
@@ -139,16 +136,12 @@ def _build_stale_disk_cache_payload() -> dict:
         "aliases": {
             "chat": "ollama-cloud/chat-1",
         },
-        # Current schema (so the stale-cache loader's schema guard accepts it),
-        # but a deliberately stale _webui_version + fingerprint so the STRICT
-        # loader rejects it — this is exactly the "recoverable stale cache" case.
+        # Current schema and sources, but a stale _webui_version so the STRICT loader
+        # rejects it: the "recoverable stale cache" case. A source-fingerprint
+        # mismatch is a wrong catalog and is covered by the rejection test below.
         "_schema_version": cfg._MODELS_CACHE_SCHEMA_VERSION,
         "_webui_version": "v999",
-        "_source_fingerprint": {
-            "catalog": "stale",
-            "config_yaml": {"size": 42},
-            "auth_json": {"size": 7},
-        },
+        "_source_fingerprint": cfg._models_cache_source_fingerprint(),
     }
 
 
@@ -397,6 +390,19 @@ def test_load_stale_models_cache_from_disk_rejects_cross_schema(
     picker and serving it could surface a broken catalog."""
     payload = _build_stale_disk_cache_payload()
     payload["_schema_version"] = cfg._MODELS_CACHE_SCHEMA_VERSION + 1
+    models_cache_path = isolate_models_catalog_state["models_cache_path"]
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: models_cache_path)
+    models_cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert cfg._load_stale_models_cache_from_disk() is None
+
+
+def test_load_stale_models_cache_from_disk_rejects_source_fingerprint_mismatch(
+    monkeypatch,
+    isolate_models_catalog_state,
+):
+    payload = _build_stale_disk_cache_payload()
+    payload["_source_fingerprint"] = "other-sources"
     models_cache_path = isolate_models_catalog_state["models_cache_path"]
     monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: models_cache_path)
     models_cache_path.write_text(json.dumps(payload), encoding="utf-8")
