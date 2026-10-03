@@ -81,13 +81,22 @@ async function cancelSessionStream(session){
   }catch(e){/* close local stream; keep UI state honest below */}
   if(!respOk) return false;
   if(typeof closeLiveStream==='function') closeLiveStream(sid, streamId);
-  session.active_stream_id=null;
-  delete INFLIGHT[sid];
-  clearInflightState(sid);
-  if(S.session&&S.session.session_id===sid){
+  // The sidebar (and extensions) can await cancellation while this SID starts
+  // another stream. Only the captured owner may authorize shared cleanup.
+  const inflight=INFLIGHT[sid];
+  const activeSession=S.session&&S.session.session_id===sid;
+  if(session.session_id!==sid||
+     (session.active_stream_id&&session.active_stream_id!==streamId)||
+     (inflight&&inflight.streamId!==streamId)||
+     (activeSession&&(S.activeStreamId!==streamId||
+       (S.session.active_stream_id&&S.session.active_stream_id!==streamId)))) return true;
+  if(session.active_stream_id===streamId) session.active_stream_id=null;
+  if(inflight&&inflight.streamId===streamId) delete INFLIGHT[sid];
+  clearInflightState(sid, streamId);
+  if(activeSession&&S.activeStreamId===streamId){
     S.activeStreamId=null;
     if(S.session) S.session.active_stream_id=null;
-    clearInflight();
+    clearInflight(sid, streamId);
     setBusy(false);
     if(typeof setComposerStatus==='function') setComposerStatus('');
     else setStatus('');
