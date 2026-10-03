@@ -300,6 +300,146 @@ def _share_media_ref_is_private(raw: str) -> bool:
     )
 
 
+class _BoundedShareMarkdownPattern:
+    """Preserve existing matches while avoiding repeated malformed-tail scans.
+
+    The sanitizer uses only finditer/sub. Structural bounds retain the original
+    Match objects and groups, including nested alt brackets and angle references.
+    """
+
+    def __init__(self, pattern, *, image=False):
+        self.original = pattern
+        self.opener = re.compile(r"!\[" if image else r"!?\[")
+        self.angle = image
+        guard = _SHARE_MARKDOWN_IMAGE_DESTINATION_GUARD
+        self.guard = re.compile(guard, re.I) if guard in pattern.pattern else None
+
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
+    def finditer(self, text):
+        cursor = 0
+        cached = {}
+        spaces = {}
+        size = len(text)
+
+        def next_at(token, start, purpose=""):
+            key = (token, purpose)
+            position = cached.get(key, -1)
+            if position < start:
+                position = text.find(token, start)
+                if position < 0:
+                    position = size
+                cached[key] = position
+            return position
+
+        def skip_space(start, purpose):
+            first, last = spaces.get(purpose, (-1, -1))
+            if first <= start <= last:
+                return last
+            end = start
+            while end < size and text[end].isspace():
+                end += 1
+            spaces[purpose] = (start, end)
+            return end
+
+        def guard_ok(start, purpose):
+            if self.guard is None:
+                return True
+            boundary = min(
+                next_at(")", start, purpose),
+                next_at("\r", start, purpose),
+                next_at("\n", start, purpose),
+            )
+            nested = next_at("![", start, purpose)
+            end = min(boundary, nested + 2) if nested < boundary else boundary
+            return self.guard.match(text, start, end) is not None
+
+        while cursor < size:
+            opened = self.opener.search(text, cursor)
+            if not opened:
+                return
+            # One failed destination invalidates every opener sharing this alt close.
+            close = next_at("]", opened.end(), "label")
+            line = min(
+                next_at("\r", opened.end(), "label"),
+                next_at("\n", opened.end(), "label"),
+            )
+            if line < close:
+                cursor = line + 1
+                continue
+            if close == size:
+                return
+            if text[close + 1 : close + 2] != "(":
+                cursor = close + 1
+                continue
+            # No later closing paren proves every remaining match impossible.
+            if next_at(")", close + 2, "global") == size:
+                return
+            raw_start = close + 2
+            dest = skip_space(raw_start, "leading")
+            paren = next_at(")", dest, "bare")
+            newline = min(next_at("\r", dest, "bare"), next_at("\n", dest, "bare"))
+            boundary = min(paren, newline)
+            tail = (
+                skip_space(boundary, "bare-tail") if boundary == newline else boundary
+            )
+            bare_end = (
+                tail + 1
+                if tail < size
+                and text[tail] == ")"
+                and (boundary > dest or dest > raw_start)
+                and guard_ok(dest, "bare-guard")
+                else None
+            )
+            angle_end = None
+            if self.angle and text[dest : dest + 1] == "<":
+                angle_close = next_at(">", dest + 1, "angle")
+                angle_line = min(
+                    next_at("\r", dest + 1, "angle"), next_at("\n", dest + 1, "angle")
+                )
+                if dest + 1 < angle_close < angle_line:
+                    angle_tail = skip_space(angle_close + 1, "angle-tail")
+                    if (
+                        angle_tail < size
+                        and text[angle_tail] == ")"
+                        and guard_ok(dest + 1, "angle-guard")
+                    ):
+                        angle_end = angle_tail + 1
+            # Bound the regex to a viable terminator, rather than every later tail.
+            end = angle_end if angle_end is not None else bare_end
+            found = (
+                self.original.match(text, opened.start(), end)
+                if end is not None
+                else None
+            )
+            if found:
+                yield found
+                cursor = found.end()
+            else:
+                cursor = close + 1
+
+    def sub(self, replacement, text, count=0):
+        out = []
+        cursor = 0
+        number = 0
+        for match in self.finditer(text):
+            out.append(text[cursor : match.start()])
+            out.append(
+                replacement(match)
+                if callable(replacement)
+                else match.expand(replacement)
+            )
+            cursor = match.end()
+            number += 1
+            if count and number >= count:
+                break
+        out.append(text[cursor:])
+        return "".join(out)
+
+_SHARE_MARKDOWN_IMAGE_RE = _BoundedShareMarkdownPattern(_SHARE_MARKDOWN_IMAGE_RE, image=True)
+_SHARE_FILE_MARKDOWN_RE = _BoundedShareMarkdownPattern(_SHARE_FILE_MARKDOWN_RE)
+
 def _omit_private_share_media_references(text: str, *, plain_text: bool = False) -> str:
     """Remove renderer-active private media references from a public snapshot.
 
