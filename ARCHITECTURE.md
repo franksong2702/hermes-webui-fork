@@ -708,6 +708,11 @@ Link/rendering contract:
   destination semantics. A model may emit an unencoded space in a Markdown
   destination; normalization removes only an optional terminal Markdown title
   and preserves the destination itself so both paths produce the same link.
+- The vendored live SMD destination parser tracks a whitespace-separated
+  `[label](` boundary incrementally across token chunks. A malformed predecessor
+  cannot consume its successor's close; recovery advances to that opener without
+  rescanning the growing suffix. Attached URL brackets and title text keep their
+  existing contextual protection. This local patch does not replace SMD's grammar.
 - Labeled links are accepted only for the explicit schemes handled by the chat
   renderer (`http(s)`, `file`, `workspace`, `session`, `mailto`,
   `tel`, and `message`). Unknown or dangerous schemes fail closed, and the

@@ -103,3 +103,105 @@ def test_repeated_spaced_bad_openers_keep_successor_with_bounded_growth(tmp_path
     small, middle, large = json.loads(result.stdout)['medians']
     assert large < 500, (small, middle, large)
     assert large <= max(3 * middle, 3 * small, 20), (small, middle, large)
+
+
+def _live_hrefs(markdown, chunk_size, *, repeat_sizes=None):
+    import json
+    import subprocess
+
+    script = r'''
+import fs from 'node:fs';
+import * as smd from './static/vendor/smd.min.js';
+const source=fs.readFileSync('static/ui.js','utf8');
+const start=source.indexOf('function _normalizeMarkdownLinkDestination(');
+const end=source.indexOf('\nfunction ',start+1);
+const normalize=(0,eval)('('+source.slice(start,end)+')');
+const messages=fs.readFileSync('static/messages.js','utf8');
+const hrefStart=messages.indexOf('function _smdLinkHref(');
+const hrefEnd=messages.indexOf('\n  function ',hrefStart+1);
+const linkHref=(new Function('_normalizeMarkdownLinkDestination','_sessionUrlForSid',
+  'return ('+messages.slice(hrefStart,hrefEnd)+');'))(
+    normalize,sid=>'/app/session/'+encodeURIComponent(sid));
+const safe=(0,eval)(messages.match(/const _SMD_SAFE_URL_RE=([^;\n]+);/)[1]);
+const input=JSON.parse(process.argv[1]);
+function run(text,chunkSize){
+const hrefs=[];
+const parser=smd.parser({
+  data:{},add_token(){},end_token(){},add_text(){},
+  set_attr(_data,attr,value){
+    if(attr===smd.HREF){
+      const href=linkHref(value);
+      if(safe.test(href)) hrefs.push(href);
+    }
+  },
+});
+for(let i=0;i<text.length;i+=chunkSize)
+  smd.parser_write(parser,text.slice(i,i+chunkSize));
+smd.parser_end(parser);
+return hrefs;
+}
+if(input.repeatSizes){
+  run(input.text,1);
+  const counts=[],medians=[];
+  for(const n of input.repeatSizes){
+    const text='[bad](https://broken.test/path '.repeat(n)+input.text;
+    const samples=[];
+    for(let i=0;i<3;i++){
+      const start=performance.now(),hrefs=run(text,input.chunkSize);
+      samples.push(performance.now()-start);
+      if(i===0)counts.push(hrefs.length);
+    }
+    medians.push(samples.sort((a,b)=>a-b)[1]);
+  }
+  console.log(JSON.stringify({counts,medians}));
+}else console.log(JSON.stringify(run(input.text,input.chunkSize)));
+'''
+    result = subprocess.run(
+        [_renderer.NODE, '--input-type=module', '-e', script,
+         json.dumps({'text': markdown, 'chunkSize': chunk_size,
+                     'repeatSizes': repeat_sizes})],
+        cwd=_renderer.REPO_ROOT, capture_output=True, text=True, timeout=15,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize('chunk_size', [1, 7, 4096])
+@pytest.mark.parametrize('markdown', [
+    '[bad](https://broken.test/path [Good](https://good.test/path)',
+    '[bad](https://broken.test/path\t[Good](https://good.test/a b.pdf "Title")',
+    '[bad](https://broken.test/path [broken](https://broken.test/ [Good](https://good.test/path)',
+    '[Good](https://good.test/a b.pdf)',
+    '[Good](https://good.test/a[part](name)',
+    '[Good](https://good.test/a b.pdf "Title")',
+    '[bad](https://broken.test/path [Good](mailto:good@example.test)',
+    '[bad](https://broken.test/path [Good](file:///tmp/report final.pdf)',
+    '[bad](https://broken.test/path [Good](workspace://reports/report.pdf)',
+    '[bad](javascript:bad [Good](https://good.test/path)',
+    '[bad](https://broken.test/path [Good](javascript:bad)',
+])
+def test_live_and_settled_link_destinations_agree(driver_path, markdown, chunk_size):
+    expected = _Rendered(_render(driver_path, markdown)).links
+    assert _live_hrefs(markdown, chunk_size) == expected
+
+
+@pytest.mark.parametrize('title', [
+    '"See [Other](https://other.test/path)"',
+    "'See [Other](https://other.test/path)'",
+    '(See [Other](https://other.test/path))',
+])
+def test_live_title_lookalikes_do_not_gain_successor_anchors(title):
+    # Existing SMD title grammar is unchanged; the boundary patch must not turn
+    # text inside a title into an extra anchor.
+    hrefs = _live_hrefs(f'[Good](https://good.test/a b.pdf {title})', 1)
+    assert len(hrefs) == 1
+    assert not any(href == 'https://other.test/path' for href in hrefs)
+
+
+def test_live_successor_recovery_keeps_bounded_growth():
+    sizes = [2048, 4096, 8192]
+    result = _live_hrefs('[Good](https://good.test/path)', 7, repeat_sizes=sizes)
+    assert result['counts'] == [n + 1 for n in sizes]
+    small, middle, large = result['medians']
+    assert large < 500, result
+    assert large <= max(3 * middle, 3 * small, 20), result
