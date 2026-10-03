@@ -1,6 +1,7 @@
 """Sidebar cancellation must not clean a replacement stream after HTTP await.
 
-Executes the real boot.js function and ui.js storage helpers under Node, plus
+Executes the real boot.js function, messages.js close helper and ui.js storage
+helpers under Node, plus
 the real Handler/GET route/cancel_stream with synthetic local stream owners.
 No provider, browser package, external service or extension checkout is needed.
 """
@@ -24,6 +25,7 @@ const fs=require('node:fs'),vm=require('node:vm');
 const input=JSON.parse(process.argv[1]);
 const boot=fs.readFileSync('static/boot.js','utf8');
 const ui=fs.readFileSync('static/ui.js','utf8');
+const messages=fs.readFileSync('static/messages.js','utf8');
 function source(text,name,async=false){
   const start=text.indexOf((async?'async ':'')+'function '+name+'(');
   if(start<0)throw Error('missing '+name);
@@ -43,7 +45,9 @@ let argument;
 const context={S,INFLIGHT,console:{info(){}},document:{baseURI:input.base||'http://localhost/'},URL,
   INFLIGHT_KEY:'hermes-webui-inflight',INFLIGHT_STATE_KEY:'hermes-webui-inflight-state',
   localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},
-  closeLiveStream:(owner,stream)=>effects.push(['close',owner,stream]),
+  window:{},
+  LIVE_STREAMS:{[sid]:{streamId:old,source:{readyState:1,close:()=>effects.push(['close',sid,old])}}},
+  _resumeSessionStreamAfterLiveChat:()=>effects.push(['resume']),
   setBusy:v=>{S.busy=v;effects.push(['busy',v]);},setComposerStatus:()=>effects.push(['status']),
   renderSessionList:()=>effects.push(['render']),_clearPendingPromptsForSession:()=>effects.push(['prompts']),
   stopApprovalPollingForSession:()=>effects.push(['approval']),stopClarifyPollingForSession:()=>effects.push(['clarify']),
@@ -52,13 +56,18 @@ const context={S,INFLIGHT,console:{info(){}},document:{baseURI:input.base||'http
   stopClarifyPolling:()=>effects.push(['clarify-stop']),hideClarifyCard:()=>effects.push(['clarify-hide']),
 };
 vm.createContext(context);
+// Execute the production compaction/budget/write chain, not a save stub.
+vm.runInContext(ui.slice(ui.indexOf('const INFLIGHT_STATE_DEFAULT_LIMITS ='),
+  ui.indexOf('function loadInflightState(')),context);
+vm.runInContext(source(messages,'closeLiveStream'),context);
 for(const name of ['_readInflightStateMap','clearInflightState','clearInflight'])
   vm.runInContext(source(ui,name),context);
 vm.runInContext(source(boot,'cancelSessionStream',true),context);
-function snapshot(){return {sid:S.session.session_id,active:S.activeStreamId,
+function snapshot(){return JSON.parse(JSON.stringify({sid:S.session.session_id,active:S.activeStreamId,
   sessionActive:S.session.active_stream_id,busy:S.busy,inflight:INFLIGHT[sid]||null,
   saved:JSON.parse(storage.get('hermes-webui-inflight-state')||'{}'),
-  activeSaved:JSON.parse(storage.get('hermes-webui-inflight')||'null')};}
+  activeSaved:JSON.parse(storage.get('hermes-webui-inflight')||'null'),
+  live:context.LIVE_STREAMS[sid]?context.LIVE_STREAMS[sid].streamId:null}));}
 function rotate(){
   const mode=input.mode;
   if(mode==='switch-session'){
@@ -138,7 +147,7 @@ def test_replacement_or_unknown_owner_survives_sidebar_cancel(mode, alias):
     result = _node({"rotate": True, "mode": mode, "alias": alias})
     assert result["result"] is True
     assert result["after"] == result["rotated"]
-    assert not any(effect[0] in {"busy", "prompts", "approval", "clarify"}
+    assert not any(effect[0] in {"close", "resume", "busy", "prompts", "approval", "clarify"}
                    for effect in result["effects"])
     assert not any(effect[0].endswith(("-stop", "-hide")) for effect in result["effects"])
 
@@ -153,6 +162,8 @@ def test_matching_owner_and_http_failure_keep_existing_cancel_semantics(ok):
         assert after["inflight"] is None and after["busy"] is False
         assert after["saved"] == {"other": {"streamId": "other"}}
         assert after["activeSaved"] is None
+        assert after["live"] is None
+        assert ["close", "session-B", "stream-old"] in result["effects"]
     else:
         assert after["active"] == "stream-old" and after["busy"] is True
         assert after["inflight"]["streamId"] == "stream-old"
