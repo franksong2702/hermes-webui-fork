@@ -8059,6 +8059,12 @@ function renderMd(raw){
     }
     return lead+'\x00P'+(_preBlock_stash.length-1)+'\x00';
   });
+  // Protect raw preformatted regions before inline code/Markdown rewrites.
+  const rawPreStash=[];
+  s=s.replace(/(<pre\b[^>]*>[\s\S]*?<\/pre>)/gi,m=>{rawPreStash.push(m);return `\x00R${rawPreStash.length-1}\x00`;});
+  // Raw code has the same literal boundary as backtick code. Keep its body
+  // opaque before backticks, math, labeled links and autolinks can consume it.
+  s=s.replace(/<code>([^<]*?)<\/code>/gi,(_,c)=>{fence_stash.push('<code>'+c+'</code>');return '\x00F'+(fence_stash.length-1)+'\x00';});
   s=s.replace(/`([^`\n]+)`/g,(_,c)=>{fence_stash.push('<code>'+esc(c)+'</code>');return '\x00F'+(fence_stash.length-1)+'\x00';});
   // Math stash: protect $$..$$ and $..$ from markdown processing
   // Runs AFTER fence_stash so backtick code spans protect their dollar-sign contents
@@ -8075,11 +8081,6 @@ function renderMd(raw){
   // Match a single literal backslash before the delimiter (the common LLM form).
   s=s.replace(/\\\((.+?)\\\)/g,(_,m)=>{math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
   // Safe tag → markdown equivalent (these produce the same output as **text** etc.)
-  // Stash raw <pre> blocks so the inline <code> rewrite below does not run
-  // inside them. Running that rewrite in <pre> content can introduce stray
-  // backticks for multiline code and break subsequent code-box rendering.
-  const rawPreStash=[];
-  s=s.replace(/(<pre\b[^>]*>[\s\S]*?<\/pre>)/gi,m=>{rawPreStash.push(m);return `\x00R${rawPreStash.length-1}\x00`;});
   // Bare file:// artifact links → media. Some gateway/tool surfaces emit bare
   // file:// links for local artifacts instead of MEDIA: tokens; browser clients
   // cannot open the server filesystem directly, so route them through /api/media.
@@ -8103,7 +8104,6 @@ function renderMd(raw){
   };
   s=s.replace(/<em>([\s\S]*?)<\/em>/gi,(_,t)=>_emphasis(t));
   s=s.replace(/<i>([\s\S]*?)<\/i>/gi,(_,t)=>_emphasis(t));
-  s=s.replace(/<code>([^<]*?)<\/code>/gi,(_,t)=>'`'+t+'`');
   // Convert <br> to a newline, EXCEPT inside genuine markdown table rows — there a
   // newline would split the row and destroy the table. No sentinel token is used on
   // purpose: any fixed placeholder is attacker-suppliable in message text and would be
@@ -8249,6 +8249,7 @@ function renderMd(raw){
       if(opener==="'") return /^'(?:\\.|[^'\\])*'\s*\)/.test(rest);
       return /^\((?:\\.|[^()\\])*\)\s*\)/.test(rest);
     };
+    const nextLinkOpener=/\[[^\[\]\r\n]+\]\(/y;
     let out='', cursor=0;
     while(cursor<src.length){
       const open=src.indexOf('[',cursor);
@@ -8269,7 +8270,7 @@ function renderMd(raw){
         cursor=open+1;
         continue;
       }
-      let end=-1, rawUrl='', quote='', titleDepth=0;
+      let end=-1, rawUrl='', quote='', titleDepth=0, nextOpen=-1;
       for(let i=start;i<src.length;i++){
         const ch=src[i];
         if(ch==='\n'||ch==='\r')break;
@@ -8286,6 +8287,10 @@ function renderMd(raw){
           titleDepth++;
           continue;
         }
+        if(ch==='['&&i>start&&/\s/.test(src[i-1])){
+          nextLinkOpener.lastIndex=i;
+          if(nextLinkOpener.test(src)){nextOpen=i;break;}
+        }
         if(ch===')'){
           if(titleDepth>0){titleDepth--;continue;}
           rawUrl=src.slice(start,i);
@@ -8295,6 +8300,13 @@ function renderMd(raw){
       }
       const normalizedUrl=normalizeLinkDestination(rawUrl);
       if(end<0){
+        if(nextOpen>=0){
+          // A later link owns its own close; retain the malformed prefix and
+          // resume at that opener without rescanning the already-read span.
+          out+=src.slice(cursor,nextOpen);
+          cursor=nextOpen;
+          continue;
+        }
         // The scan stopped at a proven line boundary (or end-of-input). Keep
         // the already-scanned literal span intact and resume there; advancing
         // only one character would rescan every later `[` in a malformed line.
