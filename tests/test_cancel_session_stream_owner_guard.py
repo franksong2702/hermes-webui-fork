@@ -6,6 +6,7 @@ No provider, browser package, external service or extension checkout is needed.
 """
 import json
 from collections import OrderedDict
+import os
 from pathlib import Path
 import queue
 import shutil
@@ -194,10 +195,9 @@ def test_storage_helpers_compare_identity_and_preserve_legacy_calls(mode, expect
 def cancel_runtime(monkeypatch):
     """Actual server dispatch; the repo conftest owns isolated home/state."""
     from api import config, models, streaming
-    from conftest import TEST_STATE_DIR
     import server
 
-    isolated = TEST_STATE_DIR.resolve()
+    isolated = Path(os.environ["HERMES_WEBUI_TEST_STATE_DIR"]).resolve()
     assert Path(config.STATE_DIR).resolve().is_relative_to(isolated)
     assert Path(models.SESSION_DIR).resolve().is_relative_to(isolated)
     Path(models.SESSION_DIR).mkdir(parents=True, exist_ok=True)
