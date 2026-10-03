@@ -672,6 +672,23 @@ def _activity_snapshot(page) -> dict:
             })),
             rows: rows.map(row => {
               const sceneRow = sceneRowForDomRow(row);
+              // The renderer puts the locale clock in its own
+              // .agent-activity-status-time element, a SIBLING of
+              // .agent-activity-status-copy. Capture the clock and the label
+              // text separately so a reload that drops the clock is still
+              // caught: stripping the last line of `text` compared
+              // "…error.\\n9:14 PM" with "…error." as equal. textContent keeps
+              // this layout-independent, and reading the copy block directly
+              // excludes the clock element instead of guessing where it landed.
+              const clockEl = row.querySelector('.agent-activity-status-time');
+              const clock = (clockEl && clockEl.textContent || '').trim();
+              const copyEl = row.querySelector('.agent-activity-status-copy');
+              let label = ((copyEl && copyEl.textContent) || row.textContent || '').trim();
+              if (!copyEl && clock && label.endsWith(clock)) {
+                // Rows without a copy block have no clock of their own, so never
+                // let a clock bleed back into the label comparison.
+                label = label.slice(0, -clock.length).trim();
+              }
               return {
                 role: row.getAttribute('data-anchor-row-role'),
                 rowId: row.getAttribute('data-anchor-row-id') || '',
@@ -679,9 +696,10 @@ def _activity_snapshot(page) -> dict:
                 source: row.getAttribute('data-anchor-source-event-type'),
                 status: sceneRow ? (sceneRow.status ?? '') : null,
                 tool: row.getAttribute('data-tool-name'),
-                label: ((row.querySelector('.agent-activity-status-label') || {}).textContent || '').trim(),
-                detail: ((row.querySelector('.agent-activity-status-detail') || {}).textContent || '').trim(),
                 text: row.innerText.trim(),
+                label,
+                detail: ((row.querySelector('.agent-activity-status-detail') || {}).textContent || '').trim(),
+                clock,
                 classes: row.className,
               };
             }),
@@ -761,6 +779,53 @@ def _terminal_row_semantics(row: dict) -> dict:
             "detail",
             "classes",
         )
+    }
+
+
+def _assert_terminal_parity(settled_terminal: list[dict], reloaded_terminal: list[dict]) -> None:
+    """Assert the terminal row survives a hard reload unchanged.
+
+    The renderer puts the clock in its own ``.agent-activity-status-time``
+    element, so the snapshot exposes ``label`` (row text minus the clock) and
+    ``clock`` separately.  Comparing stripped last lines instead would let a
+    reload that dropped the clock entirely pass as identical, which is a real
+    user-visible regression.  The clock VALUES are allowed to differ (the
+    wall clock can cross a minute boundary between the two snapshots).
+    """
+    assert len(settled_terminal) == len(reloaded_terminal) == 1, {
+        "settled_terminal": settled_terminal,
+        "reloaded_terminal": reloaded_terminal,
+    }
+    settled = settled_terminal[0]
+    reloaded = reloaded_terminal[0]
+    assert settled.get("rowId"), {
+        "settled_terminal": settled,
+        "hint": "terminal row is missing data-anchor-row-id; rowId parity is vacuous",
+    }
+    assert reloaded.get("rowId"), {
+        "reloaded_terminal": reloaded,
+        "hint": "terminal row is missing data-anchor-row-id; rowId parity is vacuous",
+    }
+    assert settled["rowId"] == reloaded["rowId"], {
+        "settled_rowId": settled.get("rowId"),
+        "reloaded_rowId": reloaded.get("rowId"),
+    }
+    assert settled.get("label") == reloaded.get("label"), {
+        "settled_label": settled.get("label"),
+        "reloaded_label": reloaded.get("label"),
+    }
+    assert settled.get("clock"), {
+        "settled_terminal": settled,
+        "hint": "settled terminal row lost its rendered clock",
+    }
+    assert reloaded.get("clock"), {
+        "reloaded_terminal": reloaded,
+        "hint": "reloaded terminal row lost its rendered clock",
+    }
+
+    assert _terminal_row_semantics(settled) == _terminal_row_semantics(reloaded), {
+        "settled_terminal": settled,
+        "reloaded_terminal": reloaded,
     }
 
 
@@ -1741,16 +1806,7 @@ def main() -> int:
                 "settled_process": settled_process,
                 "reloaded_process": reloaded_process,
             }
-            assert len(settled_terminal) == len(reloaded_terminal) == 1, {
-                "settled_terminal": settled_terminal,
-                "reloaded_terminal": reloaded_terminal,
-            }
-            assert _terminal_row_semantics(settled_terminal[0]) == _terminal_row_semantics(
-                reloaded_terminal[0]
-            ), {
-                "settled_terminal": settled_terminal[0],
-                "reloaded_terminal": reloaded_terminal[0],
-            }
+            _assert_terminal_parity(settled_terminal, reloaded_terminal)
         print("OK  hard reload: transcript-backed Anchor scene preserves settled parity")
 
         assert gateway.request_body and gateway.request_body.get("input") == PROMPT, gateway.request_body
