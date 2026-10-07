@@ -11,6 +11,18 @@ _render = _renderer._render
 driver_path = _renderer.driver_path
 
 
+@pytest.mark.parametrize('context', ['{}', '- {}', '> {}', '| label |\n| --- |\n| {} |'])
+def test_link_scanner_and_cjk_autolink_keep_independent_destinations(driver_path, context):
+    source = (
+        '[File](https://good.test/a b.pdf) '
+        'https://example.com/pull/8040（OPEN、待复核） '
+        '<code>https://literal.test/x（OPEN）</code>'
+    )
+    rendered = _Rendered(_render(driver_path, context.format(source)))
+    assert rendered.links == ['https://good.test/a b.pdf', 'https://example.com/pull/8040']
+    assert rendered.code == ['https://literal.test/x（OPEN）']
+
+
 class _Rendered(HTMLParser):
     def __init__(self, source):
         super().__init__(convert_charrefs=True)
