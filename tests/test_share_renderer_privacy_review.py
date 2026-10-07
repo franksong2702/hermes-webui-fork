@@ -62,6 +62,33 @@ def review_cases():
     for quote in ('"', "'", ""):
         cases.append((f"<img src={quote}{PNG}{quote}>", PNG, "raw-data-src"))
         cases.append((f"<img src={quote}{PNG}{quote}> file:///tmp/outside.txt", PNG, "raw-data-neighbor"))
+    # Link labels cross the same renderer phases as omitted image labels.
+    labels = [f'<img src="{PRIVATE}">',
+              f'&lt;img src="{PRIVATE}"&gt;',
+              f'&amp;lt;img src="{PRIVATE}"&amp;gt;',
+              f'&#60;img src="{PRIVATE}"&#62;',
+              f'&ltimg src="{PRIVATE}"&gt',
+              f'&#x60;<img src="{PRIVATE}">&#x60;']
+    contexts = [("", ""), ("- ", ""), ("> > > ", ""),
+                ("| body |\n|---|\n| ", " |"), ("`", "`")]
+    for label in labels:
+        for prefix, suffix in contexts:
+            for scheme in ("file", "FILE"):
+                cases.append((f'{prefix}[{label}]({scheme}:///tmp/f.png){suffix}',
+                              None, "inert-file-link-label"))
+    for form in ("![a]({ref})", "MEDIA:{ref}"):
+        ref = "https://cdn.example/profile://avatar.png"
+        cases.append((form.format(ref=ref), ref, "preserve-public"))
+    for quote in ('"', "'", ""):
+        ref = "https://cdn.example/profile://avatar.png"
+        cases.append((f"<img src={quote}{ref}{quote}>", ref, "preserve-public"))
+    for prefix in ("pro", "my", "a+", "a-", "a.", "a0"):
+        cases.append((f"see {prefix}file://alice", None, "preserve-public"))
+    for body in ("file://`file:///tmp/private.png", "`file:///tmp/private dir/secret.txt`",
+                 "file://`", "`file://`", "file://"):
+        cases.append((body, None, "file-code-residual"))
+    for label, visible in (("A &amp; B", "A & B"), ("A &#96; B", "A ` B")):
+        cases.append((f'[{label}](file:///tmp/f.png)', None, "entity-label:" + visible))
     return cases
 
 
@@ -100,16 +127,19 @@ def test_review_snapshot_and_renderer(body, expected, kind, tmp_path):
         assert not images, (kind, content, markup)
     else:
         assert images == [expected], (kind, content, markup)
-    if kind in ("code-opener", "private-code-opener", "destination-code-opener", "closing-backtick"):
+    if kind in ("code-opener", "private-code-opener", "destination-code-opener", "closing-backtick", "file-code-residual", "inert-file-link-label"):
         assert content.count("`") == body.count("`")
     if kind.startswith("entity-label:"):
         parsed = Images()
         parsed.feed(markup)
         assert kind.partition(":")[2] in "".join(parsed.text), (content, markup)
         assert content.count("`") == body.count("`")
-    if kind in ("profile", "folded-public", "raw-data-src"):
+    if kind in ("profile", "folded-public", "raw-data-src", "preserve-public"):
         assert content == body
     assert "file:///tmp/outside.txt" not in content
+    if kind == "file-code-residual":
+        assert "file://" not in content.lower()
+        assert "secret.txt" not in content
 
 
 @pytest.mark.parametrize("text", [
@@ -125,3 +155,39 @@ def test_raw_data_protection_does_not_exempt_invalid_or_shadowed_src(text):
 def test_plain_title_retains_literal_private_image_label(label):
     session = Session(session_id="plain-share-title", title=f"![{label}]({PRIVATE})", messages=[{"role": "assistant", "content": "hello"}])
     assert shares.build_share_snapshot(session)["title"] == f"![{label}]({shares._PLACEHOLDER})"
+
+
+@pytest.mark.parametrize("scheme", ["http", "https", "HTTP", "HTTPS", "HtTpS"])
+@pytest.mark.parametrize("wrapper", ["{}", "`{}`"])
+def test_plain_title_preserves_public_media_scheme_case(scheme, wrapper):
+    title = wrapper.format(f"MEDIA:{scheme}://cdn.example/icon.png")
+    session = Session(session_id="public-title", title=title,
+                      messages=[{"role": "assistant", "content": "hello"}])
+    before = copy.deepcopy(vars(session))
+    assert shares.build_share_snapshot(session)["title"] == title
+    assert vars(session) == before
+
+
+@pytest.mark.parametrize("scheme", ["http", "https", "HTTP", "HTTPS", "HtTpS"])
+@pytest.mark.parametrize("wrapper", ["{}", "`{}`"])
+def test_plain_title_omits_private_media_before_scheme_preservation(scheme, wrapper):
+    title = wrapper.format(f"MEDIA:{scheme}://webui.example/api/media?path=/tmp/private.png")
+    session = Session(session_id="private-title", title=title,
+                      messages=[{"role": "assistant", "content": "hello"}])
+    assert shares.build_share_snapshot(session)["title"] == shares._PLACEHOLDER
+
+
+@pytest.mark.parametrize("quote", ['"', "'", ""])
+@pytest.mark.parametrize("shadowed", [False, True])
+def test_rejected_data_image_scheme_boundary_exception_is_attribute_scoped(quote, shadowed):
+    data = "data:image/png,%89PNGfile:///inert?invalid"
+    src = f"src={quote}{data}{quote}"
+    tail = ' src="file:///outside"' if shadowed else ""
+    public = "https://cdn.example/profile://avatar.png"
+    text = f"<img {src}{tail}> ![public]({public}) see profile://alice"
+    clean = shares._omit_private_share_media_references(text)
+    assert "PNGfile://" not in clean
+    assert "file:///outside" not in clean
+    assert public in clean
+    assert "profile://alice" in clean
+    assert shares._omit_private_share_media_references(clean) == clean

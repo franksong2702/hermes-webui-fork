@@ -2117,14 +2117,22 @@ state. These cases call `build_share_snapshot` and production `renderMd`, includ
 its real remote-image policy with a same-origin WebUI and an allowlisted public
 CDN. They cover browser authority slash folding, labels and destinations whose
 backticks keep adjacent HTML inert, closing code delimiters, `profile:` public
-URLs, and complete raw `<img>` data-image attributes containing inert file metadata.
+URLs (including `profile://` in URL paths and prose), and complete raw `<img>`
+data-image attributes containing inert file metadata. Omitted file-link labels use
+the same numeric escaping as image labels, preserving link wrappers and literal
+backticks across encoded, nested quote, list, table and code-span forms. Bare
+`file://` before a backtick is removed, and a backtick-wrapped local URI with
+spaces is omitted completely while keeping its code delimiters.
 Invalid and shadowed data-image `src` attributes remain scrubbed. Raw HTML in
 omitted image labels remains text in paragraphs, lists, tables, and recursively
 rendered blockquotes; retaining labels must not introduce a new active image.
 Named/numeric entity labels retain their visible characters without adding a
 Markdown backtick delimiter; Chromium also verifies the visible label text.
 Plain-text titles retain literal label text and code delimiters without renderer
-escaping.
+escaping. Public HTTP(S) MEDIA references retain their scheme case in titles,
+including wrapped uppercase schemes, after private classification. Scheme-less
+file matching never consumes a suffix of another scheme; only rejected or
+shadowed raw data-image attribute payloads use a boundary-free scrub.
 
 For actual Chromium request and pixel-decoding evidence, run
 `python tests/browser_public_share_media_privacy.py --snapshot-python .venv/bin/python

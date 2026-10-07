@@ -150,7 +150,12 @@ _SHARE_FILE_MARKDOWN_RE = re.compile(
     re.IGNORECASE,
 )
 _SHARE_FILE_CODE_RE = re.compile(r"`file://[^`\r\n]+`", re.IGNORECASE)
-_SHARE_FILE_URI_RE = re.compile(r"file://[^`\s<>\"')\]]+", re.IGNORECASE)
+_SHARE_FILE_URI_RE = re.compile(
+    r"(?<![a-z0-9+.-])file://[^`\s<>\"')\]]*", re.IGNORECASE,
+)
+# Only rejected/shadowed raw data-image attributes need a boundary-free scrub:
+# payload bytes can run directly into file://, unlike a standalone URI scheme.
+_SHARE_DATA_FILE_URI_RE = re.compile(r"file://[^`\s<>\"')\]]*", re.IGNORECASE)
 # Attribute shapes accepted by renderMd's raw-tag sanitizer. Only complete
 # data-image src values are protected; other attributes and neighbors are scrubbed.
 _SHARE_RAW_IMG_RE = re.compile(r"<img(?=[\s/>])[^>]*>", re.IGNORECASE)
@@ -491,6 +496,8 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
         if _share_media_ref_is_private(raw):
             return _PLACEHOLDER + suffix
         if plain_text:
+            if re.match(r"https?://", raw, re.IGNORECASE):
+                return match.group(0)
             if _share_media_ref_is_self_contained_image(raw):
                 return match.group(0)
             # Titles have no file-reading context: reuse the no-root embedding
@@ -502,6 +509,15 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
 
     media_re = _SHARE_TITLE_MEDIA_RE if plain_text else _SHARE_ANY_MEDIA_RE
     text = media_re.sub(_replace_media, text)
+
+    def _escape_label(label: str) -> str:
+        if plain_text:
+            return label
+
+        def _label_entity(entity):
+            return "".join(f"&#{ord(char)};" for char in html.unescape(entity.group(0)))
+
+        return _SHARE_IMAGE_LABEL_ENTITY_RE.sub(_label_entity, label)
 
     # Markdown images are renderer-active even without the MEDIA: prefix.
     # Run their URL through the same classifier so direct private media links
@@ -523,14 +539,9 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
         # become tags even when the renderer recurses through nested quotes.
         label_start = match.start() + 2
         label_end = text.index("](", label_start, start)
-        # Preserve existing entity characters without materializing new Markdown
-        # delimiters: even an encoded backtick stays numeric until DOM parsing.
-        def _label_entity(entity):
-            return "".join(f"&#{ord(char)};" for char in html.unescape(entity.group(0)))
-
-        label = text[label_start:label_end]
-        if not plain_text:
-            label = _SHARE_IMAGE_LABEL_ENTITY_RE.sub(_label_entity, label)
+        # Numeric references cannot materialize tags or Markdown delimiters
+        # during renderer entity decoding, even inside nested blockquotes.
+        label = _escape_label(text[label_start:label_end])
         prefix = (
             text[match.start():label_start]
             + label
@@ -540,13 +551,57 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
 
     text = _SHARE_MARKDOWN_IMAGE_RE.sub(_replace_markdown_image, text)
 
-    def _replace_file(match: re.Match) -> str:
-        return _SHARE_FILE_URI_RE.sub(_PLACEHOLDER, match.group(0))
+    def _replace_file_markdown(match: re.Match) -> str:
+        source = match.group(0)
+        label_start = 2 if source.startswith("![") else 1
+        label_end = source.index("](", label_start)
+        destination_start = label_end + 2
+        while source[destination_start].isspace():
+            destination_start += 1
+        destination_end = len(source) - 1
+        while source[destination_end - 1].isspace():
+            destination_end -= 1
+        destination = re.sub(r"[^`]+", _PLACEHOLDER,
+                             source[destination_start:destination_end])
+        return (source[:label_start] + _escape_label(source[label_start:label_end])
+                + source[label_end:destination_start] + destination
+                + source[destination_end:])
+
+    # Rewrite the complete link before splitting protected data-image spans;
+    # otherwise an image-looking label can be exposed to the raw HTML pass.
+    text = _SHARE_FILE_MARKDOWN_RE.sub(_replace_file_markdown, text)
+
+    def _scrub_rejected_data_attributes(tag: re.Match) -> str:
+        source = tag.group(0)
+        attrs = list(_SHARE_RAW_ATTR_RE.finditer(source[4:-1]))
+        active_src = next((attr for attr in reversed(attrs)
+                           if attr.group(1).lower() == "src"), None)
+        replacements = []
+        for attr in attrs:
+            group = next((i for i in (2, 3, 4) if attr.group(i) is not None), None)
+            if group is None:
+                continue
+            value = attr.group(group)
+            decoded = html.unescape(value)
+            if (re.match(r"data:image/", decoded, re.IGNORECASE)
+                    and (attr is not active_src
+                         or not _share_media_ref_is_self_contained_image(decoded))):
+                start, end = attr.span(group)
+                replacements.append((4 + start, 4 + end,
+                                     _SHARE_DATA_FILE_URI_RE.sub(_PLACEHOLDER, value)))
+        for start, end, replacement in reversed(replacements):
+            source = source[:start] + replacement + source[end:]
+        return source
+
+    text = _SHARE_RAW_IMG_RE.sub(_scrub_rejected_data_attributes, text)
 
     # Public JSON must not expose filesystem URIs even when markdown would have
     # treated the literal as inert code. Preserve syntax delimiters: they may
     # keep adjacent HTML inert. Only filesystem destinations are replaced.
-    for pattern in (_SHARE_FILE_MARKDOWN_RE, _SHARE_FILE_CODE_RE, _SHARE_FILE_URI_RE):
+    for pattern, replacement in (
+        (_SHARE_FILE_CODE_RE, lambda match: "`" + _PLACEHOLDER + "`"),
+        (_SHARE_FILE_URI_RE, _PLACEHOLDER),
+    ):
         # Recompute after every scrub: replacing a private neighbor shifts the
         # image offsets. URI metadata is inert within a complete accepted image.
         protected = []
@@ -583,10 +638,10 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
             # Scrub gaps rather than whole matches: an internal file:// match
             # can cross a closing backtick into an outside private neighbor.
             start = max(start, cursor)
-            parts.append(pattern.sub(_replace_file, text[cursor:start]))
+            parts.append(pattern.sub(replacement, text[cursor:start]))
             parts.append(text[start:end])
             cursor = end
-        parts.append(pattern.sub(_replace_file, text[cursor:]))
+        parts.append(pattern.sub(replacement, text[cursor:]))
         text = "".join(parts)
     return text
 
