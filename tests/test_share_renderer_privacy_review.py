@@ -119,3 +119,9 @@ def test_review_snapshot_and_renderer(body, expected, kind, tmp_path):
 def test_raw_data_protection_does_not_exempt_invalid_or_shadowed_src(text):
     content = shares._omit_private_share_media_references(text)
     assert "file://" not in content
+
+
+@pytest.mark.parametrize("label", ["A &amp; B", "A &#60; B", "A < B", "A ` B"])
+def test_plain_title_retains_literal_private_image_label(label):
+    session = Session(session_id="plain-share-title", title=f"![{label}]({PRIVATE})", messages=[{"role": "assistant", "content": "hello"}])
+    assert shares.build_share_snapshot(session)["title"] == f"![{label}]({shares._PLACEHOLDER})"

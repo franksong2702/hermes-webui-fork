@@ -2123,6 +2123,8 @@ omitted image labels remains text in paragraphs, lists, tables, and recursively
 rendered blockquotes; retaining labels must not introduce a new active image.
 Named/numeric entity labels retain their visible characters without adding a
 Markdown backtick delimiter; Chromium also verifies the visible label text.
+Plain-text titles retain literal label text and code delimiters without renderer
+escaping.
 
 For actual Chromium request and pixel-decoding evidence, run
 `python tests/browser_public_share_media_privacy.py --snapshot-python .venv/bin/python

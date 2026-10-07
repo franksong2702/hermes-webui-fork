@@ -528,7 +528,9 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
         def _label_entity(entity):
             return "".join(f"&#{ord(char)};" for char in html.unescape(entity.group(0)))
 
-        label = _SHARE_IMAGE_LABEL_ENTITY_RE.sub(_label_entity, text[label_start:label_end])
+        label = text[label_start:label_end]
+        if not plain_text:
+            label = _SHARE_IMAGE_LABEL_ENTITY_RE.sub(_label_entity, label)
         prefix = (
             text[match.start():label_start]
             + label
