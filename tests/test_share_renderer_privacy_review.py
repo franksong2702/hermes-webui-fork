@@ -29,10 +29,14 @@ class Images(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.sources = []
+        self.text = []
 
     def handle_starttag(self, tag, attrs):
         if tag == "img":
             self.sources.append(dict(attrs).get("src", ""))
+
+    def handle_data(self, data):
+        self.text.append(data)
 
 
 def review_cases():
@@ -47,6 +51,9 @@ def review_cases():
     for destination in ("file:///tmp/f.png", PRIVATE):
         for prefix, suffix in (("", ""), ("- ", ""), ("> > > ", ""), ("| body |\n|---|\n| ", " |")):
             cases.append((f'{prefix}![<img src="{PRIVATE}">]({destination}){suffix}', None, "inert-image-label"))
+    for label, visible in (("A &amp; B", "A & B"), ("A &#60; B", "A < B"), ("A &#96; B", "A ` B")):
+        for destination in ("file:///tmp/f.png", PRIVATE):
+            cases.append((f'![{label}]({destination})', None, "entity-label:" + visible))
     for ticks in ("`", "``"):
         cases.append((f'![a]({PRIVATE}{ticks}) <img src="{PRIVATE}">{ticks}', None, "destination-code-opener"))
     cases.append((f"`path file:///tmp/private.txt` MEDIA:{PNG_B64} `note`", PNG_B64, "closing-backtick"))
@@ -94,6 +101,11 @@ def test_review_snapshot_and_renderer(body, expected, kind, tmp_path):
     else:
         assert images == [expected], (kind, content, markup)
     if kind in ("code-opener", "private-code-opener", "destination-code-opener", "closing-backtick"):
+        assert content.count("`") == body.count("`")
+    if kind.startswith("entity-label:"):
+        parsed = Images()
+        parsed.feed(markup)
+        assert kind.partition(":")[2] in "".join(parsed.text), (content, markup)
         assert content.count("`") == body.count("`")
     if kind in ("profile", "folded-public", "raw-data-src"):
         assert content == body

@@ -21,12 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = """
 import json, tempfile
 from pathlib import Path
-from tests.test_share_renderer_privacy_review import review_cases, rendered_case, PNG_B64
+from tests.test_share_renderer_privacy_review import review_cases, rendered_case, PNG_B64, PRIVATE
 with tempfile.TemporaryDirectory() as folder:
     rows=[]
     for body, expected, kind in review_cases():
         content, markup, images=rendered_case(body, Path(folder))
-        rows.append(dict(body=body, content=content, markup=markup, expected=expected, kind=kind))
+        label = f'<img src="{PRIVATE}">' if kind == "inert-image-label" else (kind.partition(":")[2] if kind.startswith("entity-label:") else None)
+        rows.append(dict(body=body, content=content, markup=markup, expected=expected, kind=kind, label=label))
     print(json.dumps(dict(rows=rows, png=PNG_B64.split(',',1)[1])))
 """
 
@@ -73,6 +74,8 @@ def main():
                     not images if expected is None else
                     len(images) == 1 and images[0]["src"] == expected and images[0]["width"] == 3
                 )
+                if row["label"] is not None:
+                    passed = passed and row["label"] in page.locator("body").text_content()
                 evidence = dict(width=width, kind=row["kind"], passed=passed, images=images, requests=list(requests))
                 results.append(evidence)
                 if not passed:

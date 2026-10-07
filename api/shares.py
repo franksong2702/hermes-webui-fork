@@ -157,6 +157,9 @@ _SHARE_RAW_IMG_RE = re.compile(r"<img(?=[\s/>])[^>]*>", re.IGNORECASE)
 _SHARE_RAW_ATTR_RE = re.compile(
     r'''([a-zA-Z0-9:_-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>`]+)))?'''
 )
+_SHARE_IMAGE_LABEL_ENTITY_RE = re.compile(
+    r"&(?:#[0-9]{1,8}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]{0,31});|[<>&]"
+)
 # Unknown malformed destinations must not consume a later image marker. A
 # renderer-supported outer scheme still consumes its full reference so a private
 # outer URL cannot evade classification by nesting a public image inside it.
@@ -520,9 +523,15 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
         # become tags even when the renderer recurses through nested quotes.
         label_start = match.start() + 2
         label_end = text.index("](", label_start, start)
+        # Preserve existing entity characters without materializing new Markdown
+        # delimiters: even an encoded backtick stays numeric until DOM parsing.
+        def _label_entity(entity):
+            return "".join(f"&#{ord(char)};" for char in html.unescape(entity.group(0)))
+
+        label = _SHARE_IMAGE_LABEL_ENTITY_RE.sub(_label_entity, text[label_start:label_end])
         prefix = (
             text[match.start():label_start]
-            + text[label_start:label_end].replace("&", "&#38;").replace("<", "&#60;").replace(">", "&#62;")
+            + label
             + text[label_end:start]
         )
         return prefix + destination + text[end:match.end()]

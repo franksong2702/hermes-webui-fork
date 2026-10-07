@@ -2121,6 +2121,8 @@ URLs, and complete raw `<img>` data-image attributes containing inert file metad
 Invalid and shadowed data-image `src` attributes remain scrubbed. Raw HTML in
 omitted image labels remains text in paragraphs, lists, tables, and recursively
 rendered blockquotes; retaining labels must not introduce a new active image.
+Named/numeric entity labels retain their visible characters without adding a
+Markdown backtick delimiter; Chromium also verifies the visible label text.
 
 For actual Chromium request and pixel-decoding evidence, run
 `python tests/browser_public_share_media_privacy.py --snapshot-python .venv/bin/python
