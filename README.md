@@ -212,6 +212,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Code block copy button with "Copied!" feedback
 - Syntax highlighting via Prism.js (Python, JS, bash, JSON, SQL, and more)
 - Safe HTML rendering in AI responses (bold, italic, code converted to markdown)
+- Bare HTTP(S) URLs are auto-linked without absorbing adjacent CJK prose; Unicode IDN host separators and raw-CJK IRI paths remain linkable
 - rAF-throttled token streaming for smoother rendering during long responses
 - Context usage indicator in composer footer -- token count, cost, and fill bar (model-aware)
 
@@ -219,12 +220,14 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Create, rename, duplicate, delete, search by title and message content
 - Session actions via `⋯` dropdown per session — pin, move to project, archive, duplicate, delete
 - Pin/star sessions to the top of the sidebar (gold indicator)
+- Pinned-conversation limits apply separately to each session's owning profile; root/default aliases share a limit. Unpin an empty session before switching its profile through chat or `/goal`.
 - Archive sessions (hide without deleting, toggle to show)
 - Session projects -- named groups with colors for organizing sessions; delegated subagent sessions have no project of their own and follow their nearest ancestor's project in the project filter and the Unassigned chip; forks and other child sessions keep their own project, so a fork moved to "No project" stays Unassigned
 - Session tags -- add #tag to titles for colored chips and click-to-filter
 - Grouped by Today / Yesterday / Earlier in the sidebar (collapsible date groups)
 - Download as Markdown transcript, full JSON export, or import from JSON
 - Create a public read-only share link for the active conversation from the Control Center; shared pages show a sanitized transcript snapshot without workspace, profile, or live controls; eligible local images are frozen into the snapshot, and self-contained base64 images and renderer-supported percent-encoded raster images retain the renderer's 2 MiB URI limit independently of the private-reference decode budget (SVG remains base64-only; raster base64 payloads may use percent escapes only when one decode yields browser-compatible base64 (missing padding and ASCII whitespace are accepted), with the original URI text and size limit preserved; inert `file://` metadata inside accepted self-contained image URIs is preserved), while private `MEDIA:` and Markdown-image references to authenticated `/api/media?path=...` routes, plus literal `file://` references, are omitted (including a private image after a malformed image prefix)
+  Body `MEDIA:data:` tokens use the same in-memory validation as eligible local attachments: strict base64, PNG/JPEG/GIF/WebP MIME and magic bytes, and a 512 KiB decoded-byte cap. Unsupported, malformed, mismatched or oversized tokens are omitted before the private-reference filter; data URIs never enter filesystem resolution. Markdown image destinations retain their existing renderer URI policy.
   Share titles are plain text: public `MEDIA:` references, including supported self-contained image data URIs within the same 2 MiB limit, keep their exact text and any backtick wrapper; private references are omitted together with their surrounding backticks; paired prose quotes stay balanced.
 - Sessions persist across page reloads and SSH tunnel reconnects
 - Browser tab title reflects the active session name
@@ -430,6 +433,7 @@ Full list of environment variables:
 | `HERMES_WEBUI_DEFAULT_MODEL` | *(provider default)* | Optional model override; leave unset to use the active Hermes provider default |
 | `HERMES_WEBUI_PASSWORD` | *(unset)* | Set to enable password authentication |
 | `HERMES_WEBUI_CSP_CONNECT_EXTRA` | *(unset)* | Optional space-separated `http(s)://` or `ws(s)://` origins to append to the enforced and report-only CSP `connect-src` directives for trusted reverse-proxy, tunnel, or extension sidecar deployments |
+| `HERMES_WEBUI_CSP_IMG_EXTRA` | *(unset)* | Optional space-separated `http(s)://` image origins (wildcard subdomain and port allowed), or the bare `https:` / `http:` scheme, added to the CSP `img-src`. Remote images are blocked by default so an assistant reply cannot make the browser fetch an arbitrary URL; blocked images render as an inert "Open image" link. Use this to show images from a trusted CDN inline, e.g. an image-generation provider |
 | `HERMES_WEBUI_SSE_CHUNKED` | *(unset)* | Set truthy (`1`/`true`/`yes`/`on`) to send SSE with `Transfer-Encoding: chunked`. Needed behind buffering reverse proxies (e.g. `jupyter-server-proxy`) that otherwise buffer the whole stream; harmless but unnecessary for directly-served deployments |
 | `HERMES_WEBUI_EXTENSION_DIR` | *(unset)* | Optional local directory served at `/extensions/`; must point to an existing directory before extension injection is enabled |
 | `HERMES_WEBUI_EXTENSION_MANIFEST` | *(unset)* | Optional relative JSON manifest inside `HERMES_WEBUI_EXTENSION_DIR` listing bundled scripts/styles to inject; see [WebUI Extensions](docs/EXTENSIONS.md) |
