@@ -512,7 +512,20 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
         # image. Removing the whole match would activate previously inert HTML.
         start, end = match.span(group)
         destination = re.sub(r"[^`]+", _PLACEHOLDER, raw)
-        return text[match.start():start] + destination + text[end:match.end()]
+        # The omitted destination no longer enters _mdImageHtml's alt escaping.
+        # Keep label text/code delimiters, but do not expose its inert HTML to
+        # the renderer's raw-tag pass when the image syntax becomes plain text.
+        # renderMd decodes named entities repeatedly (also in blockquotes).
+        # Numeric references remain inert until DOM text parsing, so they cannot
+        # become tags even when the renderer recurses through nested quotes.
+        label_start = match.start() + 2
+        label_end = text.index("](", label_start, start)
+        prefix = (
+            text[match.start():label_start]
+            + text[label_start:label_end].replace("&", "&#38;").replace("<", "&#60;").replace(">", "&#62;")
+            + text[label_end:start]
+        )
+        return prefix + destination + text[end:match.end()]
 
     text = _SHARE_MARKDOWN_IMAGE_RE.sub(_replace_markdown_image, text)
 

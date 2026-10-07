@@ -44,6 +44,9 @@ def review_cases():
     for opener in ("![`label]", "[`label]"):
         cases.append((f'{opener}(file:///tmp/f.png) <img src="{PRIVATE}">`', None, "code-opener"))
     cases.append((f'![`label]({PRIVATE}) <img src="{PRIVATE}">`', None, "private-code-opener"))
+    for destination in ("file:///tmp/f.png", PRIVATE):
+        for prefix, suffix in (("", ""), ("- ", ""), ("> > > ", ""), ("| body |\n|---|\n| ", " |")):
+            cases.append((f'{prefix}![<img src="{PRIVATE}">]({destination}){suffix}', None, "inert-image-label"))
     for ticks in ("`", "``"):
         cases.append((f'![a]({PRIVATE}{ticks}) <img src="{PRIVATE}">{ticks}', None, "destination-code-opener"))
     cases.append((f"`path file:///tmp/private.txt` MEDIA:{PNG_B64} `note`", PNG_B64, "closing-backtick"))

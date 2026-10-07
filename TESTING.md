@@ -2118,7 +2118,9 @@ its real remote-image policy with a same-origin WebUI and an allowlisted public
 CDN. They cover browser authority slash folding, labels and destinations whose
 backticks keep adjacent HTML inert, closing code delimiters, `profile:` public
 URLs, and complete raw `<img>` data-image attributes containing inert file metadata.
-Invalid and shadowed data-image `src` attributes remain scrubbed.
+Invalid and shadowed data-image `src` attributes remain scrubbed. Raw HTML in
+omitted image labels remains text in paragraphs, lists, tables, and recursively
+rendered blockquotes; retaining labels must not introduce a new active image.
 
 For actual Chromium request and pixel-decoding evidence, run
 `python tests/browser_public_share_media_privacy.py --snapshot-python .venv/bin/python
