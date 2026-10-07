@@ -150,7 +150,13 @@ _SHARE_FILE_MARKDOWN_RE = re.compile(
     re.IGNORECASE,
 )
 _SHARE_FILE_CODE_RE = re.compile(r"`file://[^`\r\n]+`", re.IGNORECASE)
-_SHARE_FILE_URI_RE = re.compile(r"file://[^\s<>\"')\]]+", re.IGNORECASE)
+_SHARE_FILE_URI_RE = re.compile(r"file://[^`\s<>\"')\]]+", re.IGNORECASE)
+# Attribute shapes accepted by renderMd's raw-tag sanitizer. Only complete
+# data-image src values are protected; other attributes and neighbors are scrubbed.
+_SHARE_RAW_IMG_RE = re.compile(r"<img(?=[\s/>])[^>]*>", re.IGNORECASE)
+_SHARE_RAW_ATTR_RE = re.compile(
+    r'''([a-zA-Z0-9:_-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>`]+)))?'''
+)
 # Unknown malformed destinations must not consume a later image marker. A
 # renderer-supported outer scheme still consumes its full reference so a private
 # outer URL cannot evade classification by nesting a public image inside it.
@@ -232,7 +238,11 @@ def _canonical_share_url_path(path: str) -> str:
 def _share_url_candidate_is_private(candidate: str) -> bool:
     """Classify one decoded URL/path candidate against the private media route."""
     try:
-        parsed = urlsplit(str(candidate or "").strip())
+        text = str(candidate or "").strip().replace("\\", "/")
+        # WHATWG folds excess authority slashes (including backslashes) before
+        # parsing the host; urlsplit alone leaves that host in the path.
+        text = re.sub(r"^(https?:)/{2,}", r"\1//", text, flags=re.IGNORECASE)
+        parsed = urlsplit(text)
     except ValueError:
         # An unparseable renderer-active candidate cannot be proven public.
         return True
@@ -300,7 +310,7 @@ def _share_media_ref_is_private(raw: str) -> bool:
     if decoded is None:
         return True
     normalized = decoded.strip().replace("\\", "/")
-    if "file:" in normalized.lower():
+    if re.search(r"(?<![a-z0-9+.-])file:", normalized, re.IGNORECASE):
         return True
     return any(
         _share_url_candidate_is_private(candidate)
@@ -494,18 +504,40 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
     # Run their URL through the same classifier so direct private media links
     # cannot survive into the anonymous share page.
     def _replace_markdown_image(match: re.Match) -> str:
-        raw = str(match.group(1) or match.group(2) or "")
-        return _PLACEHOLDER if _share_media_ref_is_private(raw) else match.group(0)
+        group = 1 if match.group(1) is not None else 2
+        raw = str(match.group(group) or "")
+        if not _share_media_ref_is_private(raw):
+            return match.group(0)
+        # Labels can contain the opener of a code span which ends outside the
+        # image. Removing the whole match would activate previously inert HTML.
+        start, end = match.span(group)
+        destination = re.sub(r"[^`]+", _PLACEHOLDER, raw)
+        return text[match.start():start] + destination + text[end:match.end()]
 
     text = _SHARE_MARKDOWN_IMAGE_RE.sub(_replace_markdown_image, text)
 
+    def _replace_file(match: re.Match) -> str:
+        return _SHARE_FILE_URI_RE.sub(_PLACEHOLDER, match.group(0))
+
     # Public JSON must not expose filesystem URIs even when markdown would have
-    # treated the literal as inert code. Replace larger constructs first so the
-    # snapshot does not retain broken markdown shells around the placeholder.
+    # treated the literal as inert code. Preserve syntax delimiters: they may
+    # keep adjacent HTML inert. Only filesystem destinations are replaced.
     for pattern in (_SHARE_FILE_MARKDOWN_RE, _SHARE_FILE_CODE_RE, _SHARE_FILE_URI_RE):
         # Recompute after every scrub: replacing a private neighbor shifts the
         # image offsets. URI metadata is inert within a complete accepted image.
         protected = []
+        for tag in _SHARE_RAW_IMG_RE.finditer(text):
+            attrs = {}
+            for attr in _SHARE_RAW_ATTR_RE.finditer(tag.group(0)[4:-1]):
+                attrs[attr.group(1).lower()] = attr
+            src = attrs.get("src")
+            if src is not None:
+                group = next((i for i in (2, 3, 4) if src.group(i) is not None), None)
+                if group is not None and _share_media_ref_is_self_contained_image(
+                    html.unescape(src.group(group))
+                ):
+                    start, end = src.span(group)
+                    protected.append((tag.start() + 4 + start, tag.start() + 4 + end))
         for image in _SHARE_MARKDOWN_IMAGE_RE.finditer(text):
             group = 1 if image.group(1) is not None else 2
             if _share_media_ref_is_self_contained_image(image.group(group)):
@@ -527,10 +559,10 @@ def _omit_private_share_media_references(text: str, *, plain_text: bool = False)
             # Scrub gaps rather than whole matches: an internal file:// match
             # can cross a closing backtick into an outside private neighbor.
             start = max(start, cursor)
-            parts.append(pattern.sub(_PLACEHOLDER, text[cursor:start]))
+            parts.append(pattern.sub(_replace_file, text[cursor:start]))
             parts.append(text[start:end])
             cursor = end
-        parts.append(pattern.sub(_PLACEHOLDER, text[cursor:]))
+        parts.append(pattern.sub(_replace_file, text[cursor:]))
         text = "".join(parts)
     return text
 

@@ -49,12 +49,23 @@ def _sanitize(text: str, *, workspace: Path | None = None) -> str:
         "MEDIA:https://cdn.example/render?next=https%253A%252F%252Fwebui.example%252Fapi%252Fmedia%253Fpath%253D%252Ftmp%252Fprivate.png",
         "MEDIA:https://cdn.example/render?next=file%3A%2F%2F%2Ftmp%2Fprivate.png",
         "`MEDIA:https://webui.example/api/media?path=/tmp/private.png`",
+        "![a](https:///webui.example/api/media?path=/tmp/private.png)",
+        "![a](https:////webui.example/api/media?path=/tmp/private.png)",
+        "MEDIA:https:///webui.example/api/media?path=/tmp/private.png",
+        "MEDIA:https://\\webui.example/api/media?path=/tmp/private.png",
     ],
 )
 def test_public_share_snapshot_omits_private_renderer_media_references(text):
     content = _sanitize(text)
 
-    assert content == shares._PLACEHOLDER
+    expected = shares._PLACEHOLDER
+    if text.startswith("[open]"):
+        expected = f"[open]({shares._PLACEHOLDER})"
+    elif text.startswith("`file:"):
+        expected = f"`{shares._PLACEHOLDER}`"
+    elif text.startswith("![a]"):
+        expected = f"![a]({shares._PLACEHOLDER})"
+    assert content == expected
     assert "file://" not in content.lower()
     assert "/api/media" not in content.lower()
 
@@ -76,7 +87,7 @@ def test_public_link_before_file_link_on_same_line_is_preserved():
 
     content = _sanitize(text)
 
-    assert content == f"see [public](https://cdn.example/a.png) and {shares._PLACEHOLDER}"
+    assert content == f"see [public](https://cdn.example/a.png) and [x]({shares._PLACEHOLDER})"
 
 
 def test_external_api_media_like_path_without_path_parameter_is_preserved():
@@ -97,7 +108,7 @@ def test_deep_dot_segments_cannot_evade_private_media_route():
 def test_direct_markdown_image_to_private_media_is_omitted():
     text = "![private](https://webui.example/api/media?path=/tmp/private.png)"
 
-    assert _sanitize(text) == shares._PLACEHOLDER
+    assert _sanitize(text) == f"![private]({shares._PLACEHOLDER})"
 
 
 @pytest.mark.parametrize("mime", ["png", "jpeg", "gif", "webp", "avif", "svg+xml"])
@@ -178,7 +189,7 @@ def test_self_contained_image_uri_size_boundary(encoding, offset):
     if encoding == "percent":
         payload = "%89" + payload[3:]
     text = f"![image]({prefix}{payload})"
-    assert _sanitize(text) == (text if offset <= 0 else shares._PLACEHOLDER)
+    assert _sanitize(text) == (text if offset <= 0 else f"![image]({shares._PLACEHOLDER})")
 
 
 @pytest.mark.parametrize("ref", [
@@ -193,7 +204,7 @@ def test_self_contained_image_uri_size_boundary(encoding, offset):
 ], ids=["percent-svg", "charset-parameter", "unsupported-raster", "html-scheme",
         "private-url-suffix", "fragment", "backslash", "html-payload"])
 def test_large_non_renderer_percent_image_fails_closed(ref):
-    assert _sanitize(f"![unsafe]({ref})") == shares._PLACEHOLDER
+    assert _sanitize(f"![unsafe]({ref})") == f"![unsafe]({shares._PLACEHOLDER})"
 
 
 def test_percent_image_does_not_exempt_neighboring_private_references():
@@ -203,7 +214,7 @@ def test_percent_image_does_not_exempt_neighboring_private_references():
         "![private](https://webui.example/api/media?path=/tmp/private.png) "
         "file:///tmp/private.png after"
     )
-    assert _sanitize(text) == f"before {image} {shares._PLACEHOLDER} {shares._PLACEHOLDER} after"
+    assert _sanitize(text) == f"before {image} ![private]({shares._PLACEHOLDER}) {shares._PLACEHOLDER} after"
 
 
 @pytest.mark.parametrize("ref", [
@@ -213,7 +224,7 @@ def test_percent_image_does_not_exempt_neighboring_private_references():
     "data:text/html;base64," + "A" * 17000,
 ], ids=["oversized", "encoded-private-path", "literal-file-path", "html-scheme"])
 def test_large_non_renderer_base64_image_does_not_bypass_private_boundary(ref):
-    assert _sanitize(f"![unsafe]({ref})") == shares._PLACEHOLDER
+    assert _sanitize(f"![unsafe]({ref})") == f"![unsafe]({shares._PLACEHOLDER})"
 
 
 def test_public_media_path_with_fragment_path_text_is_preserved():
@@ -582,7 +593,8 @@ def test_once_escaped_base64_formats_survive_snapshot(tmp_path, location, payloa
 def test_malformed_escaped_base64_fails_closed_in_snapshot(tmp_path, location, payload):
     ref = "data:image/png;base64," + payload
     actual, _ = _snapshot_escaped_image(tmp_path, ref, location)
-    assert actual == f"before {shares._PLACEHOLDER} after"
+    expected = f"![image]({shares._PLACEHOLDER})" if location == "body" else shares._PLACEHOLDER
+    assert actual == f"before {expected} after"
 
 
 @pytest.mark.parametrize("location", ["body", "bare-title", "wrapped-title"])
@@ -597,7 +609,8 @@ def test_escaped_base64_original_uri_size_boundary(tmp_path, location, offset):
     ref = prefix + payload
     assert len(ref) == size
     actual, original = _snapshot_escaped_image(tmp_path, ref, location)
-    assert actual == (original if offset <= 0 else f"before {shares._PLACEHOLDER} after")
+    expected = f"![image]({shares._PLACEHOLDER})" if location == "body" else shares._PLACEHOLDER
+    assert actual == (original if offset <= 0 else f"before {expected} after")
 
 
 @pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "wrapped"])
@@ -735,7 +748,7 @@ def test_png_file_uri_metadata_survives_snapshot_with_private_neighbors(tmp_path
     assert f'src="{ref}"' in before
     snapshot = shares.build_share_snapshot(session)
     actual = snapshot["messages"][0]["content"] if location == "body" else snapshot["title"]
-    assert actual == f"before {image} after " + " and ".join([shares._PLACEHOLDER] * len(private))
+    assert actual == f"before {image} after " + " and ".join([shares._PLACEHOLDER, f"![private]({shares._PLACEHOLDER})", f"`{shares._PLACEHOLDER}`", shares._PLACEHOLDER])
     if location == "body":
         after = subprocess.run([NODE, str(driver), str(REPO_ROOT / "static" / "ui.js")], input=actual, capture_output=True, text=True, timeout=30, check=True).stdout
         assert f'src="{ref}"' in after
@@ -758,7 +771,7 @@ def test_image_metadata_protection_stops_at_wrapped_title_boundary(tmp_path, nei
     if neighbor == "bare":
         text, expected = image + "file:///etc/secret.txt", image + shares._PLACEHOLDER
     elif neighbor == "code":
-        text, expected = image + "`file:///etc/secret.txt`", image + shares._PLACEHOLDER
+        text, expected = image + "`file:///etc/secret.txt`", image + f"`{shares._PLACEHOLDER}`"
     else:
         text = "file:///etc/before.txt " + image + "file:///etc/after.txt"
         expected = shares._PLACEHOLDER + " " + image + shares._PLACEHOLDER

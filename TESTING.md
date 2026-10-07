@@ -2109,3 +2109,22 @@ Bridged CLI sessions:
   Matching empty wrappers such as `**MEDIA:**` must remain prose.
 - Recheck settled and safe/fade streaming output across callback boundaries.
   Automated coverage: renderer behavior, MEDIA consumer parity, and SMD stream tests.
+
+### Public-share privacy review regression
+
+Run `./scripts/test.sh tests/test_share_renderer_privacy_review.py` with isolated
+state. These cases call `build_share_snapshot` and production `renderMd`, including
+its real remote-image policy with a same-origin WebUI and an allowlisted public
+CDN. They cover browser authority slash folding, labels and destinations whose
+backticks keep adjacent HTML inert, closing code delimiters, `profile:` public
+URLs, and complete raw `<img>` data-image attributes containing inert file metadata.
+Invalid and shadowed data-image `src` attributes remain scrubbed.
+
+For actual Chromium request and pixel-decoding evidence, run
+`python tests/browser_public_share_media_privacy.py --snapshot-python .venv/bin/python
+--evidence /tmp/share-privacy-browser.json` using a Python with Playwright and
+Chromium installed. This runs desktop (1280px) and narrow (390px) widths; every HTTP
+request is intercepted, and no real private file or provider is accessed. It must
+observe zero `/api/media` requests for private cases and decoded public controls.
+This gate does not widen the existing `/api/file*` route policy or certify arbitrary
+raw HTML privacy.
